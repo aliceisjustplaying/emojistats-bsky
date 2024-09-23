@@ -1,4 +1,4 @@
-import React, { memo, useMemo } from 'react';
+import React, { memo } from 'react';
 import { FixedSizeGrid as Grid, GridChildComponentProps } from 'react-window';
 import AutoSizer from 'react-virtualized-auto-sizer';
 
