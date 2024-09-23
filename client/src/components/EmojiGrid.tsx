@@ -34,7 +34,7 @@ const EmojiGrid: React.FC<EmojiGridProps> = ({ topEmojis }) => {
 
     return (
       <div style={cellStyle} className="flex items-center justify-between bg-gray-50 p-2 rounded shadow-sm">
-        <span className="text-lg">{emoji}</span>
+        <span className="text-lg text-black">{emoji}</span>
         <span className="text-sm text-gray-600">{count}</span>
       </div>
     );
