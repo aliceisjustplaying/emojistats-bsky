@@ -3,6 +3,7 @@ import emojiRegexFunc from 'emoji-regex';
 import dotenv from 'dotenv';
 import logger from './logger.js';
 import { createServer } from "http";
+import { createClient } from 'redis';
 import { Server } from "socket.io";
 
 dotenv.config();
@@ -28,19 +29,32 @@ const jetstream = new Jetstream({
   cursor: currentEpochMicroseconds.toString(),
 });
 
+// Initialize Redis client
+const redisClient = createClient({
+  url: process.env.REDIS_URL ?? 'redis://localhost:6379',
+  // Optional: Configure connection options for performance
+  // For example, max retries, timeouts, etc.
+});
+
+// Handle Redis events
+redisClient.on('error', (err: Error) => { logger.error('Redis Client Error', { error: err }); });
+redisClient.on('connect', () => { logger.info('Connected to Redis'); });
+redisClient.on('ready', () => { logger.info('Redis client ready'); });
+redisClient.on('end', () => { logger.info('Redis client disconnected'); });
+
+// Connect to Redis
+await redisClient.connect();
+
+
 const emojiRegex: RegExp = emojiRegexFunc();
 
-interface EmojiStats {
-  emoji: string;
-  count: number;
-}
+const EMOJI_SORTED_SET_KEY = 'emojiStats';
+const PROCESSED_POSTS_KEY = 'processedPosts';
+const POSTS_WITH_EMOJIS_KEY = 'postsWithEmojis';
+const PROCESSED_EMOJIS_KEY = 'processedEmojis';
 
-const emojiStats = new Map<string, number>();
-let processedPosts = 0;
-let postsWithEmojis = 0;
-let processedEmojis = 0;
 
-function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
+async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
   const { commit } = event;
 
   if (!commit.rkey) return;
@@ -53,14 +67,17 @@ function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
     const emojiMatches = text.match(emojiRegex);
 
     if (emojiMatches) {
-      postsWithEmojis++;
+      await redisClient.incr(POSTS_WITH_EMOJIS_KEY);
+
+      const pipeline = redisClient.multi();
       for (const emoji of emojiMatches) {
-        emojiStats.set(emoji, (emojiStats.get(emoji) || 0) + 1);
-        processedEmojis++;
+        pipeline.zIncrBy(EMOJI_SORTED_SET_KEY, 1, emoji);
+        pipeline.incr(PROCESSED_EMOJIS_KEY);
       }
+      await pipeline.exec();
     }
 
-    processedPosts++;
+    await redisClient.incr(PROCESSED_POSTS_KEY);
 
   } catch (error) {
     logger.error(`Error parsing record in "create" commit: ${(error as Error).message}`, { commit, record });
@@ -68,27 +85,40 @@ function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
   }
 }
 
-function getEmojiStats() {
-  const topEmojis = Array.from(emojiStats.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, MAX_EMOJIS)
-    .map(([emoji, count]) => ({ emoji, count }));
+async function getEmojiStats() {
+  // Retrieve top emojis (up to MAX_EMOJIS)
+  const topEmojis = await redisClient.zRangeWithScores(EMOJI_SORTED_SET_KEY, -MAX_EMOJIS, -1, { REV: true });
 
-  const postsWithoutEmojis = processedPosts - postsWithEmojis;
-  const ratio = postsWithoutEmojis > 0 ? (postsWithEmojis / postsWithoutEmojis).toFixed(2) : 'N/A';
+
+  
+  // Retrieve counters
+  const [processedPosts, postsWithEmojis, processedEmojis] = await redisClient.mGet([
+    PROCESSED_POSTS_KEY,
+    POSTS_WITH_EMOJIS_KEY,
+    PROCESSED_EMOJIS_KEY
+  ]);
+
+  const postsWithoutEmojis = (Number(processedPosts) || 0) - (Number(postsWithEmojis) || 0);
+  const ratio = postsWithoutEmojis > 0 ? ((Number(postsWithEmojis) || 0) / (Number(postsWithoutEmojis) || 1)).toFixed(2) : 'N/A';
+
+  // Format top emojis
+  const formattedTopEmojis = topEmojis.map(({ value, score }) => ({
+    emoji: value,
+    count: score,
+  })).slice(0, MAX_EMOJIS);
 
   return {
-    processedPosts,
-    processedEmojis,
-    postsWithEmojis,
+    processedPosts: Number(processedPosts) || 0,
+    processedEmojis: Number(processedEmojis) || 0,
+    postsWithEmojis: Number(postsWithEmojis) || 0,
     postsWithoutEmojis,
     ratio,
-    topEmojis,
+    topEmojis: formattedTopEmojis,
   };
 }
 
-function logEmojiStats() {
-  const stats = getEmojiStats();
+async function logEmojiStats() {
+  const stats = await getEmojiStats();
   logger.info(`Processed ${stats.processedPosts} posts`);
   logger.info(`Processed ${stats.processedEmojis} emojis`);
   logger.info(`Posts with emojis: ${stats.postsWithEmojis}`);
@@ -100,10 +130,16 @@ function logEmojiStats() {
   });
 }
 
-setInterval(() => {
-  // Emit aggregated emoji stats every 3 seconds
-  io.emit('emojiStats', getEmojiStats());
-  logEmojiStats();
+
+setInterval(async () => {
+  try {
+    // Emit aggregated emoji stats every EMIT_INTERVAL milliseconds
+    const stats = await getEmojiStats();
+    io.emit('emojiStats', stats);
+    await logEmojiStats();
+  } catch (error) {
+    logger.error(`Error emitting or logging emoji stats: ${(error as Error).message}`);
+  }
 }, EMIT_INTERVAL);
 
 jetstream.on('open', () => {
@@ -120,7 +156,7 @@ jetstream.on('error', (error) => {
 });
 
 jetstream.onCreate('app.bsky.feed.post', (event) => {
-  handleCreate(event);
+  void handleCreate(event);
 });
 
 jetstream.start();
@@ -130,7 +166,14 @@ const PORT = parseInt(process.env.PORT ?? '9202', 10);
 function shutdown() {
   logger.info('Shutting down gracefully...');
 
-  // Perform any cleanup here
+  try {
+    void redisClient.quit();
+    logger.info('Redis client disconnected');
+  } catch (error) {
+    logger.error('Error disconnecting Redis client:', error);
+  }
+
+  // Perform any other cleanup here
   process.exit(0);
 
   setTimeout(() => {
