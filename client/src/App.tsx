@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { io, Socket } from 'socket.io-client';
 import Header from './components/Header';
 import EmojiGrid from './components/EmojiGrid';
@@ -18,18 +18,19 @@ interface EmojiStats {
 
 function App() {
   const [emojiStats, setEmojiStats] = useState<EmojiStats | null>(null);
-  const [socket, setSocket] = useState<Socket | null>(null);
 
   useEffect(() => {
-    const newSocket = io('http://localhost:3000'); // Connects to the host that serves the page
-    setSocket(newSocket);
+    const socket: Socket = io('http://localhost:3000');
 
-    newSocket.on('emojiStats', (data: EmojiStats) => {
+    const handleEmojiStats = (data: EmojiStats) => {
       setEmojiStats(data);
-    });
+    };
+
+    socket.on('emojiStats', handleEmojiStats);
 
     return () => {
-      newSocket.disconnect();
+      socket.off('emojiStats', handleEmojiStats);
+      socket.disconnect();
     };
   }, []);
 
