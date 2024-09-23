@@ -14,8 +14,8 @@ interface FooterProps {
 
 function Footer({ stats }: FooterProps) {
   return (
-    <footer className="w-full bg-blue-600 p-4 h-16 flex-none">
-      <div className="flex flex-col sm:flex-row justify-between items-center text-white space-y-2 sm:space-y-0">
+    <footer className="w-full bg-gray-200 p-4 h-8 flex justify-center items-center">
+      <div className="text-sm flex flex-col sm:flex-row justify-between items-center text-gray-800 space-y-2 sm:space-y-0 sm:space-x-8">
         <span>Processed Posts: {stats.processedPosts}</span>
         <span>Processed Emojis: {stats.processedEmojis}</span>
         <span>Posts with Emojis: {stats.postsWithEmojis}</span>
