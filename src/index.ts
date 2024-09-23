@@ -5,6 +5,8 @@ import logger from './logger.js';
 import { createServer } from "http";
 import { createClient } from 'redis';
 import { Server } from "socket.io";
+import fs from 'fs';
+import path from 'path';
 
 dotenv.config();
 
@@ -45,7 +47,6 @@ redisClient.on('end', () => { logger.info('Redis client disconnected'); });
 // Connect to Redis
 await redisClient.connect();
 
-
 const emojiRegex: RegExp = emojiRegexFunc();
 
 const EMOJI_SORTED_SET_KEY = 'emojiStats';
@@ -53,6 +54,20 @@ const PROCESSED_POSTS_KEY = 'processedPosts';
 const POSTS_WITH_EMOJIS_KEY = 'postsWithEmojis';
 const PROCESSED_EMOJIS_KEY = 'processedEmojis';
 
+
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+const incrementEmojisScript = fs.readFileSync(
+  path.join(__dirname, 'lua', 'incrementEmojis.lua'),
+  'utf8'
+);
+
+// Register the script
+const SCRIPT_SHA = await redisClient.scriptLoad(incrementEmojisScript);
 
 async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
   const { commit } = event;
@@ -62,36 +77,52 @@ async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
   const { record } = commit;
 
   try {
+    let langs = new Set<string>();
+    if (record.langs && Array.isArray(record.langs)) {
+      langs = new Set(
+        record.langs.map((lang: string) =>
+          lang.split('-')[0].toLowerCase()
+        )
+      );
+    } else {
+      logger.debug(
+        `"langs" field is missing or invalid in record ${JSON.stringify(
+          record
+        )}`
+      );
+      langs.add('UNKNOWN');
+    }
+
     const text = record.text;
+    const emojiMatches = text.match(emojiRegex) ?? [];
 
-    const emojiMatches = text.match(emojiRegex);
-
-    if (emojiMatches) {
-      await redisClient.incr(POSTS_WITH_EMOJIS_KEY);
-
-      const pipeline = redisClient.multi();
+    if (emojiMatches.length > 0) {
       for (const emoji of emojiMatches) {
-        pipeline.zIncrBy(EMOJI_SORTED_SET_KEY, 1, emoji);
-        pipeline.incr(PROCESSED_EMOJIS_KEY);
+        await redisClient.evalSha(
+          SCRIPT_SHA,
+          {
+            keys: [],
+            arguments: [emoji, JSON.stringify(Array.from(langs))],
+          }
+        );
       }
-      await pipeline.exec();
     }
 
     await redisClient.incr(PROCESSED_POSTS_KEY);
-
   } catch (error) {
-    logger.error(`Error parsing record in "create" commit: ${(error as Error).message}`, { commit, record });
+    logger.error(
+      `Error processing "create" commit: ${(error as Error).message}`,
+      { commit, record }
+    );
     logger.error(`Malformed record data: ${JSON.stringify(record)}`);
   }
 }
 
 async function getEmojiStats() {
   // Retrieve top emojis (up to MAX_EMOJIS)
-  const topEmojis = await redisClient.zRangeWithScores(EMOJI_SORTED_SET_KEY, -MAX_EMOJIS, -1, { REV: true });
+  const topEmojis = await redisClient.zRangeWithScores(EMOJI_SORTED_SET_KEY, 0, MAX_EMOJIS - 1, { REV: true });
 
-
-  
-  // Retrieve counters
+  // Retrieve global counters
   const [processedPosts, postsWithEmojis, processedEmojis] = await redisClient.mGet([
     PROCESSED_POSTS_KEY,
     POSTS_WITH_EMOJIS_KEY,
@@ -116,7 +147,6 @@ async function getEmojiStats() {
     topEmojis: formattedTopEmojis,
   };
 }
-
 async function logEmojiStats() {
   const stats = await getEmojiStats();
   logger.info(`Processed ${stats.processedPosts} posts`);
@@ -129,7 +159,6 @@ async function logEmojiStats() {
     logger.info(`${emoji}: ${count}`);
   });
 }
-
 
 setInterval(async () => {
   try {
@@ -160,8 +189,6 @@ jetstream.onCreate('app.bsky.feed.post', (event) => {
 });
 
 jetstream.start();
-
-const PORT = parseInt(process.env.PORT ?? '9202', 10);
 
 function shutdown() {
   logger.info('Shutting down gracefully...');
