@@ -1,0 +1,33 @@
+{
+  "name": "name-goes-here",
+  "version": "1.0.0",
+  "description": "description-goes-here",
+  "main": "src/index.ts",
+  "type": "module",
+  "scripts": {
+    "start": "bunx tsx src/index.ts",
+    "dev": "bunx --watch src/index.ts",
+    "format": "bunx prettier --write .",
+    "lint": "bunx eslint .",
+    "lint:fix": "bunx eslint --fix ."
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "pino": "^9.4.0",
+    "pino-pretty": "^11.2.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.11.0",
+    "@trivago/prettier-plugin-sort-imports": "^4.3.0",
+    "@types/eslint__js": "^8.42.3",
+    "@types/node": "^22.5.5",
+    "eslint": "^9.11.0",
+    "prettier": "^3.3.3",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.2",
+    "typescript-eslint": "^8.6.0"
+  },
+  "author": "alice",
+  "license": "MIT",
+  "packageManager": "pnpm@9.10.0+sha512.73a29afa36a0d092ece5271de5177ecbf8318d454ecd701343131b8ebc0c1a91c487da46ab77c8e596d6acf1461e3594ced4becedf8921b074fbd8653ed7051c"
+}
