@@ -12,7 +12,9 @@
     "lint:fix": "bunx eslint --fix ."
   },
   "dependencies": {
+    "@skyware/jetstream": "^0.1.5",
     "dotenv": "^16.4.5",
+    "emoji-regex": "^10.4.0",
     "pino": "^9.4.0",
     "pino-pretty": "^11.2.2"
   },
@@ -20,12 +22,12 @@
     "@eslint/js": "^9.11.0",
     "@trivago/prettier-plugin-sort-imports": "^4.3.0",
     "@types/eslint__js": "^8.42.3",
-    "@types/node": "^22.5.5",
+    "@types/node": "^22.6.0",
     "eslint": "^9.11.0",
     "prettier": "^3.3.3",
     "tsx": "^4.19.1",
     "typescript": "^5.6.2",
-    "typescript-eslint": "^8.6.0"
+    "typescript-eslint": "^8.7.0"
   },
   "author": "alice",
   "license": "MIT",
