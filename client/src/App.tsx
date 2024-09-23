@@ -7,7 +7,7 @@ interface EmojiStats {
   postsWithEmojis: number;
   postsWithoutEmojis: number;
   ratio: string;
-  top10Emojis: Array<{
+  topEmojis: Array<{
     emoji: string;
     count: number;
   }>;
@@ -34,18 +34,29 @@ function App() {
 
   return (
     <div>
-      <h1>Emoji Tracker</h1>
+      <h1 className="text-3xl font-bold underline">
+        Emoji Tracker for Bluesky 🦋
+      </h1>
       <p>Processed Posts: {emojiStats.processedPosts}</p>
       <p>Processed Emojis: {emojiStats.processedEmojis}</p>
       <p>Posts with Emojis: {emojiStats.postsWithEmojis}</p>
       <p>Posts without Emojis: {emojiStats.postsWithoutEmojis}</p>
       <p>Ratio: {emojiStats.ratio}</p>
-      <h2>Top 10 Emojis</h2>
-      <ul>
-        {emojiStats.top10Emojis.map(({ emoji, count }) => (
-          <li key={emoji}>{`${emoji}: ${count}`}</li>
+      <h2>Top 100 Emojis</h2>
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(10, 1fr)',
+        gap: '10px',
+        maxWidth: '800px',
+        margin: '0 auto'
+      }}>
+        {emojiStats.topEmojis.map(({ emoji, count }) => (
+          <div key={emoji} style={{ textAlign: 'center' }}>
+            <div style={{ fontSize: '24px' }}>{emoji}</div>
+            <div>{count}</div>
+          </div>
         ))}
-      </ul>
+      </div>
     </div>
   );
 }
