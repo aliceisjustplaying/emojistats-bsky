@@ -28,6 +28,8 @@ interface EmojiStats {
 
 const emojiStats: EmojiStats[] = [];
 let processedPosts = 0;
+let postsWithEmojis = 0;
+let processedEmojis = 0;
 
 function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
   
@@ -43,6 +45,7 @@ function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
     const emojiMatches = text.match(emojiRegex);
 
     if (emojiMatches) {
+      postsWithEmojis++;
       for (const emoji of emojiMatches) {
         const existingEmoji = emojiStats.find(e => e.emoji === emoji);
         if (existingEmoji) {
@@ -50,20 +53,38 @@ function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
         } else {
           emojiStats.push({ emoji, count: 1 });
         }
+
+        processedEmojis++;
       }
     }
 
     processedPosts++;
 
-    setTimeout(() => {
-      console.log(`Processed ${processedPosts} posts`);
-      console.dir(emojiStats, { depth: null });
-    }, 2000);
   } catch (error) {
     logger.error(`Error parsing record in "create" commit: ${(error as Error).message}`, { commit, record });
     logger.error(`Malformed record data: ${JSON.stringify(record)}`);
   }
 }
+
+function logEmojiStats() {
+  logger.info(`Processed ${processedPosts} posts`);
+  const top10Emojis = emojiStats
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 10);
+  logger.info(`Processed ${processedEmojis} emojis`);
+  logger.info(`Posts with emojis: ${postsWithEmojis}`);
+  const postsWithoutEmojis = processedPosts - postsWithEmojis;
+  const ratio = postsWithEmojis / postsWithoutEmojis;
+  logger.info(`Ratio of posts with emojis to posts without: ${ratio.toFixed(2)}`);
+  logger.info('Top 10 Emojis:');
+  top10Emojis.forEach(({ emoji, count }) => {
+    logger.info(`${emoji}: ${count}`);
+  });
+}
+
+setInterval(() => {
+  logEmojiStats();
+}, 3000);
 
 jetstream.on('open', () => {
   logger.info('Connected to Jetstream firehose.');
