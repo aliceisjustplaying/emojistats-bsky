@@ -42,7 +42,7 @@ function App() {
   }
 
   return (
-    <div className="flex flex-col h-screen bg-gray-900 text-white">
+    <div className="flex flex-col h-screen text-white">
       <Header />
       <EmojiGrid topEmojis={emojiStats.topEmojis} />
       <Footer stats={emojiStats} />
