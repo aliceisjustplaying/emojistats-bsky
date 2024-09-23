@@ -20,6 +20,7 @@ httpServer.listen(3000);
 const currentEpochMicroseconds = BigInt(Date.now()) * 1000n;
 
 const FIREHOSE_URL = process.env.FIREHOSE_URL ?? 'wss://jetstream.atproto.tools/subscribe'; // default to Jaz's Jetstream instance
+const MAX_EMOJIS = 100;
 
 const jetstream = new Jetstream({
   wantedCollections: ['app.bsky.feed.post'],
@@ -76,9 +77,9 @@ function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
 }
 
 function getEmojiStats() {
-  const top10Emojis = [...emojiStats]
+  const topEmojis = [...emojiStats]
     .sort((a, b) => b.count - a.count)
-    .slice(0, 10);
+    .slice(0, MAX_EMOJIS);
 
   const postsWithoutEmojis = processedPosts - postsWithEmojis;
   const ratio = postsWithoutEmojis > 0 ? (postsWithEmojis / postsWithoutEmojis).toFixed(2) : 'N/A';
@@ -89,7 +90,7 @@ function getEmojiStats() {
     postsWithEmojis,
     postsWithoutEmojis,
     ratio,
-    top10Emojis,
+    topEmojis,
   };
 }
 
@@ -101,7 +102,7 @@ function logEmojiStats() {
   logger.info(`Posts without emojis: ${stats.postsWithoutEmojis}`);
   logger.info(`Ratio of posts with emojis to posts without: ${stats.ratio}`);
   logger.info('Top 10 Emojis:');
-  stats.top10Emojis.forEach(({ emoji, count }) => {
+  stats.topEmojis.forEach(({ emoji, count }) => {
     logger.info(`${emoji}: ${count}`);
   });
 }
