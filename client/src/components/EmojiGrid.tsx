@@ -1,4 +1,4 @@
-import React, { memo } from 'react';
+import React, { memo, useMemo } from 'react';
 import { FixedSizeGrid as Grid, GridChildComponentProps } from 'react-window';
 import AutoSizer from 'react-virtualized-auto-sizer';
 
@@ -11,20 +11,18 @@ interface EmojiGridProps {
   topEmojis: Emoji[];
 }
 
-const COLUMN_COUNT = 15; // Number of columns matching your grid setup
-const ROW_HEIGHT = 30; // Increased to accommodate padding
-const COLUMN_WIDTH = 98; // Increased to accommodate padding
-const CELL_PADDING = 2; // New constant for cell padding
+const MIN_COLUMN_WIDTH = 80;
+const ROW_HEIGHT = 40;
+const CELL_PADDING = 4;
 
 const EmojiGrid: React.FC<EmojiGridProps> = ({ topEmojis }) => {
-  const rowCount = Math.ceil(topEmojis.length / COLUMN_COUNT);
-
-  const Cell = memo(({ columnIndex, rowIndex, style }: GridChildComponentProps) => {
-    const index = rowIndex * COLUMN_COUNT + columnIndex;
-    if (index >= topEmojis.length) {
+  const Cell = memo(({ columnIndex, rowIndex, style, data }: GridChildComponentProps) => {
+    const { items, columnCount } = data;
+    const index = rowIndex * columnCount + columnIndex;
+    if (index >= items.length) {
       return null;
     }
-    const { emoji, count } = topEmojis[index];
+    const { emoji, count } = items[index];
 
     const cellStyle = {
       ...style,
@@ -35,29 +33,35 @@ const EmojiGrid: React.FC<EmojiGridProps> = ({ topEmojis }) => {
     };
 
     return (
-      <div style={cellStyle} className="flex items-center justify-start space-x-2 bg-gray-50 p-1 rounded shadow-sm">
-        <span className="text-lg text-black">{emoji}</span>
-        <span className="text-gray-900">{count}</span>
+      <div style={cellStyle} className="flex items-center justify-between bg-gray-50 p-2 rounded shadow-sm">
+        <span className="text-lg">{emoji}</span>
+        <span className="text-sm text-gray-600">{count}</span>
       </div>
     );
   });
 
   return (
-    <main className="flex-grow w-full p-4 bg-white overflow-auto">
+    <main className="flex-grow w-full p-4 bg-white overflow-hidden">
       <AutoSizer>
-        {({ height, width }) => (
-          <Grid
-  columnCount={COLUMN_COUNT}
-  columnWidth={COLUMN_WIDTH}
-  height={height}
-  rowCount={rowCount}
-  rowHeight={ROW_HEIGHT}
-  width={width}
-  overscanRowCount={5}
->
-  {Cell}
-</Grid>
-        )}
+        {({ height, width }) => {
+          const columnCount = Math.floor(width / MIN_COLUMN_WIDTH);
+          const columnWidth = width / columnCount;
+          const rowCount = Math.ceil(topEmojis.length / columnCount);
+
+          return (
+            <Grid
+              columnCount={columnCount}
+              columnWidth={columnWidth}
+              height={height}
+              rowCount={rowCount}
+              rowHeight={ROW_HEIGHT}
+              width={width}
+              itemData={{ items: topEmojis, columnCount }}
+            >
+              {Cell}
+            </Grid>
+          );
+        }}
       </AutoSizer>
     </main>
   );
