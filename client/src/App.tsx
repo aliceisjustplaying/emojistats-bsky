@@ -1,5 +1,8 @@
 import { useEffect, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
+import Header from './components/Header';
+import EmojiGrid from './components/EmojiGrid';
+import Footer from './components/Footer';
 
 interface EmojiStats {
   processedPosts: number;
@@ -30,33 +33,19 @@ function App() {
     };
   }, []);
 
-  if (!emojiStats) return <div>Loading...</div>;
+  if (!emojiStats) {
+    return (
+      <div className="flex items-center justify-center h-screen bg-gray-900 text-white">
+        Loading...
+      </div>
+    );
+  }
 
   return (
-    <div>
-      <h1 className="text-3xl font-bold underline">
-        Emoji Tracker for Bluesky 🦋
-      </h1>
-      <p>Processed Posts: {emojiStats.processedPosts}</p>
-      <p>Processed Emojis: {emojiStats.processedEmojis}</p>
-      <p>Posts with Emojis: {emojiStats.postsWithEmojis}</p>
-      <p>Posts without Emojis: {emojiStats.postsWithoutEmojis}</p>
-      <p>Ratio: {emojiStats.ratio}</p>
-      <h2>Top 100 Emojis</h2>
-      <div style={{
-        display: 'grid',
-        gridTemplateColumns: 'repeat(10, 1fr)',
-        gap: '10px',
-        maxWidth: '800px',
-        margin: '0 auto'
-      }}>
-        {emojiStats.topEmojis.map(({ emoji, count }) => (
-          <div key={emoji} style={{ textAlign: 'center' }}>
-            <div style={{ fontSize: '24px' }}>{emoji}</div>
-            <div>{count}</div>
-          </div>
-        ))}
-      </div>
+    <div className="flex flex-col h-screen bg-gray-900 text-white">
+      <Header />
+      <EmojiGrid topEmojis={emojiStats.topEmojis} />
+      <Footer stats={emojiStats} />
     </div>
   );
 }
