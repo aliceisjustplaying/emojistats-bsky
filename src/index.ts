@@ -7,6 +7,11 @@ import { Server } from "socket.io";
 
 dotenv.config();
 
+const FIREHOSE_URL = process.env.FIREHOSE_URL ?? 'wss://jetstream.atproto.tools/subscribe';
+const MAX_EMOJIS = 1000;
+const EMIT_INTERVAL = 1000;
+const currentEpochMicroseconds = BigInt(Date.now()) * 1000n;
+
 const httpServer = createServer();
 const io = new Server(httpServer, {
   cors: {
@@ -16,11 +21,6 @@ const io = new Server(httpServer, {
 });
 
 httpServer.listen(3000);
-
-const currentEpochMicroseconds = BigInt(Date.now()) * 1000n;
-
-const FIREHOSE_URL = process.env.FIREHOSE_URL ?? 'wss://jetstream.atproto.tools/subscribe'; // default to Jaz's Jetstream instance
-const MAX_EMOJIS = 100;
 
 const jetstream = new Jetstream({
   wantedCollections: ['app.bsky.feed.post'],
@@ -35,7 +35,7 @@ interface EmojiStats {
   count: number;
 }
 
-const emojiStats: EmojiStats[] = [];
+const emojiStats = new Map<string, number>();
 let processedPosts = 0;
 let postsWithEmojis = 0;
 let processedEmojis = 0;
@@ -55,17 +55,9 @@ function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
     if (emojiMatches) {
       postsWithEmojis++;
       for (const emoji of emojiMatches) {
-        const existingEmoji = emojiStats.find(e => e.emoji === emoji);
-        if (existingEmoji) {
-          existingEmoji.count++;
-        } else {
-          emojiStats.push({ emoji, count: 1 });
-        }
-
+        emojiStats.set(emoji, (emojiStats.get(emoji) || 0) + 1);
         processedEmojis++;
       }
-
-      io.emit('emojiStats', getEmojiStats());
     }
 
     processedPosts++;
@@ -77,9 +69,10 @@ function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
 }
 
 function getEmojiStats() {
-  const topEmojis = [...emojiStats]
-    .sort((a, b) => b.count - a.count)
-    .slice(0, MAX_EMOJIS);
+  const topEmojis = Array.from(emojiStats.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, MAX_EMOJIS)
+    .map(([emoji, count]) => ({ emoji, count }));
 
   const postsWithoutEmojis = processedPosts - postsWithEmojis;
   const ratio = postsWithoutEmojis > 0 ? (postsWithEmojis / postsWithoutEmojis).toFixed(2) : 'N/A';
@@ -102,14 +95,16 @@ function logEmojiStats() {
   logger.info(`Posts without emojis: ${stats.postsWithoutEmojis}`);
   logger.info(`Ratio of posts with emojis to posts without: ${stats.ratio}`);
   logger.info('Top 10 Emojis:');
-  stats.topEmojis.forEach(({ emoji, count }) => {
+  stats.topEmojis.slice(0, 10).forEach(({ emoji, count }) => {
     logger.info(`${emoji}: ${count}`);
   });
 }
 
 setInterval(() => {
+  // Emit aggregated emoji stats every 3 seconds
+  io.emit('emojiStats', getEmojiStats());
   logEmojiStats();
-}, 3000);
+}, EMIT_INTERVAL);
 
 jetstream.on('open', () => {
   logger.info('Connected to Jetstream firehose.');
@@ -135,7 +130,7 @@ const PORT = parseInt(process.env.PORT ?? '9202', 10);
 function shutdown() {
   logger.info('Shutting down gracefully...');
 
-  // ...
+  // Perform any cleanup here
   process.exit(0);
 
   setTimeout(() => {
