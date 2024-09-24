@@ -100,28 +100,20 @@ async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
     const text = record.text;
     const emojiMatches = text.match(emojiRegex) ?? [];
 
-    // logger.info(`Processing post with languages: ${Array.from(langs).join(', ')}`);
-    // logger.info(`Found ${emojiMatches.length} emojis in post.`);
+    logger.debug(`Processing post with languages: ${Array.from(langs).join(', ')}`);
+    logger.debug(`Found ${emojiMatches.length} emojis in post.`);
 
     if (emojiMatches.length > 0) {
       for (const emoji of emojiMatches) {
-        // logger.info(`Processing emoji: ${emoji}`);
-          //  logger.info(`Calling evalSha with SCRIPT_SHA: ${SCRIPT_SHA}, emoji: ${emoji}, langs: ${JSON.stringify(Array.from(langs))}`);
+           logger.debug(`Calling evalSha with SCRIPT_SHA: ${SCRIPT_SHA}, emoji: ${emoji}, langs: ${JSON.stringify(Array.from(langs))}`);
            await redisClient.evalSha(SCRIPT_SHA, {
             arguments: [emoji, JSON.stringify(Array.from(langs))]
            });
-  //  await redisClient.evalSha
-  //    SCRIPT_SHA,
-  //    0, // Number of keys
-  //    emoji,
-  //    JSON.stringify(Array.from(langs))
-  //  );
-        // logger.info(`Emojis updated for languages: ${Array.from(langs).join(', ')}`);
+        logger.debug(`Emojis updated for languages: ${Array.from(langs).join(', ')}`);
       }
     }
 
     await redisClient.incr(PROCESSED_POSTS_KEY);
-    // logger.info(`Incremented processed posts. Total: ${await redisClient.get(PROCESSED_POSTS_KEY)}`);
   } catch (error) {
     logger.error(
       `Error processing "create" commit: ${(error as Error).message}`,

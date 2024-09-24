@@ -4,8 +4,6 @@ import Header from './components/Header';
 import EmojiGrid from './components/EmojiGrid';
 import Footer from './components/Footer';
 import LanguageTabs from './components/LanguageTabs';
-import * as Tabs from '@radix-ui/react-tabs';
-
 
 interface EmojiStats {
   processedPosts: number;
@@ -30,13 +28,7 @@ function App() {
   const [selectedLanguage, setSelectedLanguage] = useState<string>('all');
   const [currentEmojis, setCurrentEmojis] = useState<Array<{ emoji: string; count: number }>>([]);
   const socketRef = useRef<Socket | null>(null);
-  const selectedLanguageRef = useRef<string>(selectedLanguage);
   const [loading, setLoading] = useState<boolean>(false);
-
-  // Update the ref whenever selectedLanguage changes
-  useEffect(() => {
-    selectedLanguageRef.current = selectedLanguage;
-  }, [selectedLanguage]);
 
   useEffect(() => {
     // Initialize socket connection once
@@ -45,7 +37,7 @@ function App() {
     // Handle incoming emoji stats
     socket.on('emojiStats', (data: EmojiStats) => {
       setEmojiStats(data);
-      if (selectedLanguageRef.current === 'all') {
+      if (selectedLanguage === 'all') {
         setCurrentEmojis(data.topEmojis);
       }
     });
@@ -59,7 +51,7 @@ function App() {
     socket.on(
       'topEmojisForLanguage',
       (data: { language: string; topEmojis: Array<{ emoji: string; count: number }> }) => {
-        if (data.language === selectedLanguageRef.current) {
+        if (data.language === selectedLanguage) {
           setCurrentEmojis(data.topEmojis);
           setLoading(false);
         }
@@ -72,7 +64,7 @@ function App() {
     return () => {
       socket.disconnect();
     };
-  }, []); // Empty dependency array ensures this runs once
+  }, [selectedLanguage]); // Include selectedLanguage to handle updates
 
   useEffect(() => {
     if (selectedLanguage !== 'all' && socketRef.current) {
@@ -96,15 +88,19 @@ function App() {
         onSelect={handleLanguageSelect}
       />
       <EmojiGrid topEmojis={currentEmojis} />
-      <Footer stats={emojiStats || {
-        processedPosts: 0,
-        processedEmojis: 0,
-        postsWithEmojis: 0,
-        postsWithoutEmojis: 0,
-        ratio: 'N/A',
-        topEmojis: [],
-      }} />
-      {loading && <div>Loading...</div>}
+      <Footer
+        stats={
+          emojiStats || {
+            processedPosts: 0,
+            processedEmojis: 0,
+            postsWithEmojis: 0,
+            postsWithoutEmojis: 0,
+            ratio: 'N/A',
+            topEmojis: [],
+          }
+        }
+      />
+      {loading && <div className="p-4 text-center">Loading...</div>}
     </div>
   );
 }

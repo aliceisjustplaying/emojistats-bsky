@@ -5,13 +5,18 @@ export default {
     extend: {
       colors: {
         beige: {
-          100: '#f7fafc', // Beige color
-          200: '#e0e3e5', // Beige color (10% darker)
+          100: '#f7fafc',
+          200: '#e0e3e5',
         },
         gray: {
-          100: '#f7fafc', // Light Gray for emoji backgrounds
-          700: '#a0aec0', // Adjusted Gray if needed
-          800: '#2d3748', // Adjusted Gray for text
+          100: '#f7fafc',
+          700: '#a0aec0',
+          800: '#2d3748',
+          900: '#1a202c',
+        },
+        blue: {
+          500: '#3b82f6',
+          600: '#2563eb',
         },
       },
     },
