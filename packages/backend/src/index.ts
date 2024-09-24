@@ -13,12 +13,27 @@ import logger from './logger.js';
 
 dotenv.config();
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
 const FIREHOSE_URL = process.env.FIREHOSE_URL ?? 'wss://jetstream.atproto.tools/subscribe';
 const MAX_EMOJIS = 3790; // Per Unicode 16.0
 const EMIT_INTERVAL = 1000;
-const LOG_INTERVAL = 2 * 1000;
+const LOG_INTERVAL = 10 * 1000;
 const TRIM_LANGUAGE_CODES = false;
 const CURSOR_UPDATE_INTERVAL = 10 * 1000;
+
+interface Emoji {
+  codes: string;
+  char: string;
+  name: string;
+  category: string;
+  group: string;
+  subgroup: string;
+}
+
+// source: https://github.com/amio/emoji.json/blob/master/emoji.json
+const emojis = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'emoji.json'), 'utf8')) as Emoji[];
 
 /* Redis initialization */
 const redisClient = createClient({
@@ -43,8 +58,6 @@ redisClient.on('end', () => {
 
 await redisClient.connect();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
 const incrementEmojisScript = fs.readFileSync(path.join(__dirname, 'lua', 'incrementEmojis.lua'), 'utf8');
 const SCRIPT_SHA = await redisClient.scriptLoad(incrementEmojisScript);
 /* End Redis initialization */
@@ -114,6 +127,12 @@ io.on('connection', (socket: Socket) => {
       logger.error(`Error fetching top emojis for language ${language}: ${(error as Error).message}`);
       socket.emit('error', `Error fetching top emojis for language ${language}`);
     }
+  });
+
+  socket.on('getEmojiInfo', (emoji: string) => {
+    logger.info(`Getting emoji info for ${emoji}`);
+    const emojiInfo = emojis.find((e) => e.char === emoji);
+    socket.emit('emojiInfo', emojiInfo);
   });
 
   socket.on('disconnect', () => {

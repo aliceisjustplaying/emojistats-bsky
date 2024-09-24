@@ -61,6 +61,10 @@ function App() {
       },
     );
 
+    socket.on('emojiInfo', (data) => {
+      console.log('Emoji Info:', data);
+    });
+
     socketRef.current = socket;
 
     // Clean up on unmount
@@ -91,7 +95,7 @@ function App() {
         onSelect={handleLanguageSelect}
         totalEmojiCount={totalEmojiCount}
       />
-      <EmojiGrid topEmojis={currentEmojis} />
+      <EmojiGrid topEmojis={currentEmojis} socket={socketRef.current!} />
       <Footer
         stats={
           emojiStats || {

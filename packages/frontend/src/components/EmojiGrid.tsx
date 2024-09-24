@@ -1,6 +1,7 @@
 import React, { memo } from 'react';
 import AutoSizer from 'react-virtualized-auto-sizer';
 import { FixedSizeGrid as Grid, GridChildComponentProps } from 'react-window';
+import { Socket } from 'socket.io-client';
 
 interface Emoji {
   emoji: string;
@@ -9,15 +10,16 @@ interface Emoji {
 
 interface EmojiGridProps {
   topEmojis: Emoji[];
+  socket: Socket;
 }
 
 const MIN_COLUMN_WIDTH = 80;
 const ROW_HEIGHT = 40;
 const CELL_PADDING = 4;
 
-const EmojiGrid: React.FC<EmojiGridProps> = ({ topEmojis }) => {
+const EmojiGrid: React.FC<EmojiGridProps> = ({ topEmojis, socket }) => {
   const Cell = memo(({ columnIndex, rowIndex, style, data }: GridChildComponentProps) => {
-    const { items, columnCount } = data;
+    const { items, columnCount, socket }: { items: Emoji[]; columnCount: number; socket: Socket } = data;
     const index = rowIndex * columnCount + columnIndex;
     if (index >= items.length) {
       return null;
@@ -32,8 +34,17 @@ const EmojiGrid: React.FC<EmojiGridProps> = ({ topEmojis }) => {
       height: (style.height as number) - CELL_PADDING * 2,
     };
 
+    const handleClick = () => {
+      console.log(`Getting emoji info for ${emoji}`);
+      socket.emit('getEmojiInfo', emoji);
+    };
+
     return (
-      <div style={cellStyle} className="flex items-center justify-between bg-gray-50 p-2 rounded shadow-sm">
+      <div
+        style={cellStyle}
+        className="flex items-center justify-between bg-gray-50 p-2 rounded shadow-sm cursor-pointer hover:bg-gray-100"
+        onClick={handleClick}
+      >
         <span className="text text-black">{emoji}</span>
         <span className="text-xs text-gray-600">{count}</span>
       </div>
@@ -56,7 +67,7 @@ const EmojiGrid: React.FC<EmojiGridProps> = ({ topEmojis }) => {
               rowCount={rowCount}
               rowHeight={ROW_HEIGHT}
               width={width}
-              itemData={{ items: topEmojis, columnCount }}
+              itemData={{ items: topEmojis, columnCount, socket }}
             >
               {Cell}
             </Grid>
