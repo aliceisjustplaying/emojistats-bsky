@@ -5,6 +5,10 @@
   "scripts": {
     "dev:frontend": "cd packages/frontend && bun run dev",
     "dev:backend": "cd packages/backend && bun run dev",
-    "dev": "concurrently --names=backend,frontend --prefix-colors=auto 'bun run dev:backend' 'bun run dev:frontend'"
+    "dev": "concurrently --names=backend,frontend --prefix-colors=auto 'bun run dev:backend' 'bun run dev:frontend'",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "husky": "^9.1.6"
   }
 }
