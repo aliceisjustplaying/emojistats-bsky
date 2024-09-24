@@ -10,9 +10,10 @@ interface LanguageTabsProps {
   languages: LanguageStat[];
   selectedLanguage: string;
   onSelect: (language: string) => void;
+  totalEmojiCount: number;
 }
 
-const LanguageTabs: React.FC<LanguageTabsProps> = ({ languages, selectedLanguage, onSelect }) => {
+const LanguageTabs: React.FC<LanguageTabsProps> = ({ languages, selectedLanguage, onSelect, totalEmojiCount }) => {
   return (
     <Tabs.Root
       value={selectedLanguage}
@@ -20,16 +21,16 @@ const LanguageTabs: React.FC<LanguageTabsProps> = ({ languages, selectedLanguage
       className="w-full bg-white shadow-md rounded-t-lg"
     >
       <Tabs.List className="flex border-t border-l border-r border-gray-300">
-        <Tabs.Trigger
-          value="all"
-          className={`px-6 py-2 border-t border-l border-r ${
-            selectedLanguage === 'all'
-              ? 'border-blue-500 text-blue-600 rounded-t-lg'
-              : 'border-transparent text-gray-600 hover:text-blue-500'
-          } focus:outline-none focus:ring-2 focus:ring-blue-400`}
-        >
-          All
-        </Tabs.Trigger>
+      <Tabs.Trigger
+  value="all"
+  className={`px-6 py-2 border-t border-l border-r ${
+    selectedLanguage === 'all'
+      ? 'border-blue-500 text-blue-600 rounded-t-lg'
+      : 'border-transparent text-gray-600 hover:text-blue-500'
+  } focus:outline-none focus:ring-2 focus:ring-blue-400`}
+>
+  All ({totalEmojiCount})
+</Tabs.Trigger>
         {languages.map((lang) => (
           <Tabs.Trigger
             key={lang.language}

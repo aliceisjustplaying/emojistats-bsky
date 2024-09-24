@@ -104,11 +104,13 @@ async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
     logger.debug(`Found ${emojiMatches.length} emojis in post.`);
 
     if (emojiMatches.length > 0) {
-      for (const emoji of emojiMatches) {
-           logger.debug(`Calling evalSha with SCRIPT_SHA: ${SCRIPT_SHA}, emoji: ${emoji}, langs: ${JSON.stringify(Array.from(langs))}`);
-           await redisClient.evalSha(SCRIPT_SHA, {
-            arguments: [emoji, JSON.stringify(Array.from(langs))]
-           });
+      for (let i = 0; i < emojiMatches.length; i++) {
+        const emoji = emojiMatches[i];
+        const isFirstEmoji = i === 0 ? "1" : "0";
+        logger.debug(`Calling evalSha with SCRIPT_SHA: ${SCRIPT_SHA}, emoji: ${emoji}, langs: ${JSON.stringify(Array.from(langs))}, isFirstEmoji: ${isFirstEmoji}`);
+        await redisClient.evalSha(SCRIPT_SHA, {
+          arguments: [emoji, JSON.stringify(Array.from(langs)), isFirstEmoji]
+        });
         logger.debug(`Emojis updated for languages: ${Array.from(langs).join(', ')}`);
       }
     }

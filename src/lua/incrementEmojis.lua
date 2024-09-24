@@ -1,8 +1,11 @@
 local emoji = ARGV[1]
 local langKeys = cjson.decode(ARGV[2])
+local isFirstEmoji = ARGV[3]
 
 -- Increment global counters
-redis.call('INCR', 'postsWithEmojis')
+if isFirstEmoji == "1" then
+  redis.call('INCR', 'postsWithEmojis')
+end
 redis.call('ZINCRBY', 'emojiStats', 1, emoji)
 redis.call('INCR', 'processedEmojis')
 
