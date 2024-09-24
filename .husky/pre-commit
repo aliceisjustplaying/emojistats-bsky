@@ -1,1 +1,11 @@
+# shellcheck disable=SC2148
+STASH_RESULT=$(git stash --keep-index)
+
 bun run --filter '*' format
+
+# Add the formatted files back to the staging area
+git diff --cached --name-only --diff-filter=ACMR | xargs git add
+
+if [ "$STASH_RESULT" != "No local changes to save" ]; then
+  git stash pop --quiet
+fi
