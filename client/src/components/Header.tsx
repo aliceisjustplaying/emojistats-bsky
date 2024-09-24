@@ -1,5 +1,3 @@
-import React from 'react';
-
 function Header() {
   return (
     <header className="w-full p-2 h-10 flex-none">
