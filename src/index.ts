@@ -15,9 +15,6 @@ dotenv.config();
 const FIREHOSE_URL = process.env.FIREHOSE_URL ?? 'wss://jetstream.atproto.tools/subscribe';
 const MAX_EMOJIS = 1000;
 const EMIT_INTERVAL = 1000;
-const CURSOR_UPDATE_INTERVAL_MS = 10 * 1000;
-const CURSOR_KEY = 'lastCursor';
-let cursorUpdateInterval: NodeJS.Timeout | null = null;
 
 // Initialize Redis client
 const redisClient = createClient({
@@ -35,12 +32,11 @@ const io = new Server(httpServer, {
 
 httpServer.listen(process.env.PORT ?? 3000);
 
-let latestCursor = await getLastCursor();
 
 const jetstream = new Jetstream({
   wantedCollections: ['app.bsky.feed.post'],
   endpoint: FIREHOSE_URL,
-  cursor: latestCursor.toString(),
+  // cursor: TODO,
 });
 
 
@@ -77,35 +73,6 @@ interface LanguageStat {
   count: number;
 }
 
-async function getLastCursor(): Promise<bigint> {
-  const result = await redisClient.get(CURSOR_KEY);
-  if (!result) {
-    const currentEpochMicroseconds = BigInt(Date.now()) * 1000n;
-    await redisClient.set(CURSOR_KEY, currentEpochMicroseconds.toString());
-    logger.info(`Initialized cursor with value: ${currentEpochMicroseconds}`);
-    return currentEpochMicroseconds;
-  }
-  return BigInt(result);
-}
-
-async function updateLastCursor(newCursor: bigint): Promise<void> {
-  await redisClient.set(CURSOR_KEY, newCursor.toString());
-}
-
-function initializeCursorUpdate() {
-  cursorUpdateInterval = setInterval(() => {
-    if (latestCursor > 0n) {
-      updateLastCursor(latestCursor)
-        .then(() => {
-          logger.info(`Cursor updated to ${latestCursor}`);
-        })
-        .catch((error: unknown) => {
-          logger.error(`Error updating cursor: ${(error as Error).message}`);
-        });
-    }
-  }, CURSOR_UPDATE_INTERVAL_MS);
-}
-
 async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
   const { commit } = event;
 
@@ -114,9 +81,6 @@ async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
   const { record } = commit;
 
   try {
-    if (BigInt(event.time_us) > latestCursor) {
-      latestCursor = BigInt(event.time_us);
-    }
     let langs = new Set<string>();
     if (record.langs && Array.isArray(record.langs)) {
       langs = new Set(
@@ -264,10 +228,8 @@ io.on('connection', (socket: Socket) => {
 
 jetstream.on('open', () => {
   logger.info('Connected to Jetstream firehose.');
-  if (!cursorUpdateInterval) {
-    initializeCursorUpdate();
-  }
 });
+
 jetstream.on('close', () => {
   logger.info('Jetstream firehose connection closed.');
   shutdown();
@@ -290,10 +252,6 @@ function shutdown() {
     logger.error('Forcing shutdown.');
     process.exit(1);
   }, 60000);
-
-  if (cursorUpdateInterval) {
-    clearInterval(cursorUpdateInterval);
-  }
 
   redisClient.quit().then(() => {
     logger.info('Redis client disconnected');
