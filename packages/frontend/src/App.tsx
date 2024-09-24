@@ -1,9 +1,10 @@
-import { useEffect, useState, useRef } from 'react';
-import { io, Socket } from 'socket.io-client';
-import Header from './components/Header';
-import EmojiGrid from './components/EmojiGrid';
-import Footer from './components/Footer';
-import LanguageTabs from './components/LanguageTabs';
+import { useEffect, useRef, useState } from 'react';
+import { Socket, io } from 'socket.io-client';
+
+import EmojiGrid from './components/EmojiGrid.js';
+import Footer from './components/Footer.js';
+import Header from './components/Header.js';
+import LanguageTabs from './components/LanguageTabs.js';
 
 interface EmojiStats {
   processedPosts: number;
@@ -57,7 +58,7 @@ function App() {
           setCurrentEmojis(data.topEmojis);
           setLoading(false);
         }
-      }
+      },
     );
 
     socketRef.current = socket;
@@ -85,11 +86,11 @@ function App() {
     <div className="flex flex-col h-screen text-white">
       <Header />
       <LanguageTabs
-  languages={languageStats}
-  selectedLanguage={selectedLanguage}
-  onSelect={handleLanguageSelect}
-  totalEmojiCount={totalEmojiCount}
-/>
+        languages={languageStats}
+        selectedLanguage={selectedLanguage}
+        onSelect={handleLanguageSelect}
+        totalEmojiCount={totalEmojiCount}
+      />
       <EmojiGrid topEmojis={currentEmojis} />
       <Footer
         stats={

@@ -1,6 +1,6 @@
 import React, { memo } from 'react';
-import { FixedSizeGrid as Grid, GridChildComponentProps } from 'react-window';
 import AutoSizer from 'react-virtualized-auto-sizer';
+import { FixedSizeGrid as Grid, GridChildComponentProps } from 'react-window';
 
 interface Emoji {
   emoji: string;
