@@ -1,0 +1,41 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "description": "Backend for Emojitracker for Bluesky",
+  "main": "src/index.ts",
+  "type": "module",
+  "scripts": {
+    "start": "bunx tsx src/index.ts",
+    "dev": "bunx tsx --watch src/index.ts",
+    "format": "bunx prettier --write .",
+    "lint": "bunx eslint .",
+    "lint:fix": "bunx eslint --fix ."
+  },
+  "dependencies": {
+    "@skyware/jetstream": "^0.1.5",
+    "dotenv": "^16.4.5",
+    "emoji-regex": "^10.4.0",
+    "express": "^4.21.0",
+    "pino": "^9.4.0",
+    "pino-pretty": "^11.2.2",
+    "react": "^18.3.1",
+    "redis": "^4.7.0",
+    "socket.io": "^4.8.0",
+    "socket.io-client": "^4.8.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.11.1",
+    "@trivago/prettier-plugin-sort-imports": "^4.3.0",
+    "@types/eslint__js": "^8.42.3",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.6.1",
+    "eslint": "^9.11.1",
+    "prettier": "^3.3.3",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.2",
+    "typescript-eslint": "^8.7.0"
+  },
+  "author": "alice",
+  "license": "MIT",
+  "packageManager": "pnpm@9.10.0+sha512.73a29afa36a0d092ece5271de5177ecbf8318d454ecd701343131b8ebc0c1a91c487da46ab77c8e596d6acf1461e3594ced4becedf8921b074fbd8653ed7051c"
+}

@@ -1,13 +1,15 @@
 {
-  "name": "client",
+  "name": "frontend",
   "private": true,
   "version": "0.0.0",
   "type": "module",
   "scripts": {
     "dev": "bunx --bun vite",
     "build": "tsc -b && vite build",
-    "lint": "eslint .",
-    "preview": "vite preview"
+    "lint": "bunx eslint .",
+    "lint:fix": "bunx eslint --fix .",
+    "preview": "vite preview",
+    "format": "bunx prettier --write ."
   },
   "dependencies": {
     "@radix-ui/react-tabs": "^1.1.0",
@@ -33,6 +35,8 @@
     "tailwindcss": "^3.4.13",
     "typescript": "^5.6.2",
     "typescript-eslint": "^8.7.0",
-    "vite": "^5.4.7"
+    "vite": "^5.4.7",
+    "@trivago/prettier-plugin-sort-imports": "^4.3.0",
+    "prettier": "^3.3.3"
   }
 }
