@@ -4,9 +4,11 @@ import dotenv from 'dotenv';
 import logger from './logger.js';
 import { createServer } from "http";
 import { createClient } from 'redis';
-import { Server } from "socket.io";
+import { Server, Socket } from "socket.io";
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
 
 dotenv.config();
 
@@ -50,13 +52,10 @@ await redisClient.connect();
 const emojiRegex: RegExp = emojiRegexFunc();
 
 const EMOJI_SORTED_SET_KEY = 'emojiStats';
+const LANGUAGE_SORTED_SET_KEY = 'languageStats';
 const PROCESSED_POSTS_KEY = 'processedPosts';
 const POSTS_WITH_EMOJIS_KEY = 'postsWithEmojis';
 const PROCESSED_EMOJIS_KEY = 'processedEmojis';
-
-
-import { fileURLToPath } from 'url';
-import { dirname } from 'path';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -68,6 +67,11 @@ const incrementEmojisScript = fs.readFileSync(
 
 // Register the script
 const SCRIPT_SHA = await redisClient.scriptLoad(incrementEmojisScript);
+
+interface LanguageStat {
+  language: string;
+  count: number;
+}
 
 async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
   const { commit } = event;
@@ -96,19 +100,28 @@ async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
     const text = record.text;
     const emojiMatches = text.match(emojiRegex) ?? [];
 
+    // logger.info(`Processing post with languages: ${Array.from(langs).join(', ')}`);
+    // logger.info(`Found ${emojiMatches.length} emojis in post.`);
+
     if (emojiMatches.length > 0) {
       for (const emoji of emojiMatches) {
-        await redisClient.evalSha(
-          SCRIPT_SHA,
-          {
-            keys: [],
-            arguments: [emoji, JSON.stringify(Array.from(langs))],
-          }
-        );
+        // logger.info(`Processing emoji: ${emoji}`);
+          //  logger.info(`Calling evalSha with SCRIPT_SHA: ${SCRIPT_SHA}, emoji: ${emoji}, langs: ${JSON.stringify(Array.from(langs))}`);
+           await redisClient.evalSha(SCRIPT_SHA, {
+            arguments: [emoji, JSON.stringify(Array.from(langs))]
+           });
+  //  await redisClient.evalSha
+  //    SCRIPT_SHA,
+  //    0, // Number of keys
+  //    emoji,
+  //    JSON.stringify(Array.from(langs))
+  //  );
+        // logger.info(`Emojis updated for languages: ${Array.from(langs).join(', ')}`);
       }
     }
 
     await redisClient.incr(PROCESSED_POSTS_KEY);
+    // logger.info(`Incremented processed posts. Total: ${await redisClient.get(PROCESSED_POSTS_KEY)}`);
   } catch (error) {
     logger.error(
       `Error processing "create" commit: ${(error as Error).message}`,
@@ -119,8 +132,11 @@ async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
 }
 
 async function getEmojiStats() {
-  // Retrieve top emojis (up to MAX_EMOJIS)
-  const topEmojis = await redisClient.zRangeWithScores(EMOJI_SORTED_SET_KEY, 0, MAX_EMOJIS - 1, { REV: true });
+  // Retrieve top emojis in ascending order
+  const topEmojisDesc = await redisClient.zRangeWithScores(EMOJI_SORTED_SET_KEY, 0, MAX_EMOJIS - 1, { REV: true });
+  
+  // // Reverse to get descending order
+  // const topEmojisDesc = topEmojisAsc.reverse();
 
   // Retrieve global counters
   const [processedPosts, postsWithEmojis, processedEmojis] = await redisClient.mGet([
@@ -133,7 +149,7 @@ async function getEmojiStats() {
   const ratio = postsWithoutEmojis > 0 ? ((Number(postsWithEmojis) || 0) / (Number(postsWithoutEmojis) || 1)).toFixed(2) : 'N/A';
 
   // Format top emojis
-  const formattedTopEmojis = topEmojis.map(({ value, score }) => ({
+  const formattedTopEmojis = topEmojisDesc.map(({ value, score }) => ({
     emoji: value,
     count: score,
   })).slice(0, MAX_EMOJIS);
@@ -147,6 +163,29 @@ async function getEmojiStats() {
     topEmojis: formattedTopEmojis,
   };
 }
+
+async function getLanguageStats(): Promise<LanguageStat[]> {
+  // Retrieve top languages in ascending order
+  const topLanguagesDesc = await redisClient.zRangeWithScores(LANGUAGE_SORTED_SET_KEY, 0, 9, { REV: true });
+  
+  return topLanguagesDesc.map(({ value, score }) => ({
+    language: value,
+    count: score,
+  }));
+}
+
+async function getTopEmojisForLanguage(language: string) {
+  const topEmojisDesc = await redisClient.zRangeWithScores(language, 0, MAX_EMOJIS - 1, { REV: true });
+  
+  // Format the emojis
+  const formattedTopEmojis = topEmojisDesc.map(({ value, score }) => ({
+    emoji: value,
+    count: score,
+  })).slice(0, MAX_EMOJIS);
+
+  return formattedTopEmojis;
+}
+
 async function logEmojiStats() {
   const stats = await getEmojiStats();
   logger.info(`Processed ${stats.processedPosts} posts`);
@@ -164,12 +203,33 @@ setInterval(async () => {
   try {
     // Emit aggregated emoji stats every EMIT_INTERVAL milliseconds
     const stats = await getEmojiStats();
+    const languages = await getLanguageStats();
     io.emit('emojiStats', stats);
+    io.emit('languageStats', languages);
     await logEmojiStats();
   } catch (error) {
     logger.error(`Error emitting or logging emoji stats: ${(error as Error).message}`);
   }
 }, EMIT_INTERVAL);
+
+io.on('connection', (socket: Socket) => {
+  logger.info('A user connected');
+
+  socket.on('getTopEmojisForLanguage', async (language: string) => {
+    try {
+      const topEmojis = await getTopEmojisForLanguage(language);
+      console.log(`Emitting topEmojisForLanguage for ${language}:`, topEmojis);
+      socket.emit('topEmojisForLanguage', { language, topEmojis });
+    } catch (error) {
+      logger.error(`Error fetching top emojis for language ${language}: ${(error as Error).message}`);
+      socket.emit('error', `Error fetching top emojis for language ${language}`);
+    }
+  });
+
+  socket.on('disconnect', () => {
+    logger.info('A user disconnected');
+  });
+});
 
 jetstream.on('open', () => {
   logger.info('Connected to Jetstream firehose.');
