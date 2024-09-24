@@ -15,30 +15,35 @@ dotenv.config();
 const FIREHOSE_URL = process.env.FIREHOSE_URL ?? 'wss://jetstream.atproto.tools/subscribe';
 const MAX_EMOJIS = 1000;
 const EMIT_INTERVAL = 1000;
-const currentEpochMicroseconds = BigInt(Date.now()) * 1000n;
-
-const httpServer = createServer();
-const io = new Server(httpServer, {
-  cors: {
-    origin: "http://localhost:5173",
-    methods: ["GET", "POST"]
-  }
-});
-
-httpServer.listen(3000);
-
-const jetstream = new Jetstream({
-  wantedCollections: ['app.bsky.feed.post'],
-  endpoint: FIREHOSE_URL,
-  cursor: currentEpochMicroseconds.toString(),
-});
+const CURSOR_UPDATE_INTERVAL_MS = 10 * 1000;
+const CURSOR_KEY = 'lastCursor';
+let cursorUpdateInterval: NodeJS.Timeout | null = null;
 
 // Initialize Redis client
 const redisClient = createClient({
   url: process.env.REDIS_URL ?? 'redis://localhost:6379',
-  // Optional: Configure connection options for performance
-  // For example, max retries, timeouts, etc.
 });
+await redisClient.connect();
+
+const httpServer = createServer();
+const io = new Server(httpServer, {
+  cors: {
+    origin: ["http://localhost:5173", "https://emojitracker.bsky.sh"],
+    methods: ["GET", "POST"]
+  }
+});
+
+httpServer.listen(process.env.PORT ?? 3000);
+
+let latestCursor = await getLastCursor();
+
+const jetstream = new Jetstream({
+  wantedCollections: ['app.bsky.feed.post'],
+  endpoint: FIREHOSE_URL,
+  cursor: latestCursor.toString(),
+});
+
+
 
 // Handle Redis events
 redisClient.on('error', (err: Error) => { logger.error('Redis Client Error', { error: err }); });
@@ -46,8 +51,7 @@ redisClient.on('connect', () => { logger.info('Connected to Redis'); });
 redisClient.on('ready', () => { logger.info('Redis client ready'); });
 redisClient.on('end', () => { logger.info('Redis client disconnected'); });
 
-// Connect to Redis
-await redisClient.connect();
+
 
 const emojiRegex: RegExp = emojiRegexFunc();
 
@@ -73,6 +77,35 @@ interface LanguageStat {
   count: number;
 }
 
+async function getLastCursor(): Promise<bigint> {
+  const result = await redisClient.get(CURSOR_KEY);
+  if (!result) {
+    const currentEpochMicroseconds = BigInt(Date.now()) * 1000n;
+    await redisClient.set(CURSOR_KEY, currentEpochMicroseconds.toString());
+    logger.info(`Initialized cursor with value: ${currentEpochMicroseconds}`);
+    return currentEpochMicroseconds;
+  }
+  return BigInt(result);
+}
+
+async function updateLastCursor(newCursor: bigint): Promise<void> {
+  await redisClient.set(CURSOR_KEY, newCursor.toString());
+}
+
+function initializeCursorUpdate() {
+  cursorUpdateInterval = setInterval(() => {
+    if (latestCursor > 0n) {
+      updateLastCursor(latestCursor)
+        .then(() => {
+          logger.info(`Cursor updated to ${latestCursor}`);
+        })
+        .catch((error: unknown) => {
+          logger.error(`Error updating cursor: ${(error as Error).message}`);
+        });
+    }
+  }, CURSOR_UPDATE_INTERVAL_MS);
+}
+
 async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
   const { commit } = event;
 
@@ -81,6 +114,9 @@ async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
   const { record } = commit;
 
   try {
+    if (BigInt(event.time_us) > latestCursor) {
+      latestCursor = BigInt(event.time_us);
+    }
     let langs = new Set<string>();
     if (record.langs && Array.isArray(record.langs)) {
       langs = new Set(
@@ -104,15 +140,17 @@ async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
     logger.debug(`Found ${emojiMatches.length} emojis in post.`);
 
     if (emojiMatches.length > 0) {
-      for (let i = 0; i < emojiMatches.length; i++) {
-        const emoji = emojiMatches[i];
+      const stringifiedLangs = JSON.stringify(Array.from(langs));
+
+      const emojiPromises = emojiMatches.map((emoji, i) => {
         const isFirstEmoji = i === 0 ? "1" : "0";
-        logger.debug(`Calling evalSha with SCRIPT_SHA: ${SCRIPT_SHA}, emoji: ${emoji}, langs: ${JSON.stringify(Array.from(langs))}, isFirstEmoji: ${isFirstEmoji}`);
-        await redisClient.evalSha(SCRIPT_SHA, {
-          arguments: [emoji, JSON.stringify(Array.from(langs)), isFirstEmoji]
+        return redisClient.evalSha(SCRIPT_SHA, {
+          arguments: [emoji, stringifiedLangs, isFirstEmoji]
         });
-        logger.debug(`Emojis updated for languages: ${Array.from(langs).join(', ')}`);
-      }
+      });
+
+      await Promise.all([...emojiPromises, redisClient.incr(PROCESSED_POSTS_KEY)]);
+      logger.debug(`Emojis updated for languages: ${Array.from(langs).join(', ')}`);
     }
 
     await redisClient.incr(PROCESSED_POSTS_KEY);
@@ -126,23 +164,16 @@ async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
 }
 
 async function getEmojiStats() {
-  // Retrieve top emojis in ascending order
-  const topEmojisDesc = await redisClient.zRangeWithScores(EMOJI_SORTED_SET_KEY, 0, MAX_EMOJIS - 1, { REV: true });
-  
-  // // Reverse to get descending order
-  // const topEmojisDesc = topEmojisAsc.reverse();
-
-  // Retrieve global counters
-  const [processedPosts, postsWithEmojis, processedEmojis] = await redisClient.mGet([
-    PROCESSED_POSTS_KEY,
-    POSTS_WITH_EMOJIS_KEY,
-    PROCESSED_EMOJIS_KEY
+  const [topEmojisDesc, globalCounters] = await Promise.all([
+    redisClient.zRangeWithScores(EMOJI_SORTED_SET_KEY, 0, MAX_EMOJIS - 1, { REV: true }),
+    redisClient.mGet([PROCESSED_POSTS_KEY, POSTS_WITH_EMOJIS_KEY, PROCESSED_EMOJIS_KEY])
   ]);
+
+  const [processedPosts, postsWithEmojis, processedEmojis] = globalCounters;
 
   const postsWithoutEmojis = (Number(processedPosts) || 0) - (Number(postsWithEmojis) || 0);
   const ratio = postsWithoutEmojis > 0 ? ((Number(postsWithEmojis) || 0) / (Number(postsWithoutEmojis) || 1)).toFixed(2) : 'N/A';
 
-  // Format top emojis
   const formattedTopEmojis = topEmojisDesc.map(({ value, score }) => ({
     emoji: value,
     count: score,
@@ -159,7 +190,6 @@ async function getEmojiStats() {
 }
 
 async function getLanguageStats(): Promise<LanguageStat[]> {
-  // Retrieve top languages in ascending order
   const topLanguagesDesc = await redisClient.zRangeWithScores(LANGUAGE_SORTED_SET_KEY, 0, 9, { REV: true });
   
   return topLanguagesDesc.map(({ value, score }) => ({
@@ -171,7 +201,6 @@ async function getLanguageStats(): Promise<LanguageStat[]> {
 async function getTopEmojisForLanguage(language: string) {
   const topEmojisDesc = await redisClient.zRangeWithScores(language, 0, MAX_EMOJIS - 1, { REV: true });
   
-  // Format the emojis
   const formattedTopEmojis = topEmojisDesc.map(({ value, score }) => ({
     emoji: value,
     count: score,
@@ -193,18 +222,26 @@ async function logEmojiStats() {
   });
 }
 
-setInterval(async () => {
-  try {
-    // Emit aggregated emoji stats every EMIT_INTERVAL milliseconds
-    const stats = await getEmojiStats();
-    const languages = await getLanguageStats();
+setInterval(() => {
+  Promise.all([getEmojiStats(), getLanguageStats()])
+  .then(([stats, languages]) => {
     io.emit('emojiStats', stats);
     io.emit('languageStats', languages);
-    await logEmojiStats();
-  } catch (error) {
+  })
+  .catch((error: unknown) => {
     logger.error(`Error emitting or logging emoji stats: ${(error as Error).message}`);
-  }
+  });
 }, EMIT_INTERVAL);
+
+setInterval(() => {
+  getEmojiStats()
+    .then(() => {
+      return logEmojiStats();
+    })
+    .catch((error: unknown) => {
+      logger.error(`Error emitting or logging emoji stats: ${(error as Error).message}`);
+    });
+}, 10 * 1000);
 
 io.on('connection', (socket: Socket) => {
   logger.info('A user connected');
@@ -227,8 +264,10 @@ io.on('connection', (socket: Socket) => {
 
 jetstream.on('open', () => {
   logger.info('Connected to Jetstream firehose.');
+  if (!cursorUpdateInterval) {
+    initializeCursorUpdate();
+  }
 });
-
 jetstream.on('close', () => {
   logger.info('Jetstream firehose connection closed.');
   shutdown();
@@ -247,20 +286,22 @@ jetstream.start();
 function shutdown() {
   logger.info('Shutting down gracefully...');
 
-  try {
-    void redisClient.quit();
-    logger.info('Redis client disconnected');
-  } catch (error) {
-    logger.error('Error disconnecting Redis client:', error);
-  }
-
-  // Perform any other cleanup here
-  process.exit(0);
-
   setTimeout(() => {
     logger.error('Forcing shutdown.');
     process.exit(1);
   }, 60000);
+
+  if (cursorUpdateInterval) {
+    clearInterval(cursorUpdateInterval);
+  }
+
+  redisClient.quit().then(() => {
+    logger.info('Redis client disconnected');
+  }).catch((error: unknown) => {
+    logger.error('Error disconnecting Redis client:', error);
+  }).finally(() => {
+    process.exit(0);
+  });
 }
 
 process.on('SIGINT', shutdown);

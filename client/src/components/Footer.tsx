@@ -1,5 +1,3 @@
-import React from 'react';
-
 interface EmojiStats {
   processedPosts: number;
   processedEmojis: number;
