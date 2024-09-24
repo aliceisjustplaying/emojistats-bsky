@@ -8,10 +8,7 @@ export default tseslint.config(
   {
     languageOptions: {
       parserOptions: {
-        projectService: {
-          allowDefaultProject: ['*.js'],
-          defaultProject: 'tsconfig.json',
-        },
+        project: 'tsconfig.json',
       },
     },
     rules: {

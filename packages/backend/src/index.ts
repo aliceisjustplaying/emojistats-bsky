@@ -14,14 +14,21 @@ import logger from './logger.js';
 dotenv.config();
 
 const FIREHOSE_URL = process.env.FIREHOSE_URL ?? 'wss://jetstream.atproto.tools/subscribe';
-const MAX_EMOJIS = 1000;
+const MAX_EMOJIS = 3790; // Per Unicode 16.0
 const EMIT_INTERVAL = 1000;
+const LOG_INTERVAL = 2 * 1000;
+const TRIM_LANGUAGE_CODES = false;
 
-// Initialize Redis client
 const redisClient = createClient({
   url: process.env.REDIS_URL ?? 'redis://localhost:6379',
 });
+
 await redisClient.connect();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const incrementEmojisScript = fs.readFileSync(path.join(__dirname, 'lua', 'incrementEmojis.lua'), 'utf8');
+const SCRIPT_SHA = await redisClient.scriptLoad(incrementEmojisScript);
 
 const httpServer = createServer();
 const io = new Server(httpServer, {
@@ -39,16 +46,18 @@ const jetstream = new Jetstream({
   // cursor: TODO,
 });
 
-// Handle Redis events
 redisClient.on('error', (err: Error) => {
   logger.error('Redis Client Error', { error: err });
 });
+
 redisClient.on('connect', () => {
   logger.info('Connected to Redis');
 });
+
 redisClient.on('ready', () => {
   logger.info('Redis client ready');
 });
+
 redisClient.on('end', () => {
   logger.info('Redis client disconnected');
 });
@@ -60,15 +69,6 @@ const LANGUAGE_SORTED_SET_KEY = 'languageStats';
 const PROCESSED_POSTS_KEY = 'processedPosts';
 const POSTS_WITH_EMOJIS_KEY = 'postsWithEmojis';
 const PROCESSED_EMOJIS_KEY = 'processedEmojis';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-const incrementEmojisScript = fs.readFileSync(path.join(__dirname, 'lua', 'incrementEmojis.lua'), 'utf8');
-
-// Register the script
-const SCRIPT_SHA = await redisClient.scriptLoad(incrementEmojisScript);
-
 interface LanguageStat {
   language: string;
   count: number;
@@ -84,7 +84,9 @@ async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
   try {
     let langs = new Set<string>();
     if (record.langs && Array.isArray(record.langs)) {
-      langs = new Set(record.langs.map((lang: string) => lang.split('-')[0].toLowerCase()));
+      langs = new Set(record.langs.map((lang: string) => 
+        TRIM_LANGUAGE_CODES ? lang.split('-')[0].toLowerCase().slice(0, 2) : lang.toLowerCase()
+      ));
     } else {
       logger.debug(`"langs" field is missing or invalid in record ${JSON.stringify(record)}`);
       langs.add('UNKNOWN');
@@ -200,7 +202,7 @@ setInterval(() => {
     .catch((error: unknown) => {
       logger.error(`Error emitting or logging emoji stats: ${(error as Error).message}`);
     });
-}, 10 * 1000);
+}, LOG_INTERVAL);
 
 io.on('connection', (socket: Socket) => {
   logger.info('A user connected');
