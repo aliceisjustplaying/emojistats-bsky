@@ -18,32 +18,11 @@ const MAX_EMOJIS = 3790; // Per Unicode 16.0
 const EMIT_INTERVAL = 1000;
 const LOG_INTERVAL = 2 * 1000;
 const TRIM_LANGUAGE_CODES = false;
+const CURSOR_UPDATE_INTERVAL = 10 * 1000;
 
+/* Redis initialization */
 const redisClient = createClient({
   url: process.env.REDIS_URL ?? 'redis://localhost:6379',
-});
-
-await redisClient.connect();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-const incrementEmojisScript = fs.readFileSync(path.join(__dirname, 'lua', 'incrementEmojis.lua'), 'utf8');
-const SCRIPT_SHA = await redisClient.scriptLoad(incrementEmojisScript);
-
-const httpServer = createServer();
-const io = new Server(httpServer, {
-  cors: {
-    origin: ['http://localhost:5173', 'https://emojitracker.bsky.sh'],
-    methods: ['GET', 'POST'],
-  },
-});
-
-httpServer.listen(process.env.PORT ?? 3000);
-
-const jetstream = new Jetstream({
-  wantedCollections: ['app.bsky.feed.post'],
-  endpoint: FIREHOSE_URL,
-  // cursor: TODO,
 });
 
 redisClient.on('error', (err: Error) => {
@@ -62,6 +41,118 @@ redisClient.on('end', () => {
   logger.info('Redis client disconnected');
 });
 
+await redisClient.connect();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const incrementEmojisScript = fs.readFileSync(path.join(__dirname, 'lua', 'incrementEmojis.lua'), 'utf8');
+const SCRIPT_SHA = await redisClient.scriptLoad(incrementEmojisScript);
+/* End Redis initialization */
+
+/* cursor initialization */
+let latestCursor = await getLastCursor();
+
+export async function getLastCursor(): Promise<string> {
+  logger.debug('Getting last cursor...');
+  const result = await redisClient.get('cursor');
+  if (!result) {
+    logger.info('No cursor found, initializing with current epoch in microseconds...');
+    const currentEpochMicroseconds = BigInt(Date.now()) * 1000n;
+    await redisClient.set('cursor', currentEpochMicroseconds.toString());
+    logger.info(
+      `Initialized cursor with value: ${currentEpochMicroseconds} (${new Date(Number(currentEpochMicroseconds.toString()) / 1000).toISOString()})`,
+    );
+    return currentEpochMicroseconds.toString();
+  }
+  logger.info(`Returning cursor from Redis: ${result} (${new Date(Number(result) / 1000).toISOString()})`);
+  return result;
+}
+
+export async function updateLastCursor(newCursor: string): Promise<void> {
+  try {
+    await redisClient.set('cursor', newCursor);
+    logger.info(`Updated last cursor to ${newCursor} (${new Date(Number(newCursor) / 1000).toISOString()})`);
+  } catch (error: unknown) {
+    logger.error(`Error updating cursor: ${(error as Error).message}`);
+  }
+}
+
+let cursorUpdateInterval: NodeJS.Timeout | undefined;
+
+function initializeCursorUpdate() {
+  cursorUpdateInterval = setInterval(() => {
+    updateLastCursor(latestCursor)
+      .then(() => {
+        logger.info(`Cursor updated to ${latestCursor} at ${new Date().toISOString()}`);
+      })
+      .catch((error: unknown) => {
+        logger.error(`Error updating cursor: ${(error as Error).message}`);
+      });
+  }, CURSOR_UPDATE_INTERVAL);
+}
+
+initializeCursorUpdate();
+/* End cursor initialization */
+
+/* socket.io server initialization */
+const httpServer = createServer();
+const io = new Server(httpServer, {
+  cors: {
+    origin: ['http://localhost:5173', 'https://emojitracker.bsky.sh'],
+    methods: ['GET', 'POST'],
+  },
+});
+
+io.on('connection', (socket: Socket) => {
+  logger.info(`A user connected from ${socket.handshake.address}`);
+
+  socket.on('getTopEmojisForLanguage', async (language: string) => {
+    try {
+      const topEmojis = await getTopEmojisForLanguage(language);
+      socket.emit('topEmojisForLanguage', { language, topEmojis });
+    } catch (error) {
+      logger.error(`Error fetching top emojis for language ${language}: ${(error as Error).message}`);
+      socket.emit('error', `Error fetching top emojis for language ${language}`);
+    }
+  });
+
+  socket.on('disconnect', () => {
+    logger.info('A user disconnected');
+  });
+});
+
+httpServer.listen(process.env.PORT ?? 3000);
+/* End socket.io server initialization */
+
+/* Jetstream initialization */
+const jetstream = new Jetstream({
+  wantedCollections: ['app.bsky.feed.post'],
+  endpoint: FIREHOSE_URL,
+  cursor: latestCursor,
+});
+
+jetstream.on('open', () => {
+  logger.info('Connected to Jetstream firehose.');
+  if (!cursorUpdateInterval) {
+    initializeCursorUpdate();
+  }
+});
+
+jetstream.on('close', () => {
+  logger.info('Jetstream firehose connection closed.');
+  shutdown();
+});
+
+jetstream.on('error', (error) => {
+  logger.error(`Jetstream firehose error: ${error.message}`);
+});
+
+jetstream.onCreate('app.bsky.feed.post', (event) => {
+  void handleCreate(event);
+});
+
+jetstream.start();
+/* End Jetstream initialization */
 const emojiRegex: RegExp = emojiRegexFunc();
 
 const EMOJI_SORTED_SET_KEY = 'emojiStats';
@@ -84,9 +175,12 @@ async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
   try {
     let langs = new Set<string>();
     if (record.langs && Array.isArray(record.langs)) {
-      langs = new Set(record.langs.map((lang: string) => 
-        TRIM_LANGUAGE_CODES ? lang.split('-')[0].toLowerCase().slice(0, 2) : lang.toLowerCase()
-      ));
+      langs = new Set(
+        record.langs.map((lang: string) =>
+          // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+          TRIM_LANGUAGE_CODES ? lang.split('-')[0].toLowerCase().slice(0, 2) : lang.toLowerCase(),
+        ),
+      );
     } else {
       logger.debug(`"langs" field is missing or invalid in record ${JSON.stringify(record)}`);
       langs.add('UNKNOWN');
@@ -113,6 +207,7 @@ async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
     }
 
     await redisClient.incr(PROCESSED_POSTS_KEY);
+    latestCursor = event.time_us.toString();
   } catch (error) {
     logger.error(`Error processing "create" commit: ${(error as Error).message}`, { commit, record });
     logger.error(`Malformed record data: ${JSON.stringify(record)}`);
@@ -203,44 +298,6 @@ setInterval(() => {
       logger.error(`Error emitting or logging emoji stats: ${(error as Error).message}`);
     });
 }, LOG_INTERVAL);
-
-io.on('connection', (socket: Socket) => {
-  logger.info('A user connected');
-
-  socket.on('getTopEmojisForLanguage', async (language: string) => {
-    try {
-      const topEmojis = await getTopEmojisForLanguage(language);
-      console.log(`Emitting topEmojisForLanguage for ${language}:`, topEmojis);
-      socket.emit('topEmojisForLanguage', { language, topEmojis });
-    } catch (error) {
-      logger.error(`Error fetching top emojis for language ${language}: ${(error as Error).message}`);
-      socket.emit('error', `Error fetching top emojis for language ${language}`);
-    }
-  });
-
-  socket.on('disconnect', () => {
-    logger.info('A user disconnected');
-  });
-});
-
-jetstream.on('open', () => {
-  logger.info('Connected to Jetstream firehose.');
-});
-
-jetstream.on('close', () => {
-  logger.info('Jetstream firehose connection closed.');
-  shutdown();
-});
-
-jetstream.on('error', (error) => {
-  logger.error(`Jetstream firehose error: ${error.message}`);
-});
-
-jetstream.onCreate('app.bsky.feed.post', (event) => {
-  void handleCreate(event);
-});
-
-jetstream.start();
 
 function shutdown() {
   logger.info('Shutting down gracefully...');
