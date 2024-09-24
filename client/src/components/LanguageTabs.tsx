@@ -1,6 +1,5 @@
 import React from 'react';
 import * as Tabs from '@radix-ui/react-tabs';
-import { getFlagByLanguageCode } from '../helpers/languages';
 
 interface LanguageStat {
   language: string;
@@ -42,7 +41,7 @@ const LanguageTabs: React.FC<LanguageTabsProps> = ({ languages, selectedLanguage
                 : 'border-transparent text-gray-600 hover:text-blue-500'
             } focus:outline-none focus:ring-2 focus:ring-blue-400`}
           >
-            {getFlagByLanguageCode(lang.language.toLowerCase())} {lang.language.toLowerCase()} ({lang.count})
+            {lang.language.toLowerCase()} ({lang.count})
           </Tabs.Trigger>
         ))}
       </Tabs.List>
