@@ -16,5 +16,8 @@
   },
   "lint-staged": {
     "*": "prettier --ignore-unknown --write"
+  },
+  "dependencies": {
+    "react-tabs": "^6.0.2"
   }
 }

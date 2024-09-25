@@ -52,7 +52,7 @@ const EmojiGrid: React.FC<EmojiGridProps> = ({ topEmojis, socket }) => {
   });
 
   return (
-    <main className="flex-grow w-full p-4 bg-white overflow-hidden">
+    <main className="flex-grow w-full p-2 bg-white overflow-hidden">
       <AutoSizer>
         {({ height, width }) => {
           const columnCount = Math.floor(width / MIN_COLUMN_WIDTH) || 1;

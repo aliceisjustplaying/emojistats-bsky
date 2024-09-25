@@ -1,5 +1,6 @@
-import * as Tabs from '@radix-ui/react-tabs';
 import React from 'react';
+import { Tab, TabList, TabPanel, Tabs } from 'react-tabs';
+import 'react-tabs/style/react-tabs.css';
 
 interface LanguageStat {
   language: string;
@@ -13,39 +14,33 @@ interface LanguageTabsProps {
   totalEmojiCount: number;
 }
 
-const LanguageTabs: React.FC<LanguageTabsProps> = ({ languages, selectedLanguage, onSelect, totalEmojiCount }) => {
+const LanguageTabs: React.FC<LanguageTabsProps> = ({ languages, onSelect, totalEmojiCount }) => {
   return (
-    <Tabs.Root value={selectedLanguage} onValueChange={onSelect} className="w-full bg-white shadow-md rounded-t-lg">
-      <Tabs.List className="flex border-t border-l border-r border-gray-300">
-        <Tabs.Trigger
-          value="all"
-          className={`px-6 py-2 border-t border-l border-r ${
-            selectedLanguage === 'all' ?
-              'border-blue-500 text-blue-600 rounded-t-lg'
-            : 'border-transparent text-gray-600 hover:text-blue-500'
-          } focus:outline-none focus:ring-2 focus:ring-blue-400`}
-        >
+    <Tabs
+      defaultIndex={0}
+      onSelect={(index) => {
+        if (index === 0) {
+          onSelect('all');
+        } else {
+          onSelect(languages[index - 1].language);
+        }
+      }}
+    >
+      <TabList>
+        <Tab key="all" value="all">
           All ({totalEmojiCount})
-        </Tabs.Trigger>
+        </Tab>
         {languages.map((lang) => (
-          <Tabs.Trigger
-            key={lang.language}
-            value={lang.language}
-            className={`px-6 py-2 border-t border-l border-r ${
-              selectedLanguage === lang.language ?
-                'border-blue-500 text-blue-600 rounded-t-lg'
-              : 'border-transparent text-gray-600 hover:text-blue-500'
-            } focus:outline-none focus:ring-2 focus:ring-blue-400`}
-          >
+          <Tab key={lang.language} value={lang.language}>
             {lang.language.toLowerCase()} ({lang.count})
-          </Tabs.Trigger>
+          </Tab>
         ))}
-      </Tabs.List>
-      {/* Hidden Tabs.Content for accessibility */}
-      <Tabs.Content value={selectedLanguage} className="hidden">
-        {/* Content is managed by App.tsx */}
-      </Tabs.Content>
-    </Tabs.Root>
+      </TabList>
+      <TabPanel key="all"></TabPanel>
+      {languages.map((lang) => (
+        <TabPanel key={lang.language}>{null}</TabPanel>
+      ))}
+    </Tabs>
   );
 };
 
