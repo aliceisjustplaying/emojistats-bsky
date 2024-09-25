@@ -1,13 +1,8 @@
 import { CommitCreateEvent, Jetstream } from '@skyware/jetstream';
-import dotenv from 'dotenv';
 import emojiRegexFunc from 'emoji-regex';
 import fs from 'fs';
 import { createServer } from 'http';
-import path from 'path';
-import { dirname } from 'path';
-import { createClient } from 'redis';
 import { Server, Socket } from 'socket.io';
-import { fileURLToPath } from 'url';
 
 import {
   CURSOR_UPDATE_INTERVAL,
@@ -15,52 +10,19 @@ import {
   FIREHOSE_URL,
   LOG_INTERVAL,
   MAX_EMOJIS,
+  PORT,
   TRIM_LANGUAGE_CODES,
 } from './config.js';
+import { SCRIPT_SHA, loadRedisScripts, redisClient } from './lib/redis.js';
+import { Emoji, LanguageStat } from './lib/types.js';
 import logger from './logger.js';
 
-dotenv.config();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-interface Emoji {
-  codes: string;
-  char: string;
-  name: string;
-  category: string;
-  group: string;
-  subgroup: string;
-}
-
 // source: https://github.com/amio/emoji.json/blob/master/emoji.json
-const emojis = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'emoji.json'), 'utf8')) as Emoji[];
+const emojis = JSON.parse(fs.readFileSync(new URL('./data/emoji.json', import.meta.url), 'utf8')) as Emoji[];
 
-/* Redis initialization */
-const redisClient = createClient({
-  url: process.env.REDIS_URL ?? 'redis://localhost:6379',
-});
-
-redisClient.on('error', (err: Error) => {
-  logger.error('Redis Client Error', { error: err });
-});
-
-redisClient.on('connect', () => {
-  logger.info('Connected to Redis');
-});
-
-redisClient.on('ready', () => {
-  logger.info('Redis client ready');
-});
-
-redisClient.on('end', () => {
-  logger.info('Redis client disconnected');
-});
-
+/* redis initialization */
 await redisClient.connect();
-
-const incrementEmojisScript = fs.readFileSync(path.join(__dirname, 'lua', 'incrementEmojis.lua'), 'utf8');
-const SCRIPT_SHA = await redisClient.scriptLoad(incrementEmojisScript);
+await loadRedisScripts();
 /* End Redis initialization */
 
 /* cursor initialization */
@@ -137,7 +99,7 @@ io.on('connection', (socket: Socket) => {
   });
 });
 
-httpServer.listen(process.env.PORT ?? 3000);
+httpServer.listen(PORT);
 /* End socket.io server initialization */
 
 /* Jetstream initialization */
@@ -176,10 +138,6 @@ const LANGUAGE_SORTED_SET_KEY = 'languageStats';
 const PROCESSED_POSTS_KEY = 'processedPosts';
 const POSTS_WITH_EMOJIS_KEY = 'postsWithEmojis';
 const PROCESSED_EMOJIS_KEY = 'processedEmojis';
-interface LanguageStat {
-  language: string;
-  count: number;
-}
 
 async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
   const { commit } = event;

@@ -34,7 +34,7 @@ function App() {
 
   useEffect(() => {
     // Initialize socket connection once
-    const socket: Socket = io(import.meta.env.PROD ? import.meta.env.VITE_SOCKET_URL : 'http://localhost:3000');
+    const socket: Socket = io(import.meta.env.PROD ? import.meta.env.VITE_SOCKET_URL : 'http://localhost:3100');
 
     // Handle incoming emoji stats
     socket.on('emojiStats', (data: EmojiStats) => {
