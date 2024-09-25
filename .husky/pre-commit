@@ -1,2 +1,12 @@
+#!/bin/sh
+. "$(dirname "$0")/_/husky.sh"
+
+STASH_RESULT=$(git stash --keep-index)
+
 bun run --filter '*' format
-git add .
+
+git add "$(git diff --cached --name-only --diff-filter=ACMR)"
+
+if [ "$STASH_RESULT" != "No local changes to save" ]; then
+  git stash pop --quiet
+fi
