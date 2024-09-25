@@ -60,7 +60,6 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
       logger.debug(`Emojis updated for languages: ${Array.from(langs).join(', ')}`);
     }
 
-    await redisClient.incr(PROCESSED_POSTS_KEY);
     setLatestCursor(event.time_us.toString());
   } catch (error) {
     logger.error(`Error processing "create" commit: ${(error as Error).message}`, { commit, record });
