@@ -9,4 +9,5 @@ export const LOG_INTERVAL = 10 * 1000;
 export const TRIM_LANGUAGE_CODES = false;
 export const CURSOR_UPDATE_INTERVAL = 10 * 1000;
 export const REDIS_URL = process.env.REDIS_URL ?? 'redis://localhost:6379';
-export const PORT = process.env.PORT ?? 3000;
+export const PORT = process.env.PORT ?? '3000';
+export const ORIGINS = process.env.ORIGINS?.split(',') ?? ['http://localhost:5173'];

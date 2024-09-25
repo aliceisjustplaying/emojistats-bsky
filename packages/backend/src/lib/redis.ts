@@ -28,7 +28,7 @@ const loadRedisScripts = async () => {
   const scriptPath = new URL('lua/incrementEmojis.lua', import.meta.url);
   const incrementEmojisScript = fs.readFileSync(scriptPath, 'utf8');
   SCRIPT_SHA = await redisClient.scriptLoad(incrementEmojisScript);
-  console.log(`Loaded Redis script with SHA: ${SCRIPT_SHA}`);
+  logger.info(`Loaded Redis script with SHA: ${SCRIPT_SHA}`);
 };
 
 export { redisClient, loadRedisScripts, SCRIPT_SHA };

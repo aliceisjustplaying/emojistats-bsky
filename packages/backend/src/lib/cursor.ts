@@ -4,6 +4,14 @@ import { redisClient } from './redis.js';
 
 let latestCursor: string;
 
+export function getLatestCursor(): string {
+  return latestCursor;
+}
+
+export function setLatestCursor(value: string): void {
+  latestCursor = value;
+}
+
 export async function getLastCursor(): Promise<string> {
   logger.debug('Getting last cursor...');
   const result = await redisClient.get('cursor');
