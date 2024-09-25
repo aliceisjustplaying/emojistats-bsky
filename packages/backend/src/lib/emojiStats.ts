@@ -2,7 +2,7 @@ import { CommitCreateEvent } from '@skyware/jetstream';
 import emojiRegexFunc from 'emoji-regex';
 import fs from 'fs';
 
-import { MAX_EMOJIS, TRIM_LANGUAGE_CODES } from '../config.js';
+import { MAX_EMOJIS, MAX_TOP_LANGUAGES, TRIM_LANGUAGE_CODES } from '../config.js';
 import logger from '../logger.js';
 import { setLatestCursor } from './cursor.js';
 import { SCRIPT_SHA, redisClient } from './redis.js';
@@ -97,8 +97,10 @@ export async function getEmojiStats() {
   };
 }
 
-export async function getLanguageStats(): Promise<LanguageStat[]> {
-  const topLanguagesDesc = await redisClient.zRangeWithScores(LANGUAGE_SORTED_SET_KEY, 0, 9, { REV: true });
+export async function getTopLanguages(): Promise<LanguageStat[]> {
+  const topLanguagesDesc = await redisClient.zRangeWithScores(LANGUAGE_SORTED_SET_KEY, 0, MAX_TOP_LANGUAGES - 1, {
+    REV: true,
+  });
 
   return topLanguagesDesc.map(({ value, score }) => ({
     language: value,

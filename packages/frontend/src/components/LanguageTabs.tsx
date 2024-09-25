@@ -26,16 +26,18 @@ const LanguageTabs: React.FC<LanguageTabsProps> = ({ languages, onSelect, totalE
         }
       }}
     >
-      <TabList>
-        <Tab key="all" value="all">
-          All ({totalEmojiCount})
-        </Tab>
-        {languages.map((lang) => (
-          <Tab key={lang.language} value={lang.language}>
-            {lang.language.toLowerCase()} ({lang.count})
+      <div className="tablist-container">
+        <TabList>
+          <Tab key="all" value="all">
+            All ({totalEmojiCount})
           </Tab>
-        ))}
-      </TabList>
+          {languages.map((lang) => (
+            <Tab key={lang.language} value={lang.language}>
+              {lang.language.toLowerCase()} ({lang.count})
+            </Tab>
+          ))}
+        </TabList>
+      </div>
       <TabPanel key="all"></TabPanel>
       {languages.map((lang) => (
         <TabPanel key={lang.language}>{null}</TabPanel>

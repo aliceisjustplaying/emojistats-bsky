@@ -1,6 +1,6 @@
 import { EMIT_INTERVAL, LOG_INTERVAL, PORT } from './config.js';
 import { cursorUpdateInterval, getLastCursor } from './lib/cursor.js';
-import { getEmojiStats, getLanguageStats, logEmojiStats } from './lib/emojiStats.js';
+import { getEmojiStats, getTopLanguages, logEmojiStats } from './lib/emojiStats.js';
 import { initializeJetstream, jetstream } from './lib/jetstream.js';
 import { loadRedisScripts, redisClient } from './lib/redis.js';
 import { io, startSocketServer } from './lib/socket.io.js';
@@ -26,7 +26,7 @@ startSocketServer(Number(PORT));
 
 /* emitting data for frontend */
 setInterval(() => {
-  Promise.all([getEmojiStats(), getLanguageStats()])
+  Promise.all([getEmojiStats(), getTopLanguages()])
     .then(([stats, languages]) => {
       io.emit('emojiStats', stats);
       io.emit('languageStats', languages);

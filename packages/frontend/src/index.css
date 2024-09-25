@@ -64,3 +64,20 @@ button:focus-visible {
     background-color: #f9f9f9;
   }
 }
+
+.tablist-container {
+  overflow: scroll;
+}
+
+.tablist-container::-webkit-scrollbar {
+  display: none;
+}
+
+.tablist-container {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.react-tabs__tab-list {
+  width: max-content;
+}
