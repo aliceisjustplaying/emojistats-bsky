@@ -1,6 +1,6 @@
 import { CURSOR_UPDATE_INTERVAL } from '../config.js';
 import logger from '../logger.js';
-import { redisClient } from './redis.js';
+import { redis } from './redis.js';
 
 let latestCursor: string;
 
@@ -14,11 +14,11 @@ export function setLatestCursor(value: string): void {
 
 export async function getLastCursor(): Promise<string> {
   logger.debug('Getting last cursor...');
-  const result = await redisClient.get('cursor');
+  const result = await redis.get('cursor');
   if (!result) {
     logger.info('No cursor found, initializing with current epoch in microseconds...');
     const currentEpochMicroseconds = BigInt(Date.now()) * 1000n;
-    await redisClient.set('cursor', currentEpochMicroseconds.toString());
+    await redis.set('cursor', currentEpochMicroseconds.toString());
     logger.info(
       `Initialized cursor with value: ${currentEpochMicroseconds} (${new Date(Number(currentEpochMicroseconds.toString()) / 1000).toISOString()})`,
     );
@@ -30,7 +30,7 @@ export async function getLastCursor(): Promise<string> {
 
 export async function updateLastCursor(newCursor: string): Promise<void> {
   try {
-    await redisClient.set('cursor', newCursor);
+    await redis.set('cursor', newCursor);
     logger.info(`Updated last cursor to ${newCursor} (${new Date(Number(newCursor) / 1000).toISOString()})`);
   } catch (error: unknown) {
     logger.error(`Error updating cursor: ${(error as Error).message}`);

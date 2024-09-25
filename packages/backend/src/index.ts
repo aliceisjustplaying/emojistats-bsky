@@ -2,12 +2,12 @@ import { EMIT_INTERVAL, LOG_INTERVAL, PORT } from './config.js';
 import { cursorUpdateInterval, getLastCursor } from './lib/cursor.js';
 import { getEmojiStats, getTopLanguages, logEmojiStats } from './lib/emojiStats.js';
 import { initializeJetstream, jetstream } from './lib/jetstream.js';
-import { loadRedisScripts, redisClient } from './lib/redis.js';
+import { loadRedisScripts, redis } from './lib/redis.js';
 import { io, startSocketServer } from './lib/socket.io.js';
 import logger from './logger.js';
 
 /* redis initialization */
-await redisClient.connect();
+await redis.connect();
 await loadRedisScripts();
 /* End Redis initialization */
 
@@ -61,7 +61,7 @@ function shutdown() {
   void io.close();
   jetstream.close();
 
-  redisClient
+  redis
     .quit()
     .catch((error: unknown) => {
       logger.error('Error disconnecting Redis client:', error);

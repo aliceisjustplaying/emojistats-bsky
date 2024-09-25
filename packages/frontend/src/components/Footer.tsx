@@ -17,7 +17,7 @@ function Footer({ stats }: FooterProps) {
       <span className="w-full sm:w-auto text-center px-2">Emojis: {stats.processedEmojis}</span>
       {/* <span className="w-full sm:w-auto text-center">Posts with Emojis: {stats.postsWithEmojis}</span>
         <span className="w-full sm:w-auto text-center">Posts without Emojis: {stats.postsWithoutEmojis}</span> */}
-      <span className="w-full sm:w-auto text-center px-2">Ratio: {stats.ratio}</span>
+      <span className="w-full sm:w-auto text-center px-2">Ratio: {(Number(stats.ratio) * 100).toFixed(2)}%</span>
     </footer>
   );
 }

@@ -15,16 +15,16 @@ export const initializeJetstream = (cursor: string) => {
   });
 
   jetstream.on('open', () => {
-    logger.info('Connected to Jetstream firehose.');
+    logger.info('Connected to Jetstream');
     initializeCursorUpdate(cursor);
   });
 
   jetstream.on('close', () => {
-    logger.info('Jetstream firehose connection closed.');
+    logger.info('Jetstream connection closed.');
   });
 
   jetstream.on('error', (error) => {
-    logger.error(`Jetstream firehose error: ${error.message}`);
+    logger.error(`Jetstream error: ${error.message}`);
   });
 
   jetstream.onCreate('app.bsky.feed.post', (event: CommitCreateEvent<'app.bsky.feed.post'>) => {
