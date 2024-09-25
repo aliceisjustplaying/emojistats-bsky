@@ -1,6 +1,4 @@
-#!/bin/sh
-. "$(dirname "$0")/_/husky.sh"
-
+# shellcheck disable=SC2148
 STASH_RESULT=$(git stash --keep-index)
 
 bun run --filter '*' format
