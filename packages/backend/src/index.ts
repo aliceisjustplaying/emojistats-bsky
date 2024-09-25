@@ -9,19 +9,20 @@ import { createClient } from 'redis';
 import { Server, Socket } from 'socket.io';
 import { fileURLToPath } from 'url';
 
+import {
+  CURSOR_UPDATE_INTERVAL,
+  EMIT_INTERVAL,
+  FIREHOSE_URL,
+  LOG_INTERVAL,
+  MAX_EMOJIS,
+  TRIM_LANGUAGE_CODES,
+} from './config.js';
 import logger from './logger.js';
 
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-
-const FIREHOSE_URL = process.env.FIREHOSE_URL ?? 'wss://jetstream.atproto.tools/subscribe';
-const MAX_EMOJIS = 3790; // Per Unicode 16.0
-const EMIT_INTERVAL = 1000;
-const LOG_INTERVAL = 10 * 1000;
-const TRIM_LANGUAGE_CODES = false;
-const CURSOR_UPDATE_INTERVAL = 10 * 1000;
 
 interface Emoji {
   codes: string;
@@ -94,13 +95,9 @@ let cursorUpdateInterval: NodeJS.Timeout | undefined;
 
 function initializeCursorUpdate() {
   cursorUpdateInterval = setInterval(() => {
-    updateLastCursor(latestCursor)
-      .then(() => {
-        logger.info(`Cursor updated to ${latestCursor} at ${new Date().toISOString()}`);
-      })
-      .catch((error: unknown) => {
-        logger.error(`Error updating cursor: ${(error as Error).message}`);
-      });
+    updateLastCursor(latestCursor).catch((error: unknown) => {
+      logger.error(`Error updating cursor: ${(error as Error).message}`);
+    });
   }, CURSOR_UPDATE_INTERVAL);
 }
 
@@ -288,13 +285,14 @@ async function logEmojiStats() {
   const stats = await getEmojiStats();
   logger.info(`Processed ${stats.processedPosts} posts`);
   logger.info(`Processed ${stats.processedEmojis} emojis`);
-  logger.info(`Posts with emojis: ${stats.postsWithEmojis}`);
-  logger.info(`Posts without emojis: ${stats.postsWithoutEmojis}`);
-  logger.info(`Ratio of posts with emojis to posts without: ${stats.ratio}`);
-  logger.info('Top 10 Emojis:');
-  stats.topEmojis.slice(0, 10).forEach(({ emoji, count }) => {
+  logger.info(`Posts with: ${stats.postsWithEmojis}`);
+  logger.info(`Posts without: ${stats.postsWithoutEmojis}`);
+  logger.info(`Ratio: ${stats.ratio}`);
+  logger.info('Top emojis:');
+  stats.topEmojis.slice(0, 5).forEach(({ emoji, count }) => {
     logger.info(`${emoji}: ${count}`);
   });
+  logger.info('---');
 }
 
 setInterval(() => {
