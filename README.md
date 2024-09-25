@@ -1,7 +1,8 @@
 # Emojitracker for Bluesky
 
 Current todos:
-- [ ] Cursor handling
-- [ ] Nicer tabs
+
+- [x] Cursor handling
+- [x] Nicer tabs
 - [ ] Better design; retro
 - [ ] etc.
