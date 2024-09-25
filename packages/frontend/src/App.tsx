@@ -30,7 +30,6 @@ function App() {
   const [selectedLanguage, setSelectedLanguage] = useState<string>('all');
   const [currentEmojis, setCurrentEmojis] = useState<Array<{ emoji: string; count: number }>>([]);
   const socketRef = useRef<Socket | null>(null);
-  const [loading, setLoading] = useState<boolean>(false);
 
   useEffect(() => {
     // Initialize socket connection once
@@ -56,7 +55,6 @@ function App() {
       (data: { language: string; topEmojis: Array<{ emoji: string; count: number }> }) => {
         if (data.language === selectedLanguage) {
           setCurrentEmojis(data.topEmojis);
-          setLoading(false);
         }
       },
     );
@@ -75,7 +73,6 @@ function App() {
 
   useEffect(() => {
     if (selectedLanguage !== 'all' && socketRef.current) {
-      setLoading(true);
       socketRef.current.emit('getTopEmojisForLanguage', selectedLanguage);
     } else if (emojiStats) {
       setCurrentEmojis(emojiStats.topEmojis);
@@ -108,7 +105,6 @@ function App() {
           }
         }
       />
-      {loading && <div className="p-4 text-center">Loading...</div>}
     </div>
   );
 }
