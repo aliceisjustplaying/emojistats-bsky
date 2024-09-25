@@ -4,15 +4,8 @@ import fs from 'fs';
 import { createServer } from 'http';
 import { Server, Socket } from 'socket.io';
 
-import {
-  CURSOR_UPDATE_INTERVAL,
-  EMIT_INTERVAL,
-  FIREHOSE_URL,
-  LOG_INTERVAL,
-  MAX_EMOJIS,
-  PORT,
-  TRIM_LANGUAGE_CODES,
-} from './config.js';
+import { EMIT_INTERVAL, FIREHOSE_URL, LOG_INTERVAL, MAX_EMOJIS, PORT, TRIM_LANGUAGE_CODES } from './config.js';
+import { cursorUpdateInterval, getLastCursor, initializeCursorUpdate } from './lib/cursor.js';
 import { SCRIPT_SHA, loadRedisScripts, redisClient } from './lib/redis.js';
 import { Emoji, LanguageStat } from './lib/types.js';
 import logger from './logger.js';
@@ -27,43 +20,7 @@ await loadRedisScripts();
 
 /* cursor initialization */
 let latestCursor = await getLastCursor();
-
-export async function getLastCursor(): Promise<string> {
-  logger.debug('Getting last cursor...');
-  const result = await redisClient.get('cursor');
-  if (!result) {
-    logger.info('No cursor found, initializing with current epoch in microseconds...');
-    const currentEpochMicroseconds = BigInt(Date.now()) * 1000n;
-    await redisClient.set('cursor', currentEpochMicroseconds.toString());
-    logger.info(
-      `Initialized cursor with value: ${currentEpochMicroseconds} (${new Date(Number(currentEpochMicroseconds.toString()) / 1000).toISOString()})`,
-    );
-    return currentEpochMicroseconds.toString();
-  }
-  logger.info(`Returning cursor from Redis: ${result} (${new Date(Number(result) / 1000).toISOString()})`);
-  return result;
-}
-
-export async function updateLastCursor(newCursor: string): Promise<void> {
-  try {
-    await redisClient.set('cursor', newCursor);
-    logger.info(`Updated last cursor to ${newCursor} (${new Date(Number(newCursor) / 1000).toISOString()})`);
-  } catch (error: unknown) {
-    logger.error(`Error updating cursor: ${(error as Error).message}`);
-  }
-}
-
-let cursorUpdateInterval: NodeJS.Timeout | undefined;
-
-function initializeCursorUpdate() {
-  cursorUpdateInterval = setInterval(() => {
-    updateLastCursor(latestCursor).catch((error: unknown) => {
-      logger.error(`Error updating cursor: ${(error as Error).message}`);
-    });
-  }, CURSOR_UPDATE_INTERVAL);
-}
-
-initializeCursorUpdate();
+initializeCursorUpdate(latestCursor);
 /* End cursor initialization */
 
 /* socket.io server initialization */
@@ -111,9 +68,6 @@ const jetstream = new Jetstream({
 
 jetstream.on('open', () => {
   logger.info('Connected to Jetstream firehose.');
-  if (!cursorUpdateInterval) {
-    initializeCursorUpdate();
-  }
 });
 
 jetstream.on('close', () => {
@@ -281,6 +235,10 @@ function shutdown() {
     logger.error('Forcing shutdown.');
     process.exit(1);
   }, 60000);
+
+  clearInterval(cursorUpdateInterval);
+
+  jetstream.close();
 
   redisClient
     .quit()
