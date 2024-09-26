@@ -48,7 +48,7 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
       const emojiPromises = emojiMatches.map((emoji, i) => {
         const isFirstEmoji = i === 0 ? '1' : '0';
         return redis.evalSha(SCRIPT_SHA, {
-          arguments: [emoji, stringifiedLangs, isFirstEmoji],
+          arguments: [emoji.replace(/\uFE0F/g, ''), stringifiedLangs, isFirstEmoji],
         });
       });
 
