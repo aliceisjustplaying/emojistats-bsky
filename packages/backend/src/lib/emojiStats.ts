@@ -48,7 +48,9 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
       const emojiPromises = emojiMatches.map((emoji, i) => {
         const isFirstEmoji = i === 0 ? '1' : '0';
         return redis.evalSha(SCRIPT_SHA, {
-          arguments: [emoji.replace(/\uFE0F/g, ''), stringifiedLangs, isFirstEmoji],
+          // .replace(/\uFE0F/g, '') for stripping out the variation selector
+          // this would fix "Hot Beverage" but breaks red heart, ironically
+          arguments: [emoji, stringifiedLangs, isFirstEmoji],
         });
       });
 
