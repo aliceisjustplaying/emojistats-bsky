@@ -1,5 +1,5 @@
 {
-  "name": "emojitracker-bsky",
+  "name": "emojistats-bsky",
   "version": "1.0.0",
   "workspaces": [
     "packages/*"
