@@ -1,7 +1,8 @@
-import { EMIT_INTERVAL, LOG_INTERVAL, PORT } from './config.js';
+import { EMIT_INTERVAL, LOG_INTERVAL, METRICS_PORT, PORT } from './config.js';
 import { cursorUpdateInterval, getLastCursor } from './lib/cursor.js';
 import { getEmojiStats, getTopLanguages, logEmojiStats } from './lib/emojiStats.js';
 import { initializeJetstream, jetstream } from './lib/jetstream.js';
+import { startMetricsServer } from './lib/metrics.js';
 import { loadRedisScripts, redis } from './lib/redis.js';
 import { io, startSocketServer } from './lib/socket.io.js';
 import logger from './lib/logger.js';
@@ -37,6 +38,10 @@ setInterval(() => {
 }, EMIT_INTERVAL);
 /* End emitting data for frontend */
 
+/* metrics server */
+const metricsServer = startMetricsServer(Number(METRICS_PORT));
+/* End metrics server */
+
 /* logging stats to the console */
 setInterval(() => {
   getEmojiStats()
@@ -60,7 +65,7 @@ function shutdown() {
   clearInterval(cursorUpdateInterval);
   void io.close();
   jetstream.close();
-
+  metricsServer.close();
   redis
     .quit()
     .catch((error: unknown) => {

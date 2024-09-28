@@ -5,6 +5,13 @@ import fs from 'fs';
 import { MAX_EMOJIS, MAX_TOP_LANGUAGES, TRIM_LANGUAGE_CODES } from '../config.js';
 import { setLatestCursor } from './cursor.js';
 import logger from './logger.js';
+import {
+  incrementTotalEmojis,
+  incrementTotalPosts,
+  postProcessingDuration,
+  totalPostsWithEmojis,
+  totalPostsWithoutEmojis,
+} from './metrics.js';
 import { SCRIPT_SHA, redis } from './redis.js';
 import { Emoji, LanguageStat } from './types.js';
 
@@ -21,50 +28,62 @@ const POSTS_WITHOUT_EMOJIS = 'postsWithoutEmojis';
 const PROCESSED_EMOJIS = 'processedEmojis';
 
 export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
-  const { commit } = event;
-
-  if (!commit.rkey) return;
-
-  const { record } = commit;
-
+  const timer = postProcessingDuration.startTimer();
   try {
-    let langs = new Set<string>();
-    if (record.langs && Array.isArray(record.langs)) {
-      langs = new Set(
-        record.langs.map((lang: string) =>
-          // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-          TRIM_LANGUAGE_CODES ? lang.split('-')[0].toLowerCase().slice(0, 2) : lang,
-        ),
-      );
-    } else {
-      langs.add('UNKNOWN');
-    }
+    const { commit } = event;
 
-    const emojiMatches = record.text.match(emojiRegex) ?? [];
+    if (!commit.rkey) return;
 
-    if (emojiMatches.length > 0) {
-      const stringifiedLangs = JSON.stringify(Array.from(langs));
+    const { record } = commit;
 
-      const emojiPromises = emojiMatches.map((emoji, i) => {
-        const isFirstEmoji = i === 0 ? '1' : '0';
-        return redis.evalSha(SCRIPT_SHA, {
-          // .replace(/\uFE0F/g, '') for stripping out the variation selector
-          // this would fix "Hot Beverage" but breaks red heart, ironically
-          arguments: [emoji, stringifiedLangs, isFirstEmoji],
+    try {
+      let langs = new Set<string>();
+      if (record.langs && Array.isArray(record.langs)) {
+        langs = new Set(
+          record.langs.map((lang: string) =>
+            // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+            TRIM_LANGUAGE_CODES ? lang.split('-')[0].toLowerCase().slice(0, 2) : lang,
+          ),
+        );
+      } else {
+        langs.add('UNKNOWN');
+      }
+
+      const emojiMatches = record.text.match(emojiRegex) ?? [];
+
+      if (emojiMatches.length > 0) {
+        const stringifiedLangs = JSON.stringify(Array.from(langs));
+
+        const emojiPromises = emojiMatches.map((emoji, i) => {
+          const isFirstEmoji = i === 0 ? '1' : '0';
+          return redis.evalSha(SCRIPT_SHA, {
+            // .replace(/\uFE0F/g, '') for stripping out the variation selector
+            // this would fix "Hot Beverage" but breaks red heart, ironically
+            arguments: [emoji, stringifiedLangs, isFirstEmoji],
+          });
         });
-      });
 
-      await Promise.all([...emojiPromises]);
-      logger.debug(`Emojis updated for languages: ${Array.from(langs).join(', ')}`);
-    } else {
-      await redis.incr(POSTS_WITHOUT_EMOJIS);
+        await Promise.all([...emojiPromises]);
+        logger.debug(`Emojis updated for languages: ${Array.from(langs).join(', ')}`);
+        incrementTotalEmojis(emojiMatches.length);
+      } else {
+        await redis.incr(POSTS_WITHOUT_EMOJIS);
+      }
+
+      await redis.incr(PROCESSED_POSTS);
+      setLatestCursor(event.time_us.toString());
+      incrementTotalPosts();
+      if (emojiMatches.length > 0) {
+        totalPostsWithEmojis.inc();
+      } else {
+        totalPostsWithoutEmojis.inc();
+      }
+    } catch (error) {
+      logger.error(`Error processing "create" commit: ${(error as Error).message}`, { commit, record });
+      logger.error(`Malformed record data: ${JSON.stringify(record)}`);
     }
-
-    await redis.incr(PROCESSED_POSTS);
-    setLatestCursor(event.time_us.toString());
-  } catch (error) {
-    logger.error(`Error processing "create" commit: ${(error as Error).message}`, { commit, record });
-    logger.error(`Malformed record data: ${JSON.stringify(record)}`);
+  } finally {
+    timer();
   }
 }
 
