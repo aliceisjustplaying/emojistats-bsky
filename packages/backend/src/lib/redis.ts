@@ -2,7 +2,7 @@ import fs from 'fs';
 import { createClient } from 'redis';
 
 import { REDIS_URL } from '../config.js';
-import logger from '../logger.js';
+import logger from './logger.js';
 
 const redis = createClient({ url: REDIS_URL });
 

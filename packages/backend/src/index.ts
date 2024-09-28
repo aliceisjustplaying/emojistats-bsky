@@ -4,7 +4,7 @@ import { getEmojiStats, getTopLanguages, logEmojiStats } from './lib/emojiStats.
 import { initializeJetstream, jetstream } from './lib/jetstream.js';
 import { loadRedisScripts, redis } from './lib/redis.js';
 import { io, startSocketServer } from './lib/socket.io.js';
-import logger from './logger.js';
+import logger from './lib/logger.js';
 
 /* redis initialization */
 await redis.connect();

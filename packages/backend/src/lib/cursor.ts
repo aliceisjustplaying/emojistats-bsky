@@ -1,5 +1,5 @@
 import { CURSOR_UPDATE_INTERVAL } from '../config.js';
-import logger from '../logger.js';
+import logger from './logger.js';
 import { redis } from './redis.js';
 
 let latestCursor: string;

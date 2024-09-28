@@ -3,8 +3,8 @@ import emojiRegexFunc from 'emoji-regex';
 import fs from 'fs';
 
 import { MAX_EMOJIS, MAX_TOP_LANGUAGES, TRIM_LANGUAGE_CODES } from '../config.js';
-import logger from '../logger.js';
 import { setLatestCursor } from './cursor.js';
+import logger from './logger.js';
 import { SCRIPT_SHA, redis } from './redis.js';
 import { Emoji, LanguageStat } from './types.js';
 
