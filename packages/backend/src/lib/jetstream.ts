@@ -1,9 +1,9 @@
 import { CommitCreateEvent, Jetstream } from '@skyware/jetstream';
 
 import { FIREHOSE_URL } from '../config.js';
-import logger from './logger.js';
 import { initializeCursorUpdate } from './cursor.js';
 import { handleCreate } from './emojiStats.js';
+import logger from './logger.js';
 
 let jetstream: Jetstream;
 

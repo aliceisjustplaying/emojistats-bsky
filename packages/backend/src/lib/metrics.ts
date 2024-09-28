@@ -1,6 +1,7 @@
-import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from 'prom-client';
 import express from 'express';
-import logger from './logger.js'
+import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from 'prom-client';
+
+import logger from './logger.js';
 
 const register = new Registry();
 collectDefaultMetrics({ register });
@@ -58,7 +59,10 @@ export const emojisPerSecond = new Gauge({
 export const postProcessingDuration = new Histogram({
   name: 'bluesky_post_processing_duration_seconds',
   help: 'Duration of post processing in seconds',
-  buckets: [0.0001, 0.0002, 0.0003, 0.0004, 0.0005, 0.0006, 0.0007, 0.0008, 0.0009, 0.001, 0.002, 0.003, 0.004, 0.005, 0.01, 0.02, 0.03, 0.04, 0.05, 0.1, 0.25, 0.5, 1],
+  buckets: [
+    0.0001, 0.0002, 0.0003, 0.0004, 0.0005, 0.0006, 0.0007, 0.0008, 0.0009, 0.001, 0.002, 0.003, 0.004, 0.005, 0.01,
+    0.02, 0.03, 0.04, 0.05, 0.1, 0.25, 0.5, 1,
+  ],
   registers: [register],
 });
 
