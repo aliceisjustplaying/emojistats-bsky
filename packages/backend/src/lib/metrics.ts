@@ -31,13 +31,13 @@ export const totalEmojis = new Counter({
 });
 
 export const postsPerSecond = new Gauge({
-  name: 'bluesky_posts_per_second',
-  help: 'Number of posts processed per second',
+  name: 'bluesky_processed_posts_per_second_for_emojis',
+  help: 'Number of posts processed per second for emojis',
   registers: [register],
 });
 
 export const emojisPerSecond = new Gauge({
-  name: 'bluesky_emojis_per_second',
+  name: 'bluesky_processed_emojis_per_second',
   help: 'Number of emojis processed per second',
   registers: [register],
 });
