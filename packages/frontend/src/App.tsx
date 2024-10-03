@@ -91,7 +91,7 @@ function App() {
         onSelect={handleLanguageSelect}
         totalEmojiCount={totalEmojiCount}
       />
-      <EmojiGrid topEmojis={currentEmojis} socket={socketRef.current!} />
+      <EmojiGrid topEmojis={currentEmojis} socket={socketRef.current!} lang={selectedLanguage} />
       <Footer
         stats={
           emojiStats || {
