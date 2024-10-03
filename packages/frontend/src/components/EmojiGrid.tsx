@@ -11,6 +11,7 @@ interface Emoji {
 interface EmojiGridProps {
   topEmojis: Emoji[];
   socket: Socket;
+  lang: string;
 }
 
 const MIN_COLUMN_WIDTH = 80;
