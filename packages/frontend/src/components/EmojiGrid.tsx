@@ -67,7 +67,7 @@ const Cell = memo(({ columnIndex, rowIndex, style, data }: GridChildComponentPro
     console.log(`Getting emoji info for ${emoji}`);
     socket.emit('getEmojiInfo', emoji);
     const url =
-      lang === 'all' ?
+      lang === 'all' || lang === 'unknown' ?
         `https://bsky.app/search?q=${encodeURIComponent(emoji)}`
       : `https://bsky.app/search?q=${encodeURIComponent('lang:' + lang + ' ' + emoji)}`;
     // console.log(url);
