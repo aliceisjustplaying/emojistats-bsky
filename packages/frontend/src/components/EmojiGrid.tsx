@@ -20,7 +20,7 @@ const CELL_PADDING = 4;
 
 const EmojiGrid: React.FC<EmojiGridProps> = ({ topEmojis, socket, lang }) => {
   return (
-    <main className="flex-grow w-full p-2 bg-white overflow-hidden">
+    <main className="flex-grow w-full px-1 bg-white overflow-hidden">
       <AutoSizer>
         {({ height, width }) => {
           const columnCount = Math.floor(width / MIN_COLUMN_WIDTH) || 1;

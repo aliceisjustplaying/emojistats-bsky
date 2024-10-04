@@ -80,4 +80,5 @@ button:focus-visible {
 
 .react-tabs__tab-list {
   width: max-content;
+  margin-bottom: 0;
 }
