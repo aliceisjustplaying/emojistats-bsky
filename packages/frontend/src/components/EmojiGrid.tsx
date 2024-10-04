@@ -1,4 +1,4 @@
-import React, { memo } from 'react';
+import React, { memo, useEffect, useRef, useState } from 'react';
 import AutoSizer from 'react-virtualized-auto-sizer';
 import { FixedSizeGrid as Grid, GridChildComponentProps } from 'react-window';
 import { Socket } from 'socket.io-client';
@@ -50,9 +50,7 @@ const Cell = memo(({ columnIndex, rowIndex, style, data }: GridChildComponentPro
   const { items, columnCount, socket, lang }: { items: Emoji[]; columnCount: number; socket: Socket; lang: string } =
     data;
   const index = rowIndex * columnCount + columnIndex;
-  if (index >= items.length) {
-    return null;
-  }
+
   const { emoji, count } = items[index];
 
   const cellStyle = {
@@ -62,6 +60,28 @@ const Cell = memo(({ columnIndex, rowIndex, style, data }: GridChildComponentPro
     width: (style.width as number) - CELL_PADDING * 2,
     height: (style.height as number) - CELL_PADDING * 2,
   };
+
+  const [isBlinking, setIsBlinking] = useState(false);
+  const [prevCount, setPrevCount] = useState(count);
+
+  useEffect(() => {
+    if (prevCount !== count) {
+      setIsBlinking(true);
+      console.log('Blinking');
+      setPrevCount(count);
+
+      // Remove the blink effect after the animation duration
+      const timer = setTimeout(() => {
+        setIsBlinking(false);
+      }, 500); // Duration should match the CSS animation duration
+
+      return () => clearTimeout(timer);
+    }
+  }, [count, prevCount]);
+
+  if (index >= items.length) {
+    return null;
+  }
 
   const handleClick = () => {
     console.log(`Getting emoji info for ${emoji}`);
@@ -77,7 +97,7 @@ const Cell = memo(({ columnIndex, rowIndex, style, data }: GridChildComponentPro
   return (
     <div
       style={cellStyle}
-      className="flex items-center justify-between bg-gray-50 p-2 rounded shadow-sm cursor-pointer hover:bg-gray-100"
+      className={`flex items-center justify-between bg-gray-50 p-2 rounded shadow-sm cursor-pointer hover:bg-gray-100 ${isBlinking ? 'blink' : ''}`}
       onClick={handleClick}
     >
       <span className="text text-black">{emoji}</span>

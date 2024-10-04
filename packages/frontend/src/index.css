@@ -86,3 +86,21 @@ button:focus-visible {
   width: max-content;
   margin-bottom: 0;
 }
+
+/* Cell.css */
+
+.blink {
+  animation: blink-animation 0.5s;
+}
+
+@keyframes blink-animation {
+  0% {
+    background-color: #fff3cd; /* Light yellow */
+  }
+  50% {
+    background-color: #fff3cd; /* Light yellow */
+  }
+  100% {
+    background-color: #f8f9fa; /* Light gray */
+  }
+}
