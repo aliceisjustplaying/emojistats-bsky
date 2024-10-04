@@ -21,10 +21,13 @@ function Footer({ stats }: FooterProps) {
         Ratio: {(Number(stats.ratio) * 100).toFixed(2)}%
       </span>
       <span className="w-full sm:w-auto text-xs md:text-sm text-center px-2">
-        Created by <a href="https://alice.bsky.sh/">Alice</a>
+        Created by{' '}
+        <a href="https://alice.bsky.sh/" target="_blank">
+          Alice
+        </a>
       </span>
       <span className="w-full sm:w-auto text-xs md:text-sm text-center flex flex-row items-center justify-center px-2">
-        <a href="https://github.com/aliceisjustplaying/emojistats-bsky" className="leading-none">
+        <a href="https://github.com/aliceisjustplaying/emojistats-bsky" target="_blank" className="leading-none">
           <img src="/gh.png" alt="GitHub" className="w-4 h-4 inline-block" />
         </a>
       </span>
