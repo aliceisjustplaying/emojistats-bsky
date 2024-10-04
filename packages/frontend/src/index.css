@@ -30,6 +30,8 @@ body {
   margin: 0;
   min-width: 320px;
   height: 100dvh;
+  height: 100svh; /* Fallback for small viewport */
+  height: 100lvh; /* Fallback for large viewport */
   overflow: hidden; /* Prevent body from scrolling */
 }
 
