@@ -23,6 +23,11 @@ function Footer({ stats }: FooterProps) {
       <span className="w-full sm:w-auto text-xs md:text-sm text-center px-2">
         Created by <a href="https://alice.bsky.sh/">Alice</a>
       </span>
+      <span className="w-full sm:w-auto text-xs md:text-sm text-center flex flex-row items-center justify-center px-2">
+        <a href="https://github.com/aliceisjustplaying/emojistats-bsky" className="leading-none">
+          <img src="/gh.png" alt="GitHub" className="w-4 h-4 inline-block" />
+        </a>
+      </span>
     </footer>
   );
 }
