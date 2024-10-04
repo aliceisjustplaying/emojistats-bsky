@@ -86,3 +86,21 @@ button:focus-visible {
   width: max-content;
   margin-bottom: 0;
 }
+
+@media (prefers-color-scheme: dark) {
+  .react-tabs__tab--selected {
+    border-bottom: 1px solid #404040;
+    border-color: #ffffff;
+    background: #404040;
+    color: #ffffff;
+  }
+}
+
+#emoji-grid::-webkit-scrollbar {
+  display: none;
+}
+
+#emoji-grid {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}

@@ -20,7 +20,7 @@ const CELL_PADDING = 4;
 
 const EmojiGrid: React.FC<EmojiGridProps> = ({ topEmojis, socket, lang }) => {
   return (
-    <main className="flex-grow w-full px-1 bg-white overflow-hidden">
+    <main id="emoji-grid" className="flex-grow w-full px-1 bg-white dark:bg-gray-900 overflow-hidden">
       <AutoSizer>
         {({ height, width }) => {
           const columnCount = Math.floor(width / MIN_COLUMN_WIDTH) || 1;
@@ -77,11 +77,11 @@ const Cell = memo(({ columnIndex, rowIndex, style, data }: GridChildComponentPro
   return (
     <div
       style={cellStyle}
-      className="flex items-center justify-between bg-gray-50 p-2 rounded shadow-sm cursor-pointer hover:bg-gray-100"
+      className="flex items-center justify-between bg-gray-50 dark:bg-gray-800 p-2 rounded shadow-sm cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-600"
       onClick={handleClick}
     >
-      <span className="text text-black">{emoji}</span>
-      <span className="text-xs text-gray-600">{count}</span>
+      <span className="text text-black dark:text-gray-100">{emoji}</span>
+      <span className="text-xs text-gray-600 dark:text-gray-100">{count}</span>
     </div>
   );
 });
