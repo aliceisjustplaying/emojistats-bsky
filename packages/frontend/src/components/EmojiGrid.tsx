@@ -35,6 +35,7 @@ const EmojiGrid: React.FC<EmojiGridProps> = ({ topEmojis, socket, lang }) => {
               rowCount={rowCount}
               rowHeight={ROW_HEIGHT}
               width={width}
+              overscanRowCount={10}
               itemData={{ items: topEmojis, columnCount, socket, lang }}
             >
               {Cell}
