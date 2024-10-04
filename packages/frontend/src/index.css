@@ -29,31 +29,18 @@ a:hover {
 body {
   margin: 0;
   min-width: 320px;
+  /* width: 100%; */
   height: 100dvh;
-  overflow: hidden; /* Prevent body from scrolling */
+  overflow: hidden;
+}
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
 }
 
 #root {
   height: 100%;
-}
-
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.4em 0.8em; /* Reduced padding */
-  font-size: 0.9em; /* Slightly smaller font */
-  font-weight: 500;
-  font-family: inherit;
-  background-color: #1a1a1a;
-  cursor: pointer;
-  transition: border-color 0.25s;
-}
-button:hover {
-  border-color: #646cff;
-}
-button:focus,
-button:focus-visible {
-  outline: 4px auto -webkit-focus-ring-color;
 }
 
 @media (prefers-color-scheme: light) {
@@ -101,6 +88,15 @@ button:focus-visible {
 }
 
 #emoji-grid {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+*::-webkit-scrollbar {
+  display: none;
+}
+
+* {
   -ms-overflow-style: none;
   scrollbar-width: none;
 }
