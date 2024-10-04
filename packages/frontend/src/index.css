@@ -71,7 +71,7 @@ body {
 
 .react-tabs__tab-list {
   width: max-content;
-  margin-bottom: 0;
+  /* margin-bottom: 0; */ /* breaks scroll somehow */
 }
 
 @media (prefers-color-scheme: dark) {
@@ -80,6 +80,10 @@ body {
     border-color: #ffffff;
     background: #404040;
     color: #ffffff;
+  }
+
+  .react-tabs__tabs-list {
+    border-bottom-color: #404040;
   }
 }
 
