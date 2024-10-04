@@ -70,7 +70,6 @@ const Cell = memo(({ columnIndex, rowIndex, style, data }: GridChildComponentPro
       lang === 'all' || lang === 'unknown' ?
         `https://bsky.app/search?q=${encodeURIComponent(emoji)}`
       : `https://bsky.app/search?q=${encodeURIComponent('lang:' + lang + ' ' + emoji)}`;
-    // console.log(url);
     window.open(url, '_blank');
   };
 
