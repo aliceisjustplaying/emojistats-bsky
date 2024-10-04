@@ -14,7 +14,7 @@ interface EmojiGridProps {
   lang: string;
 }
 
-const MIN_COLUMN_WIDTH = 80;
+const MIN_COLUMN_WIDTH = 90;
 const ROW_HEIGHT = 40;
 const CELL_PADDING = 4;
 
