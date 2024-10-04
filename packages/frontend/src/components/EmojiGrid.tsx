@@ -14,6 +14,15 @@ interface EmojiGridProps {
   lang: string;
 }
 
+interface CellProps extends GridChildComponentProps {
+  data: {
+    items: Emoji[];
+    columnCount: number;
+    socket: Socket;
+    lang: string;
+  };
+}
+
 const MIN_COLUMN_WIDTH = 90;
 const ROW_HEIGHT = 40;
 const CELL_PADDING = 4;
@@ -46,10 +55,14 @@ const EmojiGrid: React.FC<EmojiGridProps> = ({ topEmojis, socket, lang }) => {
   );
 };
 
-const Cell = memo(({ columnIndex, rowIndex, style, data }: GridChildComponentProps) => {
-  const { items, columnCount, socket, lang }: { items: Emoji[]; columnCount: number; socket: Socket; lang: string } =
-    data;
+const Cell: React.FC<CellProps> = memo(({ columnIndex, rowIndex, style, data }) => {
+  const { items, columnCount, socket, lang } = data;
   const index = rowIndex * columnCount + columnIndex;
+
+  // Early return if index is out of bounds
+  if (index >= items.length) {
+    return null;
+  }
 
   const { emoji, count } = items[index];
 
@@ -61,14 +74,20 @@ const Cell = memo(({ columnIndex, rowIndex, style, data }: GridChildComponentPro
     height: (style.height as number) - CELL_PADDING * 2,
   };
 
-  const [isBlinking, setIsBlinking] = useState(false);
-  const [prevCount, setPrevCount] = useState(count);
+  // Ref to store the previous count
+  const prevCountRef = useRef<number>(count);
 
+  // State to control the blink effect
+  const [isBlinking, setIsBlinking] = useState(false);
+
+  // Effect to detect count changes
   useEffect(() => {
-    if (prevCount !== count) {
+    if (prevCountRef.current !== count) {
       setIsBlinking(true);
       console.log('Blinking');
-      setPrevCount(count);
+
+      // Update the previous count
+      prevCountRef.current = count;
 
       // Remove the blink effect after the animation duration
       const timer = setTimeout(() => {
@@ -77,33 +96,41 @@ const Cell = memo(({ columnIndex, rowIndex, style, data }: GridChildComponentPro
 
       return () => clearTimeout(timer);
     }
-  }, [count, prevCount]);
-
-  if (index >= items.length) {
-    return null;
-  }
+  }, [count]);
 
   const handleClick = () => {
     console.log(`Getting emoji info for ${emoji}`);
     socket.emit('getEmojiInfo', emoji);
-    const url =
-      lang === 'all' || lang === 'unknown' ?
-        `https://bsky.app/search?q=${encodeURIComponent(emoji)}`
-      : `https://bsky.app/search?q=${encodeURIComponent('lang:' + lang + ' ' + emoji)}`;
-    // console.log(url);
+    const query =
+      lang === 'all' || lang === 'unknown' ? encodeURIComponent(emoji) : encodeURIComponent(`lang:${lang} ${emoji}`);
+    const url = `https://bsky.app/search?q=${query}`;
     window.open(url, '_blank');
   };
 
   return (
     <div
       style={cellStyle}
-      className={`flex items-center justify-between bg-gray-50 p-2 rounded shadow-sm cursor-pointer hover:bg-gray-100 ${isBlinking ? 'blink' : ''}`}
+      className={`flex items-center justify-between bg-gray-50 p-2 rounded shadow-sm cursor-pointer hover:bg-gray-100 ${
+        isBlinking ? 'blink' : ''
+      }`}
       onClick={handleClick}
     >
       <span className="text text-black">{emoji}</span>
       <span className="text-xs text-gray-600">{count}</span>
     </div>
   );
-});
+}, areEqual);
+
+// Custom comparison function for React.memo
+function areEqual(prevProps: CellProps, nextProps: CellProps) {
+  const prevIndex = prevProps.rowIndex * prevProps.data.columnCount + prevProps.columnIndex;
+  const nextIndex = nextProps.rowIndex * nextProps.data.columnCount + nextProps.columnIndex;
+
+  const prevItem = prevProps.data.items[prevIndex];
+  const nextItem = nextProps.data.items[nextIndex];
+
+  // Compare emoji and count
+  return prevItem?.emoji === nextItem?.emoji && prevItem?.count === nextItem?.count;
+}
 
 export default memo(EmojiGrid);
