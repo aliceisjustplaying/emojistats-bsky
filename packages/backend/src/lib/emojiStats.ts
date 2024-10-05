@@ -13,12 +13,23 @@ import {
   totalPostsWithoutEmojis,
 } from './metrics.js';
 import { SCRIPT_SHA, redis } from './redis.js';
-import { Emoji, LanguageStat } from './types.js';
+import { Emoji, EmojiVariationSequence, LanguageStat } from './types.js';
 
 const emojiRegex: RegExp = emojiRegexFunc();
 
 // source: https://github.com/amio/emoji.json/blob/master/emoji.json
+// export const emojis = JSON.parse(fs.readFileSync(new URL('./data/emojiAmio.json', import.meta.url), 'utf8')) as EmojiAmio[];
+
+// source: https://github.com/iamcal/emoji-data/blob/master/emoji.json
 export const emojis = JSON.parse(fs.readFileSync(new URL('./data/emoji.json', import.meta.url), 'utf8')) as Emoji[];
+
+// converted from: https://unicode.org/Public/emoji/12.1/emoji-variation-sequences.txt
+// regex in Sublime Text form:
+// find: ([0-9A-F]{4,5}) +FE0E +; +.+? style; +\# \((\d.\d)\) ([A-Z0-9\- ]+)\n[0-9A-F]{4,5} +FE0F +; +.+? style; +\# \(\d.\d\) [A-Z0-9\- ]+\n
+// replace: {"code": "$1", "textStyle": "$1 FE0E", "emojiStyle": "$1 FE0F", "version": "$2", "name": "$3"},\n
+export const emojiVariationSequences = JSON.parse(
+  fs.readFileSync(new URL('./data/emojiVariationSequences.json', import.meta.url), 'utf8'),
+) as EmojiVariationSequence[];
 
 const EMOJI_SORTED_SET = 'emojiStats';
 const LANGUAGE_SORTED_SET = 'languageStats';
