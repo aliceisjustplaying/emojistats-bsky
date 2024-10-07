@@ -15,7 +15,7 @@
     "lint-staged": "^15.2.10"
   },
   "lint-staged": {
-    "*": "prettier --ignore-unknown --write"
+    "*": "prettier --ignore-unknown --write --ignore-path packages/backend/.prettierignore"
   },
   "dependencies": {
     "react-tabs": "^6.0.2"
