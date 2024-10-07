@@ -1,6 +1,7 @@
 import fs from 'fs';
 import { createClient } from 'redis';
 
+import { codePointToEmoji, emojiToCodePoint } from '../lib/helpers.js';
 import { EmojiVariationSequence } from '../lib/types.js';
 
 const dryRun = false;
@@ -73,10 +74,9 @@ async function normalizeEmojis() {
 }
 
 function getNormalizedEmoji(emoji: string) {
-  const emojiCodePoints = [...emoji].map((char) => char.codePointAt(0)?.toString(16).padStart(4, '0')).join(' ');
+  const emojiCodePoints = emojiToCodePoint(emoji);
   const normalizedEmojiCodePoints = normalizationMap[emojiCodePoints] || emojiCodePoints;
-  const codePoints = normalizedEmojiCodePoints.split(' ').map((cp) => parseInt(cp, 16));
-  const normalizedEmoji = String.fromCodePoint(...codePoints);
+  const normalizedEmoji = codePointToEmoji(normalizedEmojiCodePoints);
   return { emojiCodePoints, normalizedEmojiCodePoints, normalizedEmoji };
 }
 
