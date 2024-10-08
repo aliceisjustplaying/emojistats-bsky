@@ -18,7 +18,9 @@
     "react-dom": "^18.3.1",
     "react-virtualized-auto-sizer": "^1.0.24",
     "react-window": "^1.8.10",
-    "socket.io-client": "^4.8.0"
+    "socket.io-client": "^4.8.0",
+    "react-tabs": "^6.0.2",
+    "use-effect-event": "^1.0.2"
   },
   "devDependencies": {
     "@eslint/js": "^9.12.0",
