@@ -25,7 +25,7 @@ normalizationMap = lowercaseObject(normalizationMap);
 let nonQualifiedMap: Record<string, string> = {};
 emojiData.forEach((emojiEntry) => {
   if (emojiEntry.non_qualified && emojiEntry.unified) {
-    nonQualifiedMap[emojiEntry.non_qualified.toLowerCase()] = emojiEntry.unified.toLowerCase();
+    nonQualifiedMap[emojiEntry.non_qualified.replaceAll('-', ' ')] = emojiEntry.unified.replaceAll('-', ' ');
   }
 });
 
