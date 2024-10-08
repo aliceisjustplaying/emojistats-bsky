@@ -35,8 +35,6 @@ emojiData.forEach((emojiEntry) => {
 
 nonQualifiedMap = lowercaseObject(nonQualifiedMap);
 
-console.dir(nonQualifiedMap, { depth: null });
-
 async function normalizeEmojis() {
   const redisClient = createClient();
   redisClient.on('error', (err) => {
