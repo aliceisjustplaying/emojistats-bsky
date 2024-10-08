@@ -1,10 +1,16 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Socket, io } from 'socket.io-client';
+import { useEffectEvent } from 'use-effect-event';
 
 import EmojiGrid from './components/EmojiGrid.js';
 import Footer from './components/Footer.js';
 import Header from './components/Header.js';
 import LanguageTabs from './components/LanguageTabs.js';
+
+type TopEmojis = Array<{
+  emoji: string;
+  count: number;
+}>;
 
 interface EmojiStats {
   processedPosts: number;
@@ -12,10 +18,7 @@ interface EmojiStats {
   postsWithEmojis: number;
   postsWithoutEmojis: number;
   ratio: string;
-  topEmojis: Array<{
-    emoji: string;
-    count: number;
-  }>;
+  topEmojis: TopEmojis;
 }
 
 interface LanguageStat {
@@ -23,23 +26,37 @@ interface LanguageStat {
   count: number;
 }
 
+type TopEmojisForLanguage = {
+  language: string;
+  topEmojis: TopEmojis;
+};
+
+const NO_EMOJIS: TopEmojis = [];
+
 function App() {
-  const [emojiStats, setEmojiStats] = useState<EmojiStats | null>(null);
-  const totalEmojiCount = emojiStats?.processedEmojis ?? 0;
-  const [languageStats, setLanguageStats] = useState<LanguageStat[]>([]);
   const [selectedLanguage, setSelectedLanguage] = useState<string>('all');
-  const [currentEmojis, setCurrentEmojis] = useState<Array<{ emoji: string; count: number }>>([]);
-  const socketRef = useRef<Socket | null>(null);
 
-  useEffect(() => {
-    const socket: Socket = io(import.meta.env.VITE_SOCKET_URL);
+  const [languageStats, setLanguageStats] = useState<LanguageStat[]>([]);
+  const [emojiStats, setEmojiStats] = useState<EmojiStats | null>(null);
 
+  const [topEmojisCache, setTopEmojisCache] = useState<Record<string, TopEmojis>>({});
+  const updateTopEmojiCacheEntry = useCallback((language: string, value: TopEmojis) => {
+    return setTopEmojisCache((prev) => ({ ...prev, [language]: value }));
+  }, []);
+
+  // TODO: loading state instead of defaulting to an empty array?
+  const topEmojis =
+    (selectedLanguage === 'all' ? emojiStats?.topEmojis : topEmojisCache[selectedLanguage]) ?? NO_EMOJIS;
+
+  const totalEmojiCount = emojiStats?.processedEmojis ?? 0;
+
+  // listen for data
+  // (technically we could avoid using useEffectvent,
+  // but it's probably good to avoid future bugs w/ effect deps)
+  const onSocketConnected = useEffectEvent((socket: Socket) => {
     // Handle incoming emoji stats
     socket.on('emojiStats', (data: EmojiStats) => {
       setEmojiStats(data);
-      if (selectedLanguage === 'all') {
-        setCurrentEmojis(data.topEmojis);
-      }
     });
 
     // Handle incoming language stats
@@ -48,39 +65,47 @@ function App() {
     });
 
     // Handle incoming top emojis for a specific language
-    socket.on(
-      'topEmojisForLanguage',
-      (data: { language: string; topEmojis: Array<{ emoji: string; count: number }> }) => {
-        if (data.language === selectedLanguage) {
-          setCurrentEmojis(data.topEmojis);
-        }
-      },
-    );
+    // NOTE: this only comes in response to a 'getTopEmojisForLanguage' message
+    // which we send in an interval if a language is selected
+    socket.on('topEmojisForLanguage', (data: TopEmojisForLanguage) => {
+      updateTopEmojiCacheEntry(data.language, data.topEmojis);
+    });
 
     socket.on('emojiInfo', (data) => {
       console.log('Emoji Info:', data);
     });
+  });
 
+  const socketRef = useRef<Socket | null>(null);
+  useEffect(() => {
+    const socket = io(import.meta.env.VITE_SOCKET_URL);
     socketRef.current = socket;
+    onSocketConnected(socket);
 
-    // Clean up on unmount
     return () => {
       socket.disconnect();
+      socketRef.current = null;
     };
-  }, [selectedLanguage]); // Include selectedLanguage to handle updates
+  }, [onSocketConnected]);
 
-  useEffect(() => {
-    if (selectedLanguage !== 'all' && socketRef.current) {
-      socketRef.current.emit('getTopEmojisForLanguage', selectedLanguage);
-    } else if (emojiStats) {
-      setCurrentEmojis(emojiStats.topEmojis);
+  // language selection
+  const handleLanguageSelect = useCallback((newLanguage: string) => {
+    setSelectedLanguage(newLanguage);
+    if (socketRef.current) {
+      maybeRequestLanguageData(socketRef.current, newLanguage);
     }
-  }, [selectedLanguage, emojiStats]);
+  }, []);
 
-  const handleLanguageSelect = (language: string) => {
-    setSelectedLanguage(language);
-    setCurrentEmojis([]); // these are per-language, so we have to clear them too
-  };
+  // we have to repeatedly send 'getTopEmojisForLanguage' messages
+  // to get back 'topEmojisForLanguage' data
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (socketRef.current) {
+        maybeRequestLanguageData(socketRef.current, selectedLanguage);
+      }
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [selectedLanguage]);
 
   return (
     <div className="flex flex-col h-full">
@@ -93,7 +118,8 @@ function App() {
       />
       <EmojiGrid
         key={selectedLanguage}
-        topEmojis={currentEmojis}
+        topEmojis={topEmojis}
+        // FIXME: reading ref in render (unnecessary, can just pass callback)
         socket={socketRef.current!}
         lang={selectedLanguage.toLowerCase()}
       />
@@ -112,5 +138,11 @@ function App() {
     </div>
   );
 }
+
+const maybeRequestLanguageData = (socket: Socket, language: string) => {
+  if (language !== 'all') {
+    socket.emit('getTopEmojisForLanguage', language);
+  }
+};
 
 export default App;
