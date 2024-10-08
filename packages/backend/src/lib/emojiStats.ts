@@ -4,6 +4,7 @@ import fs from 'fs';
 
 import { MAX_EMOJIS, MAX_TOP_LANGUAGES, TRIM_LANGUAGE_CODES } from '../config.js';
 import { setLatestCursor } from './cursor.js';
+import { batchNormalizeEmojis } from './emojiNormalization.js';
 import logger from './logger.js';
 import {
   incrementTotalEmojis,
@@ -65,11 +66,11 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
       if (emojiMatches.length > 0) {
         const stringifiedLangs = JSON.stringify(Array.from(langs));
 
-        const emojiPromises = emojiMatches.map((emoji, i) => {
+        const normalizedEmojis = batchNormalizeEmojis(emojiMatches);
+
+        const emojiPromises = normalizedEmojis.map((emoji, i) => {
           const isFirstEmoji = i === 0 ? '1' : '0';
           return redis.evalSha(SCRIPT_SHA, {
-            // .replace(/\uFE0F/g, '') for stripping out the variation selector
-            // this would fix "Hot Beverage" but breaks red heart, ironically
             arguments: [emoji, stringifiedLangs, isFirstEmoji],
           });
         });
