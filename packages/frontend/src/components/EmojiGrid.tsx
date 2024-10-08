@@ -1,7 +1,7 @@
 import React, { memo, useEffect, useRef } from 'react';
 import AutoSizer from 'react-virtualized-auto-sizer';
-import { FixedSizeGrid as Grid, GridChildComponentProps } from 'react-window';
-import { Socket } from 'socket.io-client';
+import { FixedSizeGrid as Grid, type GridChildComponentProps, type GridItemKeySelector } from 'react-window';
+import type { Socket } from 'socket.io-client';
 
 interface Emoji {
   emoji: string;
@@ -13,6 +13,8 @@ interface EmojiGridProps {
   socket: Socket;
   lang: string;
 }
+
+type EmojiGridItemData = { items: Emoji[]; columnCount: number; socket: Socket; lang: string };
 
 const MIN_COLUMN_WIDTH = 90;
 const ROW_HEIGHT = 40;
@@ -28,7 +30,7 @@ const EmojiGrid: React.FC<EmojiGridProps> = ({ topEmojis, socket, lang }) => {
           const rowCount = Math.ceil(topEmojis.length / columnCount);
 
           return (
-            <Grid
+            <Grid<EmojiGridItemData>
               columnCount={columnCount}
               columnWidth={columnWidth}
               height={height}
@@ -36,6 +38,7 @@ const EmojiGrid: React.FC<EmojiGridProps> = ({ topEmojis, socket, lang }) => {
               rowHeight={ROW_HEIGHT}
               width={width}
               overscanRowCount={10}
+              itemKey={getItemKey}
               itemData={{ items: topEmojis, columnCount, socket, lang }}
             >
               {Cell}
@@ -47,11 +50,16 @@ const EmojiGrid: React.FC<EmojiGridProps> = ({ topEmojis, socket, lang }) => {
   );
 };
 
-const Cell = memo(({ columnIndex, rowIndex, style, data }: GridChildComponentProps) => {
-  const { items, columnCount, socket, lang }: { items: Emoji[]; columnCount: number; socket: Socket; lang: string } =
-    data;
+const getItemKey: GridItemKeySelector<EmojiGridItemData> = ({ columnIndex, rowIndex, data }) => {
+  const { items, columnCount, lang } = data;
   const index = rowIndex * columnCount + columnIndex;
+  const { emoji } = items[index];
+  return `${lang}-${emoji}`;
+};
 
+const Cell = memo(({ columnIndex, rowIndex, style, data }: GridChildComponentProps<EmojiGridItemData>) => {
+  const { items, columnCount, socket, lang } = data;
+  const index = rowIndex * columnCount + columnIndex;
   const { emoji, count } = items[index];
 
   const elRef = useRef<HTMLDivElement | null>(null);
