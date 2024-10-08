@@ -1,4 +1,4 @@
-import React, { memo } from 'react';
+import React, { memo, useEffect, useRef } from 'react';
 import AutoSizer from 'react-virtualized-auto-sizer';
 import { FixedSizeGrid as Grid, GridChildComponentProps } from 'react-window';
 import { Socket } from 'socket.io-client';
@@ -51,10 +51,47 @@ const Cell = memo(({ columnIndex, rowIndex, style, data }: GridChildComponentPro
   const { items, columnCount, socket, lang }: { items: Emoji[]; columnCount: number; socket: Socket; lang: string } =
     data;
   const index = rowIndex * columnCount + columnIndex;
+
+  const { emoji, count } = items[index];
+
+  const elRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    // don't flash if this is the first render
+    if (isFirstRun.current) {
+      return;
+    }
+
+    const el = elRef.current;
+    if (!el) {
+      return;
+    }
+
+    const isDarkMode = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+
+    const colors = cellColors[isDarkMode ? 'dark' : 'light'];
+    const animation = el.animate([{ backgroundColor: colors.highlight }, { backgroundColor: colors.default }], {
+      duration: 500,
+      iterations: 1,
+    });
+
+    return () => {
+      animation.cancel();
+    };
+  }, [count]);
+
+  // NOTE: order matters here, this needs to be set *after* the above reads it
+  const isFirstRun = useRef<boolean>(true);
+  useEffect(() => {
+    isFirstRun.current = false;
+    return () => {
+      isFirstRun.current = true;
+    };
+  }, []);
+
   if (index >= items.length) {
     return null;
   }
-  const { emoji, count } = items[index];
 
   const cellStyle = {
     ...style,
@@ -76,6 +113,7 @@ const Cell = memo(({ columnIndex, rowIndex, style, data }: GridChildComponentPro
 
   return (
     <div
+      ref={elRef}
       style={cellStyle}
       className="flex items-center justify-between bg-gray-50 dark:bg-gray-800 p-2 rounded shadow-sm cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-600"
       onClick={handleClick}
@@ -85,5 +123,16 @@ const Cell = memo(({ columnIndex, rowIndex, style, data }: GridChildComponentPro
     </div>
   );
 });
+
+const cellColors = {
+  light: {
+    highlight: '#fbe8ae',
+    default: 'rgb(249 250 251)', // gray-50
+  },
+  dark: {
+    highlight: '#666',
+    default: 'rgb(45 55 72)', // gray-800
+  },
+};
 
 export default memo(EmojiGrid);

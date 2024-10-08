@@ -25,7 +25,7 @@ interface LanguageStat {
 
 function App() {
   const [emojiStats, setEmojiStats] = useState<EmojiStats | null>(null);
-  const [totalEmojiCount, setTotalEmojiCount] = useState<number>(0);
+  const totalEmojiCount = emojiStats?.processedEmojis ?? 0;
   const [languageStats, setLanguageStats] = useState<LanguageStat[]>([]);
   const [selectedLanguage, setSelectedLanguage] = useState<string>('all');
   const [currentEmojis, setCurrentEmojis] = useState<Array<{ emoji: string; count: number }>>([]);
@@ -37,7 +37,6 @@ function App() {
     // Handle incoming emoji stats
     socket.on('emojiStats', (data: EmojiStats) => {
       setEmojiStats(data);
-      setTotalEmojiCount(data.processedEmojis);
       if (selectedLanguage === 'all') {
         setCurrentEmojis(data.topEmojis);
       }
@@ -80,6 +79,7 @@ function App() {
 
   const handleLanguageSelect = (language: string) => {
     setSelectedLanguage(language);
+    setCurrentEmojis([]); // these are per-language, so we have to clear them too
   };
 
   return (
@@ -91,7 +91,12 @@ function App() {
         onSelect={handleLanguageSelect}
         totalEmojiCount={totalEmojiCount}
       />
-      <EmojiGrid topEmojis={currentEmojis} socket={socketRef.current!} lang={selectedLanguage.toLowerCase()} />
+      <EmojiGrid
+        key={selectedLanguage}
+        topEmojis={currentEmojis}
+        socket={socketRef.current!}
+        lang={selectedLanguage.toLowerCase()}
+      />
       <Footer
         stats={
           emojiStats || {
