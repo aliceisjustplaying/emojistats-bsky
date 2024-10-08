@@ -42,7 +42,7 @@ export function normalizeEmoji(emoji: string): string {
   let firstPass;
   if (normalizationMap[emojiCodePoints]) {
     firstPass = normalizationMap[emojiCodePoints];
-    console.log(`first pass normalized: ${firstPass} (${emojiCodePoints})`);
+    // console.log(`first pass normalized: ${firstPass} (${emojiCodePoints})`);
   } else {
     firstPass = emojiCodePoints;
   }
@@ -52,7 +52,7 @@ export function normalizeEmoji(emoji: string): string {
   const unifiedCodePoints = nonQualifiedMap[firstPass];
   if (unifiedCodePoints && unifiedCodePoints !== firstPass) {
     normalizedEmoji = codePointToEmoji(unifiedCodePoints);
-    console.log(`second pass normalized: ${normalizedEmoji} (${unifiedCodePoints})`);
+    // console.log(`second pass normalized: ${normalizedEmoji} (${unifiedCodePoints})`);
   }
 
   return normalizedEmoji;
