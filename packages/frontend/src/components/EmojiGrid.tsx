@@ -70,10 +70,23 @@ const Cell = memo(({ columnIndex, rowIndex, style, data }: GridChildComponentPro
     const isDarkMode = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
 
     const colors = cellColors[isDarkMode ? 'dark' : 'light'];
-    const animation = el.animate([{ backgroundColor: colors.highlight }, { backgroundColor: colors.default }], {
-      duration: 500,
-      iterations: 1,
-    });
+    // const animation = el.animate([{ backgroundColor: colors.highlight }, { backgroundColor: colors.default }], {
+    //   duration: 900,
+    //   iterations: 1,
+    //   easing: 'ease-in-out',
+    // });
+    const animation = el.animate(
+      [
+        { offset: 0.0, backgroundColor: colors.default },
+        { offset: 0.1, backgroundColor: colors.highlight },
+        { offset: 0.9, backgroundColor: colors.default },
+      ],
+      {
+        duration: 900,
+        iterations: 1,
+        easing: 'ease-in-out',
+      },
+    );
 
     return () => {
       animation.cancel();
