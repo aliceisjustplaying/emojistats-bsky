@@ -29,11 +29,13 @@ let nonQualifiedMap: Record<string, string> = {};
 
 emojiData.forEach((emojiEntry) => {
   if (emojiEntry.non_qualified && emojiEntry.unified) {
-    nonQualifiedMap[emojiEntry.non_qualified] = emojiEntry.unified;
+    nonQualifiedMap[emojiEntry.non_qualified.replaceAll('-', ' ')] = emojiEntry.unified.replaceAll('-', ' ');
   }
 });
 
 nonQualifiedMap = lowercaseObject(nonQualifiedMap);
+
+console.dir(nonQualifiedMap, { depth: null });
 
 async function normalizeEmojis() {
   const redisClient = createClient();
@@ -87,6 +89,7 @@ async function normalizeEmojis() {
   async function secondPassNormalizeEmojiSet(setKey: string, emojis: string[]) {
     for (const emoji of emojis) {
       const emojiCodePoints = emojiToCodePoint(emoji);
+      // console.log(emojiCodePoints);
       const unifiedCodePoints = nonQualifiedMap[emojiCodePoints];
       if (unifiedCodePoints && unifiedCodePoints !== emojiCodePoints) {
         const unifiedEmoji = codePointToEmoji(unifiedCodePoints);
