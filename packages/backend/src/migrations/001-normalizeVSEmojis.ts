@@ -1,23 +1,39 @@
 import fs from 'fs';
 import { createClient } from 'redis';
 
-import { codePointToEmoji, emojiToCodePoint } from '../lib/helpers.js';
+import { codePointToEmoji, emojiToCodePoint, lowercaseObject } from '../lib/helpers.js';
 import { Emoji, EmojiVariationSequence } from '../lib/types.js';
 
 const dryRun = false;
 
 // First Pass: Normalization using emojiVariationSequences.json
-const emojiVariationSequencesPath = new URL('../lib/data/emojiVariationSequences.json', import.meta.url);
-const emojiVariationSequences: EmojiVariationSequence[] = JSON.parse(
-  fs.readFileSync(emojiVariationSequencesPath, 'utf8'),
-) as EmojiVariationSequence[];
+const eVSPath = new URL('../lib/data/emojiVariationSequences.json', import.meta.url);
+const eVS: EmojiVariationSequence[] = JSON.parse(fs.readFileSync(eVSPath, 'utf8')) as EmojiVariationSequence[];
 
-const normalizationMap: Record<string, string> = {};
+let normalizationMap: Record<string, string> = {};
 
-emojiVariationSequences.forEach((seq) => {
-  normalizationMap[seq.code.toLowerCase()] = seq.emojiStyle.toLowerCase();
-  normalizationMap[seq.textStyle.toLowerCase()] = seq.emojiStyle.toLowerCase();
+eVS.forEach((seq) => {
+  normalizationMap[seq.code] = seq.emojiStyle;
+  normalizationMap[seq.textStyle] = seq.emojiStyle;
 });
+
+// --------------------------------------------------
+
+// Second Pass: Normalization using emoji.json
+const eJSONPath = new URL('../lib/data/emoji.json', import.meta.url);
+const emojiData: Emoji[] = JSON.parse(fs.readFileSync(eJSONPath, 'utf8')) as Emoji[];
+
+normalizationMap = lowercaseObject(normalizationMap);
+
+let nonQualifiedMap: Record<string, string> = {};
+
+emojiData.forEach((emojiEntry) => {
+  if (emojiEntry.non_qualified && emojiEntry.unified) {
+    nonQualifiedMap[emojiEntry.non_qualified] = emojiEntry.unified;
+  }
+});
+
+nonQualifiedMap = lowercaseObject(nonQualifiedMap);
 
 async function normalizeEmojis() {
   const redisClient = createClient();
@@ -31,24 +47,22 @@ async function normalizeEmojis() {
     for (const emoji of emojis) {
       const { emojiCodePoints, normalizedEmojiCodePoints, normalizedEmoji } = getNormalizedEmoji(emoji);
       if (normalizedEmojiCodePoints !== emojiCodePoints) {
-        const originalScore = await redisClient.zScore(setKey, emoji);
-        const normalizedScore = await redisClient.zScore(setKey, normalizedEmoji);
-        const newScore = (originalScore ?? 0) + (normalizedScore ?? 0);
-        const delta = newScore - (originalScore ?? 0);
+        const originalScore = (await redisClient.zScore(setKey, emoji)) ?? 0;
+        const normalizedScore = (await redisClient.zScore(setKey, normalizedEmoji)) ?? 0;
+        const newScore = originalScore + normalizedScore;
 
         console.log(
-          `Before - ${setKey}: O: ${emoji} (${emojiCodePoints}) - ${originalScore}, N: ${normalizedEmoji} (${normalizedEmojiCodePoints}) - ${normalizedScore}`,
+          `Before: ${setKey}: O: ${emoji} (${emojiCodePoints}) - ${originalScore} | N: ${normalizedEmoji} (${normalizedEmojiCodePoints}) - ${normalizedScore}`,
         );
 
-        if (originalScore !== null) {
+        if (originalScore !== 0) {
+          // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
           if (!dryRun) {
             await redisClient.zRem(setKey, emoji);
             await redisClient.zAdd(setKey, { score: newScore, value: normalizedEmoji });
           }
           const resultScore = await redisClient.zScore(setKey, normalizedEmoji);
-          console.log(
-            `1st - ${setKey}: ${emoji} (${emojiCodePoints}) -> ${normalizedEmoji} (${normalizedEmojiCodePoints}), After: ${normalizedEmoji} (${normalizedEmojiCodePoints}) - Score: ${resultScore}, Delta +${delta} -> ${resultScore}`,
-          );
+          console.log(`After: ${setKey}: N: ${normalizedEmoji} (${normalizedEmojiCodePoints}) - Score: ${resultScore}`);
         }
       }
     }
@@ -70,43 +84,28 @@ async function normalizeEmojis() {
   // Divider for Second Pass
   console.log('--- Starting Second Pass: Normalization Using emoji.json ---');
 
-  // Second Pass: Normalization using emoji.json
-  const emojiJsonPath = new URL('../lib/data/emoji.json', import.meta.url);
-  const emojiData: Emoji[] = JSON.parse(fs.readFileSync(emojiJsonPath, 'utf8')) as Emoji[];
-
-  // Build a map for non_qualified to unified
-  const nonQualifiedMap: Record<string, string> = {};
-
-  emojiData.forEach((emojiEntry) => {
-    if (emojiEntry.non_qualified && emojiEntry.unified) {
-      nonQualifiedMap[emojiEntry.non_qualified.toLowerCase()] = emojiEntry.unified.toLowerCase();
-    }
-  });
-
   async function secondPassNormalizeEmojiSet(setKey: string, emojis: string[]) {
     for (const emoji of emojis) {
-      const emojiCodePoints = emojiToCodePoint(emoji).toLowerCase();
+      const emojiCodePoints = emojiToCodePoint(emoji);
       const unifiedCodePoints = nonQualifiedMap[emojiCodePoints];
       if (unifiedCodePoints && unifiedCodePoints !== emojiCodePoints) {
         const unifiedEmoji = codePointToEmoji(unifiedCodePoints);
-        const originalScore = await redisClient.zScore(setKey, emoji);
-        const unifiedScore = await redisClient.zScore(setKey, unifiedEmoji);
-        const newScore = (originalScore ?? 0) + (unifiedScore ?? 0);
-        const delta = newScore - (originalScore ?? 0);
+        const originalScore = (await redisClient.zScore(setKey, emoji)) ?? 0;
+        const unifiedScore = (await redisClient.zScore(setKey, unifiedEmoji)) ?? 0;
+        const newScore = originalScore + unifiedScore;
 
         console.log(
-          `Before 2nd - ${setKey}: N: ${emoji} (${emojiCodePoints}) - ${originalScore}, U: ${unifiedEmoji} (${unifiedCodePoints}) - ${unifiedScore}`,
+          `Before: ${setKey}: N: ${emoji} (${emojiCodePoints}) - ${originalScore} | U: ${unifiedEmoji} (${unifiedCodePoints}) - ${unifiedScore}`,
         );
 
-        if (originalScore !== null) {
+        if (originalScore !== 0) {
+          // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
           if (!dryRun) {
             await redisClient.zRem(setKey, emoji);
             await redisClient.zAdd(setKey, { score: newScore, value: unifiedEmoji });
           }
           const resultScore = await redisClient.zScore(setKey, unifiedEmoji);
-          console.log(
-            `2nd - ${setKey}: ${emoji} (${emojiCodePoints}) -> ${unifiedEmoji} (${unifiedCodePoints}), Delta +${delta} -> ${resultScore}`,
-          );
+          console.log(`After: ${setKey}: ${unifiedEmoji} (${unifiedCodePoints}), Score: ${resultScore}`);
         }
       }
     }
@@ -133,4 +132,7 @@ function getNormalizedEmoji(emoji: string) {
   return { emojiCodePoints, normalizedEmojiCodePoints, normalizedEmoji };
 }
 
-normalizeEmojis().catch(console.error);
+normalizeEmojis().catch((err: unknown) => {
+  console.error(err);
+  process.exit(1);
+});
