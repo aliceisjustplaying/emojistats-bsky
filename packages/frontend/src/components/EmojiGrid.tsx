@@ -41,7 +41,7 @@ const EmojiGrid: React.FC<EmojiGridProps> = ({ topEmojis, socket, lang }) => {
               itemKey={getItemKey}
               itemData={{ items: topEmojis, columnCount, socket, lang }}
             >
-              {Cell}
+              {MaybeCell}
             </Grid>
           );
         }}
@@ -50,16 +50,50 @@ const EmojiGrid: React.FC<EmojiGridProps> = ({ topEmojis, socket, lang }) => {
   );
 };
 
-const getItemKey: GridItemKeySelector<EmojiGridItemData> = ({ columnIndex, rowIndex, data }) => {
-  const { items, columnCount, lang } = data;
-  const index = rowIndex * columnCount + columnIndex;
+function getItemIndex({
+  columnIndex,
+  rowIndex,
+  data,
+}: {
+  columnIndex: number;
+  rowIndex: number;
+  data: { columnCount: number };
+}) {
+  const { columnCount } = data;
+  return rowIndex * columnCount + columnIndex;
+}
+
+const getItemKey: GridItemKeySelector<EmojiGridItemData> = (props) => {
+  const { items, lang } = props.data;
+  const index = getItemIndex(props);
+  if (index >= items.length) {
+    // FixedSizedGrid wants to render an element we don't have data for.
+    // we don't really care what this is as long as it's unique.
+    return index;
+  }
   const { emoji } = items[index];
+
   return `${lang}-${emoji}`;
 };
 
-const Cell = memo(({ columnIndex, rowIndex, style, data }: GridChildComponentProps<EmojiGridItemData>) => {
-  const { items, columnCount, socket, lang } = data;
-  const index = rowIndex * columnCount + columnIndex;
+const MaybeCell = memo((props: GridChildComponentProps<EmojiGridItemData>) => {
+  const index = getItemIndex(props);
+  const items = props.data.items;
+  if (index >= items.length) {
+    // FixedSizedGrid wants to render an element we don't have data for.
+    // this happens because it doesn't actually know how many items we have,
+    // just rowCount x columnCount.
+    return null;
+  }
+  return <Cell {...props} />;
+});
+
+const Cell = memo((props: GridChildComponentProps<EmojiGridItemData>) => {
+  const {
+    data: { items, socket, lang },
+    style,
+  } = props;
+  const index = getItemIndex(props);
   const { emoji, count } = items[index];
 
   const elRef = useRef<HTMLDivElement | null>(null);
@@ -109,10 +143,6 @@ const Cell = memo(({ columnIndex, rowIndex, style, data }: GridChildComponentPro
       isFirstRun.current = true;
     };
   }, []);
-
-  if (index >= items.length) {
-    return null;
-  }
 
   const cellStyle = {
     ...style,
