@@ -1,18 +1,20 @@
-local emoji = ARGV[1]
-local langKeys = cjson.decode(ARGV[2])
-local isFirstEmoji = ARGV[3]
+local emojis = cjson.decode(ARGV[1]) -- array of emojis
+local langs = cjson.decode(ARGV[2]) -- array of languages
 
 -- Increment global counters
-if isFirstEmoji == "1" then
-  redis.call('INCR', 'postsWithEmojis')
+redis.call('INCR', 'postsWithEmojis')
+
+for _, emoji in ipairs(emojis) do
+  redis.call('ZINCRBY', 'emojiStats', 1, emoji) -- emojiStats is the "all" global counter
+  redis.call('INCR', 'processedEmojis')
 end
-redis.call('ZINCRBY', 'emojiStats', 1, emoji)
-redis.call('INCR', 'processedEmojis')
 
 -- Increment per-language emoji counts and global language stats
-for i, langKey in ipairs(langKeys) do
-  redis.call('ZINCRBY', langKey, 1, emoji) -- langKey being pt, ja, UNKNOWN, etc.
-  redis.call('ZINCRBY', 'languageStats', 1, langKey)
+for _, lang in ipairs(langs) do
+  for _, emoji in ipairs(emojis) do
+    redis.call('ZINCRBY', lang, 1, emoji) -- langKey being pt, ja, UNKNOWN, etc.
+    redis.call('ZINCRBY', 'languageStats', 1, lang) -- languageStats is the counter for per-language emoji count
+  end
 end
 
 return 'OK'

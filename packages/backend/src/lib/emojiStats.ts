@@ -3,7 +3,6 @@ import emojiRegexFunc from 'emoji-regex';
 import fs from 'fs';
 
 import { MAX_EMOJIS, MAX_TOP_LANGUAGES, TRIM_LANGUAGE_CODES } from '../config.js';
-import { setLatestCursor } from './cursor.js';
 import { batchNormalizeEmojis } from './emojiNormalization.js';
 import logger from './logger.js';
 import {
@@ -14,7 +13,7 @@ import {
   totalPostsWithoutEmojis,
 } from './metrics.js';
 import { SCRIPT_SHA, redis } from './redis.js';
-import { Emoji, EmojiVariationSequence, LanguageStat } from './types.js';
+import { Emoji, LanguageStat } from './types.js';
 
 const emojiRegex: RegExp = emojiRegexFunc();
 
@@ -23,14 +22,6 @@ const emojiRegex: RegExp = emojiRegexFunc();
 
 // source: https://github.com/iamcal/emoji-data/blob/master/emoji.json
 export const emojis = JSON.parse(fs.readFileSync(new URL('./data/emoji.json', import.meta.url), 'utf8')) as Emoji[];
-
-// converted from: https://unicode.org/Public/emoji/12.1/emoji-variation-sequences.txt
-// regex in Sublime Text form:
-// find: ([0-9A-F]{4,5}) +FE0E +; +.+? style; +\# \((\d.\d)\) ([A-Z0-9\- ]+)\n[0-9A-F]{4,5} +FE0F +; +.+? style; +\# \(\d.\d\) [A-Z0-9\- ]+\n
-// replace: {"code": "$1", "textStyle": "$1 FE0E", "emojiStyle": "$1 FE0F", "version": "$2", "name": "$3"},\n
-export const emojiVariationSequences = JSON.parse(
-  fs.readFileSync(new URL('./data/emojiVariationSequences.json', import.meta.url), 'utf8'),
-) as EmojiVariationSequence[];
 
 const EMOJI_SORTED_SET = 'emojiStats';
 const LANGUAGE_SORTED_SET = 'languageStats';
@@ -61,35 +52,34 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
         langs.add('UNKNOWN');
       }
 
-      const emojiMatches = record.text.match(emojiRegex) ?? [];
+      const emojiMatches: string[] = record.text.match(emojiRegex) ?? [];
 
       if (emojiMatches.length > 0) {
+        // if (emojiMatches.includes('🏳️‍⚧️')) {
+        //   console.log(`found: CID ${event.commit.cid}`);
+        //   console.dir(emojiMatches, { depth: null });
+        //   const normalized = batchNormalizeEmojis(emojiMatches);
+        //   console.log('normalized:');
+        //   console.dir(normalized, { depth: null });
+        // }
         const stringifiedLangs = JSON.stringify(Array.from(langs));
 
-        const normalizedEmojis = batchNormalizeEmojis(emojiMatches);
+        const normalizedEmojis = JSON.stringify(batchNormalizeEmojis(emojiMatches));
 
-        const emojiPromises = normalizedEmojis.map((emoji, i) => {
-          const isFirstEmoji = i === 0 ? '1' : '0';
-          return redis.evalSha(SCRIPT_SHA, {
-            arguments: [emoji, stringifiedLangs, isFirstEmoji],
-          });
+        await redis.evalSha(SCRIPT_SHA, {
+          arguments: [normalizedEmojis, stringifiedLangs],
         });
 
-        await Promise.all([...emojiPromises]);
         logger.debug(`Emojis updated for languages: ${Array.from(langs).join(', ')}`);
         incrementTotalEmojis(emojiMatches.length);
+        totalPostsWithEmojis.inc();
       } else {
         await redis.incr(POSTS_WITHOUT_EMOJIS);
+        totalPostsWithoutEmojis.inc();
       }
 
       await redis.incr(PROCESSED_POSTS);
-      setLatestCursor(event.time_us.toString());
       incrementTotalPosts();
-      if (emojiMatches.length > 0) {
-        totalPostsWithEmojis.inc();
-      } else {
-        totalPostsWithoutEmojis.inc();
-      }
     } catch (error) {
       logger.error(`Error processing "create" commit: ${(error as Error).message}`, { commit, record });
       logger.error(`Malformed record data: ${JSON.stringify(record)}`);
