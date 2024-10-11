@@ -55,13 +55,6 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
       const emojiMatches: string[] = record.text.match(emojiRegex) ?? [];
 
       if (emojiMatches.length > 0) {
-        // if (emojiMatches.includes('🏳️‍⚧️')) {
-        //   console.log(`found: CID ${event.commit.cid}`);
-        //   console.dir(emojiMatches, { depth: null });
-        //   const normalized = batchNormalizeEmojis(emojiMatches);
-        //   console.log('normalized:');
-        //   console.dir(normalized, { depth: null });
-        // }
         const stringifiedLangs = JSON.stringify(Array.from(langs));
 
         const normalizedEmojis = JSON.stringify(batchNormalizeEmojis(emojiMatches));
