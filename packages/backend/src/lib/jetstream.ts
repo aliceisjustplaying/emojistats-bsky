@@ -4,6 +4,7 @@ import { CURSOR_UPDATE_INTERVAL, FIREHOSE_URL } from '../config.js';
 import { handleCreate } from './emojiStats.js';
 import logger from './logger.js';
 import { redis } from './redis.js';
+import fs from 'node:fs';
 
 let jetstream: Jetstream;
 let cursor = 0;
@@ -14,14 +15,37 @@ function epochUsToDateTime(cursor: number): string {
 }
 
 export const initializeJetstream = async () => {
-  const result = await redis.get('cursor');
-  if (result === null) {
+  console.log(import.meta.url);
+  const cursorOverridePath = new URL('../../../../CURSOR_OVERRIDE.TXT', import.meta.url);
+
+  if (fs.existsSync(cursorOverridePath)) {
+    try {
+      const overrideCursor = fs.readFileSync(cursorOverridePath, 'utf8').trim();
+      cursor = parseInt(overrideCursor, 10);
+      
+      if (isNaN(cursor)) {
+        throw new Error('Invalid cursor value in CURSOR_OVERRIDE.TXT');
+      }
+
+      await redis.set('cursor', cursor.toString());
+      logger.info(`Cursor overridden with value: ${cursor} (${epochUsToDateTime(cursor)})`);
+      
+      fs.unlinkSync(cursorOverridePath);
+      logger.info('CURSOR_OVERRIDE.TXT file deleted after successful override');
+    } catch (error) {
+      logger.error(`Error processing CURSOR_OVERRIDE.TXT: ${(error as Error).message}`);
+    }
+  } else {
+    const result = await redis.get('cursor');
+    if (result === null) {
     logger.info('No cursor found, initializing with current epoch in microseconds...');
     cursor = Math.floor(Date.now() * 1000);
     await redis.set('cursor', cursor.toString());
     logger.info(`Initialized new cursor with value: ${cursor} (${epochUsToDateTime(cursor)})`);
+    } else {
+      logger.info(`Found existing cursor in Redis: ${result} (${epochUsToDateTime(Number(result))})`);
+    }
   }
-  logger.info(`Found existing cursor in Redis: ${result} (${epochUsToDateTime(Number(result))})`);
 
   jetstream = new Jetstream({
     wantedCollections: ['app.bsky.feed.post'],

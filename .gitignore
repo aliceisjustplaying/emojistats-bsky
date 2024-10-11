@@ -1,3 +1,4 @@
 node_modules
 .env
 bun.lockb
+CURSOR_OVERRIDE.TXT
