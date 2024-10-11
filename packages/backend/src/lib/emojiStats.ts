@@ -1,6 +1,7 @@
 import { CommitCreateEvent } from '@skyware/jetstream';
 import emojiRegexFunc from 'emoji-regex';
 import fs from 'fs';
+import { sql } from 'kysely';
 
 import { MAX_EMOJIS, MAX_TOP_LANGUAGES } from '../config.js';
 import { batchNormalizeEmojis } from './emojiNormalization.js';
@@ -12,6 +13,7 @@ import {
   totalPostsWithEmojis,
   totalPostsWithoutEmojis,
 } from './metrics.js';
+import { db } from './postgres.js';
 import { SCRIPT_SHA, redis } from './redis.js';
 import { Emoji, LanguageStat } from './types.js';
 
@@ -33,11 +35,11 @@ const PROCESSED_EMOJIS = 'processedEmojis';
 export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
   const timer = postProcessingDuration.startTimer();
   try {
-    const { commit } = event;
+    const { commit, did } = event;
 
     if (!commit.rkey) return;
 
-    const { record } = commit;
+    const { record, cid, rkey } = commit;
 
     try {
       let langs = new Set<string>();
@@ -48,26 +50,89 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
       }
 
       const emojiMatches: string[] = record.text.match(emojiRegex) ?? [];
+      await db.transaction().execute(async (tx) => {
+        if (emojiMatches.length > 0) {
+          const stringifiedLangs = JSON.stringify(Array.from(langs));
 
-      if (emojiMatches.length > 0) {
-        const stringifiedLangs = JSON.stringify(Array.from(langs));
+          const normalizedEmojis = JSON.stringify(batchNormalizeEmojis(emojiMatches));
 
-        const normalizedEmojis = JSON.stringify(batchNormalizeEmojis(emojiMatches));
+          await redis.evalSha(SCRIPT_SHA, {
+            arguments: [normalizedEmojis, stringifiedLangs],
+          });
 
-        await redis.evalSha(SCRIPT_SHA, {
-          arguments: [normalizedEmojis, stringifiedLangs],
-        });
+          logger.debug(`Emojis updated for languages: ${Array.from(langs).join(', ')}`);
+          incrementTotalEmojis(emojiMatches.length);
+          totalPostsWithEmojis.inc();
+        } else {
+          await redis.incr(POSTS_WITHOUT_EMOJIS);
+          totalPostsWithoutEmojis.inc();
+        }
 
-        logger.debug(`Emojis updated for languages: ${Array.from(langs).join(', ')}`);
-        incrementTotalEmojis(emojiMatches.length);
-        totalPostsWithEmojis.inc();
-      } else {
-        await redis.incr(POSTS_WITHOUT_EMOJIS);
-        totalPostsWithoutEmojis.inc();
-      }
+        await redis.incr(PROCESSED_POSTS);
+        incrementTotalPosts();
 
-      await redis.incr(PROCESSED_POSTS);
-      incrementTotalPosts();
+        // const createdAt = new Date().toUTCString();
+        const { id } = await tx
+          .insertInto('posts')
+          .values({
+            cid: cid,
+            did: did,
+            rkey: rkey,
+            has_emojis: emojiMatches.length > 0,
+            langs: Array.from(langs),
+            // created_at: createdAt,
+          })
+          .returning('id')
+          .executeTakeFirstOrThrow();
+
+        for (const emoji of emojiMatches) {
+          for (const lang of langs) {
+            if (lang === 'nn') console.dir(commit, { depth: null });
+            await tx
+              .insertInto('emojis')
+              .values({
+                post_id: id,
+                emoji: emoji,
+                lang: lang,
+              })
+              .returning('id')
+              .executeTakeFirstOrThrow();
+
+            await tx
+              .insertInto('emoji_stats')
+              .values({
+                lang: lang,
+                emoji: emoji,
+                count: 1,
+              })
+              .onConflict((b) =>
+                b.columns(['lang', 'emoji']).doUpdateSet({
+                  count: sql`emoji_stats.count + 1`,
+                  // created_at: createdAt,
+                }),
+              )
+              .execute();
+          }
+        }
+
+        // Update global emoji_stats (lang = 'emojiStats')
+        for (const emoji of emojiMatches) {
+          await tx
+            .insertInto('emoji_stats')
+            .values({
+              lang: 'emojiStats',
+              emoji: emoji,
+              count: 1,
+            })
+            .onConflict((b) =>
+              b.columns(['lang', 'emoji']).doUpdateSet({
+                count: sql`emoji_stats.count + 1`,
+                // created_at: createdAt,
+              }),
+            )
+            .execute();
+        }
+      });
     } catch (error) {
       logger.error(`Error processing "create" commit: ${(error as Error).message}`, { commit, record });
       logger.error(`Malformed record data: ${JSON.stringify(record)}`);

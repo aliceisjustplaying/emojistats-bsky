@@ -16,6 +16,5 @@
   },
   "lint-staged": {
     "*": "prettier --ignore-unknown --write --ignore-path packages/backend/.prettierignore"
-  },
-  "dependencies": {}
+  }
 }
