@@ -1,10 +1,10 @@
 import { CommitCreateEvent, Jetstream } from '@skyware/jetstream';
+import fs from 'node:fs';
 
 import { CURSOR_UPDATE_INTERVAL, FIREHOSE_URL } from '../config.js';
 import { handleCreate } from './emojiStats.js';
 import logger from './logger.js';
 import { redis } from './redis.js';
-import fs from 'node:fs';
 
 let jetstream: Jetstream;
 let cursor = 0;
@@ -22,14 +22,14 @@ export const initializeJetstream = async () => {
     try {
       const overrideCursor = fs.readFileSync(cursorOverridePath, 'utf8').trim();
       cursor = parseInt(overrideCursor, 10);
-      
+
       if (isNaN(cursor)) {
         throw new Error('Invalid cursor value in CURSOR_OVERRIDE.TXT');
       }
 
       await redis.set('cursor', cursor.toString());
       logger.info(`Cursor overridden with value: ${cursor} (${epochUsToDateTime(cursor)})`);
-      
+
       fs.unlinkSync(cursorOverridePath);
       logger.info('CURSOR_OVERRIDE.TXT file deleted after successful override');
     } catch (error) {
@@ -38,12 +38,13 @@ export const initializeJetstream = async () => {
   } else {
     const result = await redis.get('cursor');
     if (result === null) {
-    logger.info('No cursor found, initializing with current epoch in microseconds...');
-    cursor = Math.floor(Date.now() * 1000);
-    await redis.set('cursor', cursor.toString());
-    logger.info(`Initialized new cursor with value: ${cursor} (${epochUsToDateTime(cursor)})`);
+      logger.info('No cursor found, initializing with current epoch in microseconds...');
+      cursor = Math.floor(Date.now() * 1000);
+      await redis.set('cursor', cursor.toString());
+      logger.info(`Initialized new cursor with value: ${cursor} (${epochUsToDateTime(cursor)})`);
     } else {
       logger.info(`Found existing cursor in Redis: ${result} (${epochUsToDateTime(Number(result))})`);
+      cursor = Number(result);
     }
   }
 
@@ -58,11 +59,9 @@ export const initializeJetstream = async () => {
     cursorUpdateInterval = setInterval(() => {
       if (jetstream.cursor) {
         logger.info(`Cursor updated to: ${jetstream.cursor} (${epochUsToDateTime(jetstream.cursor)})`);
-        redis
-          .set('cursor', jetstream.cursor.toString())
-          .catch((err: unknown) => {
-            logger.error(`Error updating cursor: ${(err as Error).message}`);
-          });
+        redis.set('cursor', jetstream.cursor.toString()).catch((err: unknown) => {
+          logger.error(`Error updating cursor: ${(err as Error).message}`);
+        });
       }
     }, CURSOR_UPDATE_INTERVAL);
   });
