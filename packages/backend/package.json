@@ -17,7 +17,7 @@
     "@types/pg": "^8.11.10",
     "dotenv": "^16.4.5",
     "emoji-regex": "^10.4.0",
-    "express": "^4.21.0",
+    "express": "^4.21.1",
     "kysely": "^0.27.4",
     "pg": "^8.13.0",
     "pino": "^9.4.0",
@@ -38,7 +38,7 @@
     "kysely-codegen": "^0.16.8",
     "prettier": "^3.3.3",
     "tsx": "^4.19.1",
-    "typescript": "^5.6.2",
+    "typescript": "^5.6.3",
     "typescript-eslint": "^8.8.1"
   },
   "author": "alice",
