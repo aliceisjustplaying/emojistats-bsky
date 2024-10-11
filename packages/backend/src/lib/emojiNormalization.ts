@@ -3,14 +3,16 @@ import fs from 'fs';
 import { codePointToEmoji, emojiToCodePoint, lowercaseObject } from './helpers.js';
 import { Emoji, EmojiVariationSequence } from './types.js';
 
-const eVSPath = new URL('./data/emojiVariationSequences.json', import.meta.url);
-const eJSONPath = new URL('./data/emoji.json', import.meta.url);
-
 // Load and parse normalization data
 // converted from: https://unicode.org/Public/emoji/12.1/emoji-variation-sequences.txt
 // regex in Sublime Text form:
 // find: ([0-9A-F]{4,5}) +FE0E +; +.+? style; +\# \((\d.\d)\) ([A-Z0-9\- ]+)\n[0-9A-F]{4,5} +FE0F +; +.+? style; +\# \(\d.\d\) [A-Z0-9\- ]+\n
 // replace: {"code": "$1", "textStyle": "$1 FE0E", "emojiStyle": "$1 FE0F", "version": "$2", "name": "$3"},\n
+const eVSPath = new URL('./data/emojiVariationSequences.json', import.meta.url);
+
+// source: https://github.com/iamcal/emoji-data/blob/master/emoji.json
+const eJSONPath = new URL('./data/emoji.json', import.meta.url);
+
 const emojiVariationSequences: EmojiVariationSequence[] = JSON.parse(
   fs.readFileSync(eVSPath, 'utf8'),
 ) as EmojiVariationSequence[];
@@ -41,7 +43,6 @@ export function normalizeEmoji(emoji: string): string {
   let firstPass;
   if (normalizationMap[emojiCodePoints]) {
     firstPass = normalizationMap[emojiCodePoints];
-    // console.log(`first pass normalized: ${firstPass} (${emojiCodePoints})`);
   } else {
     firstPass = emojiCodePoints;
   }
@@ -51,7 +52,6 @@ export function normalizeEmoji(emoji: string): string {
   const unifiedCodePoints = nonQualifiedMap[firstPass];
   if (unifiedCodePoints && unifiedCodePoints !== firstPass) {
     normalizedEmoji = codePointToEmoji(unifiedCodePoints);
-    // console.log(`second pass normalized: ${normalizedEmoji} (${unifiedCodePoints})`);
   }
 
   return normalizedEmoji;
