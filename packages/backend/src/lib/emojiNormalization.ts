@@ -7,6 +7,10 @@ const eVSPath = new URL('./data/emojiVariationSequences.json', import.meta.url);
 const eJSONPath = new URL('./data/emoji.json', import.meta.url);
 
 // Load and parse normalization data
+// converted from: https://unicode.org/Public/emoji/12.1/emoji-variation-sequences.txt
+// regex in Sublime Text form:
+// find: ([0-9A-F]{4,5}) +FE0E +; +.+? style; +\# \((\d.\d)\) ([A-Z0-9\- ]+)\n[0-9A-F]{4,5} +FE0F +; +.+? style; +\# \(\d.\d\) [A-Z0-9\- ]+\n
+// replace: {"code": "$1", "textStyle": "$1 FE0E", "emojiStyle": "$1 FE0F", "version": "$2", "name": "$3"},\n
 const emojiVariationSequences: EmojiVariationSequence[] = JSON.parse(
   fs.readFileSync(eVSPath, 'utf8'),
 ) as EmojiVariationSequence[];
@@ -31,11 +35,6 @@ emojiData.forEach((emojiEntry) => {
 
 nonQualifiedMap = lowercaseObject(nonQualifiedMap);
 
-/**
- * Normalize an emoji using both normalization maps.
- * @param emoji - The original emoji string.
- * @returns The normalized emoji string.
- */
 export function normalizeEmoji(emoji: string): string {
   // First Pass: Variation Sequence Normalization
   const emojiCodePoints = emojiToCodePoint(emoji);
@@ -58,15 +57,10 @@ export function normalizeEmoji(emoji: string): string {
   return normalizedEmoji;
 }
 
-/**
- * Batch normalize a list of emojis.
- * @param emojis - Array of emojis to normalize.
- * @returns Array of normalized emojis.
- */
 export function batchNormalizeEmojis(emojis: string[]): string[] {
-  const normalizationResults: Record<string, string> = {};
+  const normalizationResults: string[] = [];
   emojis.forEach((emoji) => {
-    normalizationResults[emoji] = normalizeEmoji(emoji);
+    normalizationResults.push(normalizeEmoji(emoji));
   });
-  return Object.values(normalizationResults);
+  return normalizationResults;
 }

@@ -1,5 +1,4 @@
 import { EMIT_INTERVAL, LOG_INTERVAL, METRICS_PORT, PORT } from './config.js';
-import { cursorUpdateInterval, getLastCursor } from './lib/cursor.js';
 import { getEmojiStats, getTopLanguages, logEmojiStats } from './lib/emojiStats.js';
 import { initializeJetstream, jetstream } from './lib/jetstream.js';
 import logger from './lib/logger.js';
@@ -12,12 +11,8 @@ await redis.connect();
 await loadRedisScripts();
 /* End Redis initialization */
 
-/* cursor initialization */
-const cursor = await getLastCursor();
-/* End cursor initialization */
-
 /* Jetstream initialization */
-initializeJetstream(cursor);
+await initializeJetstream();
 jetstream.start();
 /* End Jetstream initialization */
 
@@ -57,12 +52,6 @@ setInterval(() => {
 function shutdown() {
   logger.info('Shutting down gracefully...');
 
-  setTimeout(() => {
-    logger.error('Forcing shutdown.');
-    process.exit(1);
-  }, 60000);
-
-  clearInterval(cursorUpdateInterval);
   void io.close();
   jetstream.close();
   metricsServer.close();
