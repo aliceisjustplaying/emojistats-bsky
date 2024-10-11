@@ -2,7 +2,7 @@ import { CommitCreateEvent } from '@skyware/jetstream';
 import emojiRegexFunc from 'emoji-regex';
 import fs from 'fs';
 
-import { MAX_EMOJIS, MAX_TOP_LANGUAGES, TRIM_LANGUAGE_CODES } from '../config.js';
+import { MAX_EMOJIS, MAX_TOP_LANGUAGES } from '../config.js';
 import { batchNormalizeEmojis } from './emojiNormalization.js';
 import logger from './logger.js';
 import {
@@ -42,14 +42,9 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
     try {
       let langs = new Set<string>();
       if (record.langs && Array.isArray(record.langs)) {
-        langs = new Set(
-          record.langs.map((lang: string) =>
-            // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-            TRIM_LANGUAGE_CODES ? lang.split('-')[0].toLowerCase().slice(0, 2) : lang,
-          ),
-        );
+        langs = new Set(record.langs);
       } else {
-        langs.add('UNKNOWN');
+        langs.add('unknown');
       }
 
       const emojiMatches: string[] = record.text.match(emojiRegex) ?? [];
