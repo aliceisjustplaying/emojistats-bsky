@@ -42,47 +42,38 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
 
     try {
       let langs = new Set<string>();
-      if (record.langs && Array.isArray(record.langs)) {
+      if (record.langs && Array.isArray(record.langs) && record.langs.length > 0) {
         langs = new Set(record.langs);
       } else {
         langs.add('unknown');
       }
 
-      const emojiMatches: string[] = record.text.match(emojiRegex) ?? [];
+      if (langs.size === 0) {
+        logger.error('langs.size is 0, this should never happen');
+        process.exit(1);
+      }
+
+      const emojiMatches = record.text.match(emojiRegex) ?? [];
+      const normalizedEmojis = batchNormalizeEmojis(emojiMatches);
+      const hasEmojis = normalizedEmojis.length > 0;
+
+      /* step 1: postgres */
       await db.transaction().execute(async (tx) => {
-        if (emojiMatches.length > 0) {
-          const stringifiedLangs = JSON.stringify(Array.from(langs));
-
-          const normalizedEmojis = JSON.stringify(batchNormalizeEmojis(emojiMatches));
-
-          await redis.evalSha(SCRIPT_SHA, {
-            arguments: [normalizedEmojis, stringifiedLangs],
-          });
-
-          logger.debug(`Emojis updated for languages: ${Array.from(langs).join(', ')}`);
-          incrementTotalEmojis(emojiMatches.length);
-          totalPostsWithEmojis.inc();
-        } else {
-          await redis.incr(POSTS_WITHOUT_EMOJIS);
-          totalPostsWithoutEmojis.inc();
-        }
-
-        await redis.incr(PROCESSED_POSTS);
-        incrementTotalPosts();
-
+        // add post to db
         const { id } = await tx
           .insertInto('posts')
           .values({
             cid: cid,
             did: did,
             rkey: rkey,
-            has_emojis: emojiMatches.length > 0,
+            has_emojis: hasEmojis,
             langs: Array.from(langs),
           })
           .returning('id')
           .executeTakeFirstOrThrow();
 
-        for (const emoji of emojiMatches) {
+        // add emojis to db (if any)
+        for (const emoji of normalizedEmojis) {
           for (const lang of langs) {
             await tx
               .insertInto('emojis')
@@ -91,11 +82,41 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
                 emoji: emoji,
                 lang: lang,
               })
-              .returning('id')
               .executeTakeFirstOrThrow();
           }
         }
       });
+
+      /* step 2: redis */
+      if (!hasEmojis) {
+        await redis.incr(POSTS_WITHOUT_EMOJIS);
+        totalPostsWithoutEmojis.inc();
+      } else {
+        // Start of Selection
+        const transaction = redis.multi();
+        transaction.incr('postsWithEmojis');
+
+        for (const emoji of normalizedEmojis) {
+          transaction.zIncrBy('emojiStats', 1, emoji);
+          transaction.incr('processedEmojis');
+        }
+
+        for (const emoji of normalizedEmojis) {
+          for (const lang of langs) {
+            transaction.zIncrBy(lang, 1, emoji);
+            transaction.zIncrBy('languageStats', 1, lang);
+          }
+        }
+
+        await transaction.exec();
+
+        incrementTotalEmojis(normalizedEmojis.length);
+        totalPostsWithEmojis.inc();
+      }
+
+      /* step 3: global metrics */
+      await redis.incr(PROCESSED_POSTS);
+      incrementTotalPosts();
     } catch (error) {
       logger.error(`Error processing "create" commit: ${(error as Error).message}`, { commit, record });
       logger.error(`Malformed record data: ${JSON.stringify(record)}`);

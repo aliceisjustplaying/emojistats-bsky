@@ -1,6 +1,7 @@
 import fs from 'fs';
 
 import { codePointToEmoji, emojiToCodePoint, lowercaseObject } from './helpers.js';
+import logger from './logger.js';
 import { Emoji, EmojiVariationSequence } from './types.js';
 
 // Load and parse normalization data
@@ -58,9 +59,5 @@ export function normalizeEmoji(emoji: string): string {
 }
 
 export function batchNormalizeEmojis(emojis: string[]): string[] {
-  const normalizationResults: string[] = [];
-  emojis.forEach((emoji) => {
-    normalizationResults.push(normalizeEmoji(emoji));
-  });
-  return normalizationResults;
+  return emojis.map((emoji) => normalizeEmoji(emoji));
 }
