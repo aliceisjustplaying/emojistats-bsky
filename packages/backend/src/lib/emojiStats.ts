@@ -87,7 +87,6 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
 
         for (const emoji of emojiMatches) {
           for (const lang of langs) {
-            if (lang === 'nn') console.dir(commit, { depth: null });
             await tx
               .insertInto('emojis')
               .values({
@@ -98,44 +97,44 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
               .returning('id')
               .executeTakeFirstOrThrow();
 
-            await tx
-              .insertInto('emoji_stats')
-              .values({
-                lang: lang,
-                emoji: emoji,
-                count: 1,
-              })
-              .onConflict((b) =>
-                b.columns(['lang', 'emoji']).doUpdateSet({
-                  count: sql`emoji_stats.count + 1`,
-                  // created_at: createdAt,
-                }),
-              )
-              .execute();
+            // await tx
+            //   .insertInto('emoji_stats')
+            //   .values({
+            //     lang: lang,
+            //     emoji: emoji,
+            //     count: 1,
+            //   })
+            //   .onConflict((b) =>
+            //     b.columns(['lang', 'emoji']).doUpdateSet({
+            //       count: sql`emoji_stats.count + 1`,
+            //       // created_at: createdAt,
+            //     }),
+            //   )
+            //   .execute();
           }
         }
 
         // Update global emoji_stats (lang = 'emojiStats')
-        for (const emoji of emojiMatches) {
-          await tx
-            .insertInto('emoji_stats')
-            .values({
-              lang: 'emojiStats',
-              emoji: emoji,
-              count: 1,
-            })
-            .onConflict((b) =>
-              b.columns(['lang', 'emoji']).doUpdateSet({
-                count: sql`emoji_stats.count + 1`,
-                // created_at: createdAt,
-              }),
-            )
-            .execute();
-        }
+        // for (const emoji of emojiMatches) {
+        //   await tx
+        //     .insertInto('emoji_stats')
+        //     .values({
+        //       lang: 'emojiStats',
+        //       emoji: emoji,
+        //       count: 1,
+        //     })
+        //     .onConflict((b) =>
+        //       b.columns(['lang', 'emoji']).doUpdateSet({
+        //         count: sql`emoji_stats.count + 1`,
+        //         // created_at: createdAt,
+        //       }),
+        //     )
+        //     .execute();
+        // }
       });
     } catch (error) {
       logger.error(`Error processing "create" commit: ${(error as Error).message}`, { commit, record });
-      logger.error(`Malformed record data: ${JSON.stringify(record)}`);
+      logger.error(`Record data: ${JSON.stringify(record)}`);
     }
   } finally {
     timer();

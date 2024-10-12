@@ -1,3 +1,4 @@
+import memwatch from '@airbnb/node-memwatch';
 import { CommitCreateEvent, Jetstream } from '@skyware/jetstream';
 import fs from 'node:fs';
 
@@ -9,6 +10,12 @@ import { redis } from './redis.js';
 let jetstream: Jetstream;
 let cursor = 0;
 let cursorUpdateInterval: NodeJS.Timeout;
+
+// memwatch.on('stats', function(stats) {
+//   logger.info(`Heap stats: ${JSON.stringify(stats, null, 2)}`);
+// });
+
+let hd: memwatch.HeapDiff;
 
 function epochUsToDateTime(cursor: number): string {
   return new Date(cursor / 1000).toISOString();
@@ -64,6 +71,11 @@ export const initializeJetstream = async () => {
         });
       }
     }, CURSOR_UPDATE_INTERVAL);
+    hd = new memwatch.HeapDiff();
+    setTimeout(() => {
+      const diff = hd.end();
+      logger.info(`Heap diff: ${JSON.stringify(diff, null, 2)}`);
+    }, 120000);
   });
 
   jetstream.on('close', () => {

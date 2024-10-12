@@ -6,6 +6,7 @@
   "scripts": {
     "start": "bunx tsx src/index.ts",
     "dev": "bunx tsx --watch src/index.ts",
+    "build": "bunx tsc",
     "format": "bunx prettier --write .",
     "lint": "bunx eslint .",
     "lint:fix": "bunx eslint --fix .",
@@ -13,7 +14,9 @@
     "db:create": "bunx tsx ./src/migrations/002-postgresCreate.ts"
   },
   "dependencies": {
+    "@airbnb/node-memwatch": "^2.0.0",
     "@skyware/jetstream": "^0.1.9",
+    "@types/airbnb__node-memwatch": "^2.0.3",
     "@types/pg": "^8.11.10",
     "dotenv": "^16.4.5",
     "emoji-regex": "^10.4.0",
