@@ -19,13 +19,6 @@ export interface Emojis {
   post_id: number;
 }
 
-export interface EmojiStats {
-  count: Generated<number>;
-  created_at: Generated<Timestamp>;
-  emoji: string;
-  lang: string;
-}
-
 export interface Posts {
   cid: string;
   created_at: Generated<Timestamp>;
@@ -37,7 +30,6 @@ export interface Posts {
 }
 
 export interface DB {
-  emoji_stats: EmojiStats;
   emojis: Emojis;
   posts: Posts;
 }

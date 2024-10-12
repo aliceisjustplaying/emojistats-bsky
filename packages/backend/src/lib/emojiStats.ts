@@ -1,7 +1,6 @@
 import { CommitCreateEvent } from '@skyware/jetstream';
 import emojiRegexFunc from 'emoji-regex';
 import fs from 'fs';
-import { sql } from 'kysely';
 
 import { MAX_EMOJIS, MAX_TOP_LANGUAGES } from '../config.js';
 import { batchNormalizeEmojis } from './emojiNormalization.js';
@@ -71,7 +70,6 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
         await redis.incr(PROCESSED_POSTS);
         incrementTotalPosts();
 
-        // const createdAt = new Date().toUTCString();
         const { id } = await tx
           .insertInto('posts')
           .values({
@@ -80,14 +78,12 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
             rkey: rkey,
             has_emojis: emojiMatches.length > 0,
             langs: Array.from(langs),
-            // created_at: createdAt,
           })
           .returning('id')
           .executeTakeFirstOrThrow();
 
         for (const emoji of emojiMatches) {
           for (const lang of langs) {
-            if (lang === 'nn') console.dir(commit, { depth: null });
             await tx
               .insertInto('emojis')
               .values({
@@ -97,40 +93,7 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
               })
               .returning('id')
               .executeTakeFirstOrThrow();
-
-            await tx
-              .insertInto('emoji_stats')
-              .values({
-                lang: lang,
-                emoji: emoji,
-                count: 1,
-              })
-              .onConflict((b) =>
-                b.columns(['lang', 'emoji']).doUpdateSet({
-                  count: sql`emoji_stats.count + 1`,
-                  // created_at: createdAt,
-                }),
-              )
-              .execute();
           }
-        }
-
-        // Update global emoji_stats (lang = 'emojiStats')
-        for (const emoji of emojiMatches) {
-          await tx
-            .insertInto('emoji_stats')
-            .values({
-              lang: 'emojiStats',
-              emoji: emoji,
-              count: 1,
-            })
-            .onConflict((b) =>
-              b.columns(['lang', 'emoji']).doUpdateSet({
-                count: sql`emoji_stats.count + 1`,
-                // created_at: createdAt,
-              }),
-            )
-            .execute();
         }
       });
     } catch (error) {
