@@ -6,6 +6,7 @@ import { MAX_EMOJIS, MAX_TOP_LANGUAGES } from '../config.js';
 import { batchNormalizeEmojis } from './emojiNormalization.js';
 import logger from './logger.js';
 import {
+  concurrentHandleCreates,
   incrementTotalEmojis,
   incrementTotalPosts,
   postProcessingDuration,
@@ -32,86 +33,91 @@ const POSTS_WITHOUT_EMOJIS = 'postsWithoutEmojis';
 const PROCESSED_EMOJIS = 'processedEmojis';
 
 export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
-  const timer = postProcessingDuration.startTimer();
+  concurrentHandleCreates.inc();
   try {
-    const { commit, did } = event;
-
-    if (!commit.rkey) return;
-
-    const { record, cid, rkey } = commit;
-
+    const timer = postProcessingDuration.startTimer();
     try {
-      let langs = new Set<string>();
-      if (record.langs && Array.isArray(record.langs) && record.langs.length > 0) {
-        langs = new Set(record.langs);
-      } else {
-        langs.add('unknown');
-      }
+      const { commit, did } = event;
 
-      if (langs.size === 0) {
-        logger.error('langs.size is 0, this should never happen');
-        process.exit(1);
-      }
+      if (!commit.rkey) return;
 
-      const emojiMatches = record.text.match(emojiRegex) ?? [];
-      const normalizedEmojis = batchNormalizeEmojis(emojiMatches);
-      const hasEmojis = normalizedEmojis.length > 0;
+      const { record, cid, rkey } = commit;
 
-      /* step 1: postgres */
-      await db.transaction().execute(async (tx) => {
-        // add post to db
-        const { id } = await tx
-          .insertInto('posts')
-          .values({
-            cid: cid,
-            did: did,
-            rkey: rkey,
-            has_emojis: hasEmojis,
-            langs: Array.from(langs),
-          })
-          .returning('id')
-          .executeTakeFirstOrThrow();
+      try {
+        let langs = new Set<string>();
+        if (record.langs && Array.isArray(record.langs) && record.langs.length > 0) {
+          langs = new Set(record.langs);
+        } else {
+          langs.add('unknown');
+        }
 
-        if (hasEmojis) {
-          // Prepare bulk insert for emojis
-          const emojiInserts: { post_id: number; emoji: string; lang: string }[] = [];
+        if (langs.size === 0) {
+          logger.error('langs.size is 0, this should never happen');
+          process.exit(1);
+        }
 
-          normalizedEmojis.forEach((emoji) => {
-            langs.forEach((lang) => {
-              emojiInserts.push({
-                post_id: id,
-                emoji: emoji,
-                lang: lang,
+        const emojiMatches = record.text.match(emojiRegex) ?? [];
+        const normalizedEmojis = batchNormalizeEmojis(emojiMatches);
+        const hasEmojis = normalizedEmojis.length > 0;
+
+        /* step 1: postgres */
+        await db.transaction().execute(async (tx) => {
+          // add post to db
+          const { id } = await tx
+            .insertInto('posts')
+            .values({
+              cid: cid,
+              did: did,
+              rkey: rkey,
+              has_emojis: hasEmojis,
+              langs: Array.from(langs),
+            })
+            .returning('id')
+            .executeTakeFirstOrThrow();
+
+          if (hasEmojis) {
+            // Prepare bulk insert for emojis
+            const emojiInserts: { post_id: number; emoji: string; lang: string }[] = [];
+
+            normalizedEmojis.forEach((emoji) => {
+              langs.forEach((lang) => {
+                emojiInserts.push({
+                  post_id: id,
+                  emoji: emoji,
+                  lang: lang,
+                });
               });
             });
-          });
 
-          await tx.insertInto('emojis').values(emojiInserts).execute();
-        }
-      });
-
-      /* step 2: redis */
-      if (!hasEmojis) {
-        await redis.incr(POSTS_WITHOUT_EMOJIS);
-        totalPostsWithoutEmojis.inc();
-      } else {
-        await redis.evalSha(SCRIPT_SHA, {
-          arguments: [JSON.stringify(normalizedEmojis), JSON.stringify(Array.from(langs))],
+            await tx.insertInto('emojis').values(emojiInserts).execute();
+          }
         });
 
-        incrementTotalEmojis(normalizedEmojis.length);
-        totalPostsWithEmojis.inc();
-      }
+        /* step 2: redis */
+        if (!hasEmojis) {
+          await redis.incr(POSTS_WITHOUT_EMOJIS);
+          totalPostsWithoutEmojis.inc();
+        } else {
+          await redis.evalSha(SCRIPT_SHA, {
+            arguments: [JSON.stringify(normalizedEmojis), JSON.stringify(Array.from(langs))],
+          });
 
-      /* step 3: global metrics */
-      await redis.incr(PROCESSED_POSTS);
-      incrementTotalPosts();
-    } catch (error) {
-      logger.error(`Error processing "create" commit: ${(error as Error).message}`, { commit, record });
-      logger.error(`Malformed record data: ${JSON.stringify(record)}`);
+          incrementTotalEmojis(normalizedEmojis.length);
+          totalPostsWithEmojis.inc();
+        }
+
+        /* step 3: global metrics */
+        await redis.incr(PROCESSED_POSTS);
+        incrementTotalPosts();
+      } catch (error) {
+        logger.error(`Error processing "create" commit: ${(error as Error).message}`, { commit, record });
+        logger.error(`Malformed record data: ${JSON.stringify(record)}`);
+      }
+    } finally {
+      timer();
     }
   } finally {
-    timer();
+    concurrentHandleCreates.dec();
   }
 }
 

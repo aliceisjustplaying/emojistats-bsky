@@ -76,7 +76,9 @@ export const initializeJetstream = async () => {
   });
 
   jetstream.onCreate('app.bsky.feed.post', (event: CommitCreateEvent<'app.bsky.feed.post'>) => {
-    void handleCreate(event);
+    handleCreate(event).catch((error: unknown) => {
+      logger.error(`Error in handleCreate: ${(error as Error).message}`, { event });
+    });
   });
 };
 
