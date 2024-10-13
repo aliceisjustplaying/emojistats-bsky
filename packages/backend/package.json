@@ -21,6 +21,7 @@
     "express": "^4.21.1",
     "kysely": "^0.27.4",
     "pg": "^8.13.0",
+    "pg-native": "^3.2.0",
     "pino": "^9.4.0",
     "pino-pretty": "^11.2.2",
     "prom-client": "^15.1.3",
