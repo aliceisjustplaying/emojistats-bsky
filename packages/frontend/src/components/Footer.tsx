@@ -40,7 +40,7 @@ function Footer({ stats }: FooterProps) {
         <span className="inline md:hidden">v{version}&nbsp;&nbsp;</span>
         <a href="https://github.com/aliceisjustplaying/emojistats-bsky" target="_blank" className="leading-none">
           <img src="/gh.png" alt="GitHub" className="w-4 h-4 mb-0 inline-block dark:hidden" />
-          <img src="/gh-white.png" alt="GitHub" className="w-4 h-4 mb-0 inline-block hidden dark:inline-block" />
+          <img src="/gh-white.png" alt="GitHub" className="w-4 h-4 mb-0 hidden dark:inline-block" />
         </a>
       </span>
     </footer>
