@@ -3,6 +3,7 @@ import { Server, Socket } from 'socket.io';
 
 import { ORIGINS } from '../config.js';
 import { emojis, getTopEmojisForLanguage } from './emojiStats.js';
+import { emojiToCodePoint } from './helpers.js';
 import logger from './logger.js';
 
 const httpServer = createServer();
@@ -27,9 +28,11 @@ io.on('connection', (socket: Socket) => {
   });
 
   socket.on('getEmojiInfo', (emoji: string) => {
-    logger.info(`Getting emoji info for ${emoji}`);
-    const emojiInfo = emojis.find((e) => e.char === emoji);
-    socket.emit('emojiInfo', emojiInfo);
+    // change to noop for now
+    console.log(emojiToCodePoint(emoji));
+    // logger.info(`Getting emoji info for ${emoji}`);
+    // const emojiInfo = emojis.find((e) => e.unified === emojiToCodePoint(emoji));
+    // socket.emit('emojiInfo', emojiInfo);
   });
 
   socket.on('disconnect', () => {
