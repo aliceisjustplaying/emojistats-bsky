@@ -1,9 +1,9 @@
-import { monitorPgClient, monitorPgPool } from '@christiangalsterer/node-postgres-prometheus-exporter';
+import { monitorPgPool } from '@christiangalsterer/node-postgres-prometheus-exporter';
 import express from 'express';
 import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from 'prom-client';
 
 import logger from './logger.js';
-import { db, pool } from './postgres.js';
+import { pool } from './postgres.js';
 
 const register = new Registry();
 collectDefaultMetrics({ register });
@@ -72,10 +72,6 @@ export const concurrentRedisInserts = new Gauge({
   registers: [register],
 });
 
-// monitor the pg.Client
-// monitorPgClient(db.getClient(), register)
-
-// monitor the pg.Pool
 monitorPgPool(pool, register);
 
 let postsLastInterval = 0;
@@ -90,27 +86,6 @@ export function incrementTotalEmojis(count = 1) {
   totalEmojis.inc(count);
   emojisLastInterval += count;
 }
-
-// export function setTopEmojisAll(topEmojis: { emoji: string; count: number }[]) {
-//   topEmojisAll.reset();
-
-//   topEmojis.forEach(({ emoji, count }) => {
-//     topEmojisAll.set({ emoji }, count);
-//   });
-// }
-
-// export function setTopEmojisPerLanguage(
-//   language: string,
-//   topEmojis: { emoji: string; count: number }[],
-// ) {
-//   // Clear existing metrics for the language
-//   // Note: Prometheus does not support deleting specific label combinations directly.
-//   // This implementation assumes that the setTopEmojisPerLanguage is called with the complete top list each time.
-
-//   topEmojis.forEach(({ emoji, count }) => {
-//     topEmojisPerLanguage.set({ language, emoji }, count);
-//   });
-// }
 
 setInterval(() => {
   postsPerSecond.set(postsLastInterval);
