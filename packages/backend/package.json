@@ -13,6 +13,7 @@
     "db:create": "bunx tsx ./src/migrations/002-postgresCreate.ts"
   },
   "dependencies": {
+    "@christiangalsterer/node-postgres-prometheus-exporter": "^1.3.0",
     "@skyware/jetstream": "^0.1.9",
     "@types/pg": "^8.11.10",
     "dotenv": "^16.4.5",

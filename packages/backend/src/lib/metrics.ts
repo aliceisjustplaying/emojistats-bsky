@@ -1,7 +1,9 @@
+import { monitorPgClient, monitorPgPool } from '@christiangalsterer/node-postgres-prometheus-exporter';
 import express from 'express';
 import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from 'prom-client';
 
 import logger from './logger.js';
+import { db, pool } from './postgres.js';
 
 const register = new Registry();
 collectDefaultMetrics({ register });
@@ -69,6 +71,12 @@ export const concurrentRedisInserts = new Gauge({
   help: 'Number of concurrent Redis inserts',
   registers: [register],
 });
+
+// monitor the pg.Client
+// monitorPgClient(db.getClient(), register)
+
+// monitor the pg.Pool
+monitorPgPool(pool, register);
 
 let postsLastInterval = 0;
 let emojisLastInterval = 0;
