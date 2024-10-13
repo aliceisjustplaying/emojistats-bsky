@@ -72,18 +72,21 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
           .returning('id')
           .executeTakeFirstOrThrow();
 
-        // add emojis to db (if any)
-        for (const emoji of normalizedEmojis) {
-          for (const lang of langs) {
-            await tx
-              .insertInto('emojis')
-              .values({
+        if (hasEmojis) {
+          // Prepare bulk insert for emojis
+          const emojiInserts: { post_id: number; emoji: string; lang: string }[] = [];
+
+          normalizedEmojis.forEach((emoji) => {
+            langs.forEach((lang) => {
+              emojiInserts.push({
                 post_id: id,
                 emoji: emoji,
                 lang: lang,
-              })
-              .executeTakeFirstOrThrow();
-          }
+              });
+            });
+          });
+
+          await tx.insertInto('emojis').values(emojiInserts).execute();
         }
       });
 
