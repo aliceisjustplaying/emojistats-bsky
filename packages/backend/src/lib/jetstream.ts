@@ -69,6 +69,18 @@ export const initializeJetstream = async () => {
   jetstream.on('close', () => {
     clearInterval(cursorUpdateInterval);
     logger.info('Jetstream connection closed.');
+    if (jetstream.cursor) {
+      redis
+        .set('cursor', jetstream.cursor.toString())
+        .then(() => {
+          logger.info(`Cursor updated to: ${jetstream.cursor} (${epochUsToDateTime(jetstream.cursor!)})`);
+        })
+        .catch((err: unknown) => {
+          logger.error(`Error updating cursor: ${(err as Error).message}`);
+        });
+    } else {
+      logger.error('Jetstream cursor is undefined, not updating Redis. This should never happen.');
+    }
   });
 
   jetstream.on('error', (error) => {
