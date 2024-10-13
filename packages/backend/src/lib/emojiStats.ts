@@ -104,20 +104,22 @@ export async function flushPostgresBatch() {
             langs: post.langs,
           })),
         )
-        .returning(['id', 'rkey'])
+        .returning(['id', 'cid', 'did', 'rkey'])
         .execute();
 
-      // Map rkey to id
-      const rkeyToIdMap = new Map<string, number>();
+      // Map composite key to id
+      const compositeKeyToIdMap = new Map<string, number>();
       insertedPosts.forEach((post) => {
-        rkeyToIdMap.set(post.rkey, post.id);
+        const compositeKey = `${post.cid}-${post.did}-${post.rkey}`;
+        compositeKeyToIdMap.set(compositeKey, post.id);
       });
 
       // Prepare bulk insert for emojis
       const emojiInserts: { post_id: number; emoji: string; lang: string }[] = [];
       currentBatch.forEach((post) => {
         if (post.hasEmojis) {
-          const postId = rkeyToIdMap.get(post.rkey);
+          const compositeKey = `${post.cid}-${post.did}-${post.rkey}`;
+          const postId = compositeKeyToIdMap.get(compositeKey);
           if (postId) {
             post.emojis.forEach((emoji) => {
               post.langs.forEach((lang) => {
