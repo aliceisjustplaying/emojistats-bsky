@@ -42,6 +42,13 @@ export const emojisPerSecond = new Gauge({
   registers: [register],
 });
 
+// New Gauge for concurrent handleCreate executions
+export const concurrentHandleCreates = new Gauge({
+  name: 'bluesky_concurrent_handle_create',
+  help: 'Number of handleCreate functions running concurrently',
+  registers: [register],
+});
+
 // export const topEmojisAll = new Gauge({
 //   name: 'bluesky_top_emojis_all',
 //   help: 'Top N emojis across all languages',
