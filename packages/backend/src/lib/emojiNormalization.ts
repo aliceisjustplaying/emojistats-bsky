@@ -91,9 +91,6 @@ export function batchNormalizeEmojis(emojis: string[]): string[] {
     const emoji = emojis[i];
     if (normalizationCache.has(emoji)) {
       result[i] = normalizationCache.get(emoji)!;
-      if (emojiToCodePoint(emoji) !== emojiToCodePoint(result[i])) {
-        console.log(`Cache hit for ${emojiToCodePoint(emoji)}: ${emojiToCodePoint(result[i])}`);
-      }
     } else {
       // First Pass: Variation Sequence Normalization
       const emojiCodePoints = emojiToCodePoint(emoji).toLowerCase();
