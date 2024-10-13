@@ -1,5 +1,6 @@
 import { EMIT_INTERVAL, LOG_INTERVAL, METRICS_PORT, PORT } from './config.js';
 import { getEmojiStats, getTopLanguages, logEmojiStats } from './lib/emojiStats.js';
+import { flushPostgresBatch } from './lib/emojiStats.js';
 import { initializeJetstream, jetstream } from './lib/jetstream.js';
 import logger from './lib/logger.js';
 import { startMetricsServer } from './lib/metrics.js';
@@ -49,9 +50,14 @@ setInterval(() => {
 }, LOG_INTERVAL);
 /* End logging stats */
 
-function shutdown() {
+async function shutdown() {
   logger.info('Shutting down gracefully...');
-
+  try {
+    await flushPostgresBatch();
+    logger.info('Flushed remaining PostgreSQL batch.');
+  } catch (error) {
+    logger.error(`Error flushing PostgreSQL batch during shutdown: ${(error as Error).message}`);
+  }
   void io.close();
   jetstream.close();
   metricsServer.close();
@@ -65,5 +71,16 @@ function shutdown() {
     });
 }
 
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+process.on('SIGINT', () => {
+  shutdown().catch((error: unknown) => {
+    logger.error(`Shutdown failed: ${(error as Error).message}`);
+    process.exit(1);
+  });
+});
+
+process.on('SIGTERM', () => {
+  shutdown().catch((error: unknown) => {
+    logger.error(`Shutdown failed: ${(error as Error).message}`);
+    process.exit(1);
+  });
+});
