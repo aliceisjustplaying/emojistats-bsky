@@ -10,3 +10,5 @@ Current todos:
 - [ ] Performant, realtime-ish frontend
 - [ ] Handle Weird Emojis
 - [ ] etc.
+
+See [Contributing](CONTRIBUTING.md) for more information on how to contribute.
