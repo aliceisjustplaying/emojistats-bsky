@@ -8,7 +8,7 @@ import { io, startSocketServer } from './lib/socket.io.js';
 
 /* redis initialization */
 await redis.connect();
-// await loadRedisScripts();
+await loadRedisScripts();
 /* End Redis initialization */
 
 /* Jetstream initialization */

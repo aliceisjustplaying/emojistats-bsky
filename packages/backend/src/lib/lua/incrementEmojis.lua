@@ -10,8 +10,8 @@ for _, emoji in ipairs(emojis) do
 end
 
 -- Increment per-language emoji counts and global language stats
-for _, lang in ipairs(langs) do
-  for _, emoji in ipairs(emojis) do
+for _, emoji in ipairs(emojis) do
+  for _, lang in ipairs(langs) do
     redis.call('ZINCRBY', lang, 1, emoji) -- langKey being pt, ja, unknown, etc.
     redis.call('ZINCRBY', 'languageStats', 1, lang) -- languageStats is the counter for per-language emoji count
   end

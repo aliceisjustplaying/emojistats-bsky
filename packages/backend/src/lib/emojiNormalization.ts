@@ -1,7 +1,6 @@
 import fs from 'fs';
 
 import { codePointToEmoji, emojiToCodePoint, lowercaseObject } from './helpers.js';
-import logger from './logger.js';
 import { Emoji, EmojiVariationSequence } from './types.js';
 
 // Load and parse normalization data
