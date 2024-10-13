@@ -50,6 +50,31 @@ let postBatch: PostData[] = [];
 let isBatching = false;
 let batchTimer: NodeJS.Timeout | null = null;
 
+let isShuttingDown = false;
+let ongoingHandleCreates = 0;
+let shutdownPromise: Promise<void> | null = null;
+
+function createShutdownPromise(): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const checkCompletion = setInterval(() => {
+      logger.info(`Shutting down, ongoing handleCreates: ${ongoingHandleCreates}`);
+      if (isShuttingDown && ongoingHandleCreates === 0) {
+        logger.info('All ongoing handleCreate operations have finished.');
+        clearInterval(checkCompletion);
+        resolve();
+      }
+    }, 50);
+  });
+}
+
+export function initiateShutdown(): Promise<void> {
+  if (!shutdownPromise) {
+    isShuttingDown = true;
+    shutdownPromise = createShutdownPromise();
+  }
+  return shutdownPromise;
+}
+
 /**
  * Flush the current batch to the PostgreSQL database.
  */
@@ -134,6 +159,7 @@ function scheduleBatchFlush() {
 }
 
 export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
+  ongoingHandleCreates++;
   concurrentHandleCreates.inc();
   try {
     const timer = postProcessingDuration.startTimer();
@@ -191,14 +217,15 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
       incrementTotalPosts();
       concurrentRedisInserts.dec();
     } catch (error) {
-      logger.error(`Error processing "create" commit: ${(error as Error).message}`);
-      logger.error(`Commit data: ${JSON.stringify(commit, null, 2)}`);
-      logger.error(`Record data: ${JSON.stringify(record, null, 2)}`);
+      console.error('Error processing "create" commit:', error);
+      console.dir(commit, { depth: null, colors: true });
+      console.dir(record, { depth: null, colors: true });
     } finally {
       timer();
     }
   } finally {
     concurrentHandleCreates.dec();
+    ongoingHandleCreates--;
   }
 }
 

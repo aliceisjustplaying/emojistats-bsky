@@ -11,15 +11,15 @@ redis.on('error', (err: Error) => {
 });
 
 redis.on('connect', () => {
-  logger.info('Connected to Redis');
+  logger.info('Connected to Redis.');
 });
 
 redis.on('ready', () => {
-  logger.info('Redis client ready');
+  logger.info('Redis client ready.');
 });
 
 redis.on('end', () => {
-  logger.info('Redis client disconnected');
+  logger.info('Redis client disconnected.');
 });
 
 let SCRIPT_SHA: string;
