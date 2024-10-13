@@ -35,9 +35,13 @@ io.on('connection', (socket: Socket) => {
     // socket.emit('emojiInfo', emojiInfo);
   });
 
-  socket.on('disconnect', () => {
-    logger.info('A user disconnected');
+  socket.on('disconnect', (reason) => {
+    logger.info(`A user disconnected. Reason: ${reason}`);
   });
+});
+
+io.on('close', () => {
+  logger.info('Socket.io server closed.');
 });
 
 export const startSocketServer = (port: number) => {

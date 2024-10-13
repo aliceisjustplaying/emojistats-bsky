@@ -1,9 +1,10 @@
 import { EMIT_INTERVAL, LOG_INTERVAL, METRICS_PORT, PORT } from './config.js';
-import { getEmojiStats, getTopLanguages, logEmojiStats } from './lib/emojiStats.js';
+import { getEmojiStats, getTopLanguages, logEmojiStats, initiateShutdown } from './lib/emojiStats.js';
 import { flushPostgresBatch } from './lib/emojiStats.js';
 import { initializeJetstream, jetstream } from './lib/jetstream.js';
 import logger from './lib/logger.js';
 import { startMetricsServer } from './lib/metrics.js';
+import { pool } from './lib/postgres.js';
 import { loadRedisScripts, redis } from './lib/redis.js';
 import { io, startSocketServer } from './lib/socket.io.js';
 
@@ -50,25 +51,62 @@ setInterval(() => {
 }, LOG_INTERVAL);
 /* End logging stats */
 
+let isShuttingDown = false;
+
 async function shutdown() {
+  if (isShuttingDown) {
+    logger.info('Shutdown called but one is already in progress.');
+    return;
+  }
+
+  isShuttingDown = true;
+
   logger.info('Shutting down gracefully...');
+  try {
+    jetstream.close();
+  } catch (error) {
+    logger.error(`Error closing Jetstream: ${(error as Error).message}`);
+  }
+
+  try {
+    await initiateShutdown();
+  } catch (error) {
+    logger.error(`Error initiating shutdown: ${(error as Error).message}`);
+  }
+
   try {
     await flushPostgresBatch();
     logger.info('Flushed remaining PostgreSQL batch.');
   } catch (error) {
     logger.error(`Error flushing PostgreSQL batch during shutdown: ${(error as Error).message}`);
   }
-  void io.close();
-  jetstream.close();
-  metricsServer.close();
-  redis
-    .quit()
-    .catch((error: unknown) => {
-      logger.error('Error disconnecting Redis client:', error);
-    })
-    .finally(() => {
-      process.exit(0);
-    });
+
+  try {
+    await io.close();
+  } catch (error) {
+    logger.error(`Error closing Socket.io server: ${(error as Error).message}`);
+  }
+
+  try {
+    metricsServer.close();
+  } catch (error) {
+    logger.error(`Error closing Metrics server: ${(error as Error).message}`);
+  }
+
+  try {
+    await redis.quit();
+  } catch (error) {
+    logger.error(`Error disconnecting Redis client: ${(error as Error).message}`);
+  }
+
+  try {
+    await pool.end();
+    logger.info('PostgreSQL pool disconnected.');
+  } catch (error) {
+    logger.error(`Error disconnecting PostgreSQL pool: ${(error as Error).message}`);
+  }
+
+  process.exit(0);
 }
 
 process.on('SIGINT', () => {
