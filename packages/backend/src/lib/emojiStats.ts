@@ -92,23 +92,9 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
         await redis.incr(POSTS_WITHOUT_EMOJIS);
         totalPostsWithoutEmojis.inc();
       } else {
-        // Start of Selection
-        const transaction = redis.multi();
-        transaction.incr('postsWithEmojis');
-
-        for (const emoji of normalizedEmojis) {
-          transaction.zIncrBy('emojiStats', 1, emoji);
-          transaction.incr('processedEmojis');
-        }
-
-        for (const emoji of normalizedEmojis) {
-          for (const lang of langs) {
-            transaction.zIncrBy(lang, 1, emoji);
-            transaction.zIncrBy('languageStats', 1, lang);
-          }
-        }
-
-        await transaction.exec();
+        await redis.evalSha(SCRIPT_SHA, {
+          arguments: [JSON.stringify(normalizedEmojis), JSON.stringify(Array.from(langs))],
+        });
 
         incrementTotalEmojis(normalizedEmojis.length);
         totalPostsWithEmojis.inc();
