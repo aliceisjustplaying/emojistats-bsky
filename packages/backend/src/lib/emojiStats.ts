@@ -110,8 +110,9 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
         await redis.incr(PROCESSED_POSTS);
         incrementTotalPosts();
       } catch (error) {
-        logger.error(`Error processing "create" commit: ${(error as Error).message}`, { commit, record });
-        logger.error(`Malformed record data: ${JSON.stringify(record)}`);
+        logger.error(`Error processing "create" commit: ${(error as Error).message}`);
+        logger.error(`Commit data: ${JSON.stringify(commit, null, 2)}`);
+        logger.error(`Record data: ${JSON.stringify(record, null, 2)}`);
       }
     } finally {
       timer();
