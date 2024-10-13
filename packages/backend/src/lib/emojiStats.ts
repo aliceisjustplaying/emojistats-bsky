@@ -7,6 +7,8 @@ import { batchNormalizeEmojis } from './emojiNormalization.js';
 import logger from './logger.js';
 import {
   concurrentHandleCreates,
+  concurrentPostgresInserts,
+  concurrentRedisInserts,
   incrementTotalEmojis,
   incrementTotalPosts,
   postProcessingDuration,
@@ -61,6 +63,7 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
         const hasEmojis = normalizedEmojis.length > 0;
 
         /* step 1: postgres */
+        concurrentPostgresInserts.inc();
         await db.transaction().execute(async (tx) => {
           // add post to db
           const { id } = await tx
@@ -92,7 +95,8 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
             await tx.insertInto('emojis').values(emojiInserts).execute();
           }
         });
-
+        concurrentPostgresInserts.dec();
+        concurrentRedisInserts.inc();
         /* step 2: redis */
         if (!hasEmojis) {
           await redis.incr(POSTS_WITHOUT_EMOJIS);
@@ -109,6 +113,7 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
         /* step 3: global metrics */
         await redis.incr(PROCESSED_POSTS);
         incrementTotalPosts();
+        concurrentRedisInserts.dec();
       } catch (error) {
         logger.error(`Error processing "create" commit: ${(error as Error).message}`);
         logger.error(`Commit data: ${JSON.stringify(commit, null, 2)}`);

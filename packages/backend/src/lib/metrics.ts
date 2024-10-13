@@ -42,27 +42,6 @@ export const emojisPerSecond = new Gauge({
   registers: [register],
 });
 
-// New Gauge for concurrent handleCreate executions
-export const concurrentHandleCreates = new Gauge({
-  name: 'bluesky_concurrent_handle_create',
-  help: 'Number of handleCreate functions running concurrently',
-  registers: [register],
-});
-
-// export const topEmojisAll = new Gauge({
-//   name: 'bluesky_top_emojis_all',
-//   help: 'Top N emojis across all languages',
-//   labelNames: ['emoji'],
-//   registers: [register],
-// });
-
-// export const topEmojisPerLanguage = new Gauge({
-//   name: 'bluesky_top_emojis_per_language',
-//   help: 'Top N emojis for each of the top N languages',
-//   labelNames: ['language', 'emoji'],
-//   registers: [register],
-// });
-
 export const postProcessingDuration = new Histogram({
   name: 'bluesky_post_processing_duration_seconds',
   help: 'Duration of post processing in seconds',
@@ -70,6 +49,24 @@ export const postProcessingDuration = new Histogram({
     0.0001, 0.0002, 0.0003, 0.0004, 0.0005, 0.0006, 0.0007, 0.0008, 0.0009, 0.001, 0.002, 0.003, 0.004, 0.005, 0.01,
     0.02, 0.03, 0.04, 0.05, 0.1, 0.25, 0.5, 1,
   ],
+  registers: [register],
+});
+
+export const concurrentHandleCreates = new Gauge({
+  name: 'bluesky_concurrent_handle_create',
+  help: 'Number of handleCreate functions running concurrently',
+  registers: [register],
+});
+
+export const concurrentPostgresInserts = new Gauge({
+  name: 'bluesky_concurrent_postgres_inserts',
+  help: 'Number of concurrent Postgres inserts',
+  registers: [register],
+});
+
+export const concurrentRedisInserts = new Gauge({
+  name: 'bluesky_concurrent_redis_inserts',
+  help: 'Number of concurrent Redis inserts',
   registers: [register],
 });
 
