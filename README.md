@@ -16,7 +16,7 @@ make BUILD_TLS=yes USE_SYSTEMD=yes
 make install
 vim valkey.conf
 
-# Append to valkey.conf
+# Add/edit valkey.conf
 save 3600 1 300 10 60 100 10 10
 appendonly yes
 appendfsync everysec
