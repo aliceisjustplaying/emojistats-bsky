@@ -1,3 +1,6 @@
+import { EMOJI } from './data/emoji.js';
+import { EMOJI_VARIATION_SEQUENCES } from './data/emojiVariationSequences.js';
+
 export interface EmojiAmio {
   codes: string;
   char: string;
@@ -7,38 +10,8 @@ export interface EmojiAmio {
   subgroup: string;
 }
 
-export interface Emoji {
-  name: string;
-  unified: string;
-  non_qualified?: string;
-  docomo?: string;
-  au?: string;
-  softbank?: string;
-  google?: string;
-  image: string;
-  sheet_x: number;
-  sheet_y: number;
-  short_name: string;
-  short_names: string[];
-  text: string | null;
-  texts: string[] | null;
-  category: string;
-  subcategory: string;
-  sort_order: number;
-  added_in: string;
-  has_img_apple: boolean;
-  has_img_google: boolean;
-  has_img_twitter: boolean;
-  has_img_facebook: boolean;
-}
-
-export interface EmojiVariationSequence {
-  code: string;
-  textStyle: string;
-  emojiStyle: string;
-  version: string;
-  name: string;
-}
+export type Emoji = (typeof EMOJI)[number];
+export type EmojiVariationSequence = (typeof EMOJI_VARIATION_SEQUENCES)[number];
 
 export interface LanguageStat {
   language: string;
