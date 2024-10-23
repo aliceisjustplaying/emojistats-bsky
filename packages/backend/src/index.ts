@@ -1,10 +1,12 @@
 import { EMIT_INTERVAL, LOG_INTERVAL, METRICS_PORT, PORT } from './config.js';
-import { getEmojiStats, getTopLanguages, logEmojiStats, initiateShutdown } from './lib/emojiStats.js';
+import { getEmojiStats, getTopLanguages, initiateShutdown, logEmojiStats } from './lib/emojiStats.js';
 import { flushPostgresBatch } from './lib/emojiStats.js';
 import { initializeJetstream, jetstream } from './lib/jetstream.js';
 import logger from './lib/logger.js';
 import { startMetricsServer } from './lib/metrics.js';
+import { run } from './lib/mqui.js';
 import { pool } from './lib/postgres.js';
+import { postQueue, worker } from './lib/queue.js';
 import { loadRedisScripts, redis } from './lib/redis.js';
 import { io, startSocketServer } from './lib/socket.io.js';
 
@@ -21,6 +23,10 @@ jetstream.start();
 /* socket.io server initialization */
 startSocketServer(Number(PORT));
 /* End socket.io server initialization */
+
+/* BullMQ UI */
+await run();
+/* End BullMQ UI */
 
 /* emitting data for frontend */
 setInterval(() => {
@@ -66,6 +72,14 @@ async function shutdown() {
     jetstream.close();
   } catch (error) {
     logger.error(`Error closing Jetstream: ${(error as Error).message}`);
+  }
+
+  try {
+    await worker.close();
+    await postQueue.close();
+    logger.info('BullMQ worker and queue closed.');
+  } catch (error) {
+    logger.error(`Error closing BullMQ: ${(error as Error).message}`);
   }
 
   try {

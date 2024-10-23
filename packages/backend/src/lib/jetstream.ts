@@ -2,8 +2,8 @@ import { CommitCreateEvent, Jetstream } from '@skyware/jetstream';
 import fs from 'node:fs';
 
 import { CURSOR_UPDATE_INTERVAL, FIREHOSE_URL } from '../config.js';
-import { handleCreate } from './emojiStats.js';
 import logger from './logger.js';
+import { postQueue } from './queue.js';
 import { redis } from './redis.js';
 
 let jetstream: Jetstream;
@@ -88,9 +88,14 @@ export const initializeJetstream = async () => {
   });
 
   jetstream.onCreate('app.bsky.feed.post', (event: CommitCreateEvent<'app.bsky.feed.post'>) => {
-    handleCreate(event).catch((error: unknown) => {
-      logger.error(`Error in handleCreate: ${(error as Error).message}`, { event });
-    });
+    postQueue
+      .add('process-post', event, {
+        removeOnComplete: true,
+        removeOnFail: 1000,
+      })
+      .catch((error: unknown) => {
+        logger.error(`Error adding job to queue: ${(error as Error).message}`, { event });
+      });
   });
 };
 
