@@ -4,7 +4,7 @@ import { flushPostgresBatch } from './lib/emojiStats.js';
 import { initializeJetstream, jetstream } from './lib/jetstream.js';
 import logger from './lib/logger.js';
 import { startMetricsServer } from './lib/metrics.js';
-import { run } from './lib/mqui.js';
+import { startBullMQUI } from './lib/mqui.js';
 import { pool } from './lib/postgres.js';
 import { postQueue, worker } from './lib/queue.js';
 import { loadRedisScripts, redis } from './lib/redis.js';
@@ -25,7 +25,7 @@ startSocketServer(Number(PORT));
 /* End socket.io server initialization */
 
 /* BullMQ UI */
-await run();
+const bullMQUI = await startBullMQUI();
 /* End BullMQ UI */
 
 /* emitting data for frontend */
@@ -80,6 +80,12 @@ async function shutdown() {
     logger.info('BullMQ worker and queue closed.');
   } catch (error) {
     logger.error(`Error closing BullMQ: ${(error as Error).message}`);
+  }
+
+  try {
+    await bullMQUI.close();
+  } catch (error) {
+    logger.error(`Error closing BullMQ UI: ${(error as Error).message}`);
   }
 
   try {
