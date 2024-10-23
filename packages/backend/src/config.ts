@@ -12,4 +12,6 @@ export const CURSOR_UPDATE_INTERVAL =
 export const REDIS_URL = process.env.REDIS_URL ?? 'redis://localhost:6379';
 export const PORT = process.env.PORT ?? '3100';
 export const METRICS_PORT = process.env.METRICS_PORT ?? '3101';
+export const BULLMQ_UI_PORT = process.env.BULLMQ_UI_PORT ?? '3102';
 export const ORIGINS = process.env.ORIGINS?.split(',') ?? ['http://localhost:5173'];
+export const BULLMQ_CONCURRENCY = 1500;

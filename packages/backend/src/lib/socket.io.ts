@@ -2,7 +2,7 @@ import { createServer } from 'http';
 import { Server, Socket } from 'socket.io';
 
 import { ORIGINS } from '../config.js';
-import { emojis, getTopEmojisForLanguage } from './emojiStats.js';
+import { getTopEmojisForLanguage } from './emojiStats.js';
 import { emojiToCodePoint } from './helpers.js';
 import logger from './logger.js';
 
