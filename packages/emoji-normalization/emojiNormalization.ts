@@ -1,8 +1,10 @@
-import { EMOJI } from './data/emoji.js';
-import { EMOJI_VARIATION_SEQUENCES } from './data/emojiVariationSequences.js';
-import { codePointToEmoji, emojiToCodePoint } from './helpers.js';
+import { EMOJI } from "./emoji.js";
+import { EMOJI_VARIATION_SEQUENCES } from "./emojiVariationSequences.js";
+import { codePointToEmoji, emojiToCodePoint } from "./helpers.js";
 
-const normalizationMap = EMOJI_VARIATION_SEQUENCES.reduce<Record<string, string>>((acc, val) => {
+const normalizationMap = EMOJI_VARIATION_SEQUENCES.reduce<
+  Record<string, string>
+>((acc, val) => {
   const code = val.code.toLowerCase();
   const textStyle = val.textStyle.toLowerCase();
   const emojiStyle = val.emojiStyle.toLowerCase();
@@ -15,8 +17,8 @@ const normalizationMap = EMOJI_VARIATION_SEQUENCES.reduce<Record<string, string>
 }, {});
 
 const nonQualifiedMap = EMOJI.reduce<Record<string, string>>((acc, val) => {
-  const unified = val.unified.replaceAll('-', ' ').toLowerCase();
-  const nonQualified = val.non_qualified?.replaceAll('-', ' ').toLowerCase();
+  const unified = val.unified.replaceAll("-", " ").toLowerCase();
+  const nonQualified = val.non_qualified?.replaceAll("-", " ").toLowerCase();
 
   if (nonQualified !== undefined) {
     acc[nonQualified] = unified;

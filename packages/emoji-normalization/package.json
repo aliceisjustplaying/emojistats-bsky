@@ -1,0 +1,11 @@
+{
+  "name": "emoji-normalization",
+  "module": "index.ts",
+  "type": "module",
+  "devDependencies": {
+    "@types/node": "^22"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}

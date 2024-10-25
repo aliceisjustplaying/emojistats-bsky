@@ -17,7 +17,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ['eslint.config.mjs'],
+    files: ['eslint.config.mjs', './src/lib/schema.d.ts'],
     extends: [tseslint.configs.disableTypeChecked],
   },
 );
