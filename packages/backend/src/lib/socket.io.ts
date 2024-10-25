@@ -1,9 +1,9 @@
+import { emojiToCodePoint } from 'emoji-normalization';
 import { createServer } from 'http';
 import { Server, Socket } from 'socket.io';
 
 import { ORIGINS } from '../config.js';
 import { getTopEmojisForLanguage } from './emojiStats.js';
-import { emojiToCodePoint } from './helpers.js';
 import logger from './logger.js';
 
 const httpServer = createServer();

@@ -1,9 +1,9 @@
 import { CommitCreateEvent } from '@skyware/jetstream';
+import { batchNormalizeEmojis } from 'emoji-normalization';
 import emojiRegexFunc from 'emoji-regex';
 import { Insertable } from 'kysely';
 
 import { MAX_EMOJIS, MAX_TOP_LANGUAGES } from '../config.js';
-import { batchNormalizeEmojis } from './emojiNormalization.js';
 import logger from './logger.js';
 import {
   concurrentHandleCreates,
