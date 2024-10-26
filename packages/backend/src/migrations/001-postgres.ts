@@ -73,7 +73,7 @@ export async function createTables() {
   `);
 
   await client.query(`
-        -- Create a continuous aggregate for language stats
+    -- Create a continuous aggregate for language stats
     CREATE MATERIALIZED VIEW IF NOT EXISTS language_stats
     WITH (timescaledb.continuous) AS
     SELECT
@@ -104,6 +104,12 @@ export async function createTables() {
       end_offset => INTERVAL '0 second',
       schedule_interval => INTERVAL '1 second');
 `);
+
+  await client.query(`
+    ALTER MATERIALIZED VIEW emoji_stats_overall SET (timescaledb.materialized_only = FALSE);
+    ALTER MATERIALIZED VIEW emoji_stats_per_language SET (timescaledb.materialized_only = FALSE);
+    ALTER MATERIALIZED VIEW language_stats SET (timescaledb.materialized_only = FALSE);
+  `);
 }
 
 createTables()

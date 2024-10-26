@@ -7,7 +7,7 @@ import logger from './logger.js';
 import { postQueue } from './queue.js';
 import { Emojis, Posts } from './schema.js';
 
-const BATCH_SIZE = 1000;
+const BATCH_SIZE = 10;
 
 const createWorker = (id: number) => {
   let currentBatch: { postData: Insertable<Posts>; emojiData: Insertable<Emojis>[] }[] = [];
