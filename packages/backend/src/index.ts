@@ -5,9 +5,10 @@ import logger from './lib/logger.js';
 import { startMetricsServer } from './lib/metrics.js';
 import { startBullMQUI } from './lib/mqui.js';
 import { pool } from './lib/postgres.js';
-import { postQueue, workers } from './lib/queue.js';
+import { postQueue } from './lib/queue.js';
 import { redis } from './lib/redis.js';
 import { io, startSocketServer } from './lib/socket.io.js';
+import { workers } from './lib/worker.js';
 
 /* redis initialization */
 await redis.connect();

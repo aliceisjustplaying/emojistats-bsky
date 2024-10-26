@@ -31,7 +31,7 @@ export const initializeJetstream = async () => {
       await redis.set('cursor', cursor.toString());
       logger.info(`Cursor overridden with value: ${cursor} (${epochUsToDateTime(cursor)})`);
 
-      // fs.unlinkSync(cursorOverridePath);
+      fs.unlinkSync(cursorOverridePath);
       logger.info('CURSOR_OVERRIDE.TXT file deleted after successful override');
     } catch (error) {
       logger.error(`Error processing CURSOR_OVERRIDE.TXT: ${(error as Error).message}`);

@@ -4,8 +4,8 @@ import logger from './logger.js';
 import { db } from './postgres.js';
 import { Emojis, Posts } from './schema.js';
 
-export async function flushBatchToDatabase(batch: { postData: Posts[]; emojiData: Emojis[] }[]) {
-  const posts: Insertable<Posts>[] = batch.map((item) => item.postData);
+export async function flushBatchToDatabase(batch: { postData: Insertable<Posts>; emojiData: Insertable<Emojis>[] }[]) {
+  const posts: Insertable<Posts>[] = batch.flatMap((item) => item.postData);
   const emojis: Insertable<Emojis>[] = batch.flatMap((item) => item.emojiData);
 
   if (posts.length === 0 && emojis.length === 0) {

@@ -5,7 +5,7 @@ import { Insertable } from 'kysely';
 
 import { MAX_EMOJIS, MAX_TOP_LANGUAGES } from '../config.js';
 import logger from './logger.js';
-import { concurrentHandleCreates, concurrentPostgresInserts, postProcessingDuration } from './metrics.js';
+import { concurrentHandleCreates, postProcessingDuration } from './metrics.js';
 import { db } from './postgres.js';
 import { postQueue } from './queue.js';
 import { Emojis, Posts } from './schema.js';
@@ -31,7 +31,7 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
       const normalizedEmojis = batchNormalizeEmojis(emojiMatches);
       const has_emojis = normalizedEmojis.length > 0;
 
-      const postData = {
+      const postData: Insertable<Posts> = {
         did,
         rkey,
         text,
@@ -41,7 +41,7 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
         created_at: new Date(),
       };
 
-      const emojiData =
+      const emojiData: Insertable<Emojis>[] =
         has_emojis ?
           normalizedEmojis.map((emoji) => ({
             did,
