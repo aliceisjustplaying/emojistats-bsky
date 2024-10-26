@@ -7,12 +7,11 @@ import { startMetricsServer } from './lib/metrics.js';
 import { startBullMQUI } from './lib/mqui.js';
 import { pool } from './lib/postgres.js';
 import { postQueue, worker } from './lib/queue.js';
-import { loadRedisScripts, redis } from './lib/redis.js';
+import { redis } from './lib/redis.js';
 import { io, startSocketServer } from './lib/socket.io.js';
 
 /* redis initialization */
 await redis.connect();
-await loadRedisScripts();
 /* End Redis initialization */
 
 /* Jetstream initialization */

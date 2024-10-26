@@ -10,7 +10,7 @@
     "lint": "bunx eslint .",
     "lint:fix": "bunx eslint --fix .",
     "db:generate": "bunx kysely-codegen --out-file ./src/lib/schema.d.ts",
-    "db:create": "bunx tsx ./src/migrations/002-postgresCreate.ts"
+    "db:create": "bunx tsx ./src/migrations/001-postgres.ts"
   },
   "dependencies": {
     "@bull-board/api": "^6.3.0",

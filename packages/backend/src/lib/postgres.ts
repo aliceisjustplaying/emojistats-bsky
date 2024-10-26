@@ -1,6 +1,7 @@
 import { Kysely, PostgresDialect } from 'kysely';
 import pg from 'pg';
 
+import logger from './logger.js';
 import type { DB } from './schema.js';
 
 const { native } = pg;
@@ -19,6 +20,9 @@ const dialect = new PostgresDialect({ pool });
 
 const db = new Kysely<DB>({
   dialect,
+  // log: (sql, timing) => {
+  //   logger.info(`${console.dir(sql, { depth: null })} (${timing}ms)`);
+  // },
 });
 
 export { pool, db };

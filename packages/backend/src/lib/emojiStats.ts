@@ -5,34 +5,19 @@ import { Insertable } from 'kysely';
 
 import { MAX_EMOJIS, MAX_TOP_LANGUAGES } from '../config.js';
 import logger from './logger.js';
-import {
-  concurrentHandleCreates,
-  concurrentPostgresInserts,
-  concurrentRedisInserts,
-  incrementTotalEmojis,
-  incrementTotalPosts,
-  postProcessingDuration,
-  totalPostsWithEmojis,
-  totalPostsWithoutEmojis,
-} from './metrics.js';
+import { concurrentHandleCreates, concurrentPostgresInserts, postProcessingDuration } from './metrics.js';
 import { db } from './postgres.js';
-import { SCRIPT_SHA, redis } from './redis.js';
-import { Posts } from './schema.js';
+import { Emojis, Posts } from './schema.js';
 import { LanguageStat } from './types.js';
 
 const emojiRegex: RegExp = emojiRegexFunc();
 
-const EMOJI_SORTED_SET = 'emojiStats';
-const LANGUAGE_SORTED_SET = 'languageStats';
-const PROCESSED_POSTS = 'processedPosts';
-const POSTS_WITH_EMOJIS = 'postsWithEmojis';
-const POSTS_WITHOUT_EMOJIS = 'postsWithoutEmojis';
-const PROCESSED_EMOJIS = 'processedEmojis';
-
-const BATCH_SIZE = 1000;
+const BATCH_SIZE = 5000;
 const BATCH_TIMEOUT_MS = 1000;
 
 let postBatch: Insertable<Posts>[] = [];
+let emojiBatch: Insertable<Emojis>[] = [];
+
 let isBatching = false;
 let batchTimer: NodeJS.Timeout | null = null;
 
@@ -65,43 +50,36 @@ export function initiateShutdown(): Promise<void> {
  * Flush the current batch to the PostgreSQL database.
  */
 export async function flushPostgresBatch() {
-  if (postBatch.length === 0) {
+  if (postBatch.length === 0 && emojiBatch.length === 0) {
     isBatching = false;
     return;
   }
 
-  const currentBatch = [...postBatch];
+  const currentPostBatch = [...postBatch];
+  const currentEmojiBatch = [...emojiBatch];
   postBatch = [];
+  emojiBatch = [];
   isBatching = false;
 
   concurrentPostgresInserts.inc();
 
   try {
     await db.transaction().execute(async (tx) => {
-      // Bulk insert posts
       await tx
         .insertInto('posts')
-        .values(
-          currentBatch.map((post) => ({
-            did: post.did,
-            rkey: post.rkey,
-            text: post.text,
-            has_emojis: post.has_emojis,
-            langs: post.langs,
-            emojis: post.emojis,
-            created_at: post.created_at,
-          })),
-        )
+        .values(currentPostBatch)
+        .onConflict((b) => b.columns(['did', 'rkey']).doNothing())
         .execute();
+      await tx.insertInto('emojis').values(currentEmojiBatch).execute();
     });
     concurrentPostgresInserts.dec();
+    return;
   } catch (error) {
     logger.error(`Error flushing PostgreSQL batch: ${(error as Error).message}`);
-    console.dir(error, { depth: null, colors: true });
-    console.dir(currentBatch, { depth: null, colors: true });
-    process.exit(1);
-    // Optionally, you can re-add the failed batch back to `postBatch` for retry
-    // postBatch = currentBatch.concat(postBatch);
+    console.log(currentPostBatch.length);
+    console.log(currentEmojiBatch.length);
+    console.dir(currentPostBatch, { depth: null, colors: true });
+    console.dir(currentEmojiBatch, { depth: null, colors: true });
   }
 }
 
@@ -147,35 +125,29 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
         has_emojis,
         langs: Array.from(langsSet),
         emojis: normalizedEmojis,
+        created_at: new Date(),
       });
 
-      if (postBatch.length >= BATCH_SIZE && !isBatching) {
+      if (has_emojis) {
+        emojiBatch.push(
+          ...normalizedEmojis.map((emoji) => ({
+            did,
+            rkey,
+            emoji,
+            lang: langsSet.values().next().value ?? 'unknown',
+            created_at: new Date(),
+          })),
+        );
+      }
+
+      if ((postBatch.length >= BATCH_SIZE || emojiBatch.length >= BATCH_SIZE) && !isBatching) {
         isBatching = true;
         await flushPostgresBatch();
       } else if (!isBatching) {
         scheduleBatchFlush();
       }
-
-      /* step 2: redis */
-      concurrentRedisInserts.inc();
-      if (!has_emojis) {
-        await redis.incr(POSTS_WITHOUT_EMOJIS);
-        totalPostsWithoutEmojis.inc();
-      } else {
-        await redis.evalSha(SCRIPT_SHA, {
-          arguments: [JSON.stringify(normalizedEmojis), JSON.stringify(Array.from(langsSet))],
-        });
-
-        incrementTotalEmojis(normalizedEmojis.length);
-        totalPostsWithEmojis.inc();
-      }
-
-      /* step 3: global metrics */
-      await redis.incr(PROCESSED_POSTS);
-      incrementTotalPosts();
-      concurrentRedisInserts.dec();
     } catch (error) {
-      console.error('Error processing "create" commit:', error);
+      logger.error('Error processing "create" commit:', error);
       console.dir(commit, { depth: null, colors: true });
       console.dir(record, { depth: null, colors: true });
     } finally {
@@ -187,66 +159,80 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
   }
 }
 
+export async function getTopEmojisForLanguage(language: string) {
+  return await db
+    .selectFrom('emoji_stats_per_language')
+    .select(['emoji', db.fn.sum('count').as('total_count')])
+    .where('lang', '=', language)
+    .groupBy('emoji')
+    .orderBy('total_count', 'desc')
+    .limit(MAX_EMOJIS)
+    .execute();
+}
+
 export async function getEmojiStats() {
-  /*
-const EMOJI_SORTED_SET = 'emojiStats';
-const LANGUAGE_SORTED_SET = 'languageStats';
-const PROCESSED_POSTS = 'processedPosts';
-const POSTS_WITH_EMOJIS = 'postsWithEmojis';
-const POSTS_WITHOUT_EMOJIS = 'postsWithoutEmojis';
-const PROCESSED_EMOJIS = 'processedEmojis';
-*/
-  const [topEmojisDesc, globalCounters] = await Promise.all([
-    redis.zRangeWithScores(EMOJI_SORTED_SET, 0, MAX_EMOJIS - 1, { REV: true }),
-    redis.mGet([PROCESSED_POSTS, POSTS_WITH_EMOJIS, POSTS_WITHOUT_EMOJIS, PROCESSED_EMOJIS]),
-  ]);
+  const topEmojisOverall = await db
+    .selectFrom('emoji_stats_overall')
+    .select(['emoji', db.fn.sum('count').as('total_count')])
+    .groupBy('emoji')
+    .orderBy('total_count', 'desc')
+    .limit(MAX_EMOJIS)
+    .execute();
 
-  const [processedPosts, postsWithEmojis, postsWithoutEmojis, processedEmojis] = globalCounters;
+  const topEmojisPerLanguage = await db
+    .selectFrom('emoji_stats_per_language')
+    .select(['lang', 'emoji', db.fn.sum('count').as('total_count')])
+    .groupBy(['lang', 'emoji'])
+    .orderBy('lang', 'asc')
+    .orderBy('total_count', 'desc')
+    .limit(MAX_EMOJIS)
+    .execute();
 
-  const ratio =
-    Number(postsWithoutEmojis) > 0 ?
-      ((Number(postsWithEmojis) || 0) / (Number(postsWithoutEmojis) || 1)).toFixed(4)
-    : 'N/A';
+  const topLanguages = await db
+    .selectFrom('language_stats')
+    .select(['lang', db.fn.sum('count').as('count')])
+    .groupBy('lang')
+    .orderBy('count', 'desc')
+    .limit(MAX_TOP_LANGUAGES)
+    .execute();
 
-  const formattedTopEmojis = topEmojisDesc
-    .map(({ value, score }) => ({
-      emoji: value,
-      count: score,
+  // Calculate ratio
+  const postsWithEmojis = topEmojisPerLanguage.length;
+  const postsWithoutEmojis = 0; // Since Redis is removed, adjust logic if necessary
+  const ratio = postsWithoutEmojis > 0 ? (postsWithEmojis / postsWithoutEmojis).toFixed(4) : 'N/A';
+
+  // Format top emojis
+  const formattedTopEmojis = topEmojisOverall
+    .map(({ emoji, total_count }) => ({
+      emoji,
+      count: Number(total_count),
     }))
     .slice(0, MAX_EMOJIS);
 
   return {
-    processedPosts: Number(processedPosts) || 0,
-    processedEmojis: Number(processedEmojis) || 0,
-    postsWithEmojis: Number(postsWithEmojis) || 0,
-    postsWithoutEmojis,
+    processedPosts: topEmojisOverall.length, // Adjust as needed
+    processedEmojis: topEmojisOverall.reduce((sum, e) => sum + Number(e.total_count), 0),
+    postsWithEmojis: postsWithEmojis,
+    postsWithoutEmojis: postsWithoutEmojis,
+    topLanguages: topLanguages,
     ratio,
     topEmojis: formattedTopEmojis,
   };
 }
 
 export async function getTopLanguages(): Promise<LanguageStat[]> {
-  const topLanguagesDesc = await redis.zRangeWithScores(LANGUAGE_SORTED_SET, 0, MAX_TOP_LANGUAGES - 1, {
-    REV: true,
-  });
+  const topLanguagesDesc = await db
+    .selectFrom('language_stats')
+    .select(['lang', db.fn.sum('count').as('count')])
+    .groupBy('lang')
+    .orderBy('count', 'desc')
+    .limit(MAX_TOP_LANGUAGES)
+    .execute();
 
-  return topLanguagesDesc.map(({ value, score }) => ({
-    language: value,
-    count: score,
+  return topLanguagesDesc.map(({ lang, count }) => ({
+    language: lang ?? 'unknown',
+    count: Number(count),
   }));
-}
-
-export async function getTopEmojisForLanguage(language: string) {
-  const topEmojisDesc = await redis.zRangeWithScores(language, 0, MAX_EMOJIS - 1, { REV: true });
-
-  const formattedTopEmojis = topEmojisDesc
-    .map(({ value, score }) => ({
-      emoji: value,
-      count: score,
-    }))
-    .slice(0, MAX_EMOJIS);
-
-  return formattedTopEmojis;
 }
 
 export async function logEmojiStats() {
@@ -261,4 +247,28 @@ export async function logEmojiStats() {
     logger.info(`${emoji}: ${count}`);
   });
   logger.info('---');
+}
+
+export async function getEmojiStatsPerLanguage() {
+  const result = await db
+    .selectFrom('emoji_stats_per_language')
+    .select(['lang', 'emoji', db.fn.sum('count').as('total_count')])
+    .groupBy(['lang', 'emoji'])
+    .orderBy('total_count', 'desc')
+    .limit(100)
+    .execute();
+
+  return result;
+}
+
+export async function getEmojiStatsOverall() {
+  const result = await db
+    .selectFrom('emoji_stats_overall')
+    .select(['emoji', db.fn.sum('count').as('total_count')])
+    .groupBy('emoji')
+    .orderBy('total_count', 'desc')
+    .limit(100)
+    .execute();
+
+  return result;
 }

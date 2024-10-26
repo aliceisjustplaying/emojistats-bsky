@@ -1,4 +1,3 @@
-import fs from 'fs';
 import { createClient } from 'redis';
 
 import { REDIS_URL } from '../config.js';
@@ -22,13 +21,4 @@ redis.on('end', () => {
   logger.info('Redis client disconnected.');
 });
 
-let SCRIPT_SHA: string;
-
-const loadRedisScripts = async () => {
-  const scriptPath = new URL('lua/incrementEmojis.lua', import.meta.url);
-  const incrementEmojisScript = fs.readFileSync(scriptPath, 'utf8');
-  SCRIPT_SHA = await redis.scriptLoad(incrementEmojisScript);
-  logger.info(`Loaded Redis script with SHA: ${SCRIPT_SHA}`);
-};
-
-export { redis, loadRedisScripts, SCRIPT_SHA };
+export { redis };

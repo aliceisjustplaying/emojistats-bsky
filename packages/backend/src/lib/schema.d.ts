@@ -284,6 +284,25 @@ export interface _TimescaledbInternalCompressedChunkStats {
   uncompressed_total_size: Int8 | null;
 }
 
+export interface _TimescaledbInternalDirectView11 {
+  bucket: Timestamp | null;
+  count: Int8 | null;
+  emoji: string | null;
+}
+
+export interface _TimescaledbInternalDirectView12 {
+  bucket: Timestamp | null;
+  count: Int8 | null;
+  emoji: string | null;
+  lang: string | null;
+}
+
+export interface _TimescaledbInternalDirectView13 {
+  bucket: Timestamp | null;
+  count: Int8 | null;
+  lang: string | null;
+}
+
 export interface _TimescaledbInternalHypertableChunkLocalSize {
   chunk_id: number | null;
   chunk_name: string | null;
@@ -299,6 +318,71 @@ export interface _TimescaledbInternalHypertableChunkLocalSize {
   index_bytes: Int8 | null;
   toast_bytes: Int8 | null;
   total_bytes: Int8 | null;
+}
+
+export interface _TimescaledbInternalMaterializedHypertable11 {
+  bucket: Timestamp;
+  count: Int8 | null;
+  emoji: string | null;
+}
+
+export interface _TimescaledbInternalMaterializedHypertable12 {
+  bucket: Timestamp;
+  count: Int8 | null;
+  emoji: string | null;
+  lang: string | null;
+}
+
+export interface _TimescaledbInternalMaterializedHypertable13 {
+  bucket: Timestamp;
+  count: Int8 | null;
+  lang: string | null;
+}
+
+export interface _TimescaledbInternalPartialView11 {
+  bucket: Timestamp | null;
+  count: Int8 | null;
+  emoji: string | null;
+}
+
+export interface _TimescaledbInternalPartialView12 {
+  bucket: Timestamp | null;
+  count: Int8 | null;
+  emoji: string | null;
+  lang: string | null;
+}
+
+export interface _TimescaledbInternalPartialView13 {
+  bucket: Timestamp | null;
+  count: Int8 | null;
+  lang: string | null;
+}
+
+export interface Emojis {
+  created_at: Generated<Timestamp>;
+  did: string;
+  emoji: string;
+  lang: string;
+  rkey: string;
+}
+
+export interface EmojiStatsOverall {
+  bucket: Timestamp | null;
+  count: Int8 | null;
+  emoji: string | null;
+}
+
+export interface EmojiStatsPerLanguage {
+  bucket: Timestamp | null;
+  count: Int8 | null;
+  emoji: string | null;
+  lang: string | null;
+}
+
+export interface LanguageStats {
+  bucket: Timestamp | null;
+  count: Int8 | null;
+  lang: string | null;
 }
 
 export interface Posts {
@@ -483,11 +567,24 @@ export interface DB {
   '_timescaledb_catalog.tablespace': _TimescaledbCatalogTablespace;
   '_timescaledb_catalog.telemetry_event': _TimescaledbCatalogTelemetryEvent;
   '_timescaledb_config.bgw_job': _TimescaledbConfigBgwJob;
+  '_timescaledb_internal._direct_view_11': _TimescaledbInternalDirectView11;
+  '_timescaledb_internal._direct_view_12': _TimescaledbInternalDirectView12;
+  '_timescaledb_internal._direct_view_13': _TimescaledbInternalDirectView13;
+  '_timescaledb_internal._materialized_hypertable_11': _TimescaledbInternalMaterializedHypertable11;
+  '_timescaledb_internal._materialized_hypertable_12': _TimescaledbInternalMaterializedHypertable12;
+  '_timescaledb_internal._materialized_hypertable_13': _TimescaledbInternalMaterializedHypertable13;
+  '_timescaledb_internal._partial_view_11': _TimescaledbInternalPartialView11;
+  '_timescaledb_internal._partial_view_12': _TimescaledbInternalPartialView12;
+  '_timescaledb_internal._partial_view_13': _TimescaledbInternalPartialView13;
   '_timescaledb_internal.bgw_job_stat': _TimescaledbInternalBgwJobStat;
   '_timescaledb_internal.bgw_job_stat_history': _TimescaledbInternalBgwJobStatHistory;
   '_timescaledb_internal.bgw_policy_chunk_stats': _TimescaledbInternalBgwPolicyChunkStats;
   '_timescaledb_internal.compressed_chunk_stats': _TimescaledbInternalCompressedChunkStats;
   '_timescaledb_internal.hypertable_chunk_local_size': _TimescaledbInternalHypertableChunkLocalSize;
+  emoji_stats_overall: EmojiStatsOverall;
+  emoji_stats_per_language: EmojiStatsPerLanguage;
+  emojis: Emojis;
+  language_stats: LanguageStats;
   posts: Posts;
   'timescaledb_experimental.policies': TimescaledbExperimentalPolicies;
   'timescaledb_information.chunk_compression_settings': TimescaledbInformationChunkCompressionSettings;
