@@ -36,6 +36,7 @@ export async function createTables() {
       'emojis',
       'created_at',
       if_not_exists => TRUE,
+      migrate_data => TRUE,
       chunk_time_interval => INTERVAL '1 hour'
     );
   `);
