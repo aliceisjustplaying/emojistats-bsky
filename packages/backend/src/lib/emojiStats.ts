@@ -7,94 +7,13 @@ import { MAX_EMOJIS, MAX_TOP_LANGUAGES } from '../config.js';
 import logger from './logger.js';
 import { concurrentHandleCreates, concurrentPostgresInserts, postProcessingDuration } from './metrics.js';
 import { db } from './postgres.js';
+import { postQueue } from './queue.js';
 import { Emojis, Posts } from './schema.js';
 import { LanguageStat } from './types.js';
 
 const emojiRegex: RegExp = emojiRegexFunc();
 
-const BATCH_SIZE = 5000;
-const BATCH_TIMEOUT_MS = 1000;
-
-let postBatch: Insertable<Posts>[] = [];
-let emojiBatch: Insertable<Emojis>[] = [];
-
-let isBatching = false;
-let batchTimer: NodeJS.Timeout | null = null;
-
-let isShuttingDown = false;
-let ongoingHandleCreates = 0;
-let shutdownPromise: Promise<void> | null = null;
-
-function createShutdownPromise(): Promise<void> {
-  return new Promise<void>((resolve) => {
-    const checkCompletion = setInterval(() => {
-      logger.info(`Shutting down, ongoing handleCreates: ${ongoingHandleCreates}`);
-      if (isShuttingDown && ongoingHandleCreates === 0) {
-        logger.info('All ongoing handleCreate operations have finished.');
-        clearInterval(checkCompletion);
-        resolve();
-      }
-    }, 50);
-  });
-}
-
-export function initiateShutdown(): Promise<void> {
-  if (!shutdownPromise) {
-    isShuttingDown = true;
-    shutdownPromise = createShutdownPromise();
-  }
-  return shutdownPromise;
-}
-
-/**
- * Flush the current batch to the PostgreSQL database.
- */
-export async function flushPostgresBatch() {
-  if (postBatch.length === 0 && emojiBatch.length === 0) {
-    isBatching = false;
-    return;
-  }
-
-  const currentPostBatch = [...postBatch];
-  const currentEmojiBatch = [...emojiBatch];
-  postBatch = [];
-  emojiBatch = [];
-  isBatching = false;
-
-  concurrentPostgresInserts.inc();
-
-  try {
-    await db.transaction().execute(async (tx) => {
-      await tx
-        .insertInto('posts')
-        .values(currentPostBatch)
-        .onConflict((b) => b.columns(['did', 'rkey']).doNothing())
-        .execute();
-      await tx.insertInto('emojis').values(currentEmojiBatch).execute();
-    });
-    concurrentPostgresInserts.dec();
-    return;
-  } catch (error) {
-    logger.error(`Error flushing PostgreSQL batch: ${(error as Error).message}`);
-    console.log(currentPostBatch.length);
-    console.log(currentEmojiBatch.length);
-    console.dir(currentPostBatch, { depth: null, colors: true });
-    console.dir(currentEmojiBatch, { depth: null, colors: true });
-  }
-}
-
-function scheduleBatchFlush() {
-  if (batchTimer) {
-    return;
-  }
-  batchTimer = setTimeout(() => {
-    batchTimer = null;
-    void flushPostgresBatch();
-  }, BATCH_TIMEOUT_MS);
-}
-
 export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'>) {
-  ongoingHandleCreates++;
   concurrentHandleCreates.inc();
   try {
     const timer = postProcessingDuration.startTimer();
@@ -106,19 +25,13 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
     const { langs, text } = record;
 
     try {
-      let langsSet = new Set<string>();
-      if (langs && Array.isArray(langs) && langs.length > 0) {
-        langsSet = new Set(langs);
-      } else {
-        langsSet.add('unknown');
-      }
+      const langsSet = new Set<string>(langs && Array.isArray(langs) && langs.length > 0 ? langs : ['unknown']);
 
       const emojiMatches = text.match(emojiRegex) ?? [];
       const normalizedEmojis = batchNormalizeEmojis(emojiMatches);
       const has_emojis = normalizedEmojis.length > 0;
 
-      // Add the post to the batch
-      postBatch.push({
+      const postData = {
         did,
         rkey,
         text,
@@ -126,26 +39,24 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
         langs: Array.from(langsSet),
         emojis: normalizedEmojis,
         created_at: new Date(),
-      });
+      };
 
-      if (has_emojis) {
-        emojiBatch.push(
-          ...normalizedEmojis.map((emoji) => ({
+      const emojiData =
+        has_emojis ?
+          normalizedEmojis.map((emoji) => ({
             did,
             rkey,
             emoji,
             lang: langsSet.values().next().value ?? 'unknown',
             created_at: new Date(),
-          })),
-        );
-      }
+          }))
+        : [];
 
-      if ((postBatch.length >= BATCH_SIZE || emojiBatch.length >= BATCH_SIZE) && !isBatching) {
-        isBatching = true;
-        await flushPostgresBatch();
-      } else if (!isBatching) {
-        scheduleBatchFlush();
-      }
+      // Enqueue the event data
+      await postQueue.add('process-post', { postData, emojiData });
+
+      logger.debug(`Enqueued post ${did}-${rkey} for processing.`);
+      timer();
     } catch (error) {
       logger.error('Error processing "create" commit:', error);
       console.dir(commit, { depth: null, colors: true });
@@ -155,7 +66,6 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
     }
   } finally {
     concurrentHandleCreates.dec();
-    ongoingHandleCreates--;
   }
 }
 

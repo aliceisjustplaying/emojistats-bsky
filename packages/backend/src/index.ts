@@ -1,12 +1,11 @@
 import { EMIT_INTERVAL, LOG_INTERVAL, METRICS_PORT, PORT } from './config.js';
-import { getEmojiStats, getTopLanguages, initiateShutdown, logEmojiStats } from './lib/emojiStats.js';
-import { flushPostgresBatch } from './lib/emojiStats.js';
+import { getEmojiStats, getTopLanguages, logEmojiStats } from './lib/emojiStats.js';
 import { initializeJetstream, jetstream } from './lib/jetstream.js';
 import logger from './lib/logger.js';
 import { startMetricsServer } from './lib/metrics.js';
 import { startBullMQUI } from './lib/mqui.js';
 import { pool } from './lib/postgres.js';
-import { postQueue, worker } from './lib/queue.js';
+import { postQueue, workers } from './lib/queue.js';
 import { redis } from './lib/redis.js';
 import { io, startSocketServer } from './lib/socket.io.js';
 
@@ -74,7 +73,7 @@ async function shutdown() {
   }
 
   try {
-    await worker.close();
+    await Promise.all(workers.map((worker) => worker.close()));
     await postQueue.close();
     logger.info('BullMQ worker and queue closed.');
   } catch (error) {
@@ -85,19 +84,6 @@ async function shutdown() {
     await bullMQUI.close();
   } catch (error) {
     logger.error(`Error closing BullMQ UI: ${(error as Error).message}`);
-  }
-
-  try {
-    await initiateShutdown();
-  } catch (error) {
-    logger.error(`Error initiating shutdown: ${(error as Error).message}`);
-  }
-
-  try {
-    await flushPostgresBatch();
-    logger.info('Flushed remaining PostgreSQL batch.');
-  } catch (error) {
-    logger.error(`Error flushing PostgreSQL batch during shutdown: ${(error as Error).message}`);
   }
 
   try {
@@ -113,16 +99,16 @@ async function shutdown() {
   }
 
   try {
-    await redis.quit();
-  } catch (error) {
-    logger.error(`Error disconnecting Redis client: ${(error as Error).message}`);
-  }
-
-  try {
     await pool.end();
     logger.info('PostgreSQL pool disconnected.');
   } catch (error) {
     logger.error(`Error disconnecting PostgreSQL pool: ${(error as Error).message}`);
+  }
+
+  try {
+    await redis.quit();
+  } catch (error) {
+    logger.error(`Error disconnecting Redis client: ${(error as Error).message}`);
   }
 
   process.exit(0);
