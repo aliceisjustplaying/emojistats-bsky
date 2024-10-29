@@ -4,3 +4,4 @@ bun.lockb
 CURSOR_OVERRIDE.TXT
 packages/backend/src/**/*.js
 *.txt
+*.car
