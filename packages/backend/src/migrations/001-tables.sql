@@ -1,0 +1,18 @@
+CREATE TABLE IF NOT EXISTS posts (
+  id BIGSERIAL,
+  did TEXT NOT NULL,
+  rkey TEXT NOT NULL,
+  text TEXT,
+  has_emojis BOOLEAN NOT NULL DEFAULT FALSE,
+  langs TEXT[] NOT NULL DEFAULT '{}',
+  emojis TEXT[] NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS emojis (
+  did TEXT NOT NULL,
+  rkey TEXT NOT NULL,
+  emoji TEXT NOT NULL,
+  lang TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL
+);
