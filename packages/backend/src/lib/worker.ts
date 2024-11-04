@@ -7,18 +7,24 @@ import logger from './logger.js';
 import { postQueue } from './queue.js';
 import { Emojis, Posts } from './schema.js';
 
-const BATCH_SIZE = 10;
+const BATCH_SIZE = 1000;
+const FLUSH_INTERVAL = 100;
 
 const createWorker = (id: number) => {
   let currentBatch: { postData: Insertable<Posts>; emojiData: Insertable<Emojis>[] }[] = [];
   let isProcessing = false;
+  let flushTimeout: NodeJS.Timeout | null = null;
 
   const processBatch = async () => {
     if (isProcessing || currentBatch.length === 0) {
-      process.stdout.write('.');
       return;
     }
     isProcessing = true;
+
+    if (flushTimeout) {
+      clearTimeout(flushTimeout);
+      flushTimeout = null;
+    }
 
     const batchToProcess = [...currentBatch];
     currentBatch = [];
@@ -37,6 +43,17 @@ const createWorker = (id: number) => {
     }
   };
 
+  const scheduleFlush = () => {
+    if (flushTimeout) {
+      return;
+    }
+    flushTimeout = setTimeout(() => {
+      processBatch().catch((err: unknown) => {
+        logger.error(`Worker ${id}: Error during scheduled flush: ${(err as Error).message}`);
+      });
+    }, FLUSH_INTERVAL);
+  };
+
   const worker = new Worker<{ postData: Insertable<Posts>; emojiData: Insertable<Emojis>[] }>(
     'post-processing',
     async (job) => {
@@ -48,6 +65,8 @@ const createWorker = (id: number) => {
 
       if (totalEmojis >= BATCH_SIZE || totalPosts >= BATCH_SIZE) {
         await processBatch();
+      } else {
+        scheduleFlush();
       }
     },
     {

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 error_exit() {
@@ -8,13 +8,15 @@ error_exit() {
 
 if [ "$#" -ne 1 ]; then
   echo "Usage: $0 <migrations_directory>"
-  echo "Error: Migrations directory not specified."
+  error_exit "Migrations directory not specified."
 fi
 
 MIGRATIONS_DIR="$1"
 
-if [ ! -d "$MIGRATIONS_DIR" ]; then
-  error_exit "'$MIGRATIONS_DIR' is not a directory or does not exist."
+if [[ ! -e "$MIGRATIONS_DIR" ]]; then
+  error_exit "'$MIGRATIONS_DIR' does not exist."
+elif [[ ! -d "$MIGRATIONS_DIR" ]]; then
+  error_exit "'$MIGRATIONS_DIR' exists but is not a directory."
 fi
 
 ENV_FILE=".env"

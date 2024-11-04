@@ -9,7 +9,7 @@ SELECT
   emoji,
   COUNT(*) AS count
 FROM
-  emojis_new
+  emojis
 GROUP BY
   bucket,
   emoji;
@@ -25,7 +25,7 @@ SELECT
   emoji,
   COUNT(*) AS count
 FROM
-  emojis_new
+  emojis
 GROUP BY
   bucket,
   emoji;
