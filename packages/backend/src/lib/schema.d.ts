@@ -284,20 +284,39 @@ export interface _TimescaledbInternalCompressedChunkStats {
   uncompressed_total_size: Int8 | null;
 }
 
-export interface _TimescaledbInternalDirectView11 {
+export interface _TimescaledbInternalDirectView3 {
   bucket: Timestamp | null;
   count: Int8 | null;
   emoji: string | null;
 }
 
-export interface _TimescaledbInternalDirectView12 {
+export interface _TimescaledbInternalDirectView4 {
+  bucket: Timestamp | null;
+  count: Int8 | null;
+  emoji: string | null;
+}
+
+export interface _TimescaledbInternalDirectView5 {
   bucket: Timestamp | null;
   count: Int8 | null;
   emoji: string | null;
   lang: string | null;
 }
 
-export interface _TimescaledbInternalDirectView13 {
+export interface _TimescaledbInternalDirectView6 {
+  bucket: Timestamp | null;
+  count: Int8 | null;
+  emoji: string | null;
+  lang: string | null;
+}
+
+export interface _TimescaledbInternalDirectView7 {
+  bucket: Timestamp | null;
+  count: Int8 | null;
+  lang: string | null;
+}
+
+export interface _TimescaledbInternalDirectView8 {
   bucket: Timestamp | null;
   count: Int8 | null;
   lang: string | null;
@@ -320,76 +339,135 @@ export interface _TimescaledbInternalHypertableChunkLocalSize {
   total_bytes: Int8 | null;
 }
 
-export interface _TimescaledbInternalMaterializedHypertable11 {
+export interface _TimescaledbInternalMaterializedHypertable3 {
   bucket: Timestamp;
   count: Int8 | null;
   emoji: string | null;
 }
 
-export interface _TimescaledbInternalMaterializedHypertable12 {
+export interface _TimescaledbInternalMaterializedHypertable4 {
+  bucket: Timestamp;
+  count: Int8 | null;
+  emoji: string | null;
+}
+
+export interface _TimescaledbInternalMaterializedHypertable5 {
   bucket: Timestamp;
   count: Int8 | null;
   emoji: string | null;
   lang: string | null;
 }
 
-export interface _TimescaledbInternalMaterializedHypertable13 {
+export interface _TimescaledbInternalMaterializedHypertable6 {
+  bucket: Timestamp;
+  count: Int8 | null;
+  emoji: string | null;
+  lang: string | null;
+}
+
+export interface _TimescaledbInternalMaterializedHypertable7 {
   bucket: Timestamp;
   count: Int8 | null;
   lang: string | null;
 }
 
-export interface _TimescaledbInternalPartialView11 {
+export interface _TimescaledbInternalMaterializedHypertable8 {
+  bucket: Timestamp;
+  count: Int8 | null;
+  lang: string | null;
+}
+
+export interface _TimescaledbInternalPartialView3 {
   bucket: Timestamp | null;
   count: Int8 | null;
   emoji: string | null;
 }
 
-export interface _TimescaledbInternalPartialView12 {
+export interface _TimescaledbInternalPartialView4 {
+  bucket: Timestamp | null;
+  count: Int8 | null;
+  emoji: string | null;
+}
+
+export interface _TimescaledbInternalPartialView5 {
   bucket: Timestamp | null;
   count: Int8 | null;
   emoji: string | null;
   lang: string | null;
 }
 
-export interface _TimescaledbInternalPartialView13 {
+export interface _TimescaledbInternalPartialView6 {
+  bucket: Timestamp | null;
+  count: Int8 | null;
+  emoji: string | null;
+  lang: string | null;
+}
+
+export interface _TimescaledbInternalPartialView7 {
+  bucket: Timestamp | null;
+  count: Int8 | null;
+  lang: string | null;
+}
+
+export interface _TimescaledbInternalPartialView8 {
   bucket: Timestamp | null;
   count: Int8 | null;
   lang: string | null;
 }
 
 export interface Emojis {
-  created_at: Generated<Timestamp>;
+  created_at: Timestamp;
   did: string;
   emoji: string;
+  id: Generated<Int8>;
   lang: string;
   rkey: string;
 }
 
-export interface EmojiStatsOverall {
+export interface EmojiStatsHourly {
   bucket: Timestamp | null;
   count: Int8 | null;
   emoji: string | null;
 }
 
-export interface EmojiStatsPerLanguage {
+export interface EmojiStatsPerLanguageHourly {
   bucket: Timestamp | null;
   count: Int8 | null;
   emoji: string | null;
   lang: string | null;
 }
 
-export interface LanguageStats {
+export interface EmojiStatsPerLanguageRealtime {
+  bucket: Timestamp | null;
+  count: Int8 | null;
+  emoji: string | null;
+  lang: string | null;
+}
+
+export interface EmojiStatsRealtime {
+  bucket: Timestamp | null;
+  count: Int8 | null;
+  emoji: string | null;
+}
+
+export interface LanguageStatsHourly {
+  bucket: Timestamp | null;
+  count: Int8 | null;
+  lang: string | null;
+}
+
+export interface LanguageStatsRealtime {
   bucket: Timestamp | null;
   count: Int8 | null;
   lang: string | null;
 }
 
 export interface Posts {
-  created_at: Generated<Timestamp>;
+  created_at: Timestamp;
   did: string;
   emojis: Generated<string[]>;
   has_emojis: Generated<boolean>;
+  id: Generated<Int8>;
   langs: Generated<string[]>;
   rkey: string;
   text: string | null;
@@ -567,24 +645,36 @@ export interface DB {
   '_timescaledb_catalog.tablespace': _TimescaledbCatalogTablespace;
   '_timescaledb_catalog.telemetry_event': _TimescaledbCatalogTelemetryEvent;
   '_timescaledb_config.bgw_job': _TimescaledbConfigBgwJob;
-  '_timescaledb_internal._direct_view_11': _TimescaledbInternalDirectView11;
-  '_timescaledb_internal._direct_view_12': _TimescaledbInternalDirectView12;
-  '_timescaledb_internal._direct_view_13': _TimescaledbInternalDirectView13;
-  '_timescaledb_internal._materialized_hypertable_11': _TimescaledbInternalMaterializedHypertable11;
-  '_timescaledb_internal._materialized_hypertable_12': _TimescaledbInternalMaterializedHypertable12;
-  '_timescaledb_internal._materialized_hypertable_13': _TimescaledbInternalMaterializedHypertable13;
-  '_timescaledb_internal._partial_view_11': _TimescaledbInternalPartialView11;
-  '_timescaledb_internal._partial_view_12': _TimescaledbInternalPartialView12;
-  '_timescaledb_internal._partial_view_13': _TimescaledbInternalPartialView13;
+  '_timescaledb_internal._direct_view_3': _TimescaledbInternalDirectView3;
+  '_timescaledb_internal._direct_view_4': _TimescaledbInternalDirectView4;
+  '_timescaledb_internal._direct_view_5': _TimescaledbInternalDirectView5;
+  '_timescaledb_internal._direct_view_6': _TimescaledbInternalDirectView6;
+  '_timescaledb_internal._direct_view_7': _TimescaledbInternalDirectView7;
+  '_timescaledb_internal._direct_view_8': _TimescaledbInternalDirectView8;
+  '_timescaledb_internal._materialized_hypertable_3': _TimescaledbInternalMaterializedHypertable3;
+  '_timescaledb_internal._materialized_hypertable_4': _TimescaledbInternalMaterializedHypertable4;
+  '_timescaledb_internal._materialized_hypertable_5': _TimescaledbInternalMaterializedHypertable5;
+  '_timescaledb_internal._materialized_hypertable_6': _TimescaledbInternalMaterializedHypertable6;
+  '_timescaledb_internal._materialized_hypertable_7': _TimescaledbInternalMaterializedHypertable7;
+  '_timescaledb_internal._materialized_hypertable_8': _TimescaledbInternalMaterializedHypertable8;
+  '_timescaledb_internal._partial_view_3': _TimescaledbInternalPartialView3;
+  '_timescaledb_internal._partial_view_4': _TimescaledbInternalPartialView4;
+  '_timescaledb_internal._partial_view_5': _TimescaledbInternalPartialView5;
+  '_timescaledb_internal._partial_view_6': _TimescaledbInternalPartialView6;
+  '_timescaledb_internal._partial_view_7': _TimescaledbInternalPartialView7;
+  '_timescaledb_internal._partial_view_8': _TimescaledbInternalPartialView8;
   '_timescaledb_internal.bgw_job_stat': _TimescaledbInternalBgwJobStat;
   '_timescaledb_internal.bgw_job_stat_history': _TimescaledbInternalBgwJobStatHistory;
   '_timescaledb_internal.bgw_policy_chunk_stats': _TimescaledbInternalBgwPolicyChunkStats;
   '_timescaledb_internal.compressed_chunk_stats': _TimescaledbInternalCompressedChunkStats;
   '_timescaledb_internal.hypertable_chunk_local_size': _TimescaledbInternalHypertableChunkLocalSize;
-  emoji_stats_overall: EmojiStatsOverall;
-  emoji_stats_per_language: EmojiStatsPerLanguage;
+  emoji_stats_hourly: EmojiStatsHourly;
+  emoji_stats_per_language_hourly: EmojiStatsPerLanguageHourly;
+  emoji_stats_per_language_realtime: EmojiStatsPerLanguageRealtime;
+  emoji_stats_realtime: EmojiStatsRealtime;
   emojis: Emojis;
-  language_stats: LanguageStats;
+  language_stats_hourly: LanguageStatsHourly;
+  language_stats_realtime: LanguageStatsRealtime;
   posts: Posts;
   'timescaledb_experimental.policies': TimescaledbExperimentalPolicies;
   'timescaledb_information.chunk_compression_settings': TimescaledbInformationChunkCompressionSettings;

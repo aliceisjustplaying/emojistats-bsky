@@ -71,7 +71,7 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
 
 export async function getTopEmojisForLanguage(language: string) {
   return await db
-    .selectFrom('emoji_stats_per_language')
+    .selectFrom('emoji_stats_per_language_realtime')
     .select(['emoji', db.fn.sum('count').as('total_count')])
     .where('lang', '=', language)
     .groupBy('emoji')
@@ -81,34 +81,41 @@ export async function getTopEmojisForLanguage(language: string) {
 }
 
 export async function getEmojiStats() {
+  const postCount = await db.selectFrom('posts').select(db.fn.countAll().as('total_count')).execute();
+  const postWithEmojisCount = await db
+    .selectFrom('posts')
+    .where('has_emojis', '=', true)
+    .select(db.fn.countAll().as('total_count'))
+    .execute();
   const topEmojisOverall = await db
-    .selectFrom('emoji_stats_overall')
+    .selectFrom('emoji_stats_realtime')
     .select(['emoji', db.fn.sum('count').as('total_count')])
     .groupBy('emoji')
     .orderBy('total_count', 'desc')
     .limit(MAX_EMOJIS)
     .execute();
 
-  const topEmojisPerLanguage = await db
-    .selectFrom('emoji_stats_per_language')
-    .select(['lang', 'emoji', db.fn.sum('count').as('total_count')])
-    .groupBy(['lang', 'emoji'])
-    .orderBy('lang', 'asc')
-    .orderBy('total_count', 'desc')
-    .limit(MAX_EMOJIS)
-    .execute();
+  // const topEmojisPerLanguage = await db
+  //   .selectFrom('emoji_stats_per_language_realtime')
+  //   .select(['lang', 'emoji', db.fn.sum('count').as('total_count')])
+  //   .groupBy(['lang', 'emoji'])
+  //   .orderBy('lang', 'asc')
+  //   .orderBy('total_count', 'desc')
+  //   .limit(MAX_EMOJIS)
+  //   .execute();
 
   const topLanguages = await db
-    .selectFrom('language_stats')
+    .selectFrom('language_stats_realtime')
     .select(['lang', db.fn.sum('count').as('count')])
     .groupBy('lang')
     .orderBy('count', 'desc')
     .limit(MAX_TOP_LANGUAGES)
     .execute();
 
-  // Calculate ratio
-  const postsWithEmojis = topEmojisPerLanguage.length;
-  const postsWithoutEmojis = 0; // Since Redis is removed, adjust logic if necessary
+  const processedPosts = Number(postCount[0].total_count);
+  const postsWithEmojis = Number(postWithEmojisCount[0].total_count);
+  const postsWithoutEmojis = processedPosts - postsWithEmojis;
+  const processedEmojis = topEmojisOverall.reduce((sum, e) => sum + Number(e.total_count), 0);
   const ratio = postsWithoutEmojis > 0 ? (postsWithEmojis / postsWithoutEmojis).toFixed(4) : 'N/A';
 
   // Format top emojis
@@ -120,11 +127,11 @@ export async function getEmojiStats() {
     .slice(0, MAX_EMOJIS);
 
   return {
-    processedPosts: topEmojisOverall.length, // Adjust as needed
-    processedEmojis: topEmojisOverall.reduce((sum, e) => sum + Number(e.total_count), 0),
-    postsWithEmojis: postsWithEmojis,
-    postsWithoutEmojis: postsWithoutEmojis,
-    topLanguages: topLanguages,
+    processedPosts,
+    processedEmojis,
+    postsWithEmojis,
+    postsWithoutEmojis,
+    topLanguages,
     ratio,
     topEmojis: formattedTopEmojis,
   };
@@ -132,7 +139,7 @@ export async function getEmojiStats() {
 
 export async function getTopLanguages(): Promise<LanguageStat[]> {
   const topLanguagesDesc = await db
-    .selectFrom('language_stats')
+    .selectFrom('language_stats_realtime')
     .select(['lang', db.fn.sum('count').as('count')])
     .groupBy('lang')
     .orderBy('count', 'desc')
@@ -161,7 +168,7 @@ export async function logEmojiStats() {
 
 export async function getEmojiStatsPerLanguage() {
   const result = await db
-    .selectFrom('emoji_stats_per_language')
+    .selectFrom('emoji_stats_per_language_realtime')
     .select(['lang', 'emoji', db.fn.sum('count').as('total_count')])
     .groupBy(['lang', 'emoji'])
     .orderBy('total_count', 'desc')
@@ -173,7 +180,7 @@ export async function getEmojiStatsPerLanguage() {
 
 export async function getEmojiStatsOverall() {
   const result = await db
-    .selectFrom('emoji_stats_overall')
+    .selectFrom('emoji_stats_realtime')
     .select(['emoji', db.fn.sum('count').as('total_count')])
     .groupBy('emoji')
     .orderBy('total_count', 'desc')

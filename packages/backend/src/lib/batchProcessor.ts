@@ -18,7 +18,7 @@ export async function flushBatchToDatabase(batch: { postData: Insertable<Posts>;
         await tx
           .insertInto('posts')
           .values(posts)
-          .onConflict((b) => b.columns(['did', 'rkey']).doNothing())
+          // .onConflict((b) => b.columns(['did', 'rkey']).doNothing())
           .execute();
       }
 
