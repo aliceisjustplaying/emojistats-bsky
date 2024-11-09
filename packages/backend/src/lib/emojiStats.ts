@@ -72,16 +72,17 @@ export async function handleCreate(event: CommitCreateEvent<'app.bsky.feed.post'
 export async function getTopEmojisForLanguage(language: string) {
   return await db
     .selectFrom('emoji_stats_per_language_realtime')
-    .select(['emoji', db.fn.sum('count').as('total_count')])
+    .select(['emoji', db.fn.sum('count').as('count')])
     .where('lang', '=', language)
     .groupBy('emoji')
-    .orderBy('total_count', 'desc')
+    .orderBy('count', 'desc')
     .limit(MAX_EMOJIS)
     .execute();
 }
 
 export async function getEmojiStats() {
   const postCount = await db.selectFrom('posts').select(db.fn.countAll().as('total_count')).execute();
+
   const postWithEmojisCount = await db
     .selectFrom('posts')
     .where('has_emojis', '=', true)
@@ -94,15 +95,6 @@ export async function getEmojiStats() {
     .orderBy('total_count', 'desc')
     .limit(MAX_EMOJIS)
     .execute();
-
-  // const topEmojisPerLanguage = await db
-  //   .selectFrom('emoji_stats_per_language_realtime')
-  //   .select(['lang', 'emoji', db.fn.sum('count').as('total_count')])
-  //   .groupBy(['lang', 'emoji'])
-  //   .orderBy('lang', 'asc')
-  //   .orderBy('total_count', 'desc')
-  //   .limit(MAX_EMOJIS)
-  //   .execute();
 
   const topLanguages = await db
     .selectFrom('language_stats_realtime')
@@ -118,7 +110,6 @@ export async function getEmojiStats() {
   const processedEmojis = topEmojisOverall.reduce((sum, e) => sum + Number(e.total_count), 0);
   const ratio = postsWithoutEmojis > 0 ? (postsWithEmojis / postsWithoutEmojis).toFixed(4) : 'N/A';
 
-  // Format top emojis
   const formattedTopEmojis = topEmojisOverall
     .map(({ emoji, total_count }) => ({
       emoji,
@@ -169,9 +160,9 @@ export async function logEmojiStats() {
 export async function getEmojiStatsPerLanguage() {
   const result = await db
     .selectFrom('emoji_stats_per_language_realtime')
-    .select(['lang', 'emoji', db.fn.sum('count').as('total_count')])
+    .select(['lang', 'emoji', db.fn.sum('count').as('count')])
     .groupBy(['lang', 'emoji'])
-    .orderBy('total_count', 'desc')
+    .orderBy('count', 'desc')
     .limit(100)
     .execute();
 
@@ -181,9 +172,9 @@ export async function getEmojiStatsPerLanguage() {
 export async function getEmojiStatsOverall() {
   const result = await db
     .selectFrom('emoji_stats_realtime')
-    .select(['emoji', db.fn.sum('count').as('total_count')])
+    .select(['emoji', db.fn.sum('count').as('count')])
     .groupBy('emoji')
-    .orderBy('total_count', 'desc')
+    .orderBy('count', 'desc')
     .limit(100)
     .execute();
 
