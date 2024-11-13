@@ -66,3 +66,5 @@ bun run start
 - [ ] Send updates efficiently
 - [ ] More performant frontend
 - [ ] etc.
+
+See [Contributing](CONTRIBUTING.md) for more information on how to contribute.
