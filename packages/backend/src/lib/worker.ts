@@ -8,12 +8,12 @@ import { postQueue } from './queue.js';
 import { Emojis, Posts } from './schema.js';
 
 const BATCH_SIZE = 1000;
-const FLUSH_INTERVAL = 100;
+// const FLUSH_INTERVAL = 2000;
 
 const createWorker = (id: number) => {
   let currentBatch: { postData: Insertable<Posts>; emojiData: Insertable<Emojis>[] }[] = [];
   let isProcessing = false;
-  let flushTimeout: NodeJS.Timeout | null = null;
+  // let flushTimeout: NodeJS.Timeout | null = null;
 
   const processBatch = async () => {
     if (isProcessing || currentBatch.length === 0) {
@@ -21,10 +21,10 @@ const createWorker = (id: number) => {
     }
     isProcessing = true;
 
-    if (flushTimeout) {
-      clearTimeout(flushTimeout);
-      flushTimeout = null;
-    }
+    // if (flushTimeout) {
+    //   clearTimeout(flushTimeout);
+    //   flushTimeout = null;
+    // }
 
     const batchToProcess = [...currentBatch];
     currentBatch = [];
@@ -43,16 +43,16 @@ const createWorker = (id: number) => {
     }
   };
 
-  const scheduleFlush = () => {
-    if (flushTimeout) {
-      return;
-    }
-    flushTimeout = setTimeout(() => {
-      processBatch().catch((err: unknown) => {
-        logger.error(`Worker ${id}: Error during scheduled flush: ${(err as Error).message}`);
-      });
-    }, FLUSH_INTERVAL);
-  };
+  // const scheduleFlush = () => {
+  //   if (flushTimeout) {
+  //     return;
+  //   }
+  //   flushTimeout = setTimeout(() => {
+  //     processBatch().catch((err: unknown) => {
+  //       logger.error(`Worker ${id}: Error during scheduled flush: ${(err as Error).message}`);
+  //     });
+  //   }, FLUSH_INTERVAL);
+  // };
 
   const worker = new Worker<{ postData: Insertable<Posts>; emojiData: Insertable<Emojis>[] }>(
     'post-processing',
@@ -65,15 +65,16 @@ const createWorker = (id: number) => {
 
       if (totalEmojis >= BATCH_SIZE || totalPosts >= BATCH_SIZE) {
         await processBatch();
-      } else {
-        scheduleFlush();
+        // } else {
+        //   scheduleFlush();
       }
     },
     {
       connection: {
         url: REDIS_URL,
       },
-      concurrency: 1,
+      // concurrency: 1,
+      concurrency: 4,
     },
   );
 
@@ -88,10 +89,14 @@ const createWorker = (id: number) => {
   return worker;
 };
 
+// const worker = createWorker(1);
+
 const workers: Worker[] = [];
-for (let i = 0; i < BULLMQ_CONCURRENCY; i++) {
+// for (let i = 0; i < BULLMQ_CONCURRENCY; i++) {
+for (let i = 0; i < 5; i++) {
   const worker = createWorker(i + 1);
   workers.push(worker);
 }
 
+// export { worker };
 export { workers };

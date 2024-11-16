@@ -8,7 +8,7 @@ import { pool } from './lib/postgres.js';
 import { postQueue } from './lib/queue.js';
 import { redis } from './lib/redis.js';
 import { io, startSocketServer } from './lib/socket.io.js';
-import { workers } from './lib/worker.js';
+import { worker, workers } from './lib/worker.js';
 
 /* redis initialization */
 await redis.connect();
@@ -75,6 +75,7 @@ async function shutdown() {
 
   try {
     await Promise.all(workers.map((worker) => worker.close()));
+    // await worker.close();
     await postQueue.close();
     logger.info('BullMQ worker and queue closed.');
   } catch (error) {
