@@ -1,0 +1,11 @@
+DROP MATERIALIZED VIEW IF EXISTS emoji_stats_realtime CASCADE;
+
+DROP MATERIALIZED VIEW IF EXISTS emoji_stats_hourly CASCADE;
+
+DROP MATERIALIZED VIEW IF EXISTS emoji_stats_per_language_realtime CASCADE;
+
+DROP MATERIALIZED VIEW IF EXISTS emoji_stats_per_language_hourly CASCADE;
+
+DROP MATERIALIZED VIEW IF EXISTS language_stats_realtime CASCADE;
+
+DROP MATERIALIZED VIEW IF EXISTS language_stats_hourly CASCADE;
