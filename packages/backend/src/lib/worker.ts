@@ -13,60 +13,35 @@ const BATCH_SIZE = 1000;
 const createWorker = (id: number) => {
   let currentBatch: { postData: Insertable<Posts>; emojiData: Insertable<Emojis>[] }[] = [];
   let isProcessing = false;
-  // let flushTimeout: NodeJS.Timeout | null = null;
-
-  const processBatch = async () => {
-    if (isProcessing || currentBatch.length === 0) {
-      return;
-    }
-    isProcessing = true;
-
-    // if (flushTimeout) {
-    //   clearTimeout(flushTimeout);
-    //   flushTimeout = null;
-    // }
-
-    const batchToProcess = [...currentBatch];
-    currentBatch = [];
-
-    try {
-      await flushBatchToDatabase(batchToProcess);
-      logger.debug(`Worker ${id}: Processed batch of ${batchToProcess.length} posts.`);
-    } catch (error) {
-      logger.error(`Worker ${id}: Error processing batch: ${(error as Error).message}`);
-      for (const jobData of batchToProcess) {
-        await postQueue.add('process-post', jobData);
-      }
-      logger.info(`Worker ${id}: Re-enqueued ${batchToProcess.length} failed jobs.`);
-    } finally {
-      isProcessing = false;
-    }
-  };
-
-  // const scheduleFlush = () => {
-  //   if (flushTimeout) {
-  //     return;
-  //   }
-  //   flushTimeout = setTimeout(() => {
-  //     processBatch().catch((err: unknown) => {
-  //       logger.error(`Worker ${id}: Error during scheduled flush: ${(err as Error).message}`);
-  //     });
-  //   }, FLUSH_INTERVAL);
-  // };
 
   const worker = new Worker<{ postData: Insertable<Posts>; emojiData: Insertable<Emojis>[] }>(
     'post-processing',
     async (job) => {
       currentBatch.push(job.data);
+      if (isProcessing) {
+        return;
+      }
 
       // Count total emojis and posts in current batch
       const totalEmojis = currentBatch.reduce((sum, item) => sum + item.emojiData.length, 0);
       const totalPosts = currentBatch.length;
 
       if (totalEmojis >= BATCH_SIZE || totalPosts >= BATCH_SIZE) {
-        await processBatch();
-        // } else {
-        //   scheduleFlush();
+        const batchToProcess = currentBatch;
+        currentBatch = [];
+        try {
+          isProcessing = true;
+          await flushBatchToDatabase(batchToProcess);
+          logger.debug(`Worker ${id}: Processed batch of ${batchToProcess.length} posts.`);
+        } catch (error) {
+          logger.error(`Worker ${id}: Error processing batch: ${(error as Error).message}`);
+          for (const jobData of batchToProcess) {
+            await postQueue.add('process-post', jobData);
+          }
+          logger.info(`Worker ${id}: Re-enqueued ${batchToProcess.length} failed jobs.`);
+        } finally {
+          isProcessing = false;
+        }
       }
     },
     {

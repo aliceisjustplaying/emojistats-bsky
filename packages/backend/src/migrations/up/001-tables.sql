@@ -9,10 +9,10 @@ CREATE TABLE IF NOT EXISTS posts (
   langs TEXT[] NOT NULL DEFAULT '{}',
   emojis TEXT[] NOT NULL DEFAULT '{}',
   created_at TIMESTAMPTZ NOT NULL,
-  UNIQUE (id, created_at)
+  UNIQUE (did, rkey)
 );
 
-CREATE UNIQUE INDEX idx_posts_id_created_at ON posts (id, created_at);
+CREATE UNIQUE INDEX idx_posts_id_created_at ON posts (did, rkey);
 
 SELECT
   create_hypertable (
@@ -29,10 +29,11 @@ CREATE TABLE IF NOT EXISTS emojis (
   rkey TEXT NOT NULL,
   emoji TEXT NOT NULL,
   lang TEXT NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL
+  created_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (did, rkey)
 );
 
-CREATE UNIQUE INDEX idx_emojis_id_created_at ON emojis (id, created_at);
+CREATE UNIQUE INDEX idx_emojis_id_created_at ON emojis (did, rkey);
 
 SELECT
   create_hypertable (
