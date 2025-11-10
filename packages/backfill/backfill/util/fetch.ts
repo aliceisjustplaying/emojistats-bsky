@@ -2,6 +2,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { errors, type Headers } from "undici";
+import { logger } from "../logger.js";
 
 let cursorCachePath = path.resolve(process.cwd(), "pds-cursor-cache.json");
 
@@ -34,7 +35,10 @@ export async function* fetchAllDids() {
 
 async function* fetchPdsDids(pds: string) {
   let cursor = getPdsCursorCache()?.[pds] ?? "";
-  if (cursor === "DONE") return console.warn(`Skipping exhausted PDS ${pds}`);
+  if (cursor === "DONE") {
+    logger.warn({ pds }, "Skipping exhausted PDS");
+    return;
+  }
   const url = new URL(`/xrpc/com.atproto.sync.listRepos`, pds).href;
   let fetched = 0;
   while (true) {
@@ -82,19 +86,24 @@ async function* fetchPdsDids(pds: string) {
           "UND_ERR_SOCKET",
         ].includes(undiciError?.code ?? "")
       ) {
-        console.warn(`Could not connect to ${url} for listRepos, skipping`);
+        logger.warn(
+          { url, pds, code: undiciError?.code },
+          "listRepos connect failure",
+        );
         break;
       } else {
         const cursorLabel = cursor && cursor.length > 0 ? cursor : "<start>";
         const reason = err?.message ?? `${err}`;
         if (pds.includes("bsky.network")) {
-          console.warn(
-            `listRepos failed for ${url} (cursor=${cursorLabel}), retrying: ${reason}`,
+          logger.warn(
+            { url, cursor: cursorLabel, reason },
+            "listRepos transient failure",
           );
           await sleep(5000);
         } else {
-          console.warn(
-            `listRepos failed for ${url} (cursor=${cursorLabel}), skipping: ${reason}`,
+          logger.warn(
+            { url, cursor: cursorLabel, reason },
+            "listRepos giving up",
           );
           break;
         }
@@ -102,9 +111,7 @@ async function* fetchPdsDids(pds: string) {
     }
   }
   const cursorLabel = cursor && cursor.length > 0 ? cursor : "<start>";
-  console.log(
-    `Exhausted ${pds}: fetched ${fetched} DIDs, ended at cursor ${cursorLabel}`,
-  );
+  logger.info({ pds, fetched, cursor: cursorLabel }, "PDS repos exhausted");
   pdsCursorCache[pds] = "DONE";
   savePdsCursorCache();
   return fetched;
@@ -184,7 +191,7 @@ async function processRatelimitHeaders(headers: Headers, url: string) {
   if (isNaN(ratelimitRemaining) || ratelimitRemaining <= 1) {
     const ratelimitReset = parseInt(resetHeader) * 1000;
     if (isNaN(ratelimitReset)) {
-      console.error("ratelimit-reset header is not a number at url " + url);
+      logger.error({ url }, "ratelimit-reset header is not numeric");
     } else {
       const now = Date.now();
       const waitTime = ratelimitReset - now + 1000; // add a second to be safe
@@ -234,7 +241,10 @@ export async function* roundRobinInterleaveIterators<T>(
     activeMap.delete(result.idx);
 
     if (result.error) {
-      console.error(result.error);
+      logger.error(
+        { iteratorIndex: result.idx, err: result.error },
+        "Iterator worker failed",
+      );
     }
 
     if (result.res.done) {

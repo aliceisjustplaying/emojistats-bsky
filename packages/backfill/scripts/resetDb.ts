@@ -13,6 +13,7 @@ async function main() {
     await client.query("BEGIN");
     await client.query("TRUNCATE TABLE emoji_post");
     await client.query("TRUNCATE TABLE repo_progress");
+    await client.query("TRUNCATE TABLE repo_validation_log");
     await client.query("TRUNCATE TABLE ingest_job_log");
     await client.query("TRUNCATE TABLE ingest_watermark");
     await client.query("DELETE FROM dim_client");

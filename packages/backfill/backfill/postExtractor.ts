@@ -2,6 +2,7 @@ import { parse as parseTid } from "@atcute/tid";
 import emojiRegexFactory from "emoji-regex";
 import { batchNormalizeEmojis } from "emoji-normalization";
 import type { NormalizedEmojiPost } from "./types.js";
+import { logger } from "./logger.js";
 
 const emojiRegex = emojiRegexFactory();
 
@@ -68,9 +69,7 @@ function resolveCreatedAt(
     return { createdAt: new Date(tid.timestamp), seq: tid.timestamp };
   } catch (error) {
     if (invalidTidWarningCount < MAX_INVALID_TID_WARNINGS) {
-      console.warn(
-        `Invalid TID for ${did} rkey=${rkey}: ${(error as Error).message}`,
-      );
+      logger.warn({ did, rkey, err: error }, "Invalid TID encountered");
       invalidTidWarningCount++;
     }
     return null;

@@ -7,6 +7,8 @@ import {
 import { setTimeout as sleep } from "node:timers/promises";
 import { Agent, setGlobalDispatcher } from "undici";
 import type {} from "@atcute/atproto";
+import { RateLimiter } from "./rateLimiter.js";
+import { rateLimiterWaitSeconds } from "../metrics.js";
 
 type ExtractSuccessData<T> = T extends { ok: true; data: infer D } ? D : never;
 
@@ -27,40 +29,20 @@ type QueryOptions = {
   skipGlobalLimiter?: boolean;
 };
 
-class RateLimiter {
-  private tokens: number;
-  private lastRefill: number;
-
-  constructor(
-    private readonly capacity: number,
-    private readonly refillPerSec: number,
-  ) {
-    this.tokens = capacity;
-    this.lastRefill = Date.now();
-  }
-
-  async take() {
-    this.refill();
-    while (this.tokens < 1) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      this.refill();
-    }
-    this.tokens -= 1;
-  }
-
-  private refill() {
-    const now = Date.now();
-    const elapsed = (now - this.lastRefill) / 1000;
-    if (elapsed <= 0) return;
-    this.tokens = Math.min(
-      this.capacity,
-      this.tokens + elapsed * this.refillPerSec,
+const GLOBAL_LIMITER = new RateLimiter({
+  capacity: 3000,
+  refillPerSec: 10,
+  defaultContext: { scope: "global", pds_host: "global" },
+  onWait: (waitMs, context) => {
+    rateLimiterWaitSeconds.observe(
+      {
+        scope: String(context?.scope ?? "global"),
+        pds_host: String(context?.pds_host ?? "global"),
+      },
+      waitMs / 1000,
     );
-    this.lastRefill = now;
-  }
-}
-
-const GLOBAL_LIMITER = new RateLimiter(3000, 10); // 3000 requests / 5 minutes
+  },
+}); // 3000 requests / 5 minutes
 
 export class XRPCManager {
   clients = new Map<string, Client>();

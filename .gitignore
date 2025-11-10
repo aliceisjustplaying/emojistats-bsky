@@ -4,3 +4,6 @@ bun.lockb
 CURSOR_OVERRIDE.TXT
 packages/backend/src/**/*.js
 *.txt
+
+# Backfill artifacts
+packages/backfill/data/parquet/*.parquet

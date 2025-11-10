@@ -1,4 +1,8 @@
 import { Pool } from "pg";
+import type { PoolClient } from "pg";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { from as copyFrom } from "pg-copy-streams";
 import type { PreparedEmojiRow } from "./types.js";
 
 export type DatabaseDeps = {
@@ -18,54 +22,159 @@ export function createPool({ databaseUrl, schema }: DatabaseDeps) {
   return pool;
 }
 
+const STAGING_TABLE = "emoji_post_stage";
+const CSV_NULL = "\\N";
+const INSERT_COLUMNS = [
+  "post_uri",
+  "repo_did",
+  "rkey",
+  "seq",
+  "created_at",
+  "received_at",
+  "lang_id",
+  "client_id",
+  "emoji_ids",
+  "author_did",
+  "reply_root_uri",
+  "reply_parent_uri",
+  "hidden",
+] as const;
+
+const CREATE_STAGE_TABLE_SQL = `
+  CREATE TEMP TABLE IF NOT EXISTS ${STAGING_TABLE} (
+    post_uri         text not null,
+    repo_did         text not null,
+    rkey             text not null,
+    seq              bigint not null,
+    created_at       timestamptz not null,
+    received_at      timestamptz not null,
+    lang_id          smallint not null,
+    client_id        smallint,
+    emoji_ids        smallint[] not null,
+    author_did       text not null,
+    reply_root_uri   text,
+    reply_parent_uri text,
+    hidden           boolean not null default false
+  ) ON COMMIT DELETE ROWS;
+`;
+
+const COPY_INTO_STAGE_SQL = `
+  COPY ${STAGING_TABLE} (${INSERT_COLUMNS.join(", ")})
+  FROM STDIN WITH (FORMAT csv, QUOTE '"', ESCAPE '"', NULL '${CSV_NULL}')
+`;
+
+const INSERT_FROM_STAGE_SQL = `
+  INSERT INTO emoji_post (${INSERT_COLUMNS.join(", ")})
+  SELECT ${INSERT_COLUMNS.join(", ")} FROM ${STAGING_TABLE}
+  ON CONFLICT (repo_did, created_at, post_uri) DO NOTHING
+  RETURNING repo_did
+`;
+
 export async function insertEmojiRows(
   pool: Pool,
   rows: PreparedEmojiRow[],
-): Promise<void> {
-  if (rows.length === 0) return;
-  const columns = [
-    "post_uri",
-    "repo_did",
-    "rkey",
-    "seq",
-    "created_at",
-    "received_at",
-    "lang_id",
-    "client_id",
-    "emoji_ids",
-    "author_did",
-    "reply_root_uri",
-    "reply_parent_uri",
-    "hidden",
-  ];
-  const values: Array<string | number | Date | number[] | null | boolean> = [];
-  let paramIndex = 1;
-  const tuples = rows.map((row) => {
-    const placeholders = [
-      row.postUri,
-      row.repoDid,
-      row.rkey,
-      row.seq,
-      row.createdAt,
-      row.receivedAt,
-      row.langId,
-      row.clientId,
-      row.emojiIds,
-      row.authorDid,
-      row.replyRootUri,
-      row.replyParentUri,
-      false,
-    ];
-    const tuplePlaceholders = placeholders
-      .map(() => `$${paramIndex++}`)
-      .join(", ");
-    values.push(...placeholders);
-    return `(${tuplePlaceholders})`;
-  });
+): Promise<Map<string, number>> {
+  if (rows.length === 0) return new Map();
+  const client = await pool.connect();
+  let inTransaction = false;
+  try {
+    await client.query("BEGIN");
+    inTransaction = true;
+    await client.query(CREATE_STAGE_TABLE_SQL);
+    await copyRowsIntoStage(client, rows);
+    const result = await client.query<{ repo_did: string }>(
+      INSERT_FROM_STAGE_SQL,
+    );
+    await client.query("COMMIT");
+    inTransaction = false;
+    const counts = new Map<string, number>();
+    for (const row of result.rows) {
+      const current = counts.get(row.repo_did) ?? 0;
+      counts.set(row.repo_did, current + 1);
+    }
+    return counts;
+  } catch (error) {
+    if (inTransaction) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        // ignore rollback errors so we can surface the original failure
+      }
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
 
-  const sql = `INSERT INTO emoji_post (${columns.join(", ")}) VALUES ${tuples.join(", ")}
-	ON CONFLICT (repo_did, created_at, post_uri) DO NOTHING`;
-  await pool.query(sql, values);
+async function copyRowsIntoStage(client: PoolClient, rows: PreparedEmojiRow[]) {
+  const copyStream = client.query(copyFrom(COPY_INTO_STAGE_SQL));
+  const source = Readable.from(generateCsvRows(rows), {
+    objectMode: false,
+  });
+  await pipeline(source, copyStream);
+}
+
+function* generateCsvRows(rows: PreparedEmojiRow[]) {
+  for (const row of rows) {
+    yield formatRow(row);
+  }
+}
+
+function formatRow(row: PreparedEmojiRow): string {
+  const values: Array<string | number | boolean | Date | null> = [
+    row.postUri,
+    row.repoDid,
+    row.rkey,
+    row.seq,
+    row.createdAt,
+    row.receivedAt,
+    row.langId,
+    row.clientId ?? null,
+    formatEmojiArray(row.emojiIds),
+    row.authorDid,
+    row.replyRootUri ?? null,
+    row.replyParentUri ?? null,
+    false,
+  ];
+  const csvRow = values
+    .map((value) => formatCsvValue(value))
+    .join(",")
+    .concat("\n");
+  return csvRow;
+}
+
+function formatEmojiArray(ids: number[]): string {
+  if (ids.length === 0) {
+    throw new Error("emoji_ids array cannot be empty");
+  }
+  return `{${ids.join(",")}}`;
+}
+
+function formatCsvValue(
+  value: string | number | boolean | Date | null,
+): string {
+  if (value === null || value === undefined) {
+    return CSV_NULL;
+  }
+  let serialized: string;
+  if (value instanceof Date) {
+    serialized = value.toISOString();
+  } else if (typeof value === "boolean") {
+    serialized = value ? "true" : "false";
+  } else {
+    serialized = String(value);
+  }
+  const escaped = serialized.replace(/"/g, '""');
+  return `"${escaped}"`;
+}
+
+export async function countRepoEmojiPosts(pool: Pool, did: string) {
+  const { rows } = await pool.query<{ count: string }>(
+    "SELECT COUNT(*)::bigint AS count FROM emoji_post WHERE repo_did = $1",
+    [did],
+  );
+  return Number(rows[0]?.count ?? 0);
 }
 
 export async function isRepoComplete(
@@ -79,11 +188,49 @@ export async function isRepoComplete(
   return rows[0]?.backfill_complete ?? false;
 }
 
-export async function markRepoComplete(pool: Pool, did: string) {
+export async function markRepoComplete(
+  pool: Pool,
+  did: string,
+  rowCount: number | null,
+  snapshotPath: string | null,
+  parquetCount: number | null,
+) {
   await pool.query(
-    `INSERT INTO repo_progress (repo_did, last_rev, last_seq, backfill_complete)
-	VALUES ($1, $2, $3, true)
-	ON CONFLICT (repo_did) DO UPDATE SET last_rev = EXCLUDED.last_rev, last_seq = EXCLUDED.last_seq, backfill_complete = true, updated_at = NOW()`,
-    [did, "backfill", 0],
+    `INSERT INTO repo_progress (repo_did, last_rev, last_seq, backfill_complete, last_snapshot_row_count, last_snapshot_path, last_snapshot_parquet_count)
+		VALUES ($1, $2, $3, true, $4, $5, $6)
+		ON CONFLICT (repo_did) DO UPDATE SET last_rev = EXCLUDED.last_rev, last_seq = EXCLUDED.last_seq, backfill_complete = true, last_snapshot_row_count = EXCLUDED.last_snapshot_row_count, last_snapshot_path = EXCLUDED.last_snapshot_path, last_snapshot_parquet_count = EXCLUDED.last_snapshot_parquet_count, updated_at = NOW()`,
+    [did, "backfill", 0, rowCount, snapshotPath, parquetCount],
+  );
+}
+
+export type RepoValidationRecord = {
+  repoDid: string;
+  processedRows: number;
+  insertedRows: number;
+  parquetRows: number;
+  existingRows: number;
+  totalRows: number;
+  snapshotPath: string | null;
+  extrasDetected: boolean;
+};
+
+export async function recordRepoValidation(
+  pool: Pool,
+  record: RepoValidationRecord,
+) {
+  await pool.query(
+    `INSERT INTO repo_validation_log
+      (repo_did, processed_rows, inserted_rows, parquet_rows, existing_rows, total_rows, snapshot_path, extras_detected)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+    [
+      record.repoDid,
+      record.processedRows,
+      record.insertedRows,
+      record.parquetRows,
+      record.existingRows,
+      record.totalRows,
+      record.snapshotPath,
+      record.extrasDetected,
+    ],
   );
 }

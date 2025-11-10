@@ -6,6 +6,7 @@ import { EmojiPostWriter } from "./writer.js";
 import { BackfillRunner } from "./runner.js";
 import { setCursorCachePath } from "./util/fetch.js";
 import { startMetricsServer } from "./metrics.js";
+import { logger } from "./logger.js";
 
 async function main() {
   const config = loadConfig();
@@ -34,6 +35,6 @@ async function main() {
 }
 
 await main().catch((error) => {
-  console.error("Backfill failed", error);
+  logger.error({ err: error }, "Backfill failed");
   process.exitCode = 1;
 });

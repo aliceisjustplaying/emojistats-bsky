@@ -8,7 +8,12 @@ import { normalizeRepoRecord } from "./postExtractor.js";
 import type { BackfillConfig } from "./config.js";
 import { EmojiPostWriter } from "./writer.js";
 import { loadAllowlist } from "./allowlist.js";
-import { isRepoComplete, markRepoComplete } from "./db.js";
+import {
+  countRepoEmojiPosts,
+  isRepoComplete,
+  markRepoComplete,
+  recordRepoValidation,
+} from "./db.js";
 import type { RepoDescriptor } from "./types.js";
 import {
   queuePendingGauge,
@@ -19,7 +24,11 @@ import {
   unknownFailures as unknownCounter,
   postsInserted as postsCounter,
   emojisProcessed as emojisCounter,
+  repoProcessingDurationSeconds,
+  rateLimiterWaitSeconds,
 } from "./metrics.js";
+import { RateLimiter } from "./util/rateLimiter.js";
+import { logger } from "./logger.js";
 
 const TERMINAL_ERROR_REASON = new Map<string, string>([
   ["RepoDeactivated", "repo deactivated"],
@@ -44,6 +53,8 @@ export class BackfillRunner {
   };
   private statsTimer?: NodeJS.Timeout;
   private readonly limiterByPds = new Map<string, RateLimiter>();
+  private lastStatsLogMs = 0;
+  private readonly inFlight = new Set<string>();
 
   constructor(
     private readonly config: BackfillConfig,
@@ -60,10 +71,18 @@ export class BackfillRunner {
 
     for await (const [did, pds] of fetchAllDids()) {
       if (allowlist && !allowlist.has(did)) continue;
+      if (this.inFlight.has(did)) continue;
       if (await isRepoComplete(this.pool, did)) continue;
+      this.inFlight.add(did);
 
       const descriptor: RepoDescriptor = { did, pds };
-      queue.add(() => this.processRepo(descriptor, queue));
+      queue.add(async () => {
+        try {
+          await this.processRepo(descriptor, queue);
+        } finally {
+          this.inFlight.delete(descriptor.did);
+        }
+      });
       scheduled++;
       this.stats.scheduled++;
 
@@ -81,7 +100,9 @@ export class BackfillRunner {
 
   private async processRepo(descriptor: RepoDescriptor, queue: PQueue) {
     let inserted = 0;
+    const startTime = Date.now();
     const deadline = Date.now() + this.config.repoProcessingTimeoutMs;
+    const existingCount = await countRepoEmojiPosts(this.pool, descriptor.did);
     try {
       const stream = await this.fetchRepoStreamWithBackoff(
         descriptor,
@@ -109,50 +130,115 @@ export class BackfillRunner {
           const emojiCount = normalized.emojiGlyphs.length;
           this.stats.emojisProcessed += emojiCount;
           if (emojiCount > 0) {
-            emojisCounter.inc(emojiCount);
+            emojisCounter.inc({ pds_host: descriptor.pds }, emojiCount);
           }
           inserted++;
         }
       } catch (err) {
         if (isCarStreamError(err)) {
-          console.warn(
-            `CAR stream error for ${descriptor.did}: ${(err as Error).message}`,
+          logger.warn(
+            {
+              did: descriptor.did,
+              pds: descriptor.pds,
+              err,
+            },
+            "CAR stream error",
           );
           this.stats.transientFailures++;
+          transientCounter.inc({
+            reason: "car_stream_error",
+            pds_host: descriptor.pds,
+          });
           this.printStats(queue);
           return;
         }
         throw err;
       }
 
-      await markRepoComplete(this.pool, descriptor.did);
-      reposCompleted.inc();
+      const snapshotPath = this.writer.getCurrentSnapshotPath();
+      const validation = await this.validateRepo(
+        descriptor,
+        inserted,
+        existingCount,
+      );
+      await recordRepoValidation(this.pool, {
+        repoDid: descriptor.did,
+        processedRows: validation.processedRows,
+        insertedRows: validation.insertedRows,
+        parquetRows: validation.parquetRows,
+        existingRows: validation.existingRows,
+        totalRows: validation.totalRows,
+        snapshotPath,
+        extrasDetected: validation.extrasDetected,
+      });
+      await markRepoComplete(
+        this.pool,
+        descriptor.did,
+        validation.totalRows,
+        snapshotPath,
+        validation.parquetRows,
+      );
+      reposCompleted.inc({ pds_host: descriptor.pds });
+      repoProcessingDurationSeconds.observe(
+        { pds_host: descriptor.pds },
+        (Date.now() - startTime) / 1000,
+      );
       this.stats.completed++;
       this.stats.postsInserted += inserted;
       if (inserted > 0) {
-        postsCounter.inc(inserted);
+        postsCounter.inc({ pds_host: descriptor.pds }, inserted);
       }
       if (process.env.EMOJI_BACKFILL_VERBOSE?.toLowerCase() === "true") {
-        console.info(
-          `Finished ${descriptor.did}: inserted ${inserted} emoji posts`,
+        logger.info(
+          { did: descriptor.did, pds: descriptor.pds, inserted },
+          "Repo finished",
         );
       }
     } catch (error) {
+      if (error instanceof RepoValidationError) {
+        logger.error(
+          {
+            did: descriptor.did,
+            pds: descriptor.pds,
+            err: error,
+          },
+          "Repo validation failed",
+        );
+        this.stats.unknownFailures++;
+        unknownCounter.inc({
+          reason: "validation_failed",
+          pds_host: descriptor.pds,
+        });
+        this.printStats(queue);
+        return;
+      }
       if (error instanceof RepoTimeoutError) {
-        console.warn(
-          `Repo ${descriptor.did} timed out after ${this.config.repoProcessingTimeoutMs}ms`,
+        logger.warn(
+          {
+            did: descriptor.did,
+            pds: descriptor.pds,
+            timeoutMs: this.config.repoProcessingTimeoutMs,
+          },
+          "Repo processing timed out",
         );
         this.stats.transientFailures++;
-        transientCounter.inc();
+        transientCounter.inc({
+          reason: "repo_timeout",
+          pds_host: descriptor.pds,
+        });
         this.printStats(queue);
         return;
       }
       if (isConnectionError(error)) {
-        console.warn(
-          `Network error fetching ${descriptor.did}: ${(error as Error).message ?? error}`,
+        logger.warn(
+          { did: descriptor.did, pds: descriptor.pds, err: error },
+          "Network error fetching repo",
         );
         this.stats.transientFailures++;
-        transientCounter.inc();
+        transientCounter.inc({
+          reason: "network_error",
+          pds_host: descriptor.pds,
+        });
         this.printStats(queue);
         return;
       }
@@ -160,45 +246,137 @@ export class BackfillRunner {
         const classification = classifyClientError(error);
         if (classification.type === "terminal") {
           if (process.env.EMOJI_BACKFILL_VERBOSE?.toLowerCase() === "true") {
-            console.info(
-              `Skipping ${descriptor.did}: ${classification.reason}`,
+            logger.info(
+              {
+                did: descriptor.did,
+                pds: descriptor.pds,
+                reason: classification.reason,
+              },
+              "Skipping repo (terminal)",
             );
           }
-          await markRepoComplete(this.pool, descriptor.did);
+          await markRepoComplete(this.pool, descriptor.did, 0, null, null);
           this.stats.skippedTerminal++;
-          terminalSkips.inc();
+          terminalSkips.inc({
+            reason: classification.reason,
+            pds_host: descriptor.pds,
+          });
           this.printStats(queue);
           return;
         }
         if (classification.type === "transient") {
-          console.warn(
-            `Transient failure for ${descriptor.did}: ${classification.reason}. Will retry on a later run.`,
+          logger.warn(
+            {
+              did: descriptor.did,
+              pds: descriptor.pds,
+              reason: classification.reason,
+            },
+            "Transient repo failure",
           );
           this.stats.transientFailures++;
-          transientCounter.inc();
+          transientCounter.inc({
+            reason: classification.reason,
+            pds_host: descriptor.pds,
+          });
           this.printStats(queue);
           return;
         }
       }
       this.stats.unknownFailures++;
-      unknownCounter.inc();
-      console.error(`Failed to process ${descriptor.did}:`, error);
+      unknownCounter.inc({
+        reason:
+          error instanceof Error
+            ? (error.name ?? "unknown_error")
+            : "unknown_error",
+        pds_host: descriptor.pds,
+      });
+      logger.error(
+        { did: descriptor.did, pds: descriptor.pds, err: error },
+        "Failed to process repo",
+      );
       this.printStats(queue);
+    } finally {
+      this.writer.resetRepo(descriptor.did);
     }
   }
 
+  private async validateRepo(
+    descriptor: RepoDescriptor,
+    processedRows: number,
+    existingRows: number,
+  ): Promise<ValidationStats> {
+    const parquetCount = this.writer.consumeParquetCount(descriptor.did);
+    if (parquetCount !== processedRows) {
+      throw new RepoValidationError(
+        descriptor.did,
+        `Parquet mismatch: processed ${processedRows}, got ${parquetCount}`,
+      );
+    }
+    await this.writer.flush();
+    const insertedCount = this.writer.consumeInsertedCount(descriptor.did);
+    const dbCount = await countRepoEmojiPosts(this.pool, descriptor.did);
+    const expectedDbCount = existingRows + insertedCount;
+    if (dbCount < expectedDbCount) {
+      throw new RepoValidationError(
+        descriptor.did,
+        `Timescale shortfall: expected at least ${expectedDbCount}, counted ${dbCount}`,
+      );
+    }
+    if (dbCount > expectedDbCount) {
+      logger.info(
+        {
+          did: descriptor.did,
+          pds: descriptor.pds,
+          processed: processedRows,
+          inserted: insertedCount,
+          existing: existingRows,
+          extras: dbCount - expectedDbCount,
+        },
+        "Repo gained additional rows during validation window",
+      );
+    }
+    const extrasDetected = dbCount > expectedDbCount;
+    if (insertedCount !== processedRows) {
+      const duplicates = processedRows - insertedCount;
+      logger.info(
+        {
+          did: descriptor.did,
+          pds: descriptor.pds,
+          duplicates,
+          processed: processedRows,
+          inserted: insertedCount,
+          existing: existingRows,
+        },
+        "Repo contained duplicate records; stored unique rows",
+      );
+    }
+    return {
+      processedRows,
+      insertedRows: insertedCount,
+      parquetRows: parquetCount,
+      existingRows,
+      totalRows: dbCount,
+      extrasDetected,
+    };
+  }
+
   private printStats(queue: PQueue, final = false) {
+    const now = Date.now();
+    if (!final && now - this.lastStatsLogMs < STATS_LOG_INTERVAL_MS) {
+      return;
+    }
+    this.lastStatsLogMs = now;
     const label = final ? "progress (final)" : "progress";
     queueSizeGauge.set(queue.size);
     queuePendingGauge.set(queue.pending);
-    // ensure counters are registered even if zero
-    postsCounter.inc(0);
-    emojisCounter.inc(0);
-    console.info(
-      `[${label}] scheduled=${this.stats.scheduled} completed=${this.stats.completed} ` +
-        `terminal_skips=${this.stats.skippedTerminal} transient=${this.stats.transientFailures} ` +
-        `unknown=${this.stats.unknownFailures} posts=${this.stats.postsInserted} ` +
-        `emojis=${this.stats.emojisProcessed} queue=${queue.size} pending=${queue.pending}`,
+    logger.info(
+      {
+        label,
+        queueSize: queue.size,
+        queuePending: queue.pending,
+        stats: this.stats,
+      },
+      "Backfill progress",
     );
   }
 
@@ -231,7 +409,20 @@ export class BackfillRunner {
   private getLimiter(pds: string) {
     let limiter = this.limiterByPds.get(pds);
     if (!limiter) {
-      limiter = new RateLimiter(20, 20);
+      limiter = new RateLimiter({
+        capacity: 20,
+        refillPerSec: 20,
+        defaultContext: { scope: "pds", pds_host: pds },
+        onWait: (waitMs, context) => {
+          rateLimiterWaitSeconds.observe(
+            {
+              scope: String(context?.scope ?? "pds"),
+              pds_host: String(context?.pds_host ?? pds),
+            },
+            waitMs / 1000,
+          );
+        },
+      });
       this.limiterByPds.set(pds, limiter);
     }
     return limiter;
@@ -242,6 +433,8 @@ export class BackfillRunner {
     deadline: number,
   ) {
     let lastError: unknown;
+    let attempts = 0;
+    let hadConnectionError = false;
     for (const delaySeconds of NETWORK_BACKOFF_SECONDS) {
       if (Date.now() > deadline) {
         break;
@@ -254,13 +447,36 @@ export class BackfillRunner {
           break;
         }
       }
+      attempts++;
       try {
-        return await this.fetchRepoStream(descriptor);
+        const stream = await this.fetchRepoStream(descriptor);
+        if (hadConnectionError) {
+          logger.info(
+            {
+              did: descriptor.did,
+              pds: descriptor.pds,
+              attempts,
+            },
+            "Connection error resolved",
+          );
+        }
+        return stream;
       } catch (error) {
         if (!isConnectionError(error)) {
           throw error;
         }
+        hadConnectionError = true;
         lastError = error;
+        logger.warn(
+          {
+            did: descriptor.did,
+            pds: descriptor.pds,
+            attempt: attempts,
+            delaySeconds,
+            err: error,
+          },
+          "Connection error fetching repo; will retry",
+        );
       }
     }
     throw lastError ?? new RepoTimeoutError(descriptor.did);
@@ -273,40 +489,26 @@ class RepoTimeoutError extends Error {
   }
 }
 
-const NETWORK_BACKOFF_SECONDS = [0, 1, 2, 4, 8, 16, 32, 64, 128];
-
-class RateLimiter {
-  private tokens: number;
-  private lastRefill: number;
-
+class RepoValidationError extends Error {
   constructor(
-    private readonly capacity: number,
-    private readonly refillPerSec: number,
+    public readonly did: string,
+    message: string,
   ) {
-    this.tokens = capacity;
-    this.lastRefill = Date.now();
-  }
-
-  async take() {
-    this.refill();
-    while (this.tokens < 1) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      this.refill();
-    }
-    this.tokens -= 1;
-  }
-
-  private refill() {
-    const now = Date.now();
-    const elapsed = (now - this.lastRefill) / 1000;
-    if (elapsed <= 0) return;
-    this.tokens = Math.min(
-      this.capacity,
-      this.tokens + elapsed * this.refillPerSec,
-    );
-    this.lastRefill = now;
+    super(message);
   }
 }
+
+const NETWORK_BACKOFF_SECONDS = [0, 1, 2, 4, 8, 16, 32, 64, 128];
+const STATS_LOG_INTERVAL_MS = 20_000;
+
+type ValidationStats = {
+  processedRows: number;
+  insertedRows: number;
+  parquetRows: number;
+  existingRows: number;
+  totalRows: number;
+  extrasDetected: boolean;
+};
 
 type ClientErrorClassification =
   | { type: "terminal"; reason: string }
@@ -335,21 +537,31 @@ function classifyClientError(
   return { type: "unknown", reason: error.error ?? "unknown" };
 }
 
+const CONNECTION_ERROR_CODES = [
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "CONNECTIONREFUSED",
+  "FAILEDTOOPENSOCKET",
+];
+
 function isConnectionError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const code = (error as any).code ?? (error as any).errno;
   const message = (error as any).message ?? "";
   if (typeof code === "string") {
-    return [
-      "ECONNREFUSED",
-      "ENOTFOUND",
-      "ECONNRESET",
-      "ETIMEDOUT",
-      "ConnectionRefused",
-    ].some((token) => code.toUpperCase().includes(token));
+    const upperCode = code.toUpperCase();
+    if (CONNECTION_ERROR_CODES.some((token) => upperCode.includes(token))) {
+      return true;
+    }
   }
   if (typeof message === "string") {
-    return /unable to connect/i.test(message) || /timed out/i.test(message);
+    const lowerMessage = message.toLowerCase();
+    return (
+      lowerMessage.includes("unable to connect") ||
+      lowerMessage.includes("timed out")
+    );
   }
   return false;
 }

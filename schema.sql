@@ -60,9 +60,37 @@ create table if not exists repo_progress (
     repo_did          text primary key,
     last_rev          text not null,
     last_seq          bigint not null,
+    last_snapshot_row_count bigint,
+    last_snapshot_path text,
+    last_snapshot_parquet_count bigint,
     updated_at        timestamptz not null default now(),
     backfill_complete boolean not null default false
 );
+
+alter table if exists repo_progress
+    add column if not exists last_snapshot_row_count bigint;
+
+alter table if exists repo_progress
+    add column if not exists last_snapshot_path text;
+
+alter table if exists repo_progress
+    add column if not exists last_snapshot_parquet_count bigint;
+
+create table if not exists repo_validation_log (
+    validation_id    bigserial primary key,
+    repo_did         text not null,
+    validated_at     timestamptz not null default now(),
+    processed_rows   bigint not null,
+    inserted_rows    bigint not null,
+    parquet_rows     bigint not null,
+    existing_rows    bigint not null,
+    total_rows       bigint not null,
+    snapshot_path    text,
+    extras_detected  boolean not null default false
+);
+
+create index if not exists idx_repo_validation_log_repo
+    on repo_validation_log (repo_did, validated_at desc);
 
 do $$
 begin

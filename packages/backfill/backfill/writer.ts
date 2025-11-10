@@ -6,6 +6,8 @@ import type { NormalizedEmojiPost, PreparedEmojiRow } from "./types.js";
 
 export class EmojiPostWriter {
   private batch: PreparedEmojiRow[] = [];
+  private readonly parquetCountByRepo = new Map<string, number>();
+  private readonly insertedCountByRepo = new Map<string, number>();
 
   constructor(
     private readonly pool: Pool,
@@ -37,6 +39,8 @@ export class EmojiPostWriter {
     });
 
     await this.parquet.append(post, emojiIds);
+    const current = this.parquetCountByRepo.get(post.repoDid) ?? 0;
+    this.parquetCountByRepo.set(post.repoDid, current + 1);
 
     if (this.batch.length >= this.batchSize) {
       await this.flush();
@@ -47,11 +51,38 @@ export class EmojiPostWriter {
     if (this.batch.length === 0) return;
     const rows = this.batch;
     this.batch = [];
-    await insertEmojiRows(this.pool, rows);
+    const inserted = await insertEmojiRows(this.pool, rows);
+    if (inserted) {
+      for (const [repoDid, count] of inserted) {
+        const current = this.insertedCountByRepo.get(repoDid) ?? 0;
+        this.insertedCountByRepo.set(repoDid, current + count);
+      }
+    }
   }
 
   async close() {
     await this.flush();
     await this.parquet.close();
+  }
+
+  consumeParquetCount(repoDid: string) {
+    const count = this.parquetCountByRepo.get(repoDid) ?? 0;
+    this.parquetCountByRepo.delete(repoDid);
+    return count;
+  }
+
+  getCurrentSnapshotPath() {
+    return this.parquet.filePath;
+  }
+
+  consumeInsertedCount(repoDid: string) {
+    const count = this.insertedCountByRepo.get(repoDid) ?? 0;
+    this.insertedCountByRepo.delete(repoDid);
+    return count;
+  }
+
+  resetRepo(repoDid: string) {
+    this.parquetCountByRepo.delete(repoDid);
+    this.insertedCountByRepo.delete(repoDid);
   }
 }
