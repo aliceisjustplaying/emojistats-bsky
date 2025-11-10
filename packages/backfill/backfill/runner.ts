@@ -43,6 +43,7 @@ export class BackfillRunner {
     emojisProcessed: 0,
   };
   private statsTimer?: NodeJS.Timeout;
+  private readonly limiterByPds = new Map<string, RateLimiter>();
 
   constructor(
     private readonly config: BackfillConfig,
@@ -80,11 +81,18 @@ export class BackfillRunner {
 
   private async processRepo(descriptor: RepoDescriptor, queue: PQueue) {
     let inserted = 0;
+    const deadline = Date.now() + this.config.repoProcessingTimeoutMs;
     try {
-      const stream = await this.fetchRepoStream(descriptor);
+      const stream = await this.fetchRepoStreamWithBackoff(
+        descriptor,
+        deadline,
+      );
       const repo = RepoReader.fromStream(stream);
       try {
         for await (const { record, collection, rkey, cid } of repo) {
+          if (Date.now() > deadline) {
+            throw new RepoTimeoutError(descriptor.did);
+          }
           const cidString = typeof cid?.$link === "string" ? cid.$link : "";
           const normalized = normalizeRepoRecord({
             did: descriptor.did,
@@ -94,6 +102,9 @@ export class BackfillRunner {
             record,
           });
           if (!normalized) continue;
+          if (normalized.emojiGlyphs.length > this.config.emojiMaxPerPost) {
+            continue;
+          }
           await this.writer.enqueue(normalized);
           const emojiCount = normalized.emojiGlyphs.length;
           this.stats.emojisProcessed += emojiCount;
@@ -127,6 +138,15 @@ export class BackfillRunner {
         );
       }
     } catch (error) {
+      if (error instanceof RepoTimeoutError) {
+        console.warn(
+          `Repo ${descriptor.did} timed out after ${this.config.repoProcessingTimeoutMs}ms`,
+        );
+        this.stats.transientFailures++;
+        transientCounter.inc();
+        this.printStats(queue);
+        return;
+      }
       if (isConnectionError(error)) {
         console.warn(
           `Network error fetching ${descriptor.did}: ${(error as Error).message ?? error}`,
@@ -139,9 +159,11 @@ export class BackfillRunner {
       if (error instanceof ClientResponseError) {
         const classification = classifyClientError(error);
         if (classification.type === "terminal") {
-          console.warn(
-            `Skipping ${descriptor.did}: ${classification.reason} (${error.message ?? error.error})`,
-          );
+          if (process.env.EMOJI_BACKFILL_VERBOSE?.toLowerCase() === "true") {
+            console.info(
+              `Skipping ${descriptor.did}: ${classification.reason}`,
+            );
+          }
           await markRepoComplete(this.pool, descriptor.did);
           this.stats.skippedTerminal++;
           terminalSkips.inc();
@@ -185,6 +207,8 @@ export class BackfillRunner {
     attempt = 0,
   ): Promise<any> {
     try {
+      const limiter = this.getLimiter(descriptor.pds);
+      await limiter.take();
       return await this.xrpc.query(
         descriptor.pds,
         async (client) =>
@@ -192,6 +216,8 @@ export class BackfillRunner {
             params: { did: descriptor.did as any },
             as: "stream",
           }),
+        attempt,
+        { skipGlobalLimiter: true },
       );
     } catch (error) {
       if (error instanceof RetryError) {
@@ -200,6 +226,85 @@ export class BackfillRunner {
       }
       throw error;
     }
+  }
+
+  private getLimiter(pds: string) {
+    let limiter = this.limiterByPds.get(pds);
+    if (!limiter) {
+      limiter = new RateLimiter(20, 20);
+      this.limiterByPds.set(pds, limiter);
+    }
+    return limiter;
+  }
+
+  private async fetchRepoStreamWithBackoff(
+    descriptor: RepoDescriptor,
+    deadline: number,
+  ) {
+    let lastError: unknown;
+    for (const delaySeconds of NETWORK_BACKOFF_SECONDS) {
+      if (Date.now() > deadline) {
+        break;
+      }
+      if (delaySeconds > 0) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, delaySeconds * 1000),
+        );
+        if (Date.now() > deadline) {
+          break;
+        }
+      }
+      try {
+        return await this.fetchRepoStream(descriptor);
+      } catch (error) {
+        if (!isConnectionError(error)) {
+          throw error;
+        }
+        lastError = error;
+      }
+    }
+    throw lastError ?? new RepoTimeoutError(descriptor.did);
+  }
+}
+
+class RepoTimeoutError extends Error {
+  constructor(public readonly did: string) {
+    super(`Repo ${did} processing timed out`);
+  }
+}
+
+const NETWORK_BACKOFF_SECONDS = [0, 1, 2, 4, 8, 16, 32, 64, 128];
+
+class RateLimiter {
+  private tokens: number;
+  private lastRefill: number;
+
+  constructor(
+    private readonly capacity: number,
+    private readonly refillPerSec: number,
+  ) {
+    this.tokens = capacity;
+    this.lastRefill = Date.now();
+  }
+
+  async take() {
+    this.refill();
+    while (this.tokens < 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      this.refill();
+    }
+    this.tokens -= 1;
+  }
+
+  private refill() {
+    const now = Date.now();
+    const elapsed = (now - this.lastRefill) / 1000;
+    if (elapsed <= 0) return;
+    this.tokens = Math.min(
+      this.capacity,
+      this.tokens + elapsed * this.refillPerSec,
+    );
+    this.lastRefill = now;
   }
 }
 

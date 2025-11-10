@@ -1,4 +1,3 @@
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -13,6 +12,8 @@ export type BackfillConfig = {
   didLimit?: number;
   repoConcurrency: number;
   metricsPort: number;
+  emojiMaxPerPost: number;
+  repoProcessingTimeoutMs: number;
 };
 
 const DEFAULT_PARQUET_DIR = path.resolve(
@@ -62,13 +63,10 @@ export function loadConfig(): BackfillConfig {
     : undefined;
   const didLimit = optionalNumber("EMOJI_BACKFILL_DID_LIMIT");
 
-  const cpuCount =
-    typeof os.availableParallelism === "function"
-      ? os.availableParallelism()
-      : os.cpus().length;
-  const repoConcurrency =
-    optionalNumber("EMOJI_BACKFILL_CONCURRENCY") ??
-    Math.max(2, Math.min(16, Math.floor(cpuCount / 2)));
+  const repoConcurrency = optionalNumber("EMOJI_BACKFILL_CONCURRENCY") ?? 64;
+  const emojiMaxPerPost = optionalNumber("EMOJI_MAX_PER_POST") ?? 250;
+  const repoProcessingTimeoutMs =
+    optionalNumber("REPO_PROCESSING_TIMEOUT_MS") ?? 5 * 60 * 1000;
 
   const metricsPort = optionalNumber("BACKFILL_METRICS_PORT") ?? 9465;
 
@@ -83,5 +81,7 @@ export function loadConfig(): BackfillConfig {
     didLimit,
     repoConcurrency,
     metricsPort,
+    emojiMaxPerPost,
+    repoProcessingTimeoutMs,
   };
 }

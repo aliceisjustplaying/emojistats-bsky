@@ -44,6 +44,9 @@ async function main() {
     try {
       const normalized = normalizeEvent(event);
       if (!normalized) return;
+      if (normalized.emojiGlyphs.length > config.emojiMaxPerPost) {
+        return;
+      }
       await handleNormalized(normalized, pool, dimensions, redisStore);
     } catch (err) {
       errorCounter.inc({ type: err instanceof Error ? err.name : "unknown" });

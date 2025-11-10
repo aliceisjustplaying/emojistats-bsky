@@ -12,18 +12,20 @@ This package replays **every** Bluesky repo, filters down to `app.bsky.feed.post
 
 Copy `.env.example` to `.env` and update the values:
 
-| Variable                       | Description                                                                     |
-| ------------------------------ | ------------------------------------------------------------------------------- |
-| `EMOJISTATS_DATABASE_URL`      | Connection string that points at the Timescale instance seeded by `schema.sql`. |
-| `EMOJISTATS_DATABASE_SCHEMA`   | Schema name (defaults to `public`).                                             |
-| `BSKY_DID_PLC_URL`             | PLC directory to resolve DIDs (e.g. `https://plc.directory`).                   |
-| `FALLBACK_PLC_URL`             | Optional PLC mirror.                                                            |
-| `EMOJI_BACKFILL_PARQUET_DIR`   | Where Parquet files are written (one file per run).                             |
-| `EMOJI_BACKFILL_CURSOR_CACHE`  | Location for `pds-cursor-cache.json`; defaults to the copy in this package.     |
-| `EMOJI_BACKFILL_DID_ALLOWLIST` | Optional newline-separated list of DIDs to run (useful for targeted tests).     |
-| `EMOJI_BACKFILL_DID_LIMIT`     | Optional numeric limit so you can stop after _n_ repos (handy on laptops).      |
-| `EMOJI_BACKFILL_CONCURRENCY`   | How many repos to process in parallel (defaults to ~half your local cores).     |
-| `BACKFILL_METRICS_PORT`        | Port for the Prometheus `/metrics` endpoint (defaults to `9465`).               |
+| Variable                       | Description                                                                             |
+| ------------------------------ | --------------------------------------------------------------------------------------- |
+| `EMOJISTATS_DATABASE_URL`      | Connection string that points at the Timescale instance seeded by `schema.sql`.         |
+| `EMOJISTATS_DATABASE_SCHEMA`   | Schema name (defaults to `public`).                                                     |
+| `BSKY_DID_PLC_URL`             | PLC directory to resolve DIDs (e.g. `https://plc.directory`).                           |
+| `FALLBACK_PLC_URL`             | Optional PLC mirror.                                                                    |
+| `EMOJI_BACKFILL_PARQUET_DIR`   | Where Parquet files are written (one file per run).                                     |
+| `EMOJI_BACKFILL_CURSOR_CACHE`  | Location for `pds-cursor-cache.json`; defaults to the copy in this package.             |
+| `EMOJI_BACKFILL_DID_ALLOWLIST` | Optional newline-separated list of DIDs to run (useful for targeted tests).             |
+| `EMOJI_BACKFILL_DID_LIMIT`     | Optional numeric limit so you can stop after _n_ repos (handy on laptops).              |
+| `EMOJI_BACKFILL_CONCURRENCY`   | How many repos to process in parallel (defaults to ~half your local cores).             |
+| `BACKFILL_METRICS_PORT`        | Port for the Prometheus `/metrics` endpoint (defaults to `9465`).                       |
+| `EMOJI_MAX_PER_POST`           | Maximum emojis per post to accept; posts above the limit are discarded (default `250`). |
+| `REPO_PROCESSING_TIMEOUT_MS`   | Maximum time (ms) to spend on a single repo before skipping (default `300000`).         |
 
 ## Running Locally
 

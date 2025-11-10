@@ -23,6 +23,45 @@ const retryableStatusCodes = new Set([
 ]);
 const maxRetries = 5;
 
+type QueryOptions = {
+  skipGlobalLimiter?: boolean;
+};
+
+class RateLimiter {
+  private tokens: number;
+  private lastRefill: number;
+
+  constructor(
+    private readonly capacity: number,
+    private readonly refillPerSec: number,
+  ) {
+    this.tokens = capacity;
+    this.lastRefill = Date.now();
+  }
+
+  async take() {
+    this.refill();
+    while (this.tokens < 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      this.refill();
+    }
+    this.tokens -= 1;
+  }
+
+  private refill() {
+    const now = Date.now();
+    const elapsed = (now - this.lastRefill) / 1000;
+    if (elapsed <= 0) return;
+    this.tokens = Math.min(
+      this.capacity,
+      this.tokens + elapsed * this.refillPerSec,
+    );
+    this.lastRefill = now;
+  }
+}
+
+const GLOBAL_LIMITER = new RateLimiter(3000, 10); // 3000 requests / 5 minutes
+
 export class XRPCManager {
   clients = new Map<string, Client>();
 
@@ -30,8 +69,12 @@ export class XRPCManager {
     service: string,
     fn: (client: Client) => Promise<T>,
     attempt = 0,
+    options?: QueryOptions,
   ): Promise<ExtractSuccessData<T>> {
     try {
+      if (!options?.skipGlobalLimiter) {
+        await GLOBAL_LIMITER.take();
+      }
       return await this.queryNoRetry(service, fn);
     } catch (error) {
       this.maybeRetry(error, service, attempt++);

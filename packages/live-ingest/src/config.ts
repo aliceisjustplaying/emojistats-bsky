@@ -27,4 +27,5 @@ export const config = {
   redisKeyPrefix: process.env.REDIS_KEY_PREFIX ?? "emoji",
   concurrency: optionalNumber("LIVE_INGEST_CONCURRENCY", 8),
   cursorOverridePath: process.env.CURSOR_OVERRIDE_PATH,
+  emojiMaxPerPost: optionalNumber("EMOJI_MAX_PER_POST", 250),
 };
