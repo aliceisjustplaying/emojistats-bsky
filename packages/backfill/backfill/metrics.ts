@@ -81,6 +81,12 @@ export const queuePendingGauge = new Gauge({
   registers: [registry],
 });
 
+export const redisStreamBacklogGauge = new Gauge({
+  name: "emoji_backfill_stream_backlog",
+  help: "Approximate backlog length reported by Redis stream",
+  registers: [registry],
+});
+
 export function startMetricsServer(port: number) {
   const server = http.createServer(async (req, res) => {
     if (!req.url) {

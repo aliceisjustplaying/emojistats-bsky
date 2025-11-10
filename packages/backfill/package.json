@@ -4,6 +4,8 @@
   "scripts": {
     "build": "tsc",
     "backfill": "bun --env-file=.env backfill/main.ts",
+    "backfill:producer": "bun --env-file=.env scripts/backfillProducer.ts",
+    "clean-state": "bun --env-file=.env scripts/cleanState.ts",
     "reset-db": "bun --env-file=.env scripts/resetDb.ts",
     "refresh-aggregates": "bun --env-file=.env scripts/refreshAggregates.ts",
     "check-validation": "bun --env-file=.env scripts/checkValidation.ts"

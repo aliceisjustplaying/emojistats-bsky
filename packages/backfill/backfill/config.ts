@@ -11,7 +11,7 @@ export type BackfillConfig = {
   allowlistPath?: string;
   didLimit?: number;
   repoConcurrency: number;
-  metricsPort: number;
+  metricsPort?: number;
   emojiMaxPerPost: number;
   repoProcessingTimeoutMs: number;
 };
@@ -46,6 +46,24 @@ function optionalNumber(name: string): number | undefined {
   return parsed;
 }
 
+function parseMetricsPort(): number | undefined {
+  const raw = process.env.BACKFILL_METRICS_PORT;
+  if (raw === undefined || raw.length === 0) {
+    return 9465;
+  }
+  const parsed = Number(raw);
+  if (Number.isNaN(parsed)) {
+    throw new Error("Env var BACKFILL_METRICS_PORT must be a number");
+  }
+  if (parsed < 0) {
+    throw new Error("BACKFILL_METRICS_PORT cannot be negative");
+  }
+  if (parsed === 0) {
+    return undefined;
+  }
+  return parsed;
+}
+
 export function loadConfig(): BackfillConfig {
   const databaseUrl = requireEnv("EMOJISTATS_DATABASE_URL");
   const databaseSchema = process.env.EMOJISTATS_DATABASE_SCHEMA ?? "public";
@@ -68,7 +86,7 @@ export function loadConfig(): BackfillConfig {
   const repoProcessingTimeoutMs =
     optionalNumber("REPO_PROCESSING_TIMEOUT_MS") ?? 5 * 60 * 1000;
 
-  const metricsPort = optionalNumber("BACKFILL_METRICS_PORT") ?? 9465;
+  const metricsPort = parseMetricsPort();
 
   return {
     databaseUrl,

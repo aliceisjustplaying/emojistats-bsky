@@ -1,23 +1,24 @@
 import PQueue from "p-queue";
+import { setTimeout as sleep } from "node:timers/promises";
 import { RepoReader } from "@atcute/car/v4";
 import { ClientResponseError } from "@atcute/client";
 import type { Pool } from "pg";
-import { fetchAllDids } from "./util/fetch.js";
 import { XRPCManager, RetryError } from "./util/xrpc.js";
 import { normalizeRepoRecord } from "./postExtractor.js";
 import type { BackfillConfig } from "./config.js";
 import { EmojiPostWriter } from "./writer.js";
-import { loadAllowlist } from "./allowlist.js";
 import {
   countRepoEmojiPosts,
   isRepoComplete,
   markRepoComplete,
+  markRepoPending,
   recordRepoValidation,
 } from "./db.js";
 import type { RepoDescriptor } from "./types.js";
 import {
   queuePendingGauge,
   queueSizeGauge,
+  redisStreamBacklogGauge,
   reposCompleted,
   terminalSkips,
   transientFailures as transientCounter,
@@ -29,6 +30,16 @@ import {
 } from "./metrics.js";
 import { RateLimiter } from "./util/rateLimiter.js";
 import { logger } from "./logger.js";
+import type { ConsumerQueueConfig } from "./queue/config.js";
+import {
+  ackJobs,
+  claimStalledJobs,
+  ensureStream,
+  getStreamLength,
+  readJobs,
+  type RedisStreamClient,
+  type RepoJobMessage,
+} from "./queue/redisStream.js";
 
 const TERMINAL_ERROR_REASON = new Map<string, string>([
   ["RepoDeactivated", "repo deactivated"],
@@ -55,46 +66,152 @@ export class BackfillRunner {
   private readonly limiterByPds = new Map<string, RateLimiter>();
   private lastStatsLogMs = 0;
   private readonly inFlight = new Set<string>();
+  private stalledClaimCursor = "0-0";
 
   constructor(
     private readonly config: BackfillConfig,
     private readonly pool: Pool,
     private readonly writer: EmojiPostWriter,
+    private readonly queueConfig: ConsumerQueueConfig,
+    private readonly redis: RedisStreamClient,
   ) {}
 
   async run() {
-    const allowlist = await loadAllowlist(this.config.allowlistPath);
     const queue = new PQueue({ concurrency: this.config.repoConcurrency });
     this.statsTimer = setInterval(() => this.printStats(queue), 10000);
 
-    let scheduled = 0;
+    await ensureStream(this.redis, {
+      stream: this.queueConfig.streamName,
+      group: this.queueConfig.groupName,
+    });
 
-    for await (const [did, pds] of fetchAllDids()) {
-      if (allowlist && !allowlist.has(did)) continue;
-      if (this.inFlight.has(did)) continue;
-      if (await isRepoComplete(this.pool, did)) continue;
-      this.inFlight.add(did);
-
-      const descriptor: RepoDescriptor = { did, pds };
-      queue.add(async () => {
-        try {
-          await this.processRepo(descriptor, queue);
-        } finally {
-          this.inFlight.delete(descriptor.did);
-        }
-      });
-      scheduled++;
-      this.stats.scheduled++;
-
-      if (this.config.didLimit && scheduled >= this.config.didLimit) {
-        break;
+    try {
+      await this.consumeQueue(queue);
+    } finally {
+      if (this.statsTimer) {
+        clearInterval(this.statsTimer);
+        this.printStats(queue, true);
       }
     }
+  }
 
-    await queue.onIdle();
-    if (this.statsTimer) {
-      clearInterval(this.statsTimer);
-      this.printStats(queue, true);
+  private async consumeQueue(queue: PQueue) {
+    const softLimit = Math.max(this.config.repoConcurrency * 4, 1);
+    while (true) {
+      if (queue.size >= softLimit) {
+        await queue.onSizeLessThan(this.config.repoConcurrency);
+      }
+      let jobs: RepoJobMessage[] = [];
+      try {
+        jobs = await readJobs({
+          client: this.redis,
+          stream: this.queueConfig.streamName,
+          group: this.queueConfig.groupName,
+          consumer: this.queueConfig.consumerName,
+          count: this.queueConfig.readCount,
+          blockMs: this.queueConfig.blockMs,
+        });
+        void this.updateStreamBacklogMetric();
+      } catch (error) {
+        logger.error({ err: error }, "Failed to read jobs from Redis stream");
+        await sleep(1000);
+        continue;
+      }
+
+      if (jobs.length === 0) {
+        await this.reclaimStalled(queue);
+        continue;
+      }
+
+      queue.addAll(
+        jobs.map((job) => this.processRepoJob.bind(this, job, queue)),
+      );
+    }
+  }
+
+  private async reclaimStalled(queue: PQueue) {
+    try {
+      const { jobs, nextCursor } = await claimStalledJobs({
+        client: this.redis,
+        stream: this.queueConfig.streamName,
+        group: this.queueConfig.groupName,
+        consumer: this.queueConfig.consumerName,
+        minIdleMs: this.queueConfig.stalledMinIdleMs,
+        count: this.queueConfig.stalledClaimCount,
+        cursor: this.stalledClaimCursor,
+      });
+      this.stalledClaimCursor = nextCursor;
+      if (jobs.length) {
+        logger.info({ count: jobs.length }, "Reclaimed stalled repo jobs");
+        queue.addAll(
+          jobs.map((job) => this.processRepoJob.bind(this, job, queue)),
+        );
+      }
+    } catch (error) {
+      logger.error({ err: error }, "Failed to reclaim stalled jobs");
+    }
+  }
+
+  private async processRepoJob(job: RepoJobMessage, queue: PQueue) {
+    const descriptor: RepoDescriptor = {
+      did: job.payload.did,
+      pds: job.payload.pds,
+    };
+
+    if (!descriptor.did || !descriptor.pds) {
+      logger.warn({ jobId: job.id }, "Skipping job with invalid payload");
+      await this.ackJob(job);
+      return;
+    }
+
+    if (this.inFlight.has(descriptor.did)) {
+      logger.debug({ did: descriptor.did }, "Dropping duplicate in-flight job");
+      await this.ackJob(job);
+      return;
+    }
+
+    this.inFlight.add(descriptor.did);
+    try {
+      if (await isRepoComplete(this.pool, descriptor.did)) {
+        logger.debug(
+          { did: descriptor.did },
+          "Repo already complete; ACKing job",
+        );
+        return;
+      }
+      await markRepoPending(this.pool, descriptor.did);
+      this.stats.scheduled++;
+      await this.processRepo(descriptor, queue);
+    } catch (error) {
+      logger.error({ err: error, did: descriptor.did }, "Repo job failed");
+    } finally {
+      this.inFlight.delete(descriptor.did);
+      await this.ackJob(job);
+    }
+  }
+
+  private async ackJob(job: RepoJobMessage) {
+    try {
+      await ackJobs({
+        client: this.redis,
+        stream: this.queueConfig.streamName,
+        group: this.queueConfig.groupName,
+        ids: [job.id],
+      });
+    } catch (error) {
+      logger.error({ err: error, jobId: job.id }, "Failed to ACK repo job");
+    }
+  }
+
+  private async updateStreamBacklogMetric() {
+    try {
+      const length = await getStreamLength(
+        this.redis,
+        this.queueConfig.streamName,
+      );
+      redisStreamBacklogGauge.set(length);
+    } catch (error) {
+      logger.debug({ err: error }, "Unable to read Redis stream backlog");
     }
   }
 

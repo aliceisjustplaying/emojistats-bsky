@@ -24,31 +24,24 @@ export async function fetchPdses(): Promise<Array<string>> {
   return pdses;
 }
 
-export async function* fetchAllDids() {
-  const pdses = await fetchPdses();
+export type ListReposPage = {
+  cursor?: string;
+  repos: Array<{ did: string }>;
+};
 
-  const cursors = getPdsCursorCache();
-  const pdsesToFetchFrom = pdses.filter((pds) => cursors[pds] !== "DONE");
-
-  yield* roundRobinInterleaveIterators(pdsesToFetchFrom.map(fetchPdsDids));
-}
-
-async function* fetchPdsDids(pds: string) {
-  let cursor = getPdsCursorCache()?.[pds] ?? "";
-  if (cursor === "DONE") {
-    logger.warn({ pds }, "Skipping exhausted PDS");
-    return;
-  }
-  const url = new URL(`/xrpc/com.atproto.sync.listRepos`, pds).href;
-  let fetched = 0;
+export async function listReposPage(
+  pds: string,
+  cursor: string,
+): Promise<ListReposPage | null> {
+  const url = new URL(`/xrpc/com.atproto.sync.listRepos`, pds);
+  url.searchParams.set("limit", "1000");
+  url.searchParams.set("cursor", cursor);
   while (true) {
     try {
-      const res = await fetch(url + "?limit=1000&cursor=" + cursor, {
-        signal: AbortSignal.timeout(10_000),
-      });
+      const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
       if (!res?.ok) {
         if (res?.status === 429) {
-          await processRatelimitHeaders(res.headers, url);
+          await processRatelimitHeaders(res.headers, url.href);
           continue;
         }
         throw new Error(
@@ -57,20 +50,8 @@ async function* fetchPdsDids(pds: string) {
           }`,
         );
       }
-
-      const { cursor: _c, repos } = (await res.json()) as {
-        cursor: string;
-        repos: Array<{ did: string }>;
-      };
-      for (const repo of repos) {
-        if (!repo.did) continue;
-        yield [repo.did, pds] as const;
-        fetched++;
-      }
-
-      if (!_c || _c === cursor) break;
-      pdsCursorCache[pds] = cursor = _c;
-      savePdsCursorCache();
+      const { cursor: nextCursor, repos } = (await res.json()) as ListReposPage;
+      return { cursor: nextCursor, repos };
     } catch (err: any) {
       const undiciError =
         err instanceof errors.UndiciError
@@ -78,6 +59,7 @@ async function* fetchPdsDids(pds: string) {
           : err instanceof Error && err.cause instanceof errors.UndiciError
             ? err.cause
             : null;
+      const cursorLabel = cursor && cursor.length > 0 ? cursor : "<start>";
       if (
         [
           "ETIMEDOUT",
@@ -87,33 +69,61 @@ async function* fetchPdsDids(pds: string) {
         ].includes(undiciError?.code ?? "")
       ) {
         logger.warn(
-          { url, pds, code: undiciError?.code },
+          { url: url.href, pds, code: undiciError?.code },
           "listRepos connect failure",
         );
-        break;
-      } else {
-        const cursorLabel = cursor && cursor.length > 0 ? cursor : "<start>";
-        const reason = err?.message ?? `${err}`;
-        if (pds.includes("bsky.network")) {
-          logger.warn(
-            { url, cursor: cursorLabel, reason },
-            "listRepos transient failure",
-          );
-          await sleep(5000);
-        } else {
-          logger.warn(
-            { url, cursor: cursorLabel, reason },
-            "listRepos giving up",
-          );
-          break;
-        }
+        return null;
       }
+      const reason = err?.message ?? `${err}`;
+      if (pds.includes("bsky.network")) {
+        logger.warn(
+          { url: url.href, cursor: cursorLabel, reason },
+          "listRepos transient failure",
+        );
+        await sleep(5000);
+        continue;
+      }
+      logger.warn(
+        { url: url.href, cursor: cursorLabel, reason },
+        "listRepos giving up",
+      );
+      return null;
     }
+  }
+}
+
+export async function* fetchAllDids() {
+  const pdses = await fetchPdses();
+
+  const cursors = getPdsCursorSnapshot();
+  const pdsesToFetchFrom = pdses.filter((pds) => cursors[pds] !== "DONE");
+
+  yield* roundRobinInterleaveIterators(pdsesToFetchFrom.map(fetchPdsDids));
+}
+
+async function* fetchPdsDids(pds: string) {
+  let cursor = getPdsCursorValue(pds) ?? "";
+  if (cursor === "DONE") {
+    logger.warn({ pds }, "Skipping exhausted PDS");
+    return;
+  }
+  let fetched = 0;
+  while (true) {
+    const page = await listReposPage(pds, cursor);
+    if (!page) break;
+    for (const repo of page.repos) {
+      if (!repo.did) continue;
+      yield [repo.did, pds] as const;
+      fetched++;
+    }
+    const nextCursor = page.cursor;
+    if (!nextCursor || nextCursor === cursor) break;
+    setPdsCursorValue(pds, nextCursor);
+    cursor = nextCursor;
   }
   const cursorLabel = cursor && cursor.length > 0 ? cursor : "<start>";
   logger.info({ pds, fetched, cursor: cursorLabel }, "PDS repos exhausted");
-  pdsCursorCache[pds] = "DONE";
-  savePdsCursorCache();
+  markPdsDone(pds);
   return fetched;
 }
 
@@ -182,7 +192,25 @@ const getPdsCursorCache = () => {
 const savePdsCursorCache = () =>
   writeFileSync(cursorCachePath, JSON.stringify(pdsCursorCache));
 
-async function processRatelimitHeaders(headers: Headers, url: string) {
+export function getPdsCursorSnapshot() {
+  return { ...getPdsCursorCache() };
+}
+
+export function getPdsCursorValue(pds: string) {
+  return getPdsCursorCache()?.[pds];
+}
+
+export function setPdsCursorValue(pds: string, cursor: string) {
+  getPdsCursorCache()[pds] = cursor;
+  savePdsCursorCache();
+}
+
+export function markPdsDone(pds: string) {
+  getPdsCursorCache()[pds] = "DONE";
+  savePdsCursorCache();
+}
+
+export async function processRatelimitHeaders(headers: Headers, url: string) {
   const remainingHeader = headers.get("ratelimit-remaining"),
     resetHeader = headers.get("ratelimit-reset");
   if (!remainingHeader || !resetHeader) return;

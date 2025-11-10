@@ -188,6 +188,15 @@ export async function isRepoComplete(
   return rows[0]?.backfill_complete ?? false;
 }
 
+export async function markRepoPending(pool: Pool, did: string) {
+  await pool.query(
+    `INSERT INTO repo_progress (repo_did, last_rev, last_seq, backfill_complete)
+		VALUES ($1, $2, $3, false)
+		ON CONFLICT (repo_did) DO UPDATE SET backfill_complete = false, updated_at = NOW()`,
+    [did, "backfill", 0],
+  );
+}
+
 export async function markRepoComplete(
   pool: Pool,
   did: string,

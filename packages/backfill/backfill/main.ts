@@ -7,6 +7,8 @@ import { BackfillRunner } from "./runner.js";
 import { setCursorCachePath } from "./util/fetch.js";
 import { startMetricsServer } from "./metrics.js";
 import { logger } from "./logger.js";
+import { loadConsumerQueueConfig } from "./queue/config.js";
+import { createRedisStreamClient } from "./queue/redisStream.js";
 
 async function main() {
   const config = loadConfig();
@@ -22,15 +24,25 @@ async function main() {
   const parquet = await ParquetSink.create(config.parquetDir);
   const writer = new EmojiPostWriter(pool, dimensions, parquet);
 
-  const runner = new BackfillRunner(config, pool, writer);
-  const metricsServer = startMetricsServer(config.metricsPort);
+  const queueConfig = loadConsumerQueueConfig();
+  const redis = createRedisStreamClient({
+    url: queueConfig.redisUrl,
+    name: queueConfig.consumerName,
+  });
+  await redis.connect();
+
+  const runner = new BackfillRunner(config, pool, writer, queueConfig, redis);
+  const metricsServer = config.metricsPort
+    ? startMetricsServer(config.metricsPort)
+    : null;
 
   try {
     await runner.run();
   } finally {
     await writer.close();
     await pool.end();
-    metricsServer.close();
+    await redis.quit();
+    metricsServer?.close();
   }
 }
 
