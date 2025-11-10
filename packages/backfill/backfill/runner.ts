@@ -10,6 +10,16 @@ import { EmojiPostWriter } from "./writer.js";
 import { loadAllowlist } from "./allowlist.js";
 import { isRepoComplete, markRepoComplete } from "./db.js";
 import type { RepoDescriptor } from "./types.js";
+import {
+  queuePendingGauge,
+  queueSizeGauge,
+  reposCompleted,
+  terminalSkips,
+  transientFailures as transientCounter,
+  unknownFailures as unknownCounter,
+  postsInserted as postsCounter,
+  emojisProcessed as emojisCounter,
+} from "./metrics.js";
 
 const TERMINAL_ERROR_REASON = new Map<string, string>([
   ["RepoDeactivated", "repo deactivated"],
@@ -85,7 +95,11 @@ export class BackfillRunner {
           });
           if (!normalized) continue;
           await this.writer.enqueue(normalized);
-          this.stats.emojisProcessed += normalized.emojiGlyphs.length;
+          const emojiCount = normalized.emojiGlyphs.length;
+          this.stats.emojisProcessed += emojiCount;
+          if (emojiCount > 0) {
+            emojisCounter.inc(emojiCount);
+          }
           inserted++;
         }
       } catch (err) {
@@ -101,8 +115,12 @@ export class BackfillRunner {
       }
 
       await markRepoComplete(this.pool, descriptor.did);
+      reposCompleted.inc();
       this.stats.completed++;
       this.stats.postsInserted += inserted;
+      if (inserted > 0) {
+        postsCounter.inc(inserted);
+      }
       if (process.env.EMOJI_BACKFILL_VERBOSE?.toLowerCase() === "true") {
         console.info(
           `Finished ${descriptor.did}: inserted ${inserted} emoji posts`,
@@ -114,6 +132,7 @@ export class BackfillRunner {
           `Network error fetching ${descriptor.did}: ${(error as Error).message ?? error}`,
         );
         this.stats.transientFailures++;
+        transientCounter.inc();
         this.printStats(queue);
         return;
       }
@@ -125,6 +144,7 @@ export class BackfillRunner {
           );
           await markRepoComplete(this.pool, descriptor.did);
           this.stats.skippedTerminal++;
+          terminalSkips.inc();
           this.printStats(queue);
           return;
         }
@@ -133,11 +153,13 @@ export class BackfillRunner {
             `Transient failure for ${descriptor.did}: ${classification.reason}. Will retry on a later run.`,
           );
           this.stats.transientFailures++;
+          transientCounter.inc();
           this.printStats(queue);
           return;
         }
       }
       this.stats.unknownFailures++;
+      unknownCounter.inc();
       console.error(`Failed to process ${descriptor.did}:`, error);
       this.printStats(queue);
     }
@@ -145,6 +167,11 @@ export class BackfillRunner {
 
   private printStats(queue: PQueue, final = false) {
     const label = final ? "progress (final)" : "progress";
+    queueSizeGauge.set(queue.size);
+    queuePendingGauge.set(queue.pending);
+    // ensure counters are registered even if zero
+    postsCounter.inc(0);
+    emojisCounter.inc(0);
     console.info(
       `[${label}] scheduled=${this.stats.scheduled} completed=${this.stats.completed} ` +
         `terminal_skips=${this.stats.skippedTerminal} transient=${this.stats.transientFailures} ` +

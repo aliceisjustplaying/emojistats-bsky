@@ -18,7 +18,7 @@
 ## TODO / next steps
 
 1. **Finish historical backfill** on a Hetzner box (AX102+). Monitor disk usage, repo lag, and `terminal_skips` until we hit cursor 0.
-2. **Live ingest:** seed Redis 8 time-series from Timescale, then add a Jetstream consumer that keeps both Redis and Timescale in sync after backfill completes.
-3. **Expose stats:** backend endpoints for daily/hourly/top emoji queries; frontend toggle to read Timescale for historical ranges and Redis for the real-time ticker.
-4. **Ops polish:** add monitoring (Prometheus/Grafana), automated aggregate refresh jobs, backups for Parquet + Timescale chunks, and optional dimension seeding.
-5. **Stretch goals:** text storage toggle (adds ~100 GB), thread-level analytics via reply URI splits, and CLI tooling for selective reprocessing.
+2. **Live ingest:** use `packages/live-ingest` to seed Redis (`bun run seed-redis`) and start the Jetstream worker (`bun run start`) so Redis + Timescale stay current.
+3. **Deployment plan:** run backfill + live ingest as separate services (systemd/pm2), expose both Prometheus endpoints (`BACKFILL_METRICS_PORT`, `LIVE_METRICS_PORT`), and wire Grafana/alerts plus regular Timescale/Parquet backups.
+4. **Expose stats:** backend endpoints for daily/hourly/top emoji queries; frontend toggle to read Timescale for historical ranges and Redis for the real-time ticker.
+5. **Ops polish / stretch:** optional text storage toggle (~100 GB), thread-level analytics via reply URI splits, CLI tooling for selective reprocessing, and automated Parquet lifecycle policies.

@@ -12,6 +12,7 @@ export type BackfillConfig = {
   allowlistPath?: string;
   didLimit?: number;
   repoConcurrency: number;
+  metricsPort: number;
 };
 
 const DEFAULT_PARQUET_DIR = path.resolve(
@@ -69,6 +70,8 @@ export function loadConfig(): BackfillConfig {
     optionalNumber("EMOJI_BACKFILL_CONCURRENCY") ??
     Math.max(2, Math.min(16, Math.floor(cpuCount / 2)));
 
+  const metricsPort = optionalNumber("BACKFILL_METRICS_PORT") ?? 9465;
+
   return {
     databaseUrl,
     databaseSchema,
@@ -79,5 +82,6 @@ export function loadConfig(): BackfillConfig {
     allowlistPath,
     didLimit,
     repoConcurrency,
+    metricsPort,
   };
 }

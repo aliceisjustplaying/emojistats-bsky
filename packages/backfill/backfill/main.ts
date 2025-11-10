@@ -5,6 +5,7 @@ import { ParquetSink } from "./parquetSink.js";
 import { EmojiPostWriter } from "./writer.js";
 import { BackfillRunner } from "./runner.js";
 import { setCursorCachePath } from "./util/fetch.js";
+import { startMetricsServer } from "./metrics.js";
 
 async function main() {
   const config = loadConfig();
@@ -21,12 +22,14 @@ async function main() {
   const writer = new EmojiPostWriter(pool, dimensions, parquet);
 
   const runner = new BackfillRunner(config, pool, writer);
+  const metricsServer = startMetricsServer(config.metricsPort);
 
   try {
     await runner.run();
   } finally {
     await writer.close();
     await pool.end();
+    metricsServer.close();
   }
 }
 

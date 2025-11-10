@@ -23,6 +23,7 @@ Copy `.env.example` to `.env` and update the values:
 | `EMOJI_BACKFILL_DID_ALLOWLIST` | Optional newline-separated list of DIDs to run (useful for targeted tests).     |
 | `EMOJI_BACKFILL_DID_LIMIT`     | Optional numeric limit so you can stop after _n_ repos (handy on laptops).      |
 | `EMOJI_BACKFILL_CONCURRENCY`   | How many repos to process in parallel (defaults to ~half your local cores).     |
+| `BACKFILL_METRICS_PORT`        | Port for the Prometheus `/metrics` endpoint (defaults to `9465`).               |
 
 ## Running Locally
 
@@ -38,6 +39,9 @@ Tips for local development:
 - Set `EMOJI_BACKFILL_DID_LIMIT=1000` to ingest a small slice of the network.
 - You can point `EMOJI_BACKFILL_DID_ALLOWLIST` at a text file with a handful of interesting DIDs to smoke-test the pipeline.
 - Parquet output lands in `EMOJI_BACKFILL_PARQUET_DIR` (default `packages/backfill/data/parquet`).
+- Run `bun run refresh-aggregates` after a backfill to populate the hourly/daily views.
+- `bun run reset-db` wipes fact + dimension tables (handy for repeat tests).
+- Metrics are exposed at `http://localhost:$BACKFILL_METRICS_PORT/metrics` for Prometheus/Grafana.
 
 ## What the backfill does
 
