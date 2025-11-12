@@ -1,102 +1,54 @@
-# Project Status (Nov 10 2025)
+# Project Status (Nov 12 2025)
 
 ## What we know
 
-- Emoji-bearing posts are ~22.65% of Bluesky traffic; a full historical ingest is ≈4.8e8 rows and stays <120 GB even when we store redundant URIs.
-- The forked `packages/backfill` pipeline can enumerate PDS hosts via `listRepos`, fetch CAR archives, normalize emoji with `packages/emoji-normalization`, and stream results into Timescale + Parquet.
-- Edge cases we already hardened against: repo deactivations/takedowns, corrupt CAR streams, invalid rkeys/TIDs, connection refusals, and UnknownXRPC 404s.
-- Network limits: `getRepo` is enforced at 20 req/sec per PDS, and all other atproto calls share a global 3k/5‑min bucket. The code now has token buckets for both.
-- External research: `futur_backfill_findings.md` captures lessons from Futur’s Oct 2025 AppView backfill (storage, COPY-based writes, worker sizing, live ingest throughput).
-- Validation: the backfill now compares per-repo Parquet rows, INSERTed rows, and Timescale totals; if Timescale gains extra rows from live ingest during validation we log the delta but only fail when Timescale is _missing_ rows.
-- Reference: the upstream Bluesky AppView backfill (~/src/a/atproto, branch `divy/backfill`) runs a ListRepos → Redis queue → `RepoBackfiller` pipeline with explicit stream backpressure, chunked CAR processing, and high-water-mark cutoffs—use it for rate-limit/backpressure ideas.
-- Migration in progress (2025-11-12): implementing Nexus-based backfill via `packages/unified-ingest` to replace the Bun/Redis pipeline. See `nexus_migration_plan.md` for step-by-step guide.
+- Historical emoji ingest is handled by Nexus (backfill + live firehose) feeding the unified ingest worker in `packages/unified-ingest`.
+- Nexus enumerates repos, fetches full CAR snapshots from each PDS, and streams live events (`live: true`). The worker reads those events, normalizes them, writes Timescale + Parquet, and validates each repo.
+- Validation compares Parquet row counts, Timescale inserts, and existing totals. We treat extra Timescale rows (due to live Jetstream traffic) as informational but fail if Timescale is missing rows.
+- Some repos never emit live emoji posts. `backfill_complete` flips to `true` once we see the first `live: true` emoji event. Emoji-scarce repos may stay `false` indefinitely even though their historical data is present.
+- Slow PDS hosts require a larger Nexus repo-fetch timeout. Run Nexus with `--repo-fetch-timeout=180s` (or set `NEXUS_REPO_FETCH_TIMEOUT=180s`) so resync workers don’t time out while streaming large CARs.
+- Unified ingest exposes Prometheus metrics (`INGEST_METRICS_PORT`), per-repo progress logging (`INGEST_PROGRESS_LOG_EVERY`, `INGEST_PROGRESS_LOG_INTERVAL_MS`), and drains Jetstream cursors from Redis.
 
 ## Current setup
 
-- Schema (`schema.sql`) defines Timescale hypertables plus hourly/daily continuous aggregates; helper scripts:
-  - `bun run backfill` – emoji-only historical ingest.
-  - `bun run refresh-aggregates` – refreshes `language_daily_totals` + `emoji_daily_stats` after a data load.
-  - `bun run reset-db` – wipes fact + dimension tables (use with caution).
-  - `bun run clean-state` – truncates DB tables, deletes the Redis stream, and removes the cursor cache so runs start fresh.
-  - `bun run backfill:producer` – enumerates PDS hosts and writes `{did,pds}` jobs into Redis (rate-limited with a high-water mark).
-- Backfill emits Parquet snapshots under `packages/backfill/data/parquet/` for replay/debugging.
-- Progress logging now shows scheduled/completed repos plus cumulative posts+emoji counts; terminal skips are recorded so we don’t retry dead repos.
-- Redis queue pipeline in progress:
-  - `bun run backfill:producer` enumerates PDS hosts and enqueues `{did,pds}` jobs into the Redis stream (`BACKFILL_REDIS_URL`, `BACKFILL_STREAM_NAME`, `BACKFILL_GROUP_NAME`, `BACKFILL_HIGH_WATER`).
-  - `bun run backfill` now acts as the consumer; set `BACKFILL_CONSUMER_NAME`, optional `BACKFILL_READ_COUNT/BLOCK_MS`, and it will pull from Redis, process repos, and expose backlog metrics via Prometheus.
+- Schema (`schema.sql`) defines Timescale hypertables plus hourly/daily aggregates.
+- Unified ingest helper scripts:
+  - `bun run clean-state` (from `packages/unified-ingest`) – truncates DB tables, clears the Jetstream cursor key, and removes any cursor override file so runs start fresh.
+  - `bun run start` – launches the worker. Configure with `.env` (database URL, `INGEST_SOURCE`, `NEXUS_URL`, Jetstream settings, etc.).
+- Nexus helper notes:
+  - Run with `--repo-fetch-timeout=180s --disable-acks=false` when consuming via unified ingest.
+  - Monitor the `repos` table (`state = error/resyncing`) to requeue any DID stuck due to PDS failures.
+- Parquet snapshots emit to `packages/unified-ingest/data/parquet/` for replay/debugging.
+- Progress logging:
+  - Per-repo logs fire every `INGEST_PROGRESS_LOG_EVERY` events (default 500) and at least every `INGEST_PROGRESS_LOG_INTERVAL_MS` milliseconds (default 30 s). These logs show `emojiEvents`, `filteredEvents`, and elapsed seconds per repo so long-running backfills appear “alive”.
 
-### Running the Redis-backed backfill locally
+## Running the Nexus-backed ingest locally
 
-1. `cd packages/backfill && bun run clean-state` – reset Timescale tables, clear the Redis stream, and delete `pds-cursor-cache.json`.
-2. Ensure Redis is running (`BACKFILL_REDIS_URL`, default `redis://localhost:6379`) and adjust `.env` with any DID limits or concurrency overrides. If you run multiple consumers, give each a unique `BACKFILL_METRICS_PORT` (or set it to `0` to disable metrics for that worker).
-3. In one shell, run `bun run backfill:producer` to enumerate PDS hosts; it will pause automatically if the Redis stream exceeds `BACKFILL_HIGH_WATER`.
-4. In another shell (per worker), export a unique `BACKFILL_CONSUMER_NAME` and run `bun run backfill` to consume jobs; start multiple workers by giving each a distinct consumer name.
-5. Monitor `http://<host>:BACKFILL_METRICS_PORT/metrics` for `emoji_backfill_stream_backlog`, `emoji_backfill_queue_*`, and per-PDS counters to verify progress; run `bun run refresh-aggregates` once historical ingest completes.
+1. Start Nexus (SQLite is fine for dev):
+   ```bash
+   cd ~/src/a/indigo/cmd/nexus
+   go run . --disable-acks=false \
+     --repo-fetch-timeout=180s \
+     --collection-filters=app.bsky.feed.post
+   ```
+2. In another shell, reset state: `cd packages/unified-ingest && bun run clean-state`.
+3. Start the worker: `bun run start` (set `INGEST_SOURCE=nexus` or `both`).
+4. Use `psql` to watch `repo_progress` and `repo_validation_log` for completion, or tail the logs for `"Repo ingest progress"` entries.
+5. For repos that never emit live emoji, post a manual emoji from that DID to flip `backfill_complete` to `true` (optional).
 
 ## TODO / next steps
 
-1. **Finish historical backfill** on a Hetzner box (AX102+). Monitor disk usage, repo lag, and `terminal_skips` until we hit cursor 0.
-2. **Live ingest:** use `packages/live-ingest` to seed Redis (`bun run seed-redis`) and start the Jetstream worker (`bun run start`). Jetstream respects the same rate limits, so Redis + Timescale stay current without hammering PDS hosts.
-3. **Deployment plan:** run backfill + live ingest as separate services (systemd/pm2), expose both Prometheus endpoints (`BACKFILL_METRICS_PORT`, `LIVE_METRICS_PORT`), and wire Grafana/alerts plus regular Timescale/Parquet backups.
-4. **Expose stats:** backend endpoints for daily/hourly/top emoji queries; frontend toggle to read Timescale for historical ranges and Redis for the real-time ticker.
-5. **Ops polish / stretch:** optional text storage toggle (~100 GB), thread-level analytics via reply URI splits, CLI tooling for selective reprocessing, automated Parquet lifecycle policies, and alerts for hitting rate-limit buckets.
-6. **Backfill reliability backlog (2025-11-10T21:21:31Z):**
-   - Validation artifacts: persist per-repo Timescale + Parquet counts (and checksum later) so retries know when a snapshot is trustworthy, plus tooling to diff/count when numbers drift.
-   - Queue/backpressure split: decouple `listRepos` enumeration from repo fetch/writes (Redis or similar) and add a high-water-mark check like Bluesky’s `streamLengthBackpressure`.
-   - COPY metrics & tuning: benchmark the new temp-table/COPY path, expose flush duration + rows/sec, and add knobs for batch size before raising repo concurrency.
-   - Retry hygiene: cap per-PDS retry loops, track retry counters in metrics, and store high-water marks (last seq per DID) so we skip CARs that only contain duplicates.
-   - Live ingest SLOs: define acceptable Jetstream lag + throughput, add dashboards/alerts, and be ready to swap runtimes if Node workers cap out around 200 events/sec.
-   - Storage lifecycle: formalize Parquet retention + Timescale chunk pruning/backups to keep the <120 GB target even if scope expands.
-   - See `backfill_rewrite_v2_plan.md` for the detailed producer/consumer rewrite blueprint (Redis streams, durable in-flight tracking, backpressure, ops tooling).
-7. **Status checkpoint (2025-11-10T21:21:31Z):**
+1. **Hetzner deployment:** run Nexus + unified ingest on a dedicated box (AX102+). Monitor disk usage, repo states (`repos.state` in Nexus), and unified-ingest metrics until all target DIDs validate.
+2. **Live ingest:** keep the Jetstream adapter enabled (`INGEST_SOURCE=both`) so Timescale stays current once historical backfill completes. Jetstream cursor persistence lives in Redis (`JETSTREAM_CURSOR_KEY`).
+3. **Monitoring/alerts:** wire Grafana dashboards for:
+   - Nexus repo states (`pending`, `resyncing`, `error`, `active`)
+   - Unified ingest counters (`emoji_ingest_events_total`, `events_failed_total`, ack lag)
+   - Timescale/parquet row growth
+4. **Ops polish:** decide how to mark repos “complete” when they’ll never emit live emoji (e.g., treat `repo_progress.backfill_complete=false` but `repo_validation_log` present as acceptable). Consider auto-flipping the flag after a successful validation even without a live emoji.
+5. **Final migration:** once Nexus + unified ingest prove reliable, archive any remaining Bun/Redis tooling (already removed from the repo) and document the deployment playbook in `nexus_migration_plan.md`.
 
-   - Implemented: COPY-based writer, per-repo validation logging, snapshot counts persisted in `repo_progress`, faster parallel validation checker, and a best-effort in-memory in-flight guard.
-   - Current issue: even on a reset DB, `listRepos` emits duplicate descriptors quickly enough that we re-run the same DID sequentially, so Timescale sees duplicates/extras immediately and `check-validation` reports drift for every repo.
-   - Planned fix: refactor to Bluesky/Futur’s Redis-backed pipeline—`listRepos` producer writes repo jobs into a Redis stream (with cursors + backpressure) and consumer workers pull from it via consumer groups, giving durable in-flight tracking and eliminating duplicate scheduling.
+## Status checkpoints
 
-8. **Status checkpoint (2025-11-10T22:38:41Z):**
-
-   - Redis producer/consumer rewrite is functional, but the producer still lacks a hard `EMOJI_BACKFILL_DID_LIMIT`, so the first end-to-end test overshot the intended 10k repos and was halted manually.
-   - Next actions before another run: add a global DID limit (or other stop conditions) to the producer, ship queue inspection/drain scripts, and decide on shared rate-limit coordination so multiple consumers don’t exceed per-PDS quotas.
-
-9. **Status checkpoint (2025-11-12T19:00:50Z):**
-
-   - We have only ever ran the backfill on my laptop for 10000 DIDs, and found the "drift" issue.
-
-10. **Status checkpoint (2025-11-12T19:31:55Z):**
-
-    - **Unified ingest package implemented**: Created `packages/unified-ingest` with Nexus and Jetstream adapters, unified event processing, and shared writer pipeline.
-    - **Features**: Timer-based flush (60s), error handling for unhandled rejections, per-repo validation tracking, and comprehensive Prometheus metrics (ack lag, repo completions, validation errors, etc.).
-    - **Architecture**: Single worker supports both Nexus (backfill) and Jetstream (live) sources via configurable `INGEST_SOURCE` env var. Reuses Timescale/Parquet writer components from `packages/backfill`.
-    - **Next steps**: Follow `nexus_migration_plan.md` Step 1-2 (run Nexus locally, add test repos), then Step 9 (test with multiple repos) to validate before production deployment.
-    - **Code review fixes**: Addressed timer-based flush, Jetstream error handling, repo validation tracking, and metrics coverage per review findings.
-
-11. **Status checkpoint (2025-11-12T20:07:37Z):**
-
-    - **Production-ready fixes**: Resolved critical batching, durability, and reliability issues:
-      - **Batching restored**: Implemented flush promise system where multiple events share the same flush promise, maintaining batch performance (up to 500 rows per COPY) while ensuring durability before ack
-      - **Error resilience**: Flush promise always resolves even on DB errors (try/finally), preventing pipeline from hanging after transient failures
-      - **Concurrent acks**: Acks run concurrently via `Promise.allSettled` to prevent slow Redis writes from blocking Nexus acks when multiple sources configured
-      - **Non-emoji acks**: All events (including filtered ones) are acknowledged in finally block to prevent Nexus stalling and ensure Jetstream cursor advances
-    - **Status**: Code complete and tested locally. Ready for Step 9 (multi-repo testing) and production deployment.
-
-12. **Status checkpoint (2025-11-12T20:28:22Z):**
-
-    - **Edge case handling**: Fixed issues discovered during multi-repo testing:
-      - **Timestamp validation**: Added validation in adapters and normalizer to filter out invalid timestamps (e.g., Unix epoch 1970, year 55648) before they reach the database, preventing PostgreSQL COPY failures
-      - **Clean ack handling**: Refactored Nexus adapter to use private `ackById()` method for filtered events instead of creating fake UnifiedEvents, improving code clarity and separation of concerns
-      - **Filtered event acks**: Invalid timestamp events are now filtered at adapter level and acked immediately, preventing Nexus stalling on corrupted repos
-      - **Date range validation**: Timestamps must be between 2000-01-01 and 2100-01-01 with valid ISO format
-    - **Testing**: Successfully handling repos with edge cases (corrupted timestamps, invalid dates). Ready for continued multi-repo testing and production deployment.
-
-13. **Status checkpoint (2025-11-12T21:45:00Z):**
-
-    - **Durable acks**: `writer.waitForFlush()` now triggers/awaits immediate flushes, so every Nexus/Jetstream ack happens only after Timescale COPY completes, even for <500-row batches.
-    - **No more low-volume stalls**: The writer keeps flushing while new rows arrive mid-flush, eliminating the “first repo runs, queue stops at 1” issue during small tests.
-    - **Ack failures retry**: Adapter acks are logged and bubbled up as processing errors, guaranteeing retries instead of silently drifting cursors.
-    - **Docs synced**: `nexus_migration_plan.md` documents the durability + ack requirements so the migration steps stay accurate.
-
-14. **Status checkpoint (2025-11-12T22:54:00Z):**
-    - **Progress visibility**: Unified ingest now logs per-repo progress every `INGEST_PROGRESS_LOG_EVERY` events and at least once per `INGEST_PROGRESS_LOG_INTERVAL_MS` (defaults: 500 events / 30 s). Use these env vars to tune CLI verbosity when chewing through emoji-scarce repos.
-    - **Backfill completeness signal**: A repo flips to `backfill_complete=true` once we see the first `live:true` event; making a new emoji-bearing post (e.g., `did:plc:by3jhwdqgbtrcc7q4tkkv3cf`) confirms the end-to-end path.
-    - **Nexus tuning**: Slow PDSes require higher `--repo-fetch-timeout`; upgrade Nexus to the new flag (default 30 s, pass `180s` for Hetzner hosts) so CAR downloads don’t time out mid-resync.
+- **2025-11-10:** Legacy Bun/Redis pipeline retired. Nexus + unified ingest under active development.
+- **2025-11-12 21:45 UTC:** Durable acks, immediate flushes, and per-repo progress logging added to unified ingest. Nexus repo-fetch timeout made configurable (set to 180 s for slow hosts).
+- **2025-11-12 22:54 UTC:** All six test repos drained via Nexus + unified ingest, `backfill_complete` flips once a live emoji is observed. Backfill cleanup scripts moved under `packages/unified-ingest`.
