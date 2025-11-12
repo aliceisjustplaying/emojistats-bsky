@@ -16,7 +16,6 @@ import {
   ackLagSeconds,
   repoCompletions,
   parquetRows,
-  timescaleRows,
   validationErrors,
 } from "./metrics.js";
 import { createClient } from "redis";
@@ -82,11 +81,43 @@ async function main() {
     );
   }
 
+  const ackEvent = async (
+    event: UnifiedEvent,
+    ackStartTime: number,
+    context: "filtered" | "processed",
+  ) => {
+    const results = await Promise.allSettled(
+      adapters.map(({ adapter }) => adapter.ack(event)),
+    );
+
+    const failures = results
+      .map((result, idx) =>
+        result.status === "rejected"
+          ? {
+              err: result.reason,
+              adapter: adapters[idx].name,
+              context,
+              source: event.source,
+              nexusEventId: event.nexusEventId,
+            }
+          : null,
+      )
+      .filter((value): value is NonNullable<typeof value> => value !== null);
+
+    if (failures.length > 0) {
+      for (const failure of failures) {
+        logger.error(failure, "Ack failed for adapter");
+      }
+      throw new Error(`Ack failed during ${context} ack`);
+    }
+
+    const ackDuration = (Date.now() - ackStartTime) / 1000;
+    ackLagSeconds.observe({ source: event.source }, ackDuration);
+  };
+
   // Set up event handler
   const handleEvent = async (event: UnifiedEvent) => {
     const ackStartTime = Date.now();
-    let shouldAck = false;
-    let hasEmoji = false;
 
     try {
       eventsReceived.inc({
@@ -116,20 +147,24 @@ async function main() {
       }
 
       const normalized = normalizeUnifiedEvent(event);
-      if (!normalized) {
-        // Not a post with emoji - ack immediately in finally block
-        shouldAck = true;
-        return;
-      }
-
-      if (normalized.emojiGlyphs.length > config.emojiMaxPerPost) {
-        // Too many emojis - ack immediately in finally block
-        shouldAck = true;
+      if (
+        !normalized ||
+        normalized.emojiGlyphs.length > config.emojiMaxPerPost
+      ) {
+        logger.debug(
+          {
+            repoDid: event.repoDid,
+            rkey: event.rkey,
+            source: event.source,
+            nexusEventId: event.nexusEventId,
+          },
+          "Event filtered out by normalizer (no emoji, invalid timestamp, or emoji limit exceeded)",
+        );
+        await ackEvent(event, ackStartTime, "filtered");
         return;
       }
 
       // Post has emoji - process it
-      hasEmoji = true;
       await writer.enqueue(normalized);
       eventsProcessed.inc({ source: event.source });
 
@@ -147,31 +182,7 @@ async function main() {
       await writer.waitForFlush();
 
       // Now safe to ack - data is durable
-      // Use Promise.allSettled to ack all adapters concurrently, preventing slow Redis
-      // writes from blocking Nexus acks when multiple sources are configured
-      shouldAck = true;
-      const ackResults = await Promise.allSettled(
-        adapters.map(({ adapter }) => adapter.ack(event)),
-      );
-
-      // Log any failed acks for observability
-      for (let i = 0; i < ackResults.length; i++) {
-        const result = ackResults[i];
-        if (result.status === "rejected") {
-          logger.error(
-            {
-              err: result.reason,
-              source: event.source,
-              adapter: adapters[i].adapter.constructor.name,
-            },
-            "Ack failed for adapter",
-          );
-        }
-      }
-
-      // Record ack lag
-      const ackDuration = (Date.now() - ackStartTime) / 1000;
-      ackLagSeconds.observe({ source: event.source }, ackDuration);
+      await ackEvent(event, ackStartTime, "processed");
     } catch (error) {
       logger.error(
         { err: error, source: event.source },
@@ -181,35 +192,7 @@ async function main() {
         source: event.source,
         reason: error instanceof Error ? error.name : "unknown",
       });
-      // Don't ack on error - let adapter retry
-      shouldAck = false;
-    } finally {
-      // Always ack non-emoji events (even if they were filtered out)
-      // This prevents Nexus from stalling and ensures Jetstream cursor advances
-      if (shouldAck && !hasEmoji) {
-        // Use concurrent acks for consistency with emoji event path
-        const ackResults = await Promise.allSettled(
-          adapters.map(({ adapter }) => adapter.ack(event)),
-        );
-
-        // Log any failed acks for observability
-        for (let i = 0; i < ackResults.length; i++) {
-          const result = ackResults[i];
-          if (result.status === "rejected") {
-            logger.error(
-              {
-                err: result.reason,
-                source: event.source,
-                adapter: adapters[i].adapter.constructor.name,
-              },
-              "Failed to ack filtered event",
-            );
-          }
-        }
-
-        const ackDuration = (Date.now() - ackStartTime) / 1000;
-        ackLagSeconds.observe({ source: event.source }, ackDuration);
-      }
+      // Ack failures propagate through ackEvent, so no ack in catch/finally
     }
   };
 

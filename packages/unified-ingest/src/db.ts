@@ -167,7 +167,9 @@ export async function insertEmojiRows(
 }
 
 async function copyRowsIntoStage(client: PoolClient, rows: PreparedEmojiRow[]) {
-  const copyStream = client.query(copyFrom(COPY_INTO_STAGE_SQL));
+  const copyStream = (client.query as unknown as (config: unknown) => unknown)(
+    copyFrom(COPY_INTO_STAGE_SQL),
+  ) as NodeJS.WritableStream;
   const source = Readable.from(generateCsvRows(rows), {
     objectMode: false,
   });

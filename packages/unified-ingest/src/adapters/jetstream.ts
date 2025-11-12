@@ -1,4 +1,5 @@
-import { CommitCreateEvent, Jetstream } from "@skyware/jetstream";
+import { Jetstream } from "@skyware/jetstream";
+import type { CommitCreateEvent } from "@skyware/jetstream";
 import type { UnifiedEvent, EventAdapter } from "./types.js";
 import { logger } from "../logger.js";
 import { parse as parseTid } from "@atcute/tid";
@@ -150,10 +151,25 @@ export class JetstreamAdapter implements EventAdapter {
     rkey: string,
     did: string,
   ): { createdAt: Date; seq: number } {
+    // Valid date range: 2000-01-01 to 2100-01-01
+    const MIN_VALID_DATE = new Date("2000-01-01T00:00:00Z").getTime();
+    const MAX_VALID_DATE = new Date("2100-01-01T00:00:00Z").getTime();
+
+    const isValidDate = (date: Date): boolean => {
+      const time = date.getTime();
+      return (
+        !Number.isNaN(time) &&
+        time >= MIN_VALID_DATE &&
+        time <= MAX_VALID_DATE &&
+        date.toISOString().match(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/) !==
+          null
+      );
+    };
+
     // Try createdAt field first
     const createdAtField =
       typeof record?.createdAt === "string" ? new Date(record.createdAt) : null;
-    if (createdAtField && !Number.isNaN(createdAtField.getTime())) {
+    if (createdAtField && isValidDate(createdAtField)) {
       return {
         createdAt: createdAtField,
         seq: createdAtField.getTime() * 1000,
@@ -163,12 +179,21 @@ export class JetstreamAdapter implements EventAdapter {
     // Fall back to TID parsing
     try {
       const tid = parseTid(rkey);
-      return { createdAt: new Date(tid.timestamp), seq: tid.timestamp };
+      const tidDate = new Date(tid.timestamp);
+      if (isValidDate(tidDate)) {
+        return { createdAt: tidDate, seq: tid.timestamp };
+      }
     } catch {
-      // Last resort: use current time
-      const now = new Date();
-      return { createdAt: now, seq: now.getTime() * 1000 };
+      // TID parsing failed
     }
+
+    // Last resort: use current time (but log the issue)
+    logger.warn(
+      { did, rkey, createdAt: record?.createdAt },
+      "Invalid timestamp, using current time as fallback",
+    );
+    const now = new Date();
+    return { createdAt: now, seq: now.getTime() * 1000 };
   }
 
   private async loadCursor(): Promise<number | undefined> {

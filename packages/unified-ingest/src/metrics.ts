@@ -1,4 +1,4 @@
-import { Registry, Counter, Gauge, Histogram } from "prom-client";
+import { Registry, Counter, Histogram } from "prom-client";
 import { createServer } from "node:http";
 
 const registry = new Registry();

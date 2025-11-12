@@ -10,9 +10,7 @@ export class EmojiPostWriter {
   private readonly parquetCountByRepo = new Map<string, number>();
   private readonly insertedCountByRepo = new Map<string, number>();
   private flushTimer?: NodeJS.Timeout;
-  // Track pending flush promise - multiple events can await the same flush
-  private pendingFlushPromise: Promise<void> | null = null;
-  private pendingFlushResolver: (() => void) | null = null;
+  private activeFlush: Promise<void> | null = null;
 
   constructor(
     private readonly pool: Pool,
@@ -55,13 +53,6 @@ export class EmojiPostWriter {
     const current = this.parquetCountByRepo.get(post.repoDid) ?? 0;
     this.parquetCountByRepo.set(post.repoDid, current + 1);
 
-    // Create flush promise for this batch if it doesn't exist
-    if (!this.pendingFlushPromise) {
-      this.pendingFlushPromise = new Promise<void>((resolve) => {
-        this.pendingFlushResolver = resolve;
-      });
-    }
-
     // If batch is full, flush immediately
     if (this.batch.length >= this.batchSize) {
       await this.flush();
@@ -74,37 +65,48 @@ export class EmojiPostWriter {
    * allowing batching while ensuring durability before ack.
    */
   async waitForFlush(): Promise<void> {
-    // If batch is empty, there's nothing to wait for
-    if (this.batch.length === 0 && !this.pendingFlushPromise) {
-      return;
-    }
-    // If there's a pending flush promise, await it
-    if (this.pendingFlushPromise) {
-      await this.pendingFlushPromise;
+    while (true) {
+      if (!this.activeFlush) {
+        if (this.batch.length === 0) {
+          return;
+        }
+        this.activeFlush = this.flushOnce();
+      }
+
+      await this.activeFlush;
+
+      if (this.batch.length === 0) {
+        return;
+      }
     }
   }
 
-  async flush() {
-    if (this.batch.length === 0) {
-      // Resolve any pending flush promise even if batch is empty
-      if (this.pendingFlushResolver) {
-        this.pendingFlushResolver();
-        this.pendingFlushResolver = null;
-        this.pendingFlushPromise = null;
+  async flush(): Promise<void> {
+    while (true) {
+      if (!this.activeFlush) {
+        if (this.batch.length === 0) {
+          return;
+        }
+        this.activeFlush = this.flushOnce();
       }
+
+      await this.activeFlush;
+
+      if (this.batch.length === 0) {
+        return;
+      }
+    }
+  }
+
+  private async flushOnce(): Promise<void> {
+    const rows = this.batch;
+    if (rows.length === 0) {
+      this.activeFlush = null;
       return;
     }
-
-    const rows = this.batch;
     this.batch = [];
 
-    // Capture the resolver before clearing it
-    const resolver = this.pendingFlushResolver;
-    this.pendingFlushResolver = null;
-    this.pendingFlushPromise = null;
-
     try {
-      // Perform the actual flush
       const inserted = await insertEmojiRows(this.pool, rows);
       if (inserted) {
         let totalInserted = 0;
@@ -113,16 +115,10 @@ export class EmojiPostWriter {
           this.insertedCountByRepo.set(repoDid, current + count);
           totalInserted += count;
         }
-        // Update metrics
         timescaleRows.inc(totalInserted);
       }
     } finally {
-      // CRITICAL: Always resolve the promise, even if flush failed
-      // This prevents all pending waitForFlush() calls from hanging forever
-      // The error will still propagate, but events can ack and retry
-      if (resolver) {
-        resolver();
-      }
+      this.activeFlush = null;
     }
   }
 
@@ -132,6 +128,9 @@ export class EmojiPostWriter {
       this.flushTimer = undefined;
     }
     await this.flush();
+    if (this.activeFlush) {
+      await this.activeFlush;
+    }
     await this.parquet.close();
   }
 

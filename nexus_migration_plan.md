@@ -11,8 +11,12 @@
 - ✅ Non-emoji event acks (prevents stalling)
 - ✅ Repo validation and progress tracking
 - ✅ Comprehensive Prometheus metrics
+- ✅ Timestamp validation (filters invalid dates before database, prevents COPY failures)
+- ✅ Edge case handling (corrupted timestamps, invalid dates handled gracefully)
 
-**Next Steps**: Step 9 (multi-repo testing) → Step 10-11 (production deployment)
+**Current Status**: Step 9 (multi-repo testing) in progress. Successfully handling repos with edge cases. Ready for production deployment after validation completes.
+
+**Next Steps**: Complete Step 9 validation → Step 10-11 (production deployment)
 
 ## Philosophy
 
@@ -219,6 +223,12 @@ Break this into tiny, testable steps. Each step should be completable in <1 hour
    - Send ack after successful write
 
 **Success criteria**: Events appear in `emoji_post` table, counts match events received.
+
+**Implementation note (2025-11-12)**:
+
+- `EmojiPostWriter.waitForFlush()` now triggers immediate flushes and loops while new rows arrive, so acks happen only after Timescale COPY completes—even for <500-row batches.
+- Adapter acks run concurrently but failures raise processing errors, guaranteeing retries instead of silently drifting Nexus/Jetstream cursors.
+- Validation helpers call `writer.flush()` to drain any in-flight batches before comparing Timescale vs Parquet counts.
 
 ---
 

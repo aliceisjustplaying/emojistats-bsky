@@ -72,9 +72,25 @@
     - **Code review fixes**: Addressed timer-based flush, Jetstream error handling, repo validation tracking, and metrics coverage per review findings.
 
 11. **Status checkpoint (2025-11-12T20:07:37Z):**
+
     - **Production-ready fixes**: Resolved critical batching, durability, and reliability issues:
       - **Batching restored**: Implemented flush promise system where multiple events share the same flush promise, maintaining batch performance (up to 500 rows per COPY) while ensuring durability before ack
       - **Error resilience**: Flush promise always resolves even on DB errors (try/finally), preventing pipeline from hanging after transient failures
       - **Concurrent acks**: Acks run concurrently via `Promise.allSettled` to prevent slow Redis writes from blocking Nexus acks when multiple sources configured
       - **Non-emoji acks**: All events (including filtered ones) are acknowledged in finally block to prevent Nexus stalling and ensure Jetstream cursor advances
     - **Status**: Code complete and tested locally. Ready for Step 9 (multi-repo testing) and production deployment.
+
+12. **Status checkpoint (2025-11-12T20:28:22Z):**
+
+    - **Edge case handling**: Fixed issues discovered during multi-repo testing:
+      - **Timestamp validation**: Added validation in adapters and normalizer to filter out invalid timestamps (e.g., Unix epoch 1970, year 55648) before they reach the database, preventing PostgreSQL COPY failures
+      - **Clean ack handling**: Refactored Nexus adapter to use private `ackById()` method for filtered events instead of creating fake UnifiedEvents, improving code clarity and separation of concerns
+      - **Filtered event acks**: Invalid timestamp events are now filtered at adapter level and acked immediately, preventing Nexus stalling on corrupted repos
+      - **Date range validation**: Timestamps must be between 2000-01-01 and 2100-01-01 with valid ISO format
+    - **Testing**: Successfully handling repos with edge cases (corrupted timestamps, invalid dates). Ready for continued multi-repo testing and production deployment.
+
+13. **Status checkpoint (2025-11-12T21:45:00Z):**
+    - **Durable acks**: `writer.waitForFlush()` now triggers/awaits immediate flushes, so every Nexus/Jetstream ack happens only after Timescale COPY completes, even for <500-row batches.
+    - **No more low-volume stalls**: The writer keeps flushing while new rows arrive mid-flush, eliminating the “first repo runs, queue stops at 1” issue during small tests.
+    - **Ack failures retry**: Adapter acks are logged and bubbled up as processing errors, guaranteeing retries instead of silently drifting cursors.
+    - **Docs synced**: `nexus_migration_plan.md` documents the durability + ack requirements so the migration steps stay accurate.
