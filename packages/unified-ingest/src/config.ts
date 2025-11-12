@@ -26,10 +26,16 @@ export const config = {
   parquetDir: process.env.EMOJI_BACKFILL_PARQUET_DIR ?? "./data/parquet",
   emojiMaxPerPost: optionalNumber("EMOJI_MAX_PER_POST", 250),
   metricsPort: optionalNumber("INGEST_METRICS_PORT", 0),
+  progressLogEvery: optionalNumber("INGEST_PROGRESS_LOG_EVERY", 500),
+  progressLogIntervalMs: optionalNumber(
+    "INGEST_PROGRESS_LOG_INTERVAL_MS",
+    30_000,
+  ),
 
   // Nexus config
   nexusUrl: process.env.NEXUS_URL ?? "ws://localhost:8080/channel",
-  nexusAckTimeout: optionalNumber("NEXUS_ACK_TIMEOUT", 10000),
+  // Default must be longer than flush interval (60s) to prevent false timeouts
+  nexusAckTimeout: optionalNumber("NEXUS_ACK_TIMEOUT", 90000), // 90 seconds
 
   // Jetstream config
   jetstreamEndpoint:

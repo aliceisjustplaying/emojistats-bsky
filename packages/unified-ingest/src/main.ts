@@ -41,11 +41,65 @@ async function main() {
   const parquet = await ParquetSink.create(config.parquetDir);
   const writer = new EmojiPostWriter(pool, dimensions, parquet);
 
+  type RepoRuntimeState = {
+    lastWasLive: boolean;
+    processedCount: number;
+    filteredCount: number;
+    firstSeenAt: Date;
+    lastProgressLogMs: number;
+  };
+
   // Track repo state for completion detection (Nexus backfill -> live transition)
-  const repoState = new Map<
-    string,
-    { lastWasLive: boolean; processedCount: number; firstSeenAt: Date }
-  >();
+  const repoState = new Map<string, RepoRuntimeState>();
+
+  const ensureRepoState = (event: UnifiedEvent): RepoRuntimeState => {
+    let state = repoState.get(event.repoDid);
+    if (!state) {
+      state = {
+        lastWasLive: event.isLive,
+        processedCount: 0,
+        filteredCount: 0,
+        firstSeenAt: new Date(),
+        lastProgressLogMs: Date.now(),
+      };
+      repoState.set(event.repoDid, state);
+    }
+    return state;
+  };
+
+  const logRepoProgress = (
+    repoDid: string,
+    state: RepoRuntimeState,
+    progressType: "filtered" | "emoji" | "periodic",
+  ) => {
+    const now = Date.now();
+    const reachedCountThreshold =
+      (progressType === "filtered" &&
+        (state.filteredCount === 1 ||
+          state.filteredCount % config.progressLogEvery === 0)) ||
+      (progressType === "emoji" &&
+        (state.processedCount === 1 ||
+          state.processedCount % config.progressLogEvery === 0));
+
+    const reachedTimeThreshold =
+      now - state.lastProgressLogMs >= config.progressLogIntervalMs;
+
+    if (!reachedCountThreshold && !reachedTimeThreshold) {
+      return;
+    }
+
+    state.lastProgressLogMs = now;
+    logger.info(
+      {
+        repoDid,
+        progressType,
+        emojiEvents: state.processedCount,
+        filteredEvents: state.filteredCount,
+        elapsedSeconds: Math.round((now - state.firstSeenAt.getTime()) / 1000),
+      },
+      "Repo ingest progress",
+    );
+  };
 
   const adapters: Array<{
     adapter: import("./adapters/types.js").EventAdapter;
@@ -118,6 +172,8 @@ async function main() {
   // Set up event handler
   const handleEvent = async (event: UnifiedEvent) => {
     const ackStartTime = Date.now();
+    const hasExistingState = repoState.has(event.repoDid);
+    const repoStateEntry = ensureRepoState(event);
 
     try {
       eventsReceived.inc({
@@ -127,23 +183,15 @@ async function main() {
 
       // Track repo state for Nexus backfill completion detection
       if (event.source === "nexus") {
-        const repoStateEntry = repoState.get(event.repoDid);
-        if (!repoStateEntry) {
+        if (!hasExistingState) {
           // First time seeing this repo
           await markRepoPending(pool, event.repoDid);
-          repoState.set(event.repoDid, {
-            lastWasLive: event.isLive,
-            processedCount: 0,
-            firstSeenAt: new Date(),
-          });
-        } else {
-          // Check for backfill completion: transition from live:false to live:true
-          if (!repoStateEntry.lastWasLive && event.isLive) {
-            await validateAndCompleteRepo(event.repoDid, writer, pool);
-            repoCompletions.inc({ source: event.source });
-          }
-          repoStateEntry.lastWasLive = event.isLive;
+        } else if (!repoStateEntry.lastWasLive && event.isLive) {
+          // Backfill finished, live stream has started
+          await validateAndCompleteRepo(event.repoDid, writer, pool);
+          repoCompletions.inc({ source: event.source });
         }
+        repoStateEntry.lastWasLive = event.isLive;
       }
 
       const normalized = normalizeUnifiedEvent(event);
@@ -160,6 +208,8 @@ async function main() {
           },
           "Event filtered out by normalizer (no emoji, invalid timestamp, or emoji limit exceeded)",
         );
+        repoStateEntry.filteredCount++;
+        logRepoProgress(event.repoDid, repoStateEntry, "filtered");
         await ackEvent(event, ackStartTime, "filtered");
         return;
       }
@@ -169,10 +219,8 @@ async function main() {
       eventsProcessed.inc({ source: event.source });
 
       // Track metrics
-      const repoStateEntry = repoState.get(event.repoDid);
-      if (repoStateEntry) {
-        repoStateEntry.processedCount++;
-      }
+      repoStateEntry.processedCount++;
+      logRepoProgress(event.repoDid, repoStateEntry, "emoji");
       parquetRows.inc();
       // Note: timescaleRows is incremented in writer.flush() via inserted count
 
@@ -289,6 +337,13 @@ async function main() {
       validationErrors.inc({ repo_did: repoDid });
     }
   }
+
+  // Periodic progress logs to show repo states even when counts aren't moving
+  setInterval(() => {
+    for (const [repoDid, state] of repoState.entries()) {
+      logRepoProgress(repoDid, state, "periodic");
+    }
+  }, config.progressLogIntervalMs).unref();
 
   // Register event handlers
   for (const { adapter, name } of adapters) {

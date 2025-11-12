@@ -20,6 +20,8 @@ Set `INGEST_SOURCE` environment variable:
 - `EMOJI_BACKFILL_PARQUET_DIR` - Parquet output directory (default: `./data/parquet`)
 - `EMOJI_MAX_PER_POST` - Maximum emojis per post (default: `250`)
 - `INGEST_METRICS_PORT` - Prometheus metrics port (default: `0` = disabled)
+- `INGEST_PROGRESS_LOG_EVERY` - Emit a per-repo progress log after this many events (default: `500`)
+- `INGEST_PROGRESS_LOG_INTERVAL_MS` - Always emit a progress log at least this often (default: `30000`)
 - `LOG_LEVEL` - Log level (default: `info`)
 
 ### Nexus Configuration

@@ -66,6 +66,20 @@ function extractLanguages(record: any): string[] {
   return ["und"];
 }
 
+// Valid date range: 2000-01-01 to 2100-01-01 (reasonable bounds for Bluesky posts)
+const MIN_VALID_DATE = new Date("2000-01-01T00:00:00Z").getTime();
+const MAX_VALID_DATE = new Date("2100-01-01T00:00:00Z").getTime();
+
+function isValidDate(date: Date): boolean {
+  const time = date.getTime();
+  return (
+    !Number.isNaN(time) &&
+    time >= MIN_VALID_DATE &&
+    time <= MAX_VALID_DATE &&
+    date.toISOString().match(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/) !== null
+  );
+}
+
 function resolveTimestamps(
   record: any,
   rkey: string,
@@ -74,22 +88,35 @@ function resolveTimestamps(
   createdAt: Date | null;
   seq: number;
 } {
+  // Try createdAt field first
   const createdAtField =
     typeof record?.createdAt === "string" ? new Date(record.createdAt) : null;
-  if (createdAtField && !Number.isNaN(createdAtField.getTime())) {
+  if (createdAtField && isValidDate(createdAtField)) {
     return { createdAt: createdAtField, seq: createdAtField.getTime() * 1000 };
   }
+
+  // Fall back to TID parsing
   try {
     if (validateTid(rkey)) {
       const tid = parseTid(rkey);
-      return { createdAt: new Date(tid.timestamp), seq: tid.timestamp };
+      const tidDate = new Date(tid.timestamp);
+      if (isValidDate(tidDate)) {
+        return { createdAt: tidDate, seq: tid.timestamp };
+      }
     }
   } catch {}
+
+  // Log invalid timestamp for investigation
   if (invalidTidWarnings < MAX_INVALID_WARNINGS) {
-    console.warn(`Invalid rkey for ${did} rkey=${rkey}`);
+    const invalidValue = record?.createdAt ?? rkey;
+    console.warn(
+      `Invalid timestamp for ${did} rkey=${rkey} createdAt=${invalidValue}`,
+    );
     invalidTidWarnings++;
   }
-  return { createdAt: new Date(), seq: Date.now() * 1000 };
+
+  // Last resort: use current time (but return null to signal invalid record)
+  return { createdAt: null, seq: Date.now() * 1000 };
 }
 
 function extractReplyUri(record: any, key: "root" | "parent"): string | null {

@@ -1,20 +1,17 @@
 import WebSocket from "ws";
-import type {
-  UnifiedEvent,
-  NexusOutboxEvent,
-  NexusRecordEvent,
-  EventAdapter,
-} from "./types.js";
+import type { UnifiedEvent, NexusOutboxEvent, EventAdapter } from "./types.js";
 import { logger } from "../logger.js";
 import { parse as parseTid } from "@atcute/tid";
 
 export interface NexusAdapterConfig {
   url: string;
-  ackTimeout?: number; // milliseconds, default 10000
+  ackTimeout?: number; // milliseconds, default 90000 (must be > flush interval 60s)
   reconnectBackoff?: number[]; // backoff delays in ms
 }
 
-const DEFAULT_ACK_TIMEOUT = 10000;
+// Default ack timeout must be longer than flush interval (60s) to prevent false timeouts
+// Events wait for batch flush before acking, which can take up to 60s (timer flush)
+const DEFAULT_ACK_TIMEOUT = 90000; // 90 seconds (flush interval 60s + buffer)
 const DEFAULT_RECONNECT_BACKOFF = [1000, 2000, 4000, 8000, 16000, 30000];
 
 export class NexusAdapter implements EventAdapter {
@@ -58,30 +55,36 @@ export class NexusAdapter implements EventAdapter {
     if (event.source !== "nexus" || !event.nexusEventId) {
       return;
     }
+    await this.ackById(event.nexusEventId);
+  }
 
+  /**
+   * Ack a Nexus event by ID directly. Used internally for filtered events
+   * that don't need to go through the full event processing pipeline.
+   */
+  private async ackById(eventId: number): Promise<void> {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       logger.warn(
-        { eventId: event.nexusEventId },
+        { eventId, wsState: this.ws?.readyState },
         "Cannot ack: WebSocket not open",
       );
-      return;
+      throw new Error(`WebSocket not open for event ${eventId}`);
     }
 
     // Clear any pending timeout for this event
-    const timeout = this.inFlightAcks.get(event.nexusEventId);
+    const timeout = this.inFlightAcks.get(eventId);
     if (timeout) {
       clearTimeout(timeout);
-      this.inFlightAcks.delete(event.nexusEventId);
+      this.inFlightAcks.delete(eventId);
     }
 
     try {
-      const ackMessage = JSON.stringify({ id: event.nexusEventId });
+      const ackMessage = JSON.stringify({ id: eventId });
       this.ws.send(ackMessage);
+      logger.trace({ eventId }, "Sent ack for filtered event");
     } catch (error) {
-      logger.error(
-        { err: error, eventId: event.nexusEventId },
-        "Failed to send ack",
-      );
+      logger.error({ err: error, eventId }, "Failed to send ack");
+      throw error; // Re-throw so caller knows ack failed
     }
   }
 
@@ -147,6 +150,56 @@ export class NexusAdapter implements EventAdapter {
 
       const unifiedEvent = this.mapNexusEvent(event);
       if (!unifiedEvent) {
+        // Event was filtered out (invalid timestamp, wrong collection, etc.)
+        // Still need to track repo state and ack it
+        // Create minimal UnifiedEvent for state tracking, handler will ack it
+        const filteredEvent: UnifiedEvent = {
+          repoDid: event.record.did,
+          collection: event.record.collection,
+          rkey: event.record.rkey,
+          record: event.record.record ?? {},
+          seq: 0,
+          createdAt: new Date(), // Won't be used since event is filtered
+          receivedAt: new Date(),
+          source: "nexus",
+          isLive: event.record.live,
+          nexusEventId: event.id,
+        };
+
+        // Set up ack timeout for filtered events too
+        if (filteredEvent.nexusEventId) {
+          const timeout = setTimeout(() => {
+            logger.warn(
+              { eventId: filteredEvent.nexusEventId },
+              "Ack timeout for filtered Nexus event",
+            );
+            this.inFlightAcks.delete(filteredEvent.nexusEventId!);
+          }, this.config.ackTimeout ?? DEFAULT_ACK_TIMEOUT);
+          this.inFlightAcks.set(filteredEvent.nexusEventId, timeout);
+        }
+
+        // Pass to handler for repo state tracking and acking
+        // Handler will ack it in finally block, but we need to ensure errors don't stop processing
+        try {
+          if (this.eventCallback) {
+            await this.eventCallback(filteredEvent);
+          } else {
+            // No callback set, ack directly
+            await this.ackById(event.id);
+          }
+        } catch (error) {
+          logger.error(
+            { err: error, eventId: event.id, repoDid: filteredEvent.repoDid },
+            "Error processing filtered event - acking to prevent stall",
+          );
+          // Handler failed, ack directly to prevent Nexus stalling
+          await this.ackById(event.id).catch((ackError) => {
+            logger.error(
+              { err: ackError, eventId: event.id },
+              "Failed to ack filtered event after handler error",
+            );
+          });
+        }
         return;
       }
 
@@ -181,11 +234,19 @@ export class NexusAdapter implements EventAdapter {
     }
 
     // Extract createdAt and seq from record or rkey
-    const { createdAt, seq } = this.resolveTimestamps(
+    // Validate timestamp BEFORE creating UnifiedEvent - if invalid, return null
+    // The event will still be acked by the handler (it's a filtered event)
+    const { createdAt, seq, isValid } = this.resolveTimestamps(
       record.record as any,
       record.rkey,
       record.did,
     );
+
+    // If timestamp is invalid (used fallback), don't create UnifiedEvent
+    // This prevents processing records with corrupted timestamps
+    if (!isValid) {
+      return null;
+    }
 
     return {
       repoDid: record.did,
@@ -205,26 +266,52 @@ export class NexusAdapter implements EventAdapter {
     record: any,
     rkey: string,
     did: string,
-  ): { createdAt: Date; seq: number } {
+  ): { createdAt: Date; seq: number; isValid: boolean } {
+    // Valid date range: 2000-01-01 to 2100-01-01
+    const MIN_VALID_DATE = new Date("2000-01-01T00:00:00Z").getTime();
+    const MAX_VALID_DATE = new Date("2100-01-01T00:00:00Z").getTime();
+
+    const isValidDate = (date: Date): boolean => {
+      const time = date.getTime();
+      return (
+        !Number.isNaN(time) &&
+        time >= MIN_VALID_DATE &&
+        time <= MAX_VALID_DATE &&
+        date.toISOString().match(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/) !==
+          null
+      );
+    };
+
     // Try createdAt field first
     const createdAtField =
       typeof record?.createdAt === "string" ? new Date(record.createdAt) : null;
-    if (createdAtField && !Number.isNaN(createdAtField.getTime())) {
+    if (createdAtField && isValidDate(createdAtField)) {
       return {
         createdAt: createdAtField,
         seq: createdAtField.getTime() * 1000,
+        isValid: true,
       };
     }
 
     // Fall back to TID parsing
     try {
       const tid = parseTid(rkey);
-      return { createdAt: new Date(tid.timestamp), seq: tid.timestamp };
+      const tidDate = new Date(tid.timestamp);
+      if (isValidDate(tidDate)) {
+        return { createdAt: tidDate, seq: tid.timestamp, isValid: true };
+      }
     } catch {
-      // Last resort: use current time
-      const now = new Date();
-      return { createdAt: now, seq: now.getTime() * 1000 };
+      // TID parsing failed
     }
+
+    // Invalid timestamp - log and return invalid flag
+    // Don't use fallback - let the event be filtered out
+    logger.warn(
+      { did, rkey, createdAt: record?.createdAt },
+      "Invalid timestamp, filtering out event",
+    );
+    const now = new Date();
+    return { createdAt: now, seq: now.getTime() * 1000, isValid: false };
   }
 
   private scheduleReconnect(): void {

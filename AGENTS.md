@@ -90,7 +90,13 @@
     - **Testing**: Successfully handling repos with edge cases (corrupted timestamps, invalid dates). Ready for continued multi-repo testing and production deployment.
 
 13. **Status checkpoint (2025-11-12T21:45:00Z):**
+
     - **Durable acks**: `writer.waitForFlush()` now triggers/awaits immediate flushes, so every Nexus/Jetstream ack happens only after Timescale COPY completes, even for <500-row batches.
     - **No more low-volume stalls**: The writer keeps flushing while new rows arrive mid-flush, eliminating the “first repo runs, queue stops at 1” issue during small tests.
     - **Ack failures retry**: Adapter acks are logged and bubbled up as processing errors, guaranteeing retries instead of silently drifting cursors.
     - **Docs synced**: `nexus_migration_plan.md` documents the durability + ack requirements so the migration steps stay accurate.
+
+14. **Status checkpoint (2025-11-12T22:54:00Z):**
+    - **Progress visibility**: Unified ingest now logs per-repo progress every `INGEST_PROGRESS_LOG_EVERY` events and at least once per `INGEST_PROGRESS_LOG_INTERVAL_MS` (defaults: 500 events / 30 s). Use these env vars to tune CLI verbosity when chewing through emoji-scarce repos.
+    - **Backfill completeness signal**: A repo flips to `backfill_complete=true` once we see the first `live:true` event; making a new emoji-bearing post (e.g., `did:plc:by3jhwdqgbtrcc7q4tkkv3cf`) confirms the end-to-end path.
+    - **Nexus tuning**: Slow PDSes require higher `--repo-fetch-timeout`; upgrade Nexus to the new flag (default 30 s, pass `180s` for Hetzner hosts) so CAR downloads don’t time out mid-resync.
