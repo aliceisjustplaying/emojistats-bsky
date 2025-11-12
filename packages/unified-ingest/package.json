@@ -4,7 +4,8 @@
   "scripts": {
     "build": "tsc",
     "start": "bun --env-file=.env src/main.ts",
-    "test-nexus": "bun --env-file=.env src/test-nexus.ts"
+    "test-nexus": "bun --env-file=.env src/test-nexus.ts",
+    "clean-state": "bun --env-file=.env scripts/cleanState.ts"
   },
   "keywords": [],
   "author": "",
