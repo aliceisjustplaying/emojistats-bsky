@@ -251,10 +251,17 @@ export async function isRepoComplete(
 
 export async function markRepoPending(pool: Pool, did: string) {
   await pool.query(
-    `INSERT INTO repo_progress (repo_did, last_rev, last_seq, backfill_complete)
-		VALUES ($1, $2, $3, false)
-		ON CONFLICT (repo_did) DO UPDATE SET backfill_complete = false, updated_at = NOW()`,
+    `INSERT INTO repo_progress (repo_did, last_rev, last_seq, backfill_complete, car_completed)
+		VALUES ($1, $2, $3, false, false)
+		ON CONFLICT (repo_did) DO UPDATE SET backfill_complete = false, car_completed = false, updated_at = NOW()`,
     [did, "backfill", 0],
+  );
+}
+
+export async function markRepoCarComplete(pool: Pool, did: string) {
+  await pool.query(
+    `UPDATE repo_progress SET car_completed = true, updated_at = NOW() WHERE repo_did = $1`,
+    [did],
   );
 }
 
@@ -266,9 +273,9 @@ export async function markRepoComplete(
   parquetCount: number | null,
 ) {
   await pool.query(
-    `INSERT INTO repo_progress (repo_did, last_rev, last_seq, backfill_complete, last_snapshot_row_count, last_snapshot_path, last_snapshot_parquet_count)
-		VALUES ($1, $2, $3, true, $4, $5, $6)
-		ON CONFLICT (repo_did) DO UPDATE SET last_rev = EXCLUDED.last_rev, last_seq = EXCLUDED.last_seq, backfill_complete = true, last_snapshot_row_count = EXCLUDED.last_snapshot_row_count, last_snapshot_path = EXCLUDED.last_snapshot_path, last_snapshot_parquet_count = EXCLUDED.last_snapshot_parquet_count, updated_at = NOW()`,
+    `INSERT INTO repo_progress (repo_did, last_rev, last_seq, backfill_complete, car_completed, last_snapshot_row_count, last_snapshot_path, last_snapshot_parquet_count)
+		VALUES ($1, $2, $3, true, true, $4, $5, $6)
+		ON CONFLICT (repo_did) DO UPDATE SET last_rev = EXCLUDED.last_rev, last_seq = EXCLUDED.last_seq, backfill_complete = true, car_completed = true, last_snapshot_row_count = EXCLUDED.last_snapshot_row_count, last_snapshot_path = EXCLUDED.last_snapshot_path, last_snapshot_parquet_count = EXCLUDED.last_snapshot_parquet_count, updated_at = NOW()`,
     [did, "backfill", 0, rowCount, snapshotPath, parquetCount],
   );
 }

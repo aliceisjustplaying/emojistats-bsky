@@ -64,7 +64,8 @@ create table if not exists repo_progress (
     last_snapshot_path text,
     last_snapshot_parquet_count bigint,
     updated_at        timestamptz not null default now(),
-    backfill_complete boolean not null default false
+    backfill_complete boolean not null default false,
+    car_completed     boolean not null default false
 );
 
 alter table if exists repo_progress
@@ -75,6 +76,9 @@ alter table if exists repo_progress
 
 alter table if exists repo_progress
     add column if not exists last_snapshot_parquet_count bigint;
+
+alter table if exists repo_progress
+    add column if not exists car_completed boolean not null default false;
 
 create table if not exists repo_validation_log (
     validation_id    bigserial primary key,

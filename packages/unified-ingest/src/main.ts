@@ -25,6 +25,7 @@ import {
   countRepoEmojiPosts,
   markRepoPending,
   markRepoComplete,
+  markRepoCarComplete,
   recordRepoValidation,
   type RepoValidationRecord,
 } from "./db.js";
@@ -105,6 +106,12 @@ async function main() {
     adapter: import("./adapters/types.js").EventAdapter;
     name: string;
   }> = [];
+  const adapterBySource: Partial<
+    Record<
+      UnifiedEvent["source"],
+      { adapter: import("./adapters/types.js").EventAdapter; name: string }
+    >
+  > = {};
 
   // Initialize adapters based on config
   if (config.ingestSource === "nexus" || config.ingestSource === "both") {
@@ -113,6 +120,7 @@ async function main() {
       ackTimeout: config.nexusAckTimeout,
     });
     adapters.push({ adapter: nexusAdapter, name: "nexus" });
+    adapterBySource.nexus = { adapter: nexusAdapter, name: "nexus" };
   }
 
   if (config.ingestSource === "jetstream" || config.ingestSource === "both") {
@@ -127,6 +135,10 @@ async function main() {
       cursorOverride: config.cursorOverride,
     });
     adapters.push({ adapter: jetstreamAdapter, name: "jetstream" });
+    adapterBySource.jetstream = {
+      adapter: jetstreamAdapter,
+      name: "jetstream",
+    };
   }
 
   if (adapters.length === 0) {
@@ -140,29 +152,23 @@ async function main() {
     ackStartTime: number,
     context: "filtered" | "processed",
   ) => {
-    const results = await Promise.allSettled(
-      adapters.map(({ adapter }) => adapter.ack(event)),
-    );
-
-    const failures = results
-      .map((result, idx) =>
-        result.status === "rejected"
-          ? {
-              err: result.reason,
-              adapter: adapters[idx].name,
-              context,
-              source: event.source,
-              nexusEventId: event.nexusEventId,
-            }
-          : null,
-      )
-      .filter((value): value is NonNullable<typeof value> => value !== null);
-
-    if (failures.length > 0) {
-      for (const failure of failures) {
-        logger.error(failure, "Ack failed for adapter");
+    const target = adapterBySource[event.source];
+    if (target) {
+      try {
+        await target.adapter.ack(event);
+      } catch (error) {
+        logger.error(
+          {
+            err: error,
+            adapter: target.name,
+            context,
+            source: event.source,
+            nexusEventId: event.nexusEventId,
+          },
+          "Ack failed",
+        );
+        throw new Error(`Ack failed during ${context} ack`);
       }
-      throw new Error(`Ack failed during ${context} ack`);
     }
 
     const ackDuration = (Date.now() - ackStartTime) / 1000;
@@ -188,6 +194,7 @@ async function main() {
           await markRepoPending(pool, event.repoDid);
         } else if (!repoStateEntry.lastWasLive && event.isLive) {
           // Backfill finished, live stream has started
+          await markRepoCarComplete(pool, event.repoDid);
           await validateAndCompleteRepo(event.repoDid, writer, pool);
           repoCompletions.inc({ source: event.source });
         }

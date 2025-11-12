@@ -2,7 +2,7 @@
 
 ## What we know
 
-- Historical emoji ingest is handled by Nexus (backfill + live firehose) feeding the unified ingest worker in `packages/unified-ingest`.
+- Historical emoji ingest is handled by [Nexus](https://github.com/bluesky-social/indigo/pull/1170) (backfill + live firehose) feeding the unified ingest worker in `packages/unified-ingest`.
 - Nexus enumerates repos, fetches full CAR snapshots from each PDS, and streams live events (`live: true`). The worker reads those events, normalizes them, writes Timescale + Parquet, and validates each repo.
 - Validation compares Parquet row counts, Timescale inserts, and existing totals. We treat extra Timescale rows (due to live Jetstream traffic) as informational but fail if Timescale is missing rows.
 - Some repos never emit live emoji posts. `backfill_complete` flips to `true` once we see the first `live: true` emoji event. Emoji-scarce repos may stay `false` indefinitely even though their historical data is present.
@@ -49,6 +49,7 @@
 
 ## Status checkpoints
 
-- **2025-11-10:** Legacy Bun/Redis pipeline retired. Nexus + unified ingest under active development.
+- **2025-11-12:** Nexus + unified ingest under active development.
 - **2025-11-12 21:45 UTC:** Durable acks, immediate flushes, and per-repo progress logging added to unified ingest. Nexus repo-fetch timeout made configurable (set to 180 s for slow hosts).
 - **2025-11-12 22:54 UTC:** All six test repos drained via Nexus + unified ingest, `backfill_complete` flips once a live emoji is observed. Backfill cleanup scripts moved under `packages/unified-ingest`.
+- **2025-11-12 23:00 UTC:** Legacy Bun/Redis pipeline retired.
