@@ -20,14 +20,15 @@ async function resetDatabase(databaseUrl: string, schema: string) {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    await client.query("TRUNCATE TABLE emoji_post");
-    await client.query("TRUNCATE TABLE repo_progress");
-    await client.query("TRUNCATE TABLE repo_validation_log");
-    await client.query("TRUNCATE TABLE ingest_job_log");
-    await client.query("TRUNCATE TABLE ingest_watermark");
-    await client.query("DELETE FROM dim_client");
-    await client.query("DELETE FROM dim_emoji");
-    await client.query("DELETE FROM dim_language");
+    await client.query("TRUNCATE TABLE emoji_post CASCADE");
+    await client.query("TRUNCATE TABLE repo_progress CASCADE");
+    await client.query("TRUNCATE TABLE repo_validation_log CASCADE");
+    await client.query("TRUNCATE TABLE ingest_job_log CASCADE");
+    await client.query("TRUNCATE TABLE ingest_watermark CASCADE");
+    // Use TRUNCATE to reset identity sequences, or reset them manually after DELETE
+    await client.query("TRUNCATE TABLE dim_client RESTART IDENTITY CASCADE");
+    await client.query("TRUNCATE TABLE dim_emoji RESTART IDENTITY CASCADE");
+    await client.query("TRUNCATE TABLE dim_language RESTART IDENTITY CASCADE");
     await client.query("COMMIT");
     logger.info("Database tables reset");
   } catch (error) {

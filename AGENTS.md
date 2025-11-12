@@ -9,7 +9,7 @@
 - External research: `futur_backfill_findings.md` captures lessons from Futur’s Oct 2025 AppView backfill (storage, COPY-based writes, worker sizing, live ingest throughput).
 - Validation: the backfill now compares per-repo Parquet rows, INSERTed rows, and Timescale totals; if Timescale gains extra rows from live ingest during validation we log the delta but only fail when Timescale is _missing_ rows.
 - Reference: the upstream Bluesky AppView backfill (~/src/a/atproto, branch `divy/backfill`) runs a ListRepos → Redis queue → `RepoBackfiller` pipeline with explicit stream backpressure, chunked CAR processing, and high-water-mark cutoffs—use it for rate-limit/backpressure ideas.
-- Active task (2025-11-10): consulting ~/src/a/atproto (`divy/backfill`) queue code for Redis stream patterns while implementing our `packages/backfill/queue` module.
+- Migration in progress (2025-11-12): implementing Nexus-based backfill via `packages/unified-ingest` to replace the Bun/Redis pipeline. See `nexus_migration_plan.md` for step-by-step guide.
 
 ## Current setup
 
@@ -55,5 +55,26 @@
    - Planned fix: refactor to Bluesky/Futur’s Redis-backed pipeline—`listRepos` producer writes repo jobs into a Redis stream (with cursors + backpressure) and consumer workers pull from it via consumer groups, giving durable in-flight tracking and eliminating duplicate scheduling.
 
 8. **Status checkpoint (2025-11-10T22:38:41Z):**
+
    - Redis producer/consumer rewrite is functional, but the producer still lacks a hard `EMOJI_BACKFILL_DID_LIMIT`, so the first end-to-end test overshot the intended 10k repos and was halted manually.
    - Next actions before another run: add a global DID limit (or other stop conditions) to the producer, ship queue inspection/drain scripts, and decide on shared rate-limit coordination so multiple consumers don’t exceed per-PDS quotas.
+
+9. **Status checkpoint (2025-11-12T19:00:50Z):**
+
+   - We have only ever ran the backfill on my laptop for 10000 DIDs, and found the "drift" issue.
+
+10. **Status checkpoint (2025-11-12T19:31:55Z):**
+
+    - **Unified ingest package implemented**: Created `packages/unified-ingest` with Nexus and Jetstream adapters, unified event processing, and shared writer pipeline.
+    - **Features**: Timer-based flush (60s), error handling for unhandled rejections, per-repo validation tracking, and comprehensive Prometheus metrics (ack lag, repo completions, validation errors, etc.).
+    - **Architecture**: Single worker supports both Nexus (backfill) and Jetstream (live) sources via configurable `INGEST_SOURCE` env var. Reuses Timescale/Parquet writer components from `packages/backfill`.
+    - **Next steps**: Follow `nexus_migration_plan.md` Step 1-2 (run Nexus locally, add test repos), then Step 9 (test with multiple repos) to validate before production deployment.
+    - **Code review fixes**: Addressed timer-based flush, Jetstream error handling, repo validation tracking, and metrics coverage per review findings.
+
+11. **Status checkpoint (2025-11-12T20:07:37Z):**
+    - **Production-ready fixes**: Resolved critical batching, durability, and reliability issues:
+      - **Batching restored**: Implemented flush promise system where multiple events share the same flush promise, maintaining batch performance (up to 500 rows per COPY) while ensuring durability before ack
+      - **Error resilience**: Flush promise always resolves even on DB errors (try/finally), preventing pipeline from hanging after transient failures
+      - **Concurrent acks**: Acks run concurrently via `Promise.allSettled` to prevent slow Redis writes from blocking Nexus acks when multiple sources configured
+      - **Non-emoji acks**: All events (including filtered ones) are acknowledged in finally block to prevent Nexus stalling and ensure Jetstream cursor advances
+    - **Status**: Code complete and tested locally. Ready for Step 9 (multi-repo testing) and production deployment.
