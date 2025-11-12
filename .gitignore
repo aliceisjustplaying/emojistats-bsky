@@ -4,3 +4,11 @@ bun.lockb
 CURSOR_OVERRIDE.TXT
 packages/backend/src/**/*.js
 *.txt
+nexus.db*
+
+# Backfill artifacts
+packages/backfill/data/parquet/*.parquet
+packages/backfill/pds-cursor-cache.json
+
+# Unified ingest artifacts
+packages/unified-ingest/data/parquet/*.parquet

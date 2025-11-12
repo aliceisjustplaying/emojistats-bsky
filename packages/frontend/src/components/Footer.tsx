@@ -1,3 +1,5 @@
+import React from 'react';
+
 import { version } from '../constants';
 
 interface EmojiStats {
@@ -12,7 +14,7 @@ interface FooterProps {
   stats: EmojiStats;
 }
 
-function Footer({ stats }: FooterProps) {
+const Footer: React.FC<FooterProps> = ({ stats }) => {
   return (
     <footer className="w-full bg-gray-200 dark:bg-gray-900 p-1 flex flex-row justify-end items-center">
       <span className="w-full sm:w-auto text-xs md:text-sm text-center px-1 sm:px-2 text-gray-900 dark:text-gray-100">
@@ -28,7 +30,7 @@ function Footer({ stats }: FooterProps) {
       </span>
       <span className="w-full sm:w-auto text-xs md:text-sm text-center px-1 sm:px-2 text-gray-900 dark:text-gray-100">
         by{' '}
-        <a href="https://alice.bsky.sh/" target="_blank">
+        <a href="https://alice.bsky.sh/" target="_blank" rel="noopener noreferrer">
           Alice
         </a>
       </span>
@@ -38,13 +40,18 @@ function Footer({ stats }: FooterProps) {
 
       <span className="w-full sm:w-auto text-xs md:text-sm text-center flex flex-row items-center justify-center px-1 sm:px-2 text-gray-900 dark:text-gray-100">
         <span className="inline md:hidden">v{version}&nbsp;&nbsp;</span>
-        <a href="https://github.com/aliceisjustplaying/emojistats-bsky" target="_blank" className="leading-none">
+        <a
+          href="https://github.com/aliceisjustplaying/emojistats-bsky"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="leading-none"
+        >
           <img src="/gh.png" alt="GitHub" className="w-4 h-4 mb-0 inline-block dark:hidden" />
           <img src="/gh-white.png" alt="GitHub" className="w-4 h-4 mb-0 hidden dark:inline-block" />
         </a>
       </span>
     </footer>
   );
-}
+};
 
 export default Footer;
