@@ -1,0 +1,6 @@
+# Pin the install layout: bun 1.3 defaults new installs to the pnpm-style
+# isolated linker, which leaves no root node_modules/.bin — but the systemd
+# units on the fleet exec <checkout>/node_modules/.bin/tsx. Hoisted keeps one
+# predictable layout everywhere (and matches how the repo grew up).
+[install]
+linker = "hoisted"
