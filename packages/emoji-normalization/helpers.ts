@@ -1,11 +1,12 @@
 export const emojiToCodePoint = (emoji: string) =>
+  // eslint-disable-next-line typescript/no-misused-spread -- code points intended
   [...emoji]
-    .map((char) => char.codePointAt(0)?.toString(16).padStart(4, "0"))
-    .join(" ");
+    .map((char) => char.codePointAt(0)?.toString(16).padStart(4, '0'))
+    .join(' ');
 
 export const codePointToEmoji = (codePoint: string) => {
   const codePoints = codePoint
-    .split(codePoint.includes(" ") ? " " : "-")
+    .split(codePoint.includes(' ') ? ' ' : '-')
     .map((cp) => parseInt(cp, 16));
   return String.fromCodePoint(...codePoints);
 };

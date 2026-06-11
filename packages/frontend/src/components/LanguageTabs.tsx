@@ -1,6 +1,7 @@
+import 'react-tabs/style/react-tabs.css';
+
 import React from 'react';
 import { Tab, TabList, TabPanel, Tabs } from 'react-tabs';
-import 'react-tabs/style/react-tabs.css';
 
 interface LanguageStat {
   language: string;
@@ -14,7 +15,11 @@ interface LanguageTabsProps {
   totalEmojiCount: number;
 }
 
-const LanguageTabs: React.FC<LanguageTabsProps> = ({ languages, onSelect, totalEmojiCount }) => {
+const LanguageTabs: React.FC<LanguageTabsProps> = ({
+  languages,
+  onSelect,
+  totalEmojiCount,
+}) => {
   return (
     <Tabs
       defaultIndex={0}

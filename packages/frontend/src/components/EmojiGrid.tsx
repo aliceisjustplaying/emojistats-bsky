@@ -1,6 +1,10 @@
 import React, { memo, useEffect, useRef } from 'react';
 import AutoSizer from 'react-virtualized-auto-sizer';
-import { FixedSizeGrid as Grid, type GridChildComponentProps, type GridItemKeySelector } from 'react-window';
+import {
+  FixedSizeGrid as Grid,
+  type GridChildComponentProps,
+  type GridItemKeySelector,
+} from 'react-window';
 import type { Socket } from 'socket.io-client';
 
 interface Emoji {
@@ -14,7 +18,12 @@ interface EmojiGridProps {
   lang: string;
 }
 
-type EmojiGridItemData = { items: Emoji[]; columnCount: number; socket: Socket; lang: string };
+type EmojiGridItemData = {
+  items: Emoji[];
+  columnCount: number;
+  socket: Socket;
+  lang: string;
+};
 
 const MIN_COLUMN_WIDTH = 90;
 const ROW_HEIGHT = 40;
@@ -22,7 +31,10 @@ const CELL_PADDING = 4;
 
 const EmojiGrid: React.FC<EmojiGridProps> = ({ topEmojis, socket, lang }) => {
   return (
-    <main id="emoji-grid" className="flex-grow w-full bg-white dark:bg-gray-900 overflow-hidden">
+    <main
+      id="emoji-grid"
+      className="flex-grow w-full bg-white dark:bg-gray-900 overflow-hidden"
+    >
       <AutoSizer>
         {({ height, width }) => {
           const columnCount = Math.floor(width / MIN_COLUMN_WIDTH) || 1;
@@ -101,15 +113,17 @@ const Cell = memo((props: GridChildComponentProps<EmojiGridItemData>) => {
   useEffect(() => {
     // don't flash if this is the first render
     if (isFirstRun.current) {
-      return;
+      return undefined;
     }
 
     const el = elRef.current;
     if (!el) {
-      return;
+      return undefined;
     }
 
-    const isDarkMode = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    const isDarkMode =
+      window.matchMedia &&
+      window.matchMedia('(prefers-color-scheme: dark)').matches;
 
     const colors = cellColors[isDarkMode ? 'dark' : 'light'];
     // const animation = el.animate([{ backgroundColor: colors.highlight }, { backgroundColor: colors.default }], {
@@ -156,9 +170,9 @@ const Cell = memo((props: GridChildComponentProps<EmojiGridItemData>) => {
     console.log(`Getting emoji info for ${emoji}`);
     socket.emit('getEmojiInfo', emoji);
     const url =
-      lang === 'all' || lang === 'unknown' ?
-        `https://bsky.app/search?q=${encodeURIComponent(emoji)}`
-      : `https://bsky.app/search?q=${encodeURIComponent('lang:' + lang + ' ' + emoji)}`;
+      lang === 'all' || lang === 'unknown'
+        ? `https://bsky.app/search?q=${encodeURIComponent(emoji)}`
+        : `https://bsky.app/search?q=${encodeURIComponent('lang:' + lang + ' ' + emoji)}`;
     window.open(url, '_blank');
   };
 

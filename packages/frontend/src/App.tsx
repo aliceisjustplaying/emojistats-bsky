@@ -39,14 +39,21 @@ function App() {
   const [languageStats, setLanguageStats] = useState<LanguageStat[]>([]);
   const [emojiStats, setEmojiStats] = useState<EmojiStats | null>(null);
 
-  const [topEmojisCache, setTopEmojisCache] = useState<Record<string, TopEmojis>>({});
-  const updateTopEmojiCacheEntry = useCallback((language: string, value: TopEmojis) => {
-    return setTopEmojisCache((prev) => ({ ...prev, [language]: value }));
-  }, []);
+  const [topEmojisCache, setTopEmojisCache] = useState<
+    Record<string, TopEmojis>
+  >({});
+  const updateTopEmojiCacheEntry = useCallback(
+    (language: string, value: TopEmojis) => {
+      return setTopEmojisCache((prev) => ({ ...prev, [language]: value }));
+    },
+    [],
+  );
 
   // TODO: loading state instead of defaulting to an empty array?
   const topEmojis =
-    (selectedLanguage === 'all' ? emojiStats?.topEmojis : topEmojisCache[selectedLanguage]) ?? NO_EMOJIS;
+    (selectedLanguage === 'all'
+      ? emojiStats?.topEmojis
+      : topEmojisCache[selectedLanguage]) ?? NO_EMOJIS;
 
   const totalEmojiCount = emojiStats?.processedEmojis ?? 0;
 
@@ -86,7 +93,7 @@ function App() {
       socket.disconnect();
       socketRef.current = null;
     };
-  }, [onSocketConnected]);
+  }, []);
 
   // language selection
   const handleLanguageSelect = useCallback((newLanguage: string) => {
