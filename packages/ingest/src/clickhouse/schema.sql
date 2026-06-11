@@ -19,7 +19,11 @@ CREATE TABLE IF NOT EXISTS posts (
   langs       Array(LowCardinality(String)),
   emojis      Array(LowCardinality(String)),
   src         LowCardinality(String),
-  ingested_at DateTime('UTC') DEFAULT now()
+  -- Microsecond version column: with second-resolution DateTime, live and
+  -- backfill copies of one post landing in the same second tie, and a tied
+  -- ReplacingMergeTree version keeps an arbitrary row — "later ingest wins"
+  -- must be deterministic for the rkey-reuse semantics documented below.
+  ingested_at DateTime64(6, 'UTC') DEFAULT now64(6)
 ) ENGINE = ReplacingMergeTree(ingested_at)
 PARTITION BY toYYYYMM(created_at)
 -- Key soundness (atproto record-key spec): (did, rkey) alone is NOT unique —
