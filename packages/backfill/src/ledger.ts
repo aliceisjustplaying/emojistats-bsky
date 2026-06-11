@@ -1,0 +1,354 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import Database from 'better-sqlite3';
+
+import { LEDGER_DB_PATH, MAX_ATTEMPTS } from './config.js';
+import type { Ledger, RepoCounts, RepoRow, RepoStatus } from './types.js';
+
+const SCHEMA_PATH = fileURLToPath(new URL('./ledger.sql', import.meta.url));
+
+interface RepoTableRow {
+  did: string;
+  pds_host: string;
+  status: string;
+  rev: string | null;
+  car_bytes: number | null;
+  records_total: number | null;
+  posts_total: number | null;
+  posts_with_emojis: number | null;
+  emoji_occurrences: number | null;
+  rkey_digest: string | null;
+  attempts: number;
+  error: string | null;
+  enumerated_at: number;
+  fetched_at: number | null;
+  loaded_at: number | null;
+  retry_after: number | null;
+}
+
+function toRepoRow(row: RepoTableRow): RepoRow {
+  return {
+    did: row.did,
+    pdsHost: row.pds_host,
+    status: row.status as RepoStatus,
+    rev: row.rev,
+    carBytes: row.car_bytes,
+    recordsTotal: row.records_total,
+    postsTotal: row.posts_total,
+    postsWithEmojis: row.posts_with_emojis,
+    emojiOccurrences: row.emoji_occurrences,
+    rkeyDigest: row.rkey_digest,
+    attempts: row.attempts,
+    error: row.error,
+    enumeratedAt: row.enumerated_at,
+    fetchedAt: row.fetched_at,
+    loadedAt: row.loaded_at,
+    retryAfter: row.retry_after,
+  };
+}
+
+export interface SqliteLedgerOptions {
+  /** Total shard count; 1 (default) disables shard filtering entirely. */
+  shards?: number;
+  /** This process's shard, 0-based; rows hashing elsewhere are invisible — neither claimable nor counted. */
+  shardIndex?: number;
+}
+
+/**
+ * Deterministic DID → shard bucket, evaluable inside SQLite. Mixes three
+ * character positions of the DID's base32 tail (single positions skew on
+ * power-of-two shard counts; odd multipliers keep every position contributing).
+ * COALESCE guards degenerate short DIDs — unicode('') is NULL and a NULL bucket
+ * would silently drop the row from every shard.
+ */
+const SHARD_BUCKET_SQL = `(
+  COALESCE(unicode(substr(did, -1)), 0)
+  + COALESCE(unicode(substr(did, -2, 1)), 0) * 31
+  + COALESCE(unicode(substr(did, -3, 1)), 0) * 961
+)`;
+
+export class SqliteLedger implements Ledger {
+  private readonly db: Database.Database;
+  private readonly stmtUpsertPending: Database.Statement;
+  private readonly stmtMarkTombstoned: Database.Statement;
+  private readonly stmtGetMeta: Database.Statement;
+  private readonly stmtSetMeta: Database.Statement;
+  private readonly stmtListClaimable: Database.Statement;
+  private readonly stmtMarkFetching: Database.Statement;
+  private readonly stmtMarkLoaded: Database.Statement;
+  private readonly stmtMarkRetry: Database.Statement;
+  private readonly stmtMarkTerminal: Database.Statement;
+  private readonly stmtMarkVerified: Database.Statement;
+  private readonly stmtStatusCounts: Database.Statement;
+  private readonly stmtLoadedSince: Database.Statement;
+  private readonly stmtTotalPosts: Database.Statement;
+  private readonly stmtLastError: Database.Statement;
+  private readonly stmtGetRepo: Database.Statement;
+  private readonly stmtByStatus: Database.Statement;
+  private readonly stmtResetUnreachable: Database.Statement;
+
+  constructor(
+    dbPath: string = LEDGER_DB_PATH,
+    options: SqliteLedgerOptions = {},
+  ) {
+    const shards = options.shards ?? 1;
+    const shardIndex = options.shardIndex ?? 0;
+    if (!Number.isInteger(shards) || shards < 1) {
+      throw new Error(`shards must be a positive integer, got ${shards}`);
+    }
+    if (
+      !Number.isInteger(shardIndex) ||
+      shardIndex < 0 ||
+      shardIndex >= shards
+    ) {
+      throw new Error(
+        `shardIndex must be in [0, ${shards}), got ${shardIndex}`,
+      );
+    }
+    // Validated integers baked into the prepared statements. The filter scopes
+    // claims AND reporting (statusCounts / totalPostsLoaded / loadedSince /
+    // iterateByStatus): a sharded instance sees only its own slice, so per-shard
+    // telemetry sums exactly across the fleet and the idle policy can never be
+    // pinned open by other shards' rows. Writes stay unfiltered — they are
+    // keyed by DID. shards=1 (the default; status/verify/enumerate construct it
+    // that way) compiles the filter away, keeping global tools global.
+    const shardPredicate = `${SHARD_BUCKET_SQL} % ${shards} = ${shardIndex}`;
+    const shardAnd = shards > 1 ? `AND ${shardPredicate}` : '';
+    const shardWhere = shards > 1 ? `WHERE ${shardPredicate}` : '';
+
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    this.db = new Database(dbPath);
+    this.db.pragma('journal_mode = WAL');
+    this.db.pragma('synchronous = NORMAL');
+    this.db.exec(fs.readFileSync(SCHEMA_PATH, 'utf8'));
+
+    // Account migrations during enumeration: a later op may move a still-pending
+    // DID to a new PDS. Rows already past 'pending' are never clobbered.
+    this.stmtUpsertPending = this.db.prepare(`
+      INSERT INTO repos (did, pds_host, status, enumerated_at) VALUES (?, ?, 'pending', ?)
+      ON CONFLICT (did) DO UPDATE SET
+        pds_host = excluded.pds_host,
+        enumerated_at = excluded.enumerated_at
+      WHERE repos.status = 'pending' AND repos.pds_host <> excluded.pds_host
+    `);
+
+    // Already-loaded rows keep their data (emojitracker semantics: posts count
+    // as they happened, even if the account is later deleted at the PLC layer).
+    this.stmtMarkTombstoned = this.db.prepare(`
+      INSERT INTO repos (did, pds_host, status, enumerated_at) VALUES (?, '', 'tombstoned', ?)
+      ON CONFLICT (did) DO UPDATE SET status = 'tombstoned', retry_after = NULL
+      WHERE repos.status NOT IN ('loaded', 'verified')
+    `);
+
+    this.stmtGetMeta = this.db.prepare('SELECT value FROM meta WHERE key = ?');
+    this.stmtSetMeta = this.db.prepare(`
+      INSERT INTO meta (key, value) VALUES (?, ?)
+      ON CONFLICT (key) DO UPDATE SET value = excluded.value
+    `);
+
+    // Strict host rotation (row 1 of every host, then row 2, ...) so a claim
+    // batch never concentrates on one mega-host. The window function scans all
+    // due rows; acceptable for batch-claims every few seconds, and the due set
+    // shrinks as the crawl progresses. Unreachable rows are offered only while
+    // attempts < MAX_ATTEMPTS — past the budget they park (never flipped to
+    // 'failed': host down ≠ data gone) as the explicit final-sweep list, and
+    // the scheduler's idle policy ends the run instead of hammering dead hosts.
+    this.stmtListClaimable = this.db.prepare(`
+      SELECT * FROM (
+        SELECT repos.*, row_number() OVER (PARTITION BY pds_host) AS host_rank
+        FROM repos
+        WHERE (status = 'pending'
+               OR (status = 'unreachable' AND retry_after <= ? AND attempts < ?))
+        ${shardAnd}
+      )
+      ORDER BY host_rank, pds_host
+      LIMIT ?
+    `);
+
+    this.stmtMarkFetching = this.db.prepare(`
+      UPDATE repos SET status = 'fetching', fetched_at = ?
+      WHERE did = ? AND status IN ('pending', 'unreachable')
+    `);
+
+    this.stmtMarkLoaded = this.db.prepare(`
+      UPDATE repos SET
+        status = 'loaded', rev = ?, car_bytes = ?, records_total = ?, posts_total = ?,
+        posts_with_emojis = ?, emoji_occurrences = ?, rkey_digest = ?, loaded_at = ?,
+        error = NULL, retry_after = NULL
+      WHERE did = ?
+    `);
+
+    this.stmtMarkRetry = this.db.prepare(`
+      UPDATE repos SET status = 'unreachable', attempts = attempts + 1, error = ?, retry_after = ?
+      WHERE did = ?
+    `);
+
+    // COALESCE keeps the last recorded error when markTerminal is called without one
+    // (e.g. 'failed' after exhausting retries — the markRetry error is the diagnosis).
+    this.stmtMarkTerminal = this.db.prepare(`
+      UPDATE repos SET status = ?, error = COALESCE(?, error), retry_after = NULL
+      WHERE did = ?
+    `);
+
+    this.stmtMarkVerified = this.db.prepare(
+      "UPDATE repos SET status = 'verified' WHERE did = ?",
+    );
+
+    // Final sweep (--final-sweep): parked unreachables become claimable again by
+    // zeroing the budget listClaimable checks. Shard-scoped like every other
+    // read/claim path; error text is kept for the post-sweep report.
+    this.stmtResetUnreachable = this.db.prepare(`
+      UPDATE repos SET attempts = 0, retry_after = 0
+      WHERE status = 'unreachable' ${shardAnd}
+    `);
+
+    this.stmtStatusCounts = this.db.prepare(
+      `SELECT status, COUNT(*) AS n FROM repos ${shardWhere} GROUP BY status`,
+    );
+    this.stmtLoadedSince = this.db.prepare(
+      `SELECT COUNT(*) AS n FROM repos WHERE loaded_at >= ? ${shardAnd}`,
+    );
+    this.stmtTotalPosts = this.db.prepare(
+      `SELECT COALESCE(SUM(posts_total), 0) AS n FROM repos ${shardWhere}`,
+    );
+
+    // No updated_at column; retry_after/fetched_at/enumerated_at approximate write recency
+    // well enough for a one-glance "what broke last" readout.
+    this.stmtLastError = this.db.prepare(`
+      SELECT did, error FROM repos WHERE error IS NOT NULL
+      ORDER BY COALESCE(retry_after, fetched_at, enumerated_at) DESC
+      LIMIT 1
+    `);
+
+    this.stmtGetRepo = this.db.prepare('SELECT * FROM repos WHERE did = ?');
+    this.stmtByStatus = this.db.prepare(
+      `SELECT * FROM repos WHERE status = ? ${shardAnd}`,
+    );
+  }
+
+  /** Not part of the Ledger contract: batches many writes (e.g. one export page) into one commit. */
+  transaction<T>(fn: () => T): T {
+    return this.db.transaction(fn)();
+  }
+
+  upsertPending(did: string, pdsHost: string): void {
+    this.stmtUpsertPending.run(did, pdsHost, Date.now());
+  }
+
+  markTombstoned(did: string): void {
+    this.stmtMarkTombstoned.run(did, Date.now());
+  }
+
+  getMeta(key: string): string | undefined {
+    const row = this.stmtGetMeta.get(key) as { value: string } | undefined;
+    return row?.value;
+  }
+
+  setMeta(key: string, value: string): void {
+    this.stmtSetMeta.run(key, value);
+  }
+
+  listClaimable(limit: number): RepoRow[] {
+    const rows = this.stmtListClaimable.all(
+      Date.now(),
+      MAX_ATTEMPTS,
+      limit,
+    ) as RepoTableRow[];
+    return rows.map(toRepoRow);
+  }
+
+  markFetching(did: string): boolean {
+    return this.stmtMarkFetching.run(Date.now(), did).changes === 1;
+  }
+
+  markLoaded(did: string, counts: RepoCounts): void {
+    this.stmtMarkLoaded.run(
+      counts.rev,
+      counts.carBytes,
+      counts.recordsTotal,
+      counts.postsTotal,
+      counts.postsWithEmojis,
+      counts.emojiOccurrences,
+      counts.rkeyDigest,
+      Date.now(),
+      did,
+    );
+  }
+
+  markRetry(did: string, error: string, retryAfterMs: number): void {
+    this.stmtMarkRetry.run(error, Date.now() + retryAfterMs, did);
+  }
+
+  // Rare path (retries only) — not worth a prepared-statement field.
+  updateHost(did: string, pdsHost: string): void {
+    this.db
+      .prepare('UPDATE repos SET pds_host = ? WHERE did = ?')
+      .run(pdsHost, did);
+  }
+
+  markTerminal(
+    did: string,
+    status: Extract<
+      RepoStatus,
+      | 'empty'
+      | 'tombstoned'
+      | 'deactivated'
+      | 'takendown'
+      | 'quarantined'
+      | 'failed'
+    >,
+    error?: string,
+  ): void {
+    this.stmtMarkTerminal.run(status, error ?? null, did);
+  }
+
+  markVerified(did: string): void {
+    this.stmtMarkVerified.run(did);
+  }
+
+  resetUnreachableAttempts(): number {
+    return this.stmtResetUnreachable.run().changes;
+  }
+
+  statusCounts(): Partial<Record<RepoStatus, number>> {
+    const rows = this.stmtStatusCounts.all() as {
+      status: RepoStatus;
+      n: number;
+    }[];
+    const counts: Partial<Record<RepoStatus, number>> = {};
+    for (const row of rows) counts[row.status] = row.n;
+    return counts;
+  }
+
+  loadedSince(sinceMs: number): number {
+    return (this.stmtLoadedSince.get(sinceMs) as { n: number }).n;
+  }
+
+  totalPostsLoaded(): number {
+    return (this.stmtTotalPosts.get() as { n: number }).n;
+  }
+
+  lastError(): { did: string; error: string } | null {
+    const row = this.stmtLastError.get() as
+      | { did: string; error: string }
+      | undefined;
+    return row ?? null;
+  }
+
+  getRepo(did: string): RepoRow | undefined {
+    const row = this.stmtGetRepo.get(did) as RepoTableRow | undefined;
+    return row === undefined ? undefined : toRepoRow(row);
+  }
+
+  *iterateByStatus(status: RepoStatus): IterableIterator<RepoRow> {
+    for (const row of this.stmtByStatus.iterate(status)) {
+      yield toRepoRow(row as RepoTableRow);
+    }
+  }
+
+  close(): void {
+    this.db.close();
+  }
+}

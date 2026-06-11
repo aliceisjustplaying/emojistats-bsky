@@ -1,0 +1,89 @@
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import dotenv from 'dotenv';
+
+const PACKAGE_ROOT = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '..',
+);
+export const REPO_ROOT = path.resolve(PACKAGE_ROOT, '../..');
+
+dotenv.config({ path: path.join(PACKAGE_ROOT, '.env') });
+
+function num(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value))
+    throw new Error(`Invalid numeric env var ${name}: ${raw}`);
+  return value;
+}
+
+export const CLICKHOUSE_URL =
+  process.env.CLICKHOUSE_URL ?? 'http://localhost:8123';
+export const CLICKHOUSE_DATABASE =
+  process.env.CLICKHOUSE_DATABASE ?? 'emojistats';
+export const CLICKHOUSE_USER = process.env.CLICKHOUSE_USER ?? 'emojistats';
+export const CLICKHOUSE_PASSWORD =
+  process.env.CLICKHOUSE_PASSWORD ?? 'emojistats';
+
+export const LEDGER_DB_PATH =
+  process.env.LEDGER_DB_PATH ??
+  path.join(PACKAGE_ROOT, 'data', 'ledger.sqlite');
+
+export const PLC_DIRECTORY_URL =
+  process.env.PLC_DIRECTORY_URL ?? 'https://plc.directory';
+export const RELAY_URL =
+  process.env.RELAY_URL ?? 'https://relay1.us-east.bsky.network';
+
+// Politeness: the per-host download concurrency is the lever that matters;
+// getRepo is one request per repo but a potentially huge body.
+export const GLOBAL_CONCURRENCY = num('GLOBAL_CONCURRENCY', 32);
+export const PER_HOST_CONCURRENCY = num('PER_HOST_CONCURRENCY', 2);
+// Bluesky's mushroom fleet (*.host.bsky.network) tolerates serious parallelism
+// (operator experience: Alice). The protocol signals are the real governor —
+// 429/Retry-After always wins, so err high and let the fleet push back.
+export const PER_HOST_CONCURRENCY_BSKY = num('PER_HOST_CONCURRENCY_BSKY', 16);
+export const REPO_FETCH_TIMEOUT_MS = num('REPO_FETCH_TIMEOUT_MS', 300_000);
+export const CAR_MAX_BYTES = num('CAR_MAX_BYTES', 1_073_741_824);
+
+export const RETRY_BASE_MS = num('RETRY_BASE_MS', 60_000);
+export const RETRY_MAX_MS = num('RETRY_MAX_MS', 3_600_000);
+export const MAX_ATTEMPTS = num('MAX_ATTEMPTS', 5);
+
+export const LOADER_CHUNK_ROWS = num('LOADER_CHUNK_ROWS', 100_000);
+
+export const USER_AGENT =
+  process.env.BACKFILL_USER_AGENT ??
+  'emojistats-backfill/0.1 (+https://github.com/aliceisjustplaying/emojistats-bsky)';
+
+export const STATS_LOG_INTERVAL_MS = num('STATS_LOG_INTERVAL_MS', 10_000);
+export const LOG_LEVEL = process.env.LOG_LEVEL ?? 'info';
+
+// Cost-revised storage (plan 0001): CH keeps text for emoji posts only; the
+// Parquet archive holds ALL text and is a hard prerequisite of the real crawl.
+export const TEXT_IN_CLICKHOUSE = (process.env.TEXT_IN_CLICKHOUSE ??
+  'emoji') as 'emoji' | 'all';
+export const ARCHIVE_ENABLED =
+  (process.env.ARCHIVE_ENABLED ?? 'true') === 'true';
+export const ARCHIVE_DIR =
+  process.env.ARCHIVE_DIR ?? path.join(PACKAGE_ROOT, 'data', 'archive');
+export const ARCHIVE_MAX_ROWS_PER_FILE = num(
+  'ARCHIVE_MAX_ROWS_PER_FILE',
+  1_000_000,
+);
+export const ARCHIVE_MAX_FILE_AGE_MS = num(
+  'ARCHIVE_MAX_FILE_AGE_MS',
+  3_600_000,
+);
+export const ARCHIVE_SYNC_COMMAND = process.env.ARCHIVE_SYNC_COMMAND;
+
+// Telemetry to ClickHouse (backfill_progress / backfill_repo_events): the
+// dashboard's data source, shared across crawl processes and boxes.
+export const TELEMETRY_INTERVAL_MS = num('TELEMETRY_INTERVAL_MS', 10_000);
+export const BACKFILL_RUN_ID = process.env.BACKFILL_RUN_ID ?? 'dev';
+export const CRAWL_SHARDS = num('CRAWL_SHARDS', 1);
+export const CRAWL_SHARD_INDEX = num('CRAWL_SHARD_INDEX', 0);
+export const SHARD_LABEL =
+  process.env.SHARD_LABEL ?? `shard${CRAWL_SHARD_INDEX}`;
