@@ -1,0 +1,33 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.3
+    container_name: emojistats-clickhouse
+    ports:
+      - '8123:8123'
+      - '9000:9000'
+    environment:
+      CLICKHOUSE_DB: emojistats
+      CLICKHOUSE_USER: emojistats
+      CLICKHOUSE_PASSWORD: emojistats
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'wget',
+          '--no-verbose',
+          '--tries=1',
+          '--spider',
+          'http://localhost:8123/ping',
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  clickhouse-data:
