@@ -12,7 +12,9 @@ CREATE TABLE IF NOT EXISTS repos (
   posts_with_emojis INTEGER,
   emoji_occurrences INTEGER,
   -- 64-bit XOR fold of the loaded rkey set (RepoCounts.rkeyDigest), fixed-width
-  -- lowercase hex. NULL on pre-digest rows; ledger.ts ALTERs this in on open.
+  -- lowercase hex. Exists on fresh ledgers only: ledger.ts runs CREATE TABLE IF
+  -- NOT EXISTS and nothing else — no ALTER shim, no backwards compatibility.
+  -- Pre-digest ledgers are unsupported; delete and re-enumerate.
   rkey_digest       TEXT,
   attempts          INTEGER NOT NULL DEFAULT 0,
   error             TEXT,

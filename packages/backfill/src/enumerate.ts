@@ -1,6 +1,7 @@
 import { parseArgs } from 'node:util';
 
 import { PLC_DIRECTORY_URL, USER_AGENT } from './config.js';
+import { pdsHostFromEndpoint } from './fetcher.js';
 import { SqliteLedger } from './ledger.js';
 import logger from './logger.js';
 
@@ -102,17 +103,6 @@ async function politeFetch(url: string): Promise<Response> {
       'plc request failed, backing off',
     );
     await sleep(delayMs);
-  }
-}
-
-function pdsHostFromEndpoint(endpoint: string): string | undefined {
-  try {
-    const url = new URL(endpoint);
-    if (url.protocol !== 'https:' && url.protocol !== 'http:') return undefined;
-    // host (not hostname) keeps a nonstandard port — it disambiguates dev PDSes.
-    return url.host.toLowerCase();
-  } catch {
-    return undefined;
   }
 }
 

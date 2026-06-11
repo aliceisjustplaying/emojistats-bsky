@@ -1,14 +1,13 @@
 /** Per-repo pipeline: fetch → parse → stream each row through archive + load in one pass. */
 
-import { createHash } from 'node:crypto';
-
 import type { StoragePolicy } from 'archive/policy';
 import type { ArchiveSink } from 'archive/types';
 import { applyTextPolicy } from 'ingest/rows';
 import type { PostRow } from 'ingest/types';
 
+import { rkeyHash64 } from './digest.js';
 import { repoPostRows } from './extract.js';
-import { fetchRepoCar, RetryableError } from './fetcher.js';
+import { fetchRepoCar, QuarantineError, RetryableError } from './fetcher.js';
 import logger from './logger.js';
 import { parseRepoCar } from './parser.js';
 import type { RetryPolicy } from './retry.js';
@@ -21,18 +20,6 @@ import type {
   RepoLoader,
   RepoRow,
 } from './types.js';
-
-/**
- * One rkey's contribution to RepoCounts.rkeyDigest: sha256(rkey) bytes 0..7 as
- * a little-endian u64. Must stay bit-identical to the ClickHouse side —
- * reinterpretAsUInt64(substring(SHA256(rkey), 1, 8)) — which verify.ts XORs
- * with groupBitXor; reinterpretAsUInt64 is little-endian, matching
- * readBigUInt64LE (proven: both map 'abc123' to 0x83c870ca523da16c). XOR of
- * u64s stays a u64, so the fold below needs no masking.
- */
-function rkeyHash64(rkey: string): bigint {
-  return createHash('sha256').update(rkey).digest().readBigUInt64LE(0);
-}
 
 export interface RepoPipelineDeps {
   ledger: Ledger;
@@ -116,6 +103,9 @@ export function createRepoPipeline(
 
   return async function processRepo(repo: RepoRow): Promise<void> {
     const startedAt = Date.now();
+    // Hoisted out of the try so the quarantine path in the catch below can
+    // report how many rows had already streamed when the walk gave up.
+    let postsTotal = 0;
     try {
       // bsky.social is the entryway, never a real sync host — a ledger pointer at
       // it is always a stale pre-mushroom op; resolve before wasting a request.
@@ -148,7 +138,6 @@ export function createRepoPipeline(
       // The interleave means partial chunks may land before an archive failure;
       // that is fine: the repo re-fetches entirely on the next run and
       // ReplacingMergeTree + the dedup tokens collapse whatever already landed.
-      let postsTotal = 0;
       let postsWithEmojis = 0;
       let emojiOccurrences = 0;
       // Folded over the same post-normalization rkeys that get loaded, so the
@@ -270,6 +259,17 @@ export function createRepoPipeline(
         );
       }
     } catch (err) {
+      // A mid-walk quarantine (malformed CBOR, caps) leaves whatever already
+      // streamed — archive appends plus full ClickHouse chunks — in place while
+      // the ledger goes 'quarantined'. Accepted consequence of the single-pass
+      // stream: buffering rows until the walk completes would undo the memory
+      // win. It is also benign: every row written was an individually valid
+      // post, 'quarantined' already records incomplete coverage, and verify's
+      // orphan check flags CH rows for non-loaded DIDs. The count is appended
+      // to the message so the operator sees the partial write in the ledger.
+      if (err instanceof QuarantineError && postsTotal > 0) {
+        err.message += `; ${postsTotal} rows already in posts/archive (valid posts, incomplete coverage)`;
+      }
       retry.handleRepoError(repo, err);
     }
   };

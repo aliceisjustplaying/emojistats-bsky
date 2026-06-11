@@ -72,6 +72,10 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
   const { ledger, stats, control, processRepo } = deps;
 
   const globalLimit = pLimit(GLOBAL_CONCURRENCY);
+  // Keyed by the ledger's pds_host string verbatim — including the
+  // 'http://host' form the rare http PDS stores (fetcher.pdsHostFromEndpoint).
+  // Each row carries exactly one canonical form, so partitions stay coherent,
+  // and endsWith below is scheme-tolerant by construction.
   const hostLimits = new Map<string, LimitFunction>();
   const hostLimitFor = (host: string): LimitFunction => {
     let limit = hostLimits.get(host);

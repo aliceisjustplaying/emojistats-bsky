@@ -31,6 +31,7 @@ import type { PostRow } from 'ingest/types';
 
 import { createClickHouseClient, pingClickHouse } from './clickhouse.js';
 import { LEDGER_DB_PATH } from './config.js';
+import { CH_RKEY_DIGEST_EXPR, normalizeDigestHex } from './digest.js';
 import { repoPostRows } from './extract.js';
 import { fetchRepoCar } from './fetcher.js';
 import logger from './logger.js';
@@ -74,22 +75,15 @@ interface ChDidStats {
 
 const RECONCILE_CHUNK = 1000;
 
-// hex() of a UInt64 prints big-endian digits of the VALUE and drops leading
-// zero bytes ('01' for 1); the ledger stores fixed-width lowercase. Compare
-// in one canonical form.
-function normalizeDigestHex(value: string): string {
-  return value.toLowerCase().padStart(16, '0');
-}
-
 // Src-agnostic on purpose: a post created during the crawl arrives via BOTH the
 // live path and the repo CAR; whichever inserts later wins the ReplacingMergeTree
 // merge and keeps its src label. Filtering on src='backfill' undercounts active
 // repos (live can lag and win). The acceptance contract is "every post the CAR
 // contained is in ClickHouse", regardless of which path carried it.
 //
-// The digest is the same 64-bit XOR fold pipeline.ts wrote to the ledger:
-// reinterpretAsUInt64 is little-endian, matching readBigUInt64LE (proven equal
-// on a literal rkey), so equal sets produce equal digests on both sides.
+// The digest is the same 64-bit XOR fold pipeline.ts wrote to the ledger —
+// digest.ts holds both sides and the bit-identity proof, so equal sets produce
+// equal digests.
 async function chStatsForDids(
   ch: ClickHouseClient,
   dids: string[],
@@ -99,7 +93,7 @@ async function chStatsForDids(
     const result = await ch.query({
       query: `
         SELECT did, toUInt64(count()) AS posts,
-               hex(groupBitXor(reinterpretAsUInt64(substring(SHA256(rkey), 1, 8)))) AS digest
+               hex(${CH_RKEY_DIGEST_EXPR}) AS digest
         FROM posts FINAL WHERE did IN ({dids:Array(String)}) GROUP BY did
       `,
       query_params: { dids: dids.slice(i, i + RECONCILE_CHUNK) },

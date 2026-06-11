@@ -48,6 +48,28 @@ export class QuarantineError extends Error {
   }
 }
 
+/**
+ * THE pds_host normalization — every writer of the ledger column (enumerate,
+ * refreshHost) goes through here so the two can never drift. https endpoints
+ * (the overwhelming majority) store the bare host, which keeps every existing
+ * ledger row, host-grouping key and known-host equality check (bsky.social)
+ * unchanged; the rare http endpoint stores the full 'http://host' string so
+ * the scheme survives the round trip to fetchRepoCar below. url.host (not
+ * hostname) keeps a nonstandard port — it disambiguates dev PDSes.
+ */
+export function pdsHostFromEndpoint(endpoint: string): string | undefined {
+  try {
+    const url = new URL(endpoint);
+    const host = url.host.toLowerCase();
+    if (host === '') return undefined;
+    if (url.protocol === 'https:') return host;
+    if (url.protocol === 'http:') return `http://${host}`;
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export interface FetchedCar {
   response: Response;
   /** CAR_MAX_BYTES is enforced here; stream errors are always RetryableError or QuarantineError. */
@@ -127,8 +149,14 @@ export async function fetchRepoCar(
   pdsHost: string,
   did: string,
 ): Promise<FetchedCar> {
+  // pds_host carries a scheme only when it isn't https (see
+  // pdsHostFromEndpoint); a bare host means https. The prefix/slash trims also
+  // tolerate hand-edited ledger rows.
   const host = pdsHost.replace(/^https?:\/\//, '').replace(/\/+$/, '');
-  const url = `https://${host}/xrpc/com.atproto.sync.getRepo?did=${encodeURIComponent(did)}`;
+  const origin = pdsHost.startsWith('http://')
+    ? `http://${host}`
+    : `https://${host}`;
+  const url = `${origin}/xrpc/com.atproto.sync.getRepo?did=${encodeURIComponent(did)}`;
 
   const abort = new AbortController();
   // One budget for connect + headers + full body download.

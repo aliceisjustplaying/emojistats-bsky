@@ -9,7 +9,9 @@ import {
   RETRY_MAX_MS,
   USER_AGENT,
 } from './config.js';
+import { CH_RKEY_DIGEST_EXPR, normalizeDigestHex } from './digest.js';
 import {
+  pdsHostFromEndpoint,
   QuarantineError,
   RetryableError,
   TerminalFetchError,
@@ -48,32 +50,48 @@ export async function reconcileRecentLoads(
     'unclean shutdown detected: reconciling recently loaded repos against ClickHouse',
   );
 
-  // Src-agnostic and >= on purpose (same contract as verify.ts): a post created
+  // Src-agnostic on purpose (same contract as verify.ts): a post created
   // during the crawl arrives via BOTH the live path and the repo CAR; whichever
   // inserts later wins the ReplacingMergeTree merge and keeps its src label, so
-  // filtering on src='backfill' undercounts active repos. Live-only posts also
-  // legitimately push the count above posts_total. Only CH < ledger means the
-  // acked rows never reached disk — that and only that requeues.
+  // filtering on src='backfill' undercounts active repos.
+  //
+  // STRICT, unlike verify: 'loaded' survives only when the counts are exactly
+  // equal AND the rkey digests match (digest.ts holds both sides). A bare >=
+  // count is blind to the offset case — one lost CAR row balanced by one
+  // live-only arrival — which is precisely what a crash can produce. Requeue is
+  // cheap and idempotent, and this window is minutes of recent loads after a
+  // crash, so strictness is free here; verify is where live-only arrivals must
+  // pass loosely, over the whole ledger. Null ledger digest (should not happen
+  // on fresh ledgers) falls back to requeue only when CH < ledger.
   let requeued = 0;
   for (let i = 0; i < recent.length; i += 1000) {
     const chunk = recent.slice(i, i + 1000);
     const result = await ch.query({
-      query:
-        'SELECT did, toUInt64(count()) AS posts FROM posts FINAL WHERE did IN ({dids:Array(String)}) GROUP BY did',
+      query: `SELECT did, toUInt64(count()) AS posts, hex(${CH_RKEY_DIGEST_EXPR}) AS digest FROM posts FINAL WHERE did IN ({dids:Array(String)}) GROUP BY did`,
       query_params: { dids: chunk.map((row) => row.did) },
       format: 'JSONEachRow',
     });
-    const counts = new Map(
-      (await result.json<{ did: string; posts: string }>()).map((r) => [
-        r.did,
-        Number(r.posts),
-      ]),
+    const stats = new Map(
+      (await result.json<{ did: string; posts: string; digest: string }>()).map(
+        (r) => [
+          r.did,
+          { posts: Number(r.posts), digest: normalizeDigestHex(r.digest) },
+        ],
+      ),
     );
     for (const row of chunk) {
-      if ((counts.get(row.did) ?? 0) < (row.postsTotal ?? 0)) {
+      const actual = stats.get(row.did);
+      const expected = row.postsTotal ?? 0;
+      const intact =
+        row.rkeyDigest === null
+          ? (actual?.posts ?? 0) >= expected
+          : actual !== undefined &&
+            actual.posts === expected &&
+            actual.digest === normalizeDigestHex(row.rkeyDigest);
+      if (!intact) {
         ledger.markRetry(
           row.did,
-          'post-crash reconcile: ClickHouse count mismatch',
+          'post-crash reconcile: ClickHouse count/digest mismatch',
           0,
         );
         requeued += 1;
@@ -200,8 +218,12 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
         (s) => s.type === 'AtprotoPersonalDataServer',
       )?.serviceEndpoint;
       if (typeof endpoint !== 'string') return 'ok';
-      const host = new URL(endpoint).hostname;
-      if (host !== '' && host !== repo.pdsHost) {
+      // Same normalization as enumeration (pdsHostFromEndpoint) so the two
+      // writers of pds_host can never drift — including the scheme-prefixed
+      // form for the rare http PDS, which also self-heals rows enumerated
+      // before that form existed.
+      const host = pdsHostFromEndpoint(endpoint);
+      if (host !== undefined && host !== repo.pdsHost) {
         logger.info(
           { did: repo.did, from: repo.pdsHost, to: host },
           'stale PDS pointer: following current DID doc',
