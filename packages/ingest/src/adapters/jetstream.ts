@@ -103,6 +103,15 @@ export class JetstreamSource implements IngestSource {
     // close() defuses it so this backoff is the only reconnect driver.
     previous.close();
     previous.removeAllListeners();
+    // The dying socket can still emit a late 'error' (often with an empty
+    // message), and an EventEmitter with no 'error' listener turns that into
+    // an uncaught exception — which took the whole worker down. Keep a drain
+    // attached for the instance's remaining lifetime.
+    previous.on('error', (error) => {
+      logger.debug(
+        `Late error from closed Jetstream socket: ${error.message || '(empty)'}`,
+      );
+    });
 
     const delayMs = this.reconnectDelayMs;
     this.reconnectDelayMs = Math.min(

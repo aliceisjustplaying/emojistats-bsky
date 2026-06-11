@@ -30,15 +30,17 @@ import { toPostRow } from './rows.js';
 import type { Anomaly } from './types.js';
 import { ClickHouseWriter } from './writer.js';
 
+// Stack traces, not just .message: a late WebSocket error once crashed the
+// worker with the unreadable line "Uncaught exception: " — never again.
 process.on('unhandledRejection', (reason) => {
   logger.fatal(
-    `Unhandled rejection: ${reason instanceof Error ? reason.message : String(reason)}`,
+    `Unhandled rejection: ${reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)}`,
   );
   process.exit(1);
 });
 
 process.on('uncaughtException', (error) => {
-  logger.fatal(`Uncaught exception: ${error.message}`);
+  logger.fatal(`Uncaught exception: ${error.stack ?? error.message}`);
   process.exit(1);
 });
 
