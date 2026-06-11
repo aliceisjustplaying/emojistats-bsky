@@ -1,0 +1,123 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "env": {
+    "browser": true,
+    "builtin": true,
+    "es2022": true,
+    "node": true
+  },
+  "plugins": [
+    "eslint",
+    "typescript",
+    "unicorn",
+    "oxc",
+    "import",
+    "jsx-a11y",
+    "react",
+    "react-perf",
+    "promise",
+    "node"
+  ],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error",
+    "perf": "warn",
+    "pedantic": "off",
+    "style": "off",
+    "restriction": "off",
+    "nursery": "off"
+  },
+  "ignorePatterns": [
+    "**/dist/**",
+    "node_modules/**",
+    "**/.output/**",
+    "**/.tanstack/**",
+    "**/.nitro/**",
+    "**/routeTree.gen.ts",
+    "docs/**",
+    "packages/emoji-normalization/emoji.ts",
+    "packages/emoji-normalization/emojiVariationSequences.ts",
+    "**/components/ui/**"
+  ],
+  "options": {
+    "typeAware": true,
+    "typeCheck": true,
+    "reportUnusedDisableDirectives": "error"
+  },
+  "rules": {
+    "eslint/func-style": "off",
+    "eslint/id-length": "off",
+    "eslint/no-magic-numbers": "off",
+    "eslint/no-alert": "off",
+    "eslint/no-console": "off",
+    "eslint/no-undefined": "off",
+    "import/no-default-export": "off",
+    "import/no-unassigned-import": "off",
+    "oxc/no-rest-spread-properties": "off",
+    "oxc/no-optional-chaining": "off",
+    "promise/prefer-await-to-then": "warn",
+    "react/jsx-filename-extension": "off",
+    "react/jsx-max-depth": "off",
+    "react/no-unknown-property": "off",
+    "react/react-in-jsx-scope": "off",
+    "unicorn/prefer-ternary": "off",
+
+    "typescript/no-deprecated": "warn",
+    "typescript/no-misused-promises": "error",
+    "typescript/switch-exhaustiveness-check": "error",
+    "typescript/restrict-plus-operands": "error",
+    "typescript/only-throw-error": "error",
+    "typescript/prefer-promise-reject-errors": "error",
+    "typescript/ban-ts-comment": "error",
+    "react/rules-of-hooks": "error",
+    "react/jsx-no-target-blank": "error",
+    "eslint/no-promise-executor-return": "error",
+    "eslint/array-callback-return": "error",
+    "eslint/no-prototype-builtins": "error",
+    "eslint/no-redeclare": "error",
+
+    "typescript/no-explicit-any": "error",
+    "typescript/no-invalid-void-type": "error",
+    "typescript/no-non-null-asserted-nullish-coalescing": "error",
+    "promise/catch-or-return": "error",
+
+    "import/no-cycle": "warn",
+    "promise/no-multiple-resolved": "warn",
+    "react/iframe-missing-sandbox": "warn",
+    "typescript/no-unnecessary-type-parameters": "warn",
+    "unicorn/require-post-message-target-origin": "warn",
+
+    "jsx-a11y/click-events-have-key-events": "warn",
+    "jsx-a11y/label-has-associated-control": "warn",
+    "jsx-a11y/media-has-caption": "warn",
+    "jsx-a11y/no-noninteractive-tabindex": "warn",
+    "jsx-a11y/no-static-element-interactions": "warn",
+    "jsx-a11y/prefer-tag-over-role": "warn",
+
+    "typescript/no-unsafe-type-assertion": "warn",
+    "typescript/no-unsafe-assignment": "warn",
+    "typescript/no-unsafe-member-access": "warn",
+    "typescript/no-unsafe-call": "warn",
+    "typescript/no-unsafe-return": "warn",
+    "typescript/no-unsafe-argument": "warn",
+
+    "typescript/strict-void-return": "warn",
+    "typescript/no-confusing-void-expression": "warn",
+    "typescript/no-non-null-assertion": "warn",
+
+    "eslint/no-underscore-dangle": ["error", {
+      "allow": ["_", "__dirname", "__filename"],
+      "allowFunctionParams": true,
+      "allowInArrayDestructuring": true,
+      "allowInObjectDestructuring": true
+    }]
+  },
+  "overrides": [
+    {
+      "files": ["**/*.tsx"],
+      "rules": {
+        "typescript/prefer-readonly-parameter-types": "off"
+      }
+    }
+  ]
+}

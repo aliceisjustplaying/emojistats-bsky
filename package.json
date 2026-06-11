@@ -8,13 +8,19 @@
     "dev:frontend": "cd packages/frontend && bun run dev",
     "dev:backend": "cd packages/backend && bun run dev",
     "dev": "concurrently --names=backend,frontend --prefix-colors=auto 'bun run dev:backend' 'bun run dev:frontend'",
+    "lint": "oxlint .",
+    "formatting": "oxfmt",
+    "formatting-check": "oxfmt --check",
     "prepare": "husky"
   },
   "devDependencies": {
     "husky": "^9.1.6",
-    "lint-staged": "^15.2.10"
+    "lint-staged": "^15.2.10",
+    "oxfmt": "^0.54.0",
+    "oxlint": "^1.69.0",
+    "oxlint-tsgolint": "^0.23.0"
   },
   "lint-staged": {
-    "*": "prettier --ignore-unknown --write --ignore-path packages/backend/.prettierignore"
+    "*.{ts,tsx,js,jsx,mjs,cjs}": "oxfmt"
   }
 }

@@ -4,3 +4,11 @@ bun.lockb
 CURSOR_OVERRIDE.TXT
 packages/backend/src/**/*.js
 *.txt
+
+# runtime state of the dead Nexus/tap experiment
+nexus.db*
+
+# local claude state
+.claude/settings.local.json
+
+.DS_Store
