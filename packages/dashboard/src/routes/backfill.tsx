@@ -185,16 +185,19 @@ function BackfillPage() {
             crawling every Bluesky repo to rebuild emoji history since 2023
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          <CrawlBadge overview={overview} />
-          {overview ? (
-            <span
-              className="text-xs text-muted-foreground tabular-nums"
-              suppressHydrationWarning
-            >
-              {new Date(overview.generatedAt).toLocaleTimeString()}
-            </span>
-          ) : null}
+        <div className="flex flex-col items-end gap-1.5">
+          <div className="flex items-center gap-2">
+            <CrawlBadge overview={overview} />
+            {overview ? (
+              <span
+                className="text-xs text-muted-foreground tabular-nums"
+                suppressHydrationWarning
+              >
+                {new Date(overview.generatedAt).toLocaleTimeString()}
+              </span>
+            ) : null}
+          </div>
+          <ShardFreshnessStrip overview={overview} />
         </div>
       </header>
 
@@ -244,6 +247,49 @@ function CrawlBadge({ overview }: { overview: BackfillOverview | null }) {
       <span className="size-1.5 rounded-full bg-muted-foreground" />
       idle · last update {formatDuration(overview.freshnessSeconds)} ago
     </Badge>
+  );
+}
+
+// A shard past amber has missed several telemetry intervals (~10s); past red
+// its breakdown counts are frozen at its last report.
+const SHARD_AMBER_SECONDS = 60;
+const SHARD_RED_SECONDS = 300;
+
+function ShardFreshnessStrip({
+  overview,
+}: {
+  overview: BackfillOverview | null;
+}) {
+  if (overview === null || overview.shardFreshness.length === 0) return null;
+  const frozen = overview.shardFreshness.filter(
+    (s) => s.ageSeconds > SHARD_RED_SECONDS,
+  );
+  return (
+    <div className="space-y-1">
+      <div className="flex flex-wrap justify-end gap-1.5">
+        {overview.shardFreshness.map((s) => (
+          <span
+            key={s.shard}
+            className={`rounded-full border px-2 py-0.5 font-mono text-[10px] tabular-nums ${
+              s.ageSeconds > SHARD_RED_SECONDS
+                ? 'border-red-600/50 text-red-600'
+                : s.ageSeconds > SHARD_AMBER_SECONDS
+                  ? 'border-amber-600/50 text-amber-600'
+                  : 'text-muted-foreground'
+            }`}
+          >
+            {s.shard} · {formatDuration(s.ageSeconds)}
+          </span>
+        ))}
+      </div>
+      {frozen.length > 0 ? (
+        <p className="text-right text-xs text-red-600/90">
+          {frozen.length === 1
+            ? `${frozen[0].shard} has stopped reporting — its counts in the breakdown below are frozen at its last report`
+            : `${frozen.length} shards have stopped reporting — their counts in the breakdown below are frozen at their last reports`}
+        </p>
+      ) : null}
+    </div>
   );
 }
 
@@ -301,20 +347,30 @@ function Hero({ overview }: { overview: BackfillOverview | null }) {
           <Stat
             label="repos/min"
             value={integer.format(Math.round(overview.reposPerMin))}
-            sub={overview.active ? 'rolling 5 min' : 'crawl idle'}
+            sub={overview.active ? 'rolling 10 min' : 'crawl idle'}
           />
           <Stat
             label="rows/s"
             value={integer.format(Math.round(overview.rowsPerSec))}
             sub={overview.active ? 'into ClickHouse' : 'last reported'}
           />
-          <Stat label="ETA" value={formatEta(overview.etaHours)} />
+          <Stat
+            label="ETA"
+            value={formatEta(overview.etaHours)}
+            sub="pending + fetching"
+          />
           <Stat
             label="in flight"
             value={integer.format(overview.inFlight)}
             sub={`${integer.format(overview.shards)} shard${overview.shards === 1 ? '' : 's'}`}
           />
         </div>
+        {overview.parkedUnreachable > 0 ? (
+          <p className="text-xs text-muted-foreground tabular-nums">
+            {integer.format(overview.parkedUnreachable)} unreachable parked
+            (retry waves + final sweep) — outside the ETA
+          </p>
+        ) : null}
       </CardContent>
     </Card>
   );

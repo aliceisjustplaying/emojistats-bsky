@@ -24,8 +24,13 @@ const ISSUE_EVENTS = [
   'deactivated',
 ] as const;
 
-/** Window for the rolling repos-per-minute estimate. */
-const RATE_WINDOW_MINUTES = 5;
+/**
+ * Window for the rolling repos-per-minute estimate. Must span multiple shard
+ * flush cycles: a single shard silent for the whole window zeroes its rate
+ * contribution while its remaining repos still count, understating the rate
+ * and inflating the ETA.
+ */
+const RATE_WINDOW_MINUTES = 10;
 /** Telemetry older than this means the crawl is idle (interval is ~10s). */
 const IDLE_AFTER_SECONDS = 60;
 /** Target point count for the throughput timeline. */
@@ -34,7 +39,7 @@ const TIMELINE_POINTS = 200;
 /** Compact crawl snapshot for the front-page panel. */
 export interface BackfillStatus {
   statusCounts: Record<BackfillRepoStatus, number>;
-  /** Repos resolved per minute (rolling, last 5 min of telemetry). */
+  /** Repos resolved per minute (rolling, last RATE_WINDOW_MINUTES). */
   reposPerMin: number;
   /** Posts written to ClickHouse by the backfill so far. */
   postsLoaded: number;
@@ -49,13 +54,17 @@ export interface BackfillOverview {
   generatedAt: string;
   runId: string;
   shards: number;
-  /** Seconds since the newest telemetry row. */
+  /** Seconds since the stalest shard's newest telemetry row. */
   freshnessSeconds: number;
   /** True while telemetry is arriving (freshness below the idle cutoff). */
   active: boolean;
+  /** Seconds since each shard's newest telemetry row, stalest first. */
+  shardFreshness: Array<{ shard: string; ageSeconds: number }>;
   totalEnumerated: number;
   /** Repos out of pending/fetching — every terminal status incl. unreachable. */
   resolved: number;
+  /** Unreachable repos parked for retry waves + the final sweep. */
+  parkedUnreachable: number;
   postsLoaded: number;
   bytesDownloaded: number;
   reposPerMin: number;
@@ -83,9 +92,10 @@ const STATUS_ARGMAX_SQL = REPO_STATUSES.map(
 
 /**
  * Statuses that still represent work. Unreachable PARKS for retry waves
- * rather than resolving, so it stays out of "resolved" everywhere — the
- * progress fraction, the rate window and the ETA must agree on this or the
- * dashboard can read 100% while retry waves still run.
+ * rather than resolving, so it stays out of "resolved" — the progress
+ * fraction and the rate window must agree on this or the dashboard can read
+ * 100% while retry waves still run. The ETA is the exception: parked repos
+ * are out of budget, so it counts pending + fetching only.
  */
 const UNRESOLVED_STATUSES: readonly string[] = [
   'pending',
@@ -143,13 +153,19 @@ async function fetchOverview(): Promise<BackfillOverview | null> {
         ) AS recent_posts
       FROM backfill_repo_events
     `),
-    chQuery<{ resolved_delta: string }>(
+    // Per-shard rate = delta / the shard's ACTUAL covered minutes, not the
+    // nominal window. Progress snapshots are replace-and-retry under load,
+    // so a "10-minute" window typically holds 7-9.5 minutes of rows per
+    // shard — dividing the delta by the flat window under-read the fleet
+    // rate by 20-30% and inflated the ETA accordingly (observed 22.3k vs
+    // true 26.2k repos/min, 2026-06-12 evening).
+    chQuery<{ repos_per_min: string }>(
       `
-      SELECT sum(d) AS resolved_delta
+      SELECT sum(rpm) AS repos_per_min
       FROM (
         SELECT
-          max(${RESOLVED_SUM_SQL})
-          - min(${RESOLVED_SUM_SQL}) AS d
+          (argMax(${RESOLVED_SUM_SQL}, ts) - argMin(${RESOLVED_SUM_SQL}, ts))
+          / greatest(dateDiff('second', min(ts), max(ts)) / 60, 1) AS rpm
         FROM backfill_progress
         WHERE run_id = {run:String}
           AND ts >= now() - INTERVAL ${RATE_WINDOW_MINUTES} MINUTE
@@ -172,12 +188,10 @@ async function fetchOverview(): Promise<BackfillOverview | null> {
     REPO_STATUSES.map((status) => [status, 0]),
   ) as Record<BackfillRepoStatus, number>;
   let inFlight = 0;
-  let oldestTs = Number.POSITIVE_INFINITY;
   for (const row of snapshot) {
     for (const status of REPO_STATUSES)
       statusCounts[status] += num(row[status]);
     inFlight += num(row.in_flight);
-    oldestTs = Math.min(oldestTs, chTsToDate(row.latest_ts).getTime());
   }
   const postsLoaded = num(totals[0]?.posts_total);
   const bytesDownloaded = num(totals[0]?.bytes_total);
@@ -187,16 +201,24 @@ async function fetchOverview(): Promise<BackfillOverview | null> {
     (acc, status) => acc + statusCounts[status],
     0,
   );
-  // Unreachable repos get retry waves, so they still count as work remaining
-  // — and symmetrically must not count as resolved (UNRESOLVED_STATUSES).
-  const remaining =
-    statusCounts.pending + statusCounts.fetching + statusCounts.unreachable;
-  const resolved = totalEnumerated - remaining;
-  const reposPerMin = num(rate[0]?.resolved_delta) / RATE_WINDOW_MINUTES;
-  const freshnessSeconds = Math.max(
-    0,
-    Math.round((Date.now() - oldestTs) / 1000),
-  );
+  // Unreachable repos get retry waves, so they must not count as resolved
+  // (UNRESOLVED_STATUSES) — but they are parked out of budget, not queued, so
+  // the ETA covers active crawl work (pending + fetching) only; millions of
+  // bulk-parked dead-host repos would otherwise inflate it.
+  const remaining = statusCounts.pending + statusCounts.fetching;
+  const resolved = totalEnumerated - remaining - statusCounts.unreachable;
+  const reposPerMin = num(rate[0]?.repos_per_min);
+  const now = Date.now();
+  const shardFreshness = snapshot
+    .map((row) => ({
+      shard: row.shard,
+      ageSeconds: Math.max(
+        0,
+        Math.round((now - chTsToDate(row.latest_ts).getTime()) / 1000),
+      ),
+    }))
+    .toSorted((a, b) => b.ageSeconds - a.ageSeconds);
+  const freshnessSeconds = shardFreshness[0]?.ageSeconds ?? 0;
 
   return {
     generatedAt: new Date().toISOString(),
@@ -204,8 +226,10 @@ async function fetchOverview(): Promise<BackfillOverview | null> {
     shards: snapshot.length,
     freshnessSeconds,
     active: freshnessSeconds < IDLE_AFTER_SECONDS,
+    shardFreshness,
     totalEnumerated,
     resolved,
+    parkedUnreachable: statusCounts.unreachable,
     postsLoaded,
     bytesDownloaded,
     reposPerMin,
