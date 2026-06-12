@@ -122,6 +122,50 @@ partial-coverage caveat died with the streaming interleave.
 Honorable mention: `pkill -f nixos-anywhere` over SSH matches its own command
 line and kills itself. It got me twice. `pkill -f "anywhere[.]sh"`.
 
+## ~04:30 — the boss's true form
+
+Even with parsing AND fetching in workers, the main thread pegged 100% in
+native code. SIGUSR1 couldn't even open the inspector — the loop was that
+dead. A restart with `--inspect` pre-armed and a hand-rolled CDP profiler
+finally produced the confession, and it was none of the four suspects above:
+
+    100.0%  Statement.all ← listClaimable (ledger.ts) ← scheduler.run
+
+The claimable query ran `row_number() OVER (PARTITION BY pds_host)` over
+EVERY claimable row — with the shard-bucket polynomial computed per row — on
+every claim batch. A full-table scan of a table that enumeration was growing
+by ~6,000 rows a second. At dry-run scale: milliseconds, invisible. At 3.7M
+rows with dead-host churn re-triggering claims: one to three seconds of
+synchronous native CPU, back to back, forever. Every earlier fix was real and
+necessary; none of them could matter while the claim path itself was the spin.
+The decay curve of the whole night — fine at first, dead by hour two — was the
+ledger growing.
+
+Fix: persist the bucket (computed once per row at write time, JS === SQL,
+modulus pinned with a constructor guard), additive migration with backfill on
+open (~70s per box over ~19M rows), index `(status, bucket, did)`, and claims
+became an O(LIMIT) index seek in did order — random base32 DIDs make did order
+a statistically fair host shuffle, so the window-function rotation wasn't even
+needed. Migration tested for JS/SQL bucket parity (5,001 DIDs, zero
+mismatches) and verified to hit the index via EXPLAIN QUERY PLAN.
+
+## ~05:30 — IT ACTUALLY HUMS
+
+First two minutes on one box after the fix: 1,696 claimed, 556 loaded, 725
+empty, 268k post rows, 552 MB — main thread at 9%. Fleet-wide: 150–250k
+posts/minute into ClickHouse sustained, ~1,300+ repos/minute resolving, boxes
+loafing at load 0.7 of 8 cores with zero 429s — so the bsky-infra host cap got
+a bump (16 → 32 per box) to let the early host-concentrated era through. The
+rate climbs on its own from here as enumeration fans out hosts and the queue
+leaves the whale era: the network's average repo is ~64 posts; tonight's were
+300+.
+
+Morals, in order of expense: profile before fixing (the CPU profile cost five
+minutes and was right; four plausible theories cost two hours and were
+upstream of the truth); O(n) on a growing n is a time bomb with a fuse
+exactly as long as your dry run; and the dashboard's "idle" badge was the
+single most honest component of the entire system all night.
+
 ## 02:15 — IT HUMS (first time, briefly)
 
 - emoji: live ingest reconnected to Jetstream, dashboard public behind Caddy
