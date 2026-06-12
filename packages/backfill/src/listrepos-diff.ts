@@ -44,6 +44,10 @@ const HOST_CONCURRENCY = 10;
  * classifies anything anyway — the skip list just saves the retries.
  */
 const SKIP_HOSTS_DEFAULT = [
+  // The relay, not a PDS: its listRepos is the ENTIRE network (~42M repos,
+  // 3+ hours to page) and on 2026-06-12 four boxes each walked it to
+  // classify a single stray ledger row. Never diff an aggregator.
+  'bsky.network',
   'atproto.brid.gy',
   'live2025demo.eurosky.social',
   'berlin-demo.eurosky.social',
