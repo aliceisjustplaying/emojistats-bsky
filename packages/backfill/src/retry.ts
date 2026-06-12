@@ -134,7 +134,7 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
         event: err.status,
         error: message,
       });
-      logger.warn(
+      logger.debug(
         { did: repo.did, status: err.status, err: message },
         'repo terminal',
       );

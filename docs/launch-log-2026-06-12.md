@@ -483,6 +483,11 @@ the ledger was skewed: 50k DID-ordered rows only exposed 14 hosts; 250k exposed
 round: claim scans are deeper but amortized through an in-memory backlog, so
 one ledger scan feeds many scheduler refills.
 
+One final hot-path tax showed up after that: this tail is mostly terminal
+classification (RepoNotFound / RepoTakendown / empty repos), and journald was
+being asked to ingest a line per repo. Those events remain in
+`backfill_repo_events`; the per-repo service logs are debug-only now.
+
 ## Running ETA honesty table (for the retro)
 
 | When | Basis | Claim |

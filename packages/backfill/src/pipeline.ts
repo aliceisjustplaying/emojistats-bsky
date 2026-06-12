@@ -187,7 +187,7 @@ export function createRepoPipeline(
           records: repoCounts.recordsTotal,
           carBytes: repoCounts.carBytes,
         });
-        logger.info(
+        logger.debug(
           { did: repo.did, ...repoCounts },
           'repo has zero posts; marked empty',
         );
