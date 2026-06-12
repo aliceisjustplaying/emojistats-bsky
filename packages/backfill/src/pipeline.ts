@@ -5,6 +5,8 @@ import type { ArchiveSink } from 'archive/types';
 import { applyTextPolicy } from 'ingest/rows';
 
 import { RetryableError } from './fetcher.js';
+import type { HostHealth } from './host-health.js';
+import type { HostPressure } from './host-pressure.js';
 import logger from './logger.js';
 import type { ParsePool } from './parse-pool.js';
 import type { RetryPolicy } from './retry.js';
@@ -22,6 +24,8 @@ export interface RepoPipelineDeps {
   retry: RetryPolicy;
   stats: CrawlStats;
   control: CrawlControl;
+  hostPressure: HostPressure;
+  hostHealth: HostHealth;
 }
 
 export function createRepoPipeline(
@@ -37,6 +41,8 @@ export function createRepoPipeline(
     retry,
     stats,
     control,
+    hostPressure,
+    hostHealth,
   } = deps;
 
   // ClickHouse being down fails every repo post-download; trip after a few in a
@@ -125,6 +131,9 @@ export function createRepoPipeline(
       // rows before any append removed the old partial-coverage caveat.
       const fetchTimeUs = Date.now() * 1000;
       const parsed = await parsePool.run(repo.did, repo.pdsHost, fetchTimeUs);
+      // The CAR arrived: feed the AIMD cap raise and reset deadness evidence.
+      hostPressure.recordSuccess(repo.pdsHost);
+      hostHealth.recordSuccess(repo.pdsHost);
 
       const postsTotal = parsed.rows.length;
       const load =

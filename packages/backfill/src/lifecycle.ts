@@ -16,6 +16,7 @@ import {
   STATS_LOG_INTERVAL_MS,
   TELEMETRY_INTERVAL_MS,
 } from './config.js';
+import type { LedgerStats } from './ledger-stats.js';
 import logger from './logger.js';
 import type { CrawlControl, CrawlStats } from './run-state.js';
 import type { Scheduler } from './scheduler.js';
@@ -58,7 +59,7 @@ export function createTelemetry(): {
 }
 
 export interface TelemetryWiring {
-  ledger: Ledger;
+  ledgerStats: LedgerStats;
   stats: CrawlStats;
   inFlight: () => number;
 }
@@ -78,13 +79,15 @@ export function startTelemetry(
         ? (deps.stats.postRows - telemetryRate.postRows) / elapsedSec
         : 0;
     telemetryRate = { postRows: deps.stats.postRows, at: now };
+    // Shard-scoped, and CACHED: the aggregates come from the ledger-stats
+    // worker thread. Computing them here was bottleneck #11 — on a 67M-row
+    // ledger the SUM + GROUP BY cost ~10s of synchronous main-thread sqlite
+    // per 10s tick, which froze the event loop, starved every socket, and
+    // masqueraded as ClickHouse "socket hang up" errors fleet-wide.
+    const aggregates = deps.ledgerStats.latest();
     return {
-      // Shard-scoped: a sharded ledger instance reports only its own slice,
-      // so the dashboard can SUM statusCounts/postsLoaded across shards and
-      // boxes and get exact fleet totals. bytesDownloaded / rowsPerSec /
-      // inFlight stay per-process as before.
-      statusCounts: deps.ledger.statusCounts(),
-      postsLoaded: deps.ledger.totalPostsLoaded(),
+      statusCounts: aggregates.statusCounts,
+      postsLoaded: aggregates.postsLoaded,
       bytesDownloaded: deps.stats.bytes,
       rowsPerSec,
       inFlight: deps.inFlight(),
@@ -130,6 +133,7 @@ export function startStatsLogging(
         rowsPerSec,
         fetching: scheduler.fetching(),
         inFlight: scheduler.inFlight(),
+        backlog: scheduler.backlog(),
         topHosts: scheduler.topHosts(),
       },
       'crawl stats',

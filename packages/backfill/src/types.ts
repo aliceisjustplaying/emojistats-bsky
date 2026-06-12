@@ -115,6 +115,19 @@ export interface Ledger {
   markVerified(did: string): void;
   /** Final sweep: zero attempts on parked unreachable rows (shard-scoped); returns rows reset. */
   resetUnreachableAttempts(): number;
+  /**
+   * Dead-host bulk park: moves up to `limit` PENDING rows on the host to
+   * out-of-budget 'unreachable' (the final-sweep list). Returns rows changed;
+   * callers loop until a short chunk, yielding between chunks.
+   */
+  parkDeadHostChunk(host: string, error: string, limit: number): number;
+  /** Companion one-shot: zeroes the budget on the host's in-budget unreachable rows. */
+  parkDeadHostUnreachable(host: string, error: string): number;
+  /** Cross-process dead-host registry (ledger meta), written by the crawler, read by enumeration. */
+  addDeadHost(host: string): void;
+  getDeadHosts(): string[];
+  /** Enumeration insert path for dead-host rows: born parked (final-sweep list). */
+  upsertParked(did: string, pdsHost: string, error: string): void;
   /** Follow an account migration discovered after enumeration (stale PLC pointer). */
   updateHost(did: string, pdsHost: string): void;
 

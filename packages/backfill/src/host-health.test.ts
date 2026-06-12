@@ -1,0 +1,212 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { afterEach, beforeEach, describe, it, mock } from 'node:test';
+
+import { MAX_ATTEMPTS } from './config.js';
+import { classifyDeadness, createHostHealth } from './host-health.js';
+import { bucketOf, SqliteLedger } from './ledger.js';
+
+describe('deadness classification', () => {
+  it('matches only failure modes that cannot be per-repo transient', () => {
+    assert.equal(
+      classifyDeadness(
+        'getRepo did@pds.trump.com: fetch failed: getaddrinfo ENOTFOUND pds.trump.com',
+      ),
+      'dns',
+    );
+    assert.equal(
+      classifyDeadness('getRepo did@plc.surge.sh: http 451'),
+      'legal',
+    );
+    // Resolver trouble is OUR problem, not the host's.
+    assert.equal(
+      classifyDeadness('fetch failed: getaddrinfo EAI_AGAIN x.example'),
+      null,
+    );
+    assert.equal(classifyDeadness('http 404 RepoNotFound'), null);
+    assert.equal(classifyDeadness('http 429'), null);
+    assert.equal(classifyDeadness('socket hang up'), null);
+  });
+});
+
+describe('host health tripping', () => {
+  it('trips only after 30 consecutive classified failures spanning 30s', (t) => {
+    const health = createHostHealth();
+    let now = 1_000_000;
+    t.mock.method(Date, 'now', () => now);
+
+    for (let i = 0; i < 40; i += 1)
+      health.recordFailure('dead.example', 'ENOTFOUND dead.example');
+    // 40 consecutive but zero elapsed span: must not trip.
+    assert.equal(health.isDead('dead.example'), false);
+
+    now += 31_000;
+    health.recordFailure('dead.example', 'ENOTFOUND dead.example');
+    assert.equal(health.isDead('dead.example'), true);
+    assert.deepEqual(health.takeNewlyTripped(), ['dead.example']);
+    // Drained: a second take returns nothing.
+    assert.deepEqual(health.takeNewlyTripped(), []);
+    assert.deepEqual(health.deadHosts(), ['dead.example']);
+  });
+
+  it('any success resets the consecutive count', (t) => {
+    const health = createHostHealth();
+    let now = 1_000_000;
+    t.mock.method(Date, 'now', () => now);
+
+    for (let i = 0; i < 29; i += 1)
+      health.recordFailure('flaky.example', 'ENOTFOUND flaky.example');
+    health.recordSuccess('flaky.example');
+    now += 60_000;
+    health.recordFailure('flaky.example', 'ENOTFOUND flaky.example');
+    assert.equal(health.isDead('flaky.example'), false);
+    assert.deepEqual(health.takeNewlyTripped(), []);
+  });
+
+  it('unclassified failures never count toward deadness', () => {
+    const health = createHostHealth();
+    for (let i = 0; i < 100; i += 1)
+      health.recordFailure('slow.example', 'fetch timeout after 300000ms');
+    assert.equal(health.isDead('slow.example'), false);
+  });
+
+  it('an HTTP response resets a DNS/451 streak; pure network errors do not', (t) => {
+    const health = createHostHealth();
+    let now = 1_000_000;
+    t.mock.method(Date, 'now', () => now);
+    for (let i = 0; i < 29; i += 1)
+      health.recordFailure('flap.example', 'ENOTFOUND flap.example');
+    // 5xx = a server answered: the streak must restart from zero.
+    health.recordFailure('flap.example', 'getRepo did@flap.example: http 503');
+    now += 60_000;
+    health.recordFailure('flap.example', 'ENOTFOUND flap.example');
+    assert.equal(health.isDead('flap.example'), false);
+    // A timeout proves nothing: streak keeps building across it.
+    const health2 = createHostHealth();
+    for (let i = 0; i < 29; i += 1)
+      health2.recordFailure('dead.example', 'ENOTFOUND dead.example');
+    health2.recordFailure('dead.example', 'fetch timeout after 300000ms');
+    now += 60_000;
+    health2.recordFailure('dead.example', 'ENOTFOUND dead.example');
+    assert.equal(health2.isDead('dead.example'), true);
+  });
+
+  it('deadness is sticky against late stray successes', (t) => {
+    const health = createHostHealth();
+    let now = 1_000_000;
+    t.mock.method(Date, 'now', () => now);
+    for (let i = 0; i < 30; i += 1)
+      health.recordFailure('dead.example', 'ENOTFOUND dead.example');
+    now += 31_000;
+    health.recordFailure('dead.example', 'ENOTFOUND dead.example');
+    assert.equal(health.isDead('dead.example'), true);
+    health.recordSuccess('dead.example');
+    assert.equal(health.isDead('dead.example'), true);
+  });
+});
+
+describe('ledger.parkDeadHostChunk', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(tmpdir(), 'ledger-park-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('parks pending and in-budget unreachable rows of the host, nothing else', () => {
+    const ledger = new SqliteLedger(path.join(dir, 'ledger.sqlite'));
+    ledger.upsertPending('did:plc:aaa1', 'dead.example');
+    ledger.upsertPending('did:plc:aaa2', 'dead.example');
+    ledger.upsertPending('did:plc:aaa3', 'dead.example');
+    ledger.upsertPending('did:plc:bbb1', 'alive.example');
+    // In-budget unreachable on the dead host: parks too.
+    ledger.markFetching('did:plc:aaa2');
+    ledger.markRetry('did:plc:aaa2', 'timeout', 60_000);
+    // Loaded rows are untouchable.
+    ledger.markFetching('did:plc:aaa3');
+    ledger.markLoaded('did:plc:aaa3', {
+      rev: 'r',
+      carBytes: 1,
+      recordsTotal: 1,
+      postsTotal: 1,
+      postsWithEmojis: 0,
+      emojiOccurrences: 0,
+      rkeyDigest: null,
+    });
+
+    let parked = 0;
+    for (;;) {
+      const changes = ledger.parkDeadHostChunk('dead.example', 'host dead', 1);
+      parked += changes;
+      if (changes < 1) break;
+    }
+    parked += ledger.parkDeadHostUnreachable('dead.example', 'host dead');
+    assert.equal(parked, 2);
+
+    const aaa1 = ledger.getRepo('did:plc:aaa1')!;
+    assert.equal(aaa1.status, 'unreachable');
+    assert.equal(aaa1.attempts, MAX_ATTEMPTS);
+    assert.equal(aaa1.retryAfter, null);
+    assert.equal(ledger.getRepo('did:plc:aaa2')!.attempts, MAX_ATTEMPTS);
+    assert.equal(ledger.getRepo('did:plc:aaa3')!.status, 'loaded');
+    assert.equal(ledger.getRepo('did:plc:bbb1')!.status, 'pending');
+    // Parked rows are out of budget: never offered to claims again this run.
+    assert.deepEqual(
+      ledger.listClaimable(10).map((r) => r.did),
+      ['did:plc:bbb1'],
+    );
+    ledger.close();
+  });
+
+  it('dead-host registry round-trips and enumeration inserts born-parked rows', () => {
+    const ledger = new SqliteLedger(path.join(dir, 'registry.sqlite'));
+    assert.deepEqual(ledger.getDeadHosts(), []);
+    ledger.addDeadHost('dead.example');
+    ledger.addDeadHost('dead.example');
+    ledger.addDeadHost('another.example');
+    assert.deepEqual(ledger.getDeadHosts(), [
+      'another.example',
+      'dead.example',
+    ]);
+
+    ledger.upsertParked('did:plc:born1', 'dead.example', 'host dead');
+    const born = ledger.getRepo('did:plc:born1')!;
+    assert.equal(born.status, 'unreachable');
+    assert.equal(born.attempts, MAX_ATTEMPTS);
+    // Existing pending rows convert; progressed rows are untouchable.
+    ledger.upsertPending('did:plc:was-pending', 'dead.example');
+    ledger.upsertParked('did:plc:was-pending', 'dead.example', 'host dead');
+    assert.equal(ledger.getRepo('did:plc:was-pending')!.status, 'unreachable');
+    ledger.markFetching('did:plc:born1');
+    assert.equal(ledger.getRepo('did:plc:born1')!.status, 'fetching');
+    ledger.upsertParked('did:plc:born1', 'dead.example', 'host dead');
+    assert.equal(ledger.getRepo('did:plc:born1')!.status, 'fetching');
+    assert.deepEqual(ledger.listClaimable(10), []);
+    ledger.close();
+  });
+
+  it('is shard-scoped like every other claim-path write', () => {
+    // Find dids landing in bucket 0 and elsewhere so the test is deterministic.
+    const dids: string[] = [];
+    for (let i = 0; dids.length < 2 && i < 1000; i += 1) {
+      const did = `did:plc:shardtest${i}`;
+      if (bucketOf(did) === 0 && dids.length === 0) dids.push(did);
+      else if (bucketOf(did) === 1 && dids.length === 1) dids.push(did);
+    }
+    const [inShard, outShard] = dids;
+    const dbPath = path.join(dir, 'sharded.sqlite');
+    const writer = new SqliteLedger(dbPath);
+    writer.upsertPending(inShard!, 'dead.example');
+    writer.upsertPending(outShard!, 'dead.example');
+    writer.close();
+
+    const shard0 = new SqliteLedger(dbPath, { shards: 6, shardIndex: 0 });
+    assert.equal(shard0.parkDeadHostChunk('dead.example', 'host dead', 100), 1);
+    assert.equal(shard0.getRepo(inShard!)!.status, 'unreachable');
+    assert.equal(shard0.getRepo(outShard!)!.status, 'pending');
+    shard0.close();
+  });
+});

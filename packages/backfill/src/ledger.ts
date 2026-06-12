@@ -9,6 +9,8 @@ import type { Ledger, RepoCounts, RepoRow, RepoStatus } from './types.js';
 
 const SCHEMA_PATH = fileURLToPath(new URL('./ledger.sql', import.meta.url));
 
+const DEAD_HOSTS_META_KEY = 'dead_hosts';
+
 interface RepoTableRow {
   did: string;
   pds_host: string;
@@ -54,6 +56,14 @@ export interface SqliteLedgerOptions {
   shards?: number;
   /** This process's shard, 0-based; rows hashing elsewhere are invisible — neither claimable nor counted. */
   shardIndex?: number;
+  /**
+   * SQLITE_BUSY wait. Default 5s suits the crawler (it is the dominant
+   * writer; long waits on its main thread would be their own bug). Operator
+   * tools writing ALONGSIDE a live crawler (healthcheck --park,
+   * listrepos-diff --apply) must pass something generous — all six morel
+   * applies died at 5s on first contact with crawl-write contention.
+   */
+  busyTimeoutMs?: number;
 }
 
 /**
@@ -101,6 +111,9 @@ export class SqliteLedger implements Ledger {
   private readonly stmtMarkLoaded: Database.Statement;
   private readonly stmtMarkRetry: Database.Statement;
   private readonly stmtMarkThrottled: Database.Statement;
+  private readonly stmtParkDeadHost: Database.Statement;
+  private readonly stmtParkDeadHostUnreachable: Database.Statement;
+  private readonly stmtUpsertParked: Database.Statement;
   private readonly stmtMarkTerminal: Database.Statement;
   private readonly stmtMarkVerified: Database.Statement;
   private readonly stmtStatusCounts: Database.Statement;
@@ -152,7 +165,9 @@ export class SqliteLedger implements Ledger {
     this.shardAnd = shardAnd;
 
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-    this.db = new Database(dbPath);
+    this.db = new Database(dbPath, {
+      timeout: options.busyTimeoutMs ?? 5_000,
+    });
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
     this.db.exec(fs.readFileSync(SCHEMA_PATH, 'utf8'));
@@ -172,6 +187,14 @@ export class SqliteLedger implements Ledger {
     );
     this.db.exec(
       'CREATE INDEX IF NOT EXISTS idx_repos_bucket_status ON repos (bucket, status)',
+    );
+    // Retry-wave claims seek (status, bucket) then range retry_after. Without
+    // this, the planner satisfied the old ORDER BY did via idx_repos_claim and
+    // walked the ENTIRE parked unreachable set filtering retry_after per row —
+    // millions of rows of synchronous main-thread work per scan when few or
+    // none were due.
+    this.db.exec(
+      'CREATE INDEX IF NOT EXISTS idx_repos_retry ON repos (status, bucket, retry_after)',
     );
 
     // Account migrations during enumeration: a later op may move a still-pending
@@ -216,7 +239,7 @@ export class SqliteLedger implements Ledger {
     this.stmtListClaimableRetry = this.db.prepare(`
       SELECT * FROM repos
       WHERE status = 'unreachable' AND retry_after <= ? AND attempts < ? ${shardAnd}
-      ORDER BY did
+      ORDER BY retry_after
       LIMIT ?
     `);
 
@@ -245,6 +268,54 @@ export class SqliteLedger implements Ledger {
     this.stmtMarkThrottled = this.db.prepare(`
       UPDATE repos SET status = 'unreachable', error = ?, retry_after = ?
       WHERE did = ?
+    `);
+
+    // Dead-host bulk park (host-health.ts): everything still claimable on the
+    // host moves to out-of-budget 'unreachable' — invisible to claims (the
+    // attempts gate) but on the explicit final-sweep list, where --final-sweep
+    // zeroes budgets and the retry path re-resolves DID docs (migrated
+    // accounts heal there). Chunked via the inner LIMIT so a 1.9M-row host
+    // never holds the write lock — or the event loop — for one giant UPDATE.
+    // The chunked arm targets ONLY 'pending': each parked row leaves the
+    // (pds_host, 'pending') index range, so successive chunks never re-visit
+    // it. A status IN ('pending','unreachable') version re-scanned every
+    // already-parked row (now in the 'unreachable' range, rejected on the
+    // attempts filter) on every chunk — quadratic, ~10 min of pegged main
+    // thread for a 1.9M-row host. The in-budget 'unreachable' stragglers are
+    // a small set (prior retry waves), parked in one shot.
+    // INDEXED BY is load-bearing: without it the planner prefers
+    // idx_repos_retry (status, bucket) and row-filters pds_host — a scan
+    // over the shard's ENTIRE pending/unreachable set per chunk (~8M rows,
+    // verified via EXPLAIN QUERY PLAN on a live 23GB ledger).
+    this.stmtParkDeadHost = this.db.prepare(`
+      UPDATE repos SET status = 'unreachable', attempts = ${MAX_ATTEMPTS}, error = ?, retry_after = NULL
+      WHERE did IN (
+        SELECT did FROM repos INDEXED BY idx_repos_host_status
+        WHERE pds_host = ? AND status = 'pending' ${shardAnd}
+        LIMIT ?
+      )
+    `);
+    this.stmtParkDeadHostUnreachable = this.db.prepare(`
+      UPDATE repos SET attempts = ${MAX_ATTEMPTS}, error = ?, retry_after = NULL
+      WHERE did IN (
+        SELECT did FROM repos INDEXED BY idx_repos_host_status
+        WHERE pds_host = ? AND status = 'unreachable' AND attempts < ${MAX_ATTEMPTS} ${shardAnd}
+      )
+    `);
+
+    // Enumeration's insert path for hosts already on the dead list: rows are
+    // born parked. Mirrors upsertPending's conflict rule — never clobbers a
+    // row that progressed past 'pending'.
+    this.stmtUpsertParked = this.db.prepare(`
+      INSERT INTO repos (did, pds_host, status, attempts, error, enumerated_at, bucket)
+      VALUES (?, ?, 'unreachable', ${MAX_ATTEMPTS}, ?, ?, ?)
+      ON CONFLICT (did) DO UPDATE SET
+        pds_host = excluded.pds_host,
+        status = 'unreachable',
+        attempts = ${MAX_ATTEMPTS},
+        error = excluded.error,
+        retry_after = NULL
+      WHERE repos.status = 'pending'
     `);
 
     // COALESCE keeps the last recorded error when markTerminal is called without one
@@ -331,7 +402,7 @@ export class SqliteLedger implements Ledger {
       retry: this.db.prepare(`
         SELECT * FROM repos
         WHERE status = 'unreachable' AND retry_after <= ? AND attempts < ? ${this.shardAnd} ${hostExclusion}
-        ORDER BY did
+        ORDER BY retry_after
         LIMIT ?
       `),
     };
@@ -394,6 +465,81 @@ export class SqliteLedger implements Ledger {
 
   markThrottled(did: string, error: string, retryAfterMs: number): void {
     this.stmtMarkThrottled.run(error, Date.now() + retryAfterMs, did);
+  }
+
+  parkDeadHostChunk(host: string, error: string, limit: number): number {
+    return this.stmtParkDeadHost.run(error, host, limit).changes;
+  }
+
+  parkDeadHostUnreachable(host: string, error: string): number {
+    return this.stmtParkDeadHostUnreachable.run(error, host).changes;
+  }
+
+  /**
+   * Cross-process dead-host registry (meta key). The crawler writes verdicts;
+   * enumeration reads them so the PLC spam tail (17.9M pds.trump.com rows and
+   * counting) lands directly as parked 'unreachable' instead of refilling
+   * 'pending' in a race against the in-process bulk park.
+   */
+  addDeadHost(host: string): void {
+    const hosts = new Set(this.getDeadHosts());
+    if (hosts.has(host)) return;
+    hosts.add(host);
+    this.setMeta(DEAD_HOSTS_META_KEY, JSON.stringify([...hosts].toSorted()));
+  }
+
+  getDeadHosts(): string[] {
+    const raw = this.getMeta(DEAD_HOSTS_META_KEY);
+    if (raw === undefined) return [];
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      return Array.isArray(parsed)
+        ? parsed.filter((h) => typeof h === 'string')
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  upsertParked(did: string, pdsHost: string, error: string): void {
+    this.stmtUpsertParked.run(did, pdsHost, error, Date.now(), bucketOf(did));
+  }
+
+  /**
+   * Keyset page of one host's rows in a status (listrepos-diff). rowid
+   * keyset + INDEXED BY: the (pds_host, status) index yields ascending
+   * rowids within the range, so each page is a seek — no sort, no offset
+   * scan, and writes can interleave between pages.
+   */
+  listHostStatusDids(
+    host: string,
+    status: 'pending' | 'unreachable',
+    afterRowid: number,
+    limit: number,
+    enumeratedBeforeMs: number,
+  ): Array<{ rowid: number; did: string }> {
+    return this.db
+      .prepare(
+        `SELECT rowid, did FROM repos INDEXED BY idx_repos_host_status
+         WHERE pds_host = ? AND status = ? AND rowid > ? AND enumerated_at < ?
+         ORDER BY rowid LIMIT ?`,
+      )
+      .all(host, status, afterRowid, enumeratedBeforeMs, limit) as Array<{
+      rowid: number;
+      did: string;
+    }>;
+  }
+
+  /** Distinct hosts still owning pending rows, deepest first (healthcheck sweep). */
+  pendingHostCounts(): Array<{ host: string; pending: number }> {
+    const rows = this.db
+      .prepare(
+        `SELECT pds_host AS host, COUNT(*) AS pending FROM repos INDEXED BY idx_repos_host_status
+         WHERE status = 'pending' ${this.shardAnd}
+         GROUP BY pds_host ORDER BY pending DESC`,
+      )
+      .all() as Array<{ host: string; pending: number }>;
+    return rows;
   }
 
   // Rare path (retries only) — not worth a prepared-statement field.

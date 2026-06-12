@@ -16,6 +16,7 @@ import {
   RetryableError,
   TerminalFetchError,
 } from './fetcher.js';
+import type { HostHealth } from './host-health.js';
 import type { HostPressure } from './host-pressure.js';
 import logger from './logger.js';
 import type { CrawlStats } from './run-state.js';
@@ -117,15 +118,18 @@ export interface RetryPolicyDeps {
   telemetry: CrawlTelemetry;
   stats: CrawlStats;
   hostPressure: HostPressure;
+  hostHealth: HostHealth;
 }
 
 export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
-  const { ledger, telemetry, stats, hostPressure } = deps;
+  const { ledger, telemetry, stats, hostPressure, hostHealth } = deps;
 
   function handleRepoError(repo: RepoRow, err: unknown): void {
     const message = err instanceof Error ? err.message : String(err);
 
     if (err instanceof TerminalFetchError) {
+      // The host answered (404/tombstone/takedown are host SUCCESSES).
+      hostHealth.recordSuccess(repo.pdsHost);
       ledger.markTerminal(repo.did, err.status, message);
       stats.terminal += 1;
       telemetry.recordEvent({
@@ -188,6 +192,8 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
     // a politer pace fetched fine. The repo still backs off (flat base; the
     // host cooldown is what actually meters the pressure).
     if (/http 429/.test(message)) {
+      // Rate limiting is proof of life — never deadness evidence.
+      hostHealth.recordSuccess(repo.pdsHost);
       hostPressure.record429(repo.pdsHost);
       ledger.markThrottled(
         repo.did,
@@ -203,6 +209,7 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
       });
       return;
     }
+    hostHealth.recordFailure(repo.pdsHost, message);
     ledger.markRetry(repo.did, message, retryAfterMs);
     stats.retried += 1;
     telemetry.recordEvent({

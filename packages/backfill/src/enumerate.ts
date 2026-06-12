@@ -130,10 +130,26 @@ async function runExport(
   );
 
   const touched = new Set<string>();
-  const stats = { pages: 0, ops: 0, upserted: 0, tombstoned: 0, skipped: 0 };
+  const stats = {
+    pages: 0,
+    ops: 0,
+    upserted: 0,
+    tombstoned: 0,
+    skipped: 0,
+    parked: 0,
+  };
   let caughtUp = false;
 
+  // Crawler-published dead-host verdicts, refreshed once a minute so a host
+  // tripping mid-run starts diverting within a page or two.
+  let deadHosts = new Set(ledger.getDeadHosts());
+  let deadHostsReadAt = Date.now();
+
   while (!stop.requested) {
+    if (Date.now() - deadHostsReadAt > 60_000) {
+      deadHosts = new Set(ledger.getDeadHosts());
+      deadHostsReadAt = Date.now();
+    }
     const response = await politeFetch(
       `${PLC_DIRECTORY_URL}/export?count=${EXPORT_PAGE_SIZE}&after=${cursor}`,
     );
@@ -174,7 +190,21 @@ async function runExport(
             stats.skipped++;
             continue;
           }
-          ledger.upsertPending(line.did, host);
+          // Hosts on the crawler's dead list (meta 'dead_hosts'): rows are
+          // born parked. Upserting them 'pending' made the crawler's bulk
+          // park race enumeration forever on spam waves (pds.trump.com:
+          // 17.9M rows) — the park drained 'pending' at ~18k rows/s while
+          // this loop refilled it, pinning the crawl main thread.
+          if (deadHosts.has(host)) {
+            ledger.upsertParked(
+              line.did,
+              host,
+              `host dead: ${host} (enumerated onto final-sweep list)`,
+            );
+            stats.parked++;
+          } else {
+            ledger.upsertPending(line.did, host);
+          }
           touched.add(line.did);
           stats.upserted++;
         }

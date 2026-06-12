@@ -17,7 +17,9 @@ import {
   LEDGER_DB_PATH,
   TEXT_IN_CLICKHOUSE,
 } from './config.js';
+import { createHostHealth } from './host-health.js';
 import { createHostPressure } from './host-pressure.js';
+import { createLedgerStats } from './ledger-stats.js';
 import { SqliteLedger } from './ledger.js';
 import {
   createTelemetry,
@@ -77,7 +79,14 @@ async function main(): Promise<void> {
 
   const { telemetry, clients: telemetryClients } = createTelemetry();
   const hostPressure = createHostPressure();
-  const retry = createRetryPolicy({ ledger, telemetry, stats, hostPressure });
+  const hostHealth = createHostHealth();
+  const retry = createRetryPolicy({
+    ledger,
+    telemetry,
+    stats,
+    hostPressure,
+    hostHealth,
+  });
   const parsePool = createParsePool();
   const processRepo = createRepoPipeline({
     ledger,
@@ -89,17 +98,28 @@ async function main(): Promise<void> {
     retry,
     stats,
     control,
+    hostPressure,
+    hostHealth,
   });
   const scheduler = createScheduler({
     ledger,
     stats,
     control,
     hostPressure,
+    hostHealth,
     processRepo,
   });
 
+  const ledgerStats = createLedgerStats({
+    dbPath: LEDGER_DB_PATH,
+    shards: CRAWL_SHARDS,
+    shardIndex: CRAWL_SHARD_INDEX,
+  });
+  // First snapshot must land before telemetry emits: an empty initial row
+  // would argMax-zero this shard's counts on the dashboard for a tick.
+  await ledgerStats.ready;
   startTelemetry(telemetry, {
-    ledger,
+    ledgerStats,
     stats,
     inFlight: () => scheduler.inFlight(),
   });
@@ -117,6 +137,7 @@ async function main(): Promise<void> {
     'crawl run finished',
   );
   await parsePool.close();
+  await ledgerStats.close();
   await shutdown({
     telemetry,
     archiveSink,

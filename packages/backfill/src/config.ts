@@ -72,7 +72,11 @@ export const MAX_ATTEMPTS = num('MAX_ATTEMPTS', 5);
 // old, whichever comes first. Sized so each box inserts ~4×/min instead of
 // ~4×/s — the per-month partition fan-out made tiny inserts a parts storm.
 export const LOADER_BATCH_ROWS = num('LOADER_BATCH_ROWS', 200_000);
-export const LOADER_FLUSH_MS = num('LOADER_FLUSH_MS', 15_000);
+// 5s, not 15s: every repo's pipeline slot is held until its rows' flush
+// lands (finish() barrier), so flush latency is slot occupancy. ClickHouse
+// p95 insert latency is sub-second; the parts-storm risk that motivated 15s
+// scales with insert COUNT, and cross-repo batching already collapsed that.
+export const LOADER_FLUSH_MS = num('LOADER_FLUSH_MS', 5_000);
 export const CRASH_RECONCILE_ON_STARTUP = bool(
   'CRASH_RECONCILE_ON_STARTUP',
   false,
