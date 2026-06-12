@@ -27,6 +27,7 @@ import {
 } from './lifecycle.js';
 import { ClickHouseRepoLoader } from './loader.js';
 import logger from './logger.js';
+import { createParsePool } from './parse-pool.js';
 import { createRepoPipeline } from './pipeline.js';
 import { createRetryPolicy, reconcileRecentLoads } from './retry.js';
 import { createCrawlStats, type CrawlControl } from './run-state.js';
@@ -70,9 +71,11 @@ async function main(): Promise<void> {
 
   const telemetry = createTelemetry(chClient);
   const retry = createRetryPolicy({ ledger, telemetry, stats });
+  const parsePool = createParsePool();
   const processRepo = createRepoPipeline({
     ledger,
     loader,
+    parsePool,
     archiveSink,
     policy,
     telemetry,
@@ -100,6 +103,7 @@ async function main(): Promise<void> {
     },
     'crawl run finished',
   );
+  await parsePool.close();
   await shutdown({ telemetry, archiveSink, ledger, chClient });
 }
 

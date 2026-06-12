@@ -1,29 +1,21 @@
-/** Per-repo pipeline: fetch → parse → stream each row through archive + load in one pass. */
+/** Per-repo pipeline: fetch (I/O) → parse in a worker (CPU) → archive + load (I/O). */
 
 import type { StoragePolicy } from 'archive/policy';
 import type { ArchiveSink } from 'archive/types';
 import { applyTextPolicy } from 'ingest/rows';
-import type { PostRow } from 'ingest/types';
 
-import { rkeyHash64 } from './digest.js';
-import { repoPostRows } from './extract.js';
 import { fetchRepoCar, QuarantineError, RetryableError } from './fetcher.js';
 import logger from './logger.js';
-import { parseRepoCar } from './parser.js';
+import type { ParsePool } from './parse-pool.js';
 import type { RetryPolicy } from './retry.js';
 import type { CrawlControl, CrawlStats } from './run-state.js';
 import type { CrawlTelemetry } from './telemetry.js';
-import type {
-  Ledger,
-  RepoCounts,
-  RepoLoad,
-  RepoLoader,
-  RepoRow,
-} from './types.js';
+import type { Ledger, RepoCounts, RepoLoader, RepoRow } from './types.js';
 
 export interface RepoPipelineDeps {
   ledger: Ledger;
   loader: RepoLoader;
+  parsePool: ParsePool;
   archiveSink: ArchiveSink | null;
   policy: StoragePolicy;
   telemetry: CrawlTelemetry;
@@ -32,12 +24,35 @@ export interface RepoPipelineDeps {
   control: CrawlControl;
 }
 
+/** Drains a (CAR_MAX_BYTES-guarded) body stream into one transferable buffer. */
+async function bufferCar(
+  body: ReadableStream<Uint8Array>,
+): Promise<ArrayBuffer> {
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  const reader = body.getReader();
+  while (true) {
+    const result = await reader.read();
+    if (result.done) break;
+    chunks.push(result.value);
+    total += result.value.byteLength;
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out.buffer;
+}
+
 export function createRepoPipeline(
   deps: RepoPipelineDeps,
 ): (repo: RepoRow) => Promise<void> {
   const {
     ledger,
     loader,
+    parsePool,
     archiveSink,
     policy,
     telemetry,
@@ -103,9 +118,6 @@ export function createRepoPipeline(
 
   return async function processRepo(repo: RepoRow): Promise<void> {
     const startedAt = Date.now();
-    // Hoisted out of the try so the quarantine path in the catch below can
-    // report how many rows had already streamed when the walk gave up.
-    let postsTotal = 0;
     try {
       // bsky.social is the entryway, never a real sync host — a ledger pointer at
       // it is always a stale pre-mushroom op; resolve before wasting a request.
@@ -130,41 +142,19 @@ export function createRepoPipeline(
       }
       const fetched = await fetchRepoCar(repo.pdsHost, repo.did);
       const fetchTimeUs = Date.now() * 1000;
-      const parsed = parseRepoCar(fetched.body);
+      // Buffer the (CAR_MAX_BYTES-guarded) body and hand it to a parse worker
+      // by transfer — all CPU happens off-thread, this thread only does I/O.
+      // The CAR is resident either way (the MST reader needs random access);
+      // the worker frees it when the job ends. A quarantine inside the worker
+      // means NO rows have been written anywhere — materializing rows before
+      // any append removed the old partial-coverage caveat.
+      const car = await bufferCar(fetched.body);
+      const parsed = await parsePool.parse(repo.did, car, fetchTimeUs);
 
-      // Single pass in MST walk order: each row goes archive → ClickHouse chunk
-      // before the next is normalized, so peak memory per repo stays the CAR
-      // buffer plus one loader chunk — never a second full copy of the repo.
-      // The interleave means partial chunks may land before an archive failure;
-      // that is fine: the repo re-fetches entirely on the next run and
-      // ReplacingMergeTree + the dedup tokens collapse whatever already landed.
-      let postsWithEmojis = 0;
-      let emojiOccurrences = 0;
-      // Folded over the same post-normalization rkeys that get loaded, so the
-      // ledger digest and ClickHouse's recomputation describe the same set.
-      let rkeyDigest = 0n;
-
-      // The dedup token (`${did}:${rev}:${chunkIdx}`) needs rev before the
-      // first chunk insert, so ClickHouse rows buffer here until the commit
-      // scanner has it. In practice that is zero rows: the MST reader cannot
-      // yield a record before consuming the commit block (see ParsedRepo.rev).
-      let load: RepoLoad | null = null;
-      const pending: PostRow[] = [];
-      const openAndFlushPending = async (): Promise<RepoLoad> => {
-        const opened = loader.openRepo(repo.did, parsed.rev);
-        for (const buffered of pending) await opened.addRow(buffered);
-        pending.length = 0;
-        return opened;
-      };
-
-      for await (const row of repoPostRows(repo.did, parsed, fetchTimeUs)) {
-        postsTotal += 1;
-        rkeyDigest ^= rkeyHash64(row.rkey);
-        if (row.emojis.length > 0) {
-          postsWithEmojis += 1;
-          emojiOccurrences += row.emojis.length;
-        }
-
+      const postsTotal = parsed.rows.length;
+      const load =
+        postsTotal > 0 ? loader.openRepo(repo.did, parsed.rev) : null;
+      for (const row of parsed.rows) {
         // Full rows (text always included) go to the parquet archive first — it
         // is the only durable home of non-emoji post text.
         if (archiveSink !== null) {
@@ -178,26 +168,21 @@ export function createRepoPipeline(
         // Cost-revised storage (plan 0001): ClickHouse keeps text for emoji
         // posts only; rows without emojis ship with text stripped. 'all' is the
         // upgrade path (applyTextPolicy passes rows through untouched).
-        const chRow = applyTextPolicy(row, policy);
         try {
-          if (load === null && parsed.rev !== null)
-            load = await openAndFlushPending();
-          if (load === null) pending.push(chRow);
-          else await load.addRow(chRow);
+          await load!.addRow(applyTextPolicy(row, policy));
         } catch (err) {
           throw loaderChunkFailed(err);
         }
       }
 
-      // Drain complete: rev, recordsTotal and carBytes are final from here on.
       const repoCounts: RepoCounts = {
         rev: parsed.rev,
         carBytes: fetched.bytesRead(),
         recordsTotal: parsed.recordsTotal,
         postsTotal,
-        postsWithEmojis,
-        emojiOccurrences,
-        rkeyDigest: rkeyDigest.toString(16).padStart(16, '0'),
+        postsWithEmojis: parsed.postsWithEmojis,
+        emojiOccurrences: parsed.emojiOccurrences,
+        rkeyDigest: parsed.rkeyDigestHex,
       };
       stats.bytes += repoCounts.carBytes;
       if (parsed.duplicatePostsSkipped > 0) {
@@ -208,11 +193,6 @@ export function createRepoPipeline(
       }
 
       try {
-        // rev-less drains quarantine inside the parser today, so this flush is
-        // belt-and-suspenders: if rows are still pending, load them under the
-        // old `${did}:null:${chunkIdx}` token shape rather than drop them.
-        if (load === null && pending.length > 0)
-          load = await openAndFlushPending();
         if (load !== null) await load.finish();
         consecutiveLoaderFailures = 0;
       } catch (err) {
@@ -259,17 +239,11 @@ export function createRepoPipeline(
         );
       }
     } catch (err) {
-      // A mid-walk quarantine (malformed CBOR, caps) leaves whatever already
-      // streamed — archive appends plus full ClickHouse chunks — in place while
-      // the ledger goes 'quarantined'. Accepted consequence of the single-pass
-      // stream: buffering rows until the walk completes would undo the memory
-      // win. It is also benign: every row written was an individually valid
-      // post, 'quarantined' already records incomplete coverage, and verify's
-      // orphan check flags CH rows for non-loaded DIDs. The count is appended
-      // to the message so the operator sees the partial write in the ledger.
-      if (err instanceof QuarantineError && postsTotal > 0) {
-        err.message += `; ${postsTotal} rows already in posts/archive (valid posts, incomplete coverage)`;
-      }
+      // Parse failures (quarantine included) surface before any row is
+      // appended anywhere — the worker materializes the full repo first. Rows
+      // can still partially land if archive/loader I/O fails mid-loop; those
+      // park as retryable and the re-fetch collapses into ReplacingMergeTree
+      // + the dedup tokens like any other at-least-once replay.
       retry.handleRepoError(repo, err);
     }
   };
