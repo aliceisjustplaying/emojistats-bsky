@@ -4,6 +4,57 @@ Raw notes for the eventual writeup. Times are local (CEST). The goal: stand up
 one serving box + six crawl boxes from bare Hetzner hardware to a running
 full-network Bluesky backfill, overnight, with correctness guarantees built in.
 
+## Chapter 0 — how we got here (pre-launch working notes, added day 2)
+
+The white whale: backfill emojistats from the first Bluesky post and serve
+down-to-the-hour historical emoji trends next to the live view. The scar
+tissue shaping every decision: a failed November 2025 attempt ("Nexus" —
+which a later archaeology dig resolved to be tap's pre-release development
+name; we'd been running pre-release tap into Timescale + Parquet). That
+attempt died of unverifiability. Hence the prime directive this time:
+**correctness must be checkable per repo**, not vibes-checked at the end.
+
+Decisions locked 2026-06-11, before any hardware:
+
+- Custom lean TypeScript crawler (not tap, not a zeppelin fork): we want the
+  ledger, verification and emoji extraction fused, and the workload (getRepo
+  CAR → posts only) is narrow.
+- Emojitracker semantics: posts count as they happened; deletes are ignored
+  on purpose. Relays are non-archival, so "history" means surviving posts.
+- One store: ClickHouse. Postgres/Timescale, Redis/Valkey and BullMQ from the
+  old stack: ripped out (16 deps deleted from the backend the same day).
+- Cost-revised storage split: ClickHouse keeps all posts but full text only
+  for emoji posts (~tens of GB); the complete text corpus goes to zstd
+  Parquet on a €4/mo Storage Box, written during the crawl and spooled hourly
+  from live. The Parquet sink was a pre-crawl blocker because the crawl is
+  the only time most of that text will ever be fetched.
+- Architecture pillars: raw `posts` (ReplacingMergeTree on (did, rkey)) is
+  the only truth; every aggregate is a disposable cache rebuildable from it;
+  a per-repo SQLite ledger is the only crawl checkpoint; explicit acceptance
+  criteria per repo.
+- Verification is digest-tiered: a 64-bit XOR fold of sha256(rkey) per repo,
+  computed identically in JS and ClickHouse (`groupBitXor(reinterpretAsUInt64
+  (substring(SHA256(rkey),1,8)))`), promotes repos to EXACT; count-based
+  LOOSE catches live-arrival deltas; everything else FAILS loudly.
+
+Four pre-launch review rounds left war stories the blogpost should keep:
+live ingest made truly at-least-once (cursor commits only after the
+ClickHouse flush AND the archive-append barrier); a latent parquet
+sequence-reuse bug — rclone-move restarts would have silently overwritten
+remote files, i.e. silent destruction of the only copy of non-emoji text —
+caught by reading the manifest at seed time; insert dedup tokens that encode
+chunk size so a config change degrades to harmless re-inserts instead of
+silent skips; and a spec dive proving (did, rkey) is only safe as a post key
+because both paths hard-filter to `app.bsky.feed.post` (the argument is
+pinned as a comment on the schema's ORDER BY — if a second collection is
+ever ingested, the key must grow a collection component).
+
+Dry run before buying anything: 2,990 repos crawled, 100% reconciled,
+including a hand-verification that the owner's own 13,999 posts came back
+byte-exact. Also on the record: the old prod stack was no ground truth at
+all — its Postgres had been off for months and its Redis counters have gaps
+in unknown places. The crawl IS the source of truth now.
+
 ## Hardware
 
 - `emoji` (serving): Hetzner Cloud CX33, 4 vCPU / 8 GB / 80 GB, Debian 13 → NixOS
