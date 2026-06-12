@@ -35,6 +35,13 @@ export async function chQuery<T>(
   const { url, database, user, password } = config();
   const endpoint = new URL(url);
   endpoint.searchParams.set('database', database);
+  // The backfill insert load keeps the server pinned at its memory cap, and
+  // the OvercommitTracker kills whichever aggregation asks next — which was
+  // these dashboard queries (the public page 500'd mid-crawl). Cap our
+  // appetite and spill big GROUP BYs to disk instead of competing for RAM.
+  endpoint.searchParams.set('max_memory_usage', '1200000000');
+  endpoint.searchParams.set('max_bytes_before_external_group_by', '600000000');
+  endpoint.searchParams.set('max_bytes_before_external_sort', '600000000');
   for (const [key, value] of Object.entries(params ?? {})) {
     endpoint.searchParams.set(`param_${key}`, value);
   }
