@@ -13,13 +13,15 @@ import {
  * tagged 'emojistats-backfill' so the two writers are distinguishable in
  * system.query_log / system.processes.
  */
-export function createClickHouseClient(): ClickHouseClient {
+export function createClickHouseClient(
+  application = 'emojistats-backfill',
+): ClickHouseClient {
   return createClient({
     url: CLICKHOUSE_URL,
     username: CLICKHOUSE_USER,
     password: CLICKHOUSE_PASSWORD,
     database: CLICKHOUSE_DATABASE,
-    application: 'emojistats-backfill',
+    application,
     request_timeout: CLICKHOUSE_REQUEST_TIMEOUT_MS,
     // JSONEachRow post batches are very repetitive but large. Compressing the
     // request body cuts upload time and avoids ClickHouse seeing truncated

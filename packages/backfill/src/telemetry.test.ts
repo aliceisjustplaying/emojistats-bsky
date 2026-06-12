@@ -85,4 +85,45 @@ void describe('crawl telemetry', () => {
     releaseEvents?.();
     await telemetry.stop();
   });
+
+  void it('uses separate clients and chunks event inserts', async () => {
+    const progressTables: string[] = [];
+    const eventBatchSizes: number[] = [];
+    const progressClient = {
+      query: async () => ({
+        json: async () => [],
+      }),
+      insert: async (params: { table: string; values: unknown[] }) => {
+        progressTables.push(params.table);
+      },
+    } as unknown as ClickHouseClient;
+    const eventClient = {
+      insert: async (params: { table: string; values: unknown[] }) => {
+        assert.equal(params.table, 'backfill_repo_events');
+        eventBatchSizes.push(params.values.length);
+      },
+    } as unknown as ClickHouseClient;
+    const telemetry = new CrawlTelemetry(
+      { progress: progressClient, events: eventClient },
+      {
+        runId: 'test',
+        shard: 'shard0',
+        intervalMs: 5,
+      },
+    );
+
+    for (let i = 0; i < 1001; i += 1) {
+      telemetry.recordEvent({
+        did: `did:plc:${i}`,
+        pdsHost: 'example.com',
+        event: 'empty',
+      });
+    }
+    telemetry.start(() => snapshot(1));
+    await waitFor(() => eventBatchSizes.length === 2);
+    await telemetry.stop();
+
+    assert.deepEqual(eventBatchSizes, [1000, 1]);
+    assert.ok(progressTables.every((table) => table === 'backfill_progress'));
+  });
 });

@@ -1,5 +1,6 @@
 import type { ClickHouseClient } from '@clickhouse/client';
 
+import { TELEMETRY_EVENT_BATCH_ROWS } from './config.js';
 import logger from './logger.js';
 import { REPO_STATUSES, type RepoStatus } from './types.js';
 
@@ -55,7 +56,8 @@ function chDateTime(ms: number): string {
 }
 
 export class CrawlTelemetry {
-  readonly #client: ClickHouseClient;
+  readonly #progressClient: ClickHouseClient;
+  readonly #eventClient: ClickHouseClient;
   readonly #runId: string;
   readonly #shard: string;
   readonly #intervalMs: number;
@@ -66,8 +68,14 @@ export class CrawlTelemetry {
   #progressFlushing = false;
   #eventFlushing = false;
 
-  constructor(client: ClickHouseClient, options: CrawlTelemetryOptions) {
-    this.#client = client;
+  constructor(
+    clients:
+      | ClickHouseClient
+      | { progress: ClickHouseClient; events: ClickHouseClient },
+    options: CrawlTelemetryOptions,
+  ) {
+    this.#progressClient = 'insert' in clients ? clients : clients.progress;
+    this.#eventClient = 'insert' in clients ? clients : clients.events;
     this.#runId = options.runId;
     this.#shard = options.shard;
     this.#intervalMs = options.intervalMs;
@@ -93,7 +101,7 @@ export class CrawlTelemetry {
    */
   async assertProgressColumns(): Promise<void> {
     try {
-      const result = await this.#client.query({
+      const result = await this.#progressClient.query({
         query: 'DESCRIBE TABLE backfill_progress',
         format: 'JSONEachRow',
       });
@@ -166,7 +174,7 @@ export class CrawlTelemetry {
       while (this.#pendingProgress !== undefined) {
         const progress = this.#pendingProgress;
         try {
-          await this.#client.insert({
+          await this.#progressClient.insert({
             table: 'backfill_progress',
             values: [progress],
             format: 'JSONEachRow',
@@ -193,20 +201,31 @@ export class CrawlTelemetry {
     const events = this.#events;
     this.#events = [];
     try {
-      try {
-        await this.#client.insert({
-          table: 'backfill_repo_events',
-          values: events,
-          format: 'JSONEachRow',
-        });
-      } catch (err) {
-        logger.warn(
-          {
-            dropped: events.length,
-            err: err instanceof Error ? err.message : String(err),
-          },
-          'telemetry: backfill_repo_events insert failed; dropping batch',
-        );
+      for (
+        let offset = 0;
+        offset < events.length;
+        offset += TELEMETRY_EVENT_BATCH_ROWS
+      ) {
+        const batch = events.slice(offset, offset + TELEMETRY_EVENT_BATCH_ROWS);
+        try {
+          await this.#eventClient.insert({
+            table: 'backfill_repo_events',
+            values: batch,
+            format: 'JSONEachRow',
+          });
+        } catch (err) {
+          logger.warn(
+            {
+              dropped: batch.length,
+              remaining: Math.max(
+                events.length - offset - TELEMETRY_EVENT_BATCH_ROWS,
+                0,
+              ),
+              err: err instanceof Error ? err.message : String(err),
+            },
+            'telemetry: backfill_repo_events insert failed; dropping batch',
+          );
+        }
       }
     } finally {
       this.#eventFlushing = false;

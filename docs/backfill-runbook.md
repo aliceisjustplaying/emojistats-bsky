@@ -250,6 +250,10 @@ Settings that were tried and should not be repeated without a new hypothesis:
   remains lossy dashboard/event telemetry. Dashboard freshness is the stalest
   shard, so status counts are current only when freshness is below the idle
   threshold.
+- Progress telemetry, repo-event telemetry, and durable post loads use separate
+  ClickHouse clients. Repo-event inserts also flush in capped chunks
+  (`TELEMETRY_EVENT_BATCH_ROWS`, default 1000), so lossy event telemetry cannot
+  monopolize or poison the post loader's HTTP connection pool.
 - Telemetry emits once at startup and the scheduler yields during large claim
   scans. If a shard is active but its progress row is stale, check for a
   CPU-bound claim/refill loop before assuming ClickHouse is down.

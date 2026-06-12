@@ -75,7 +75,7 @@ async function main(): Promise<void> {
   const stats = createCrawlStats();
   const control: CrawlControl = { stopClaiming: false };
 
-  const telemetry = createTelemetry(chClient);
+  const { telemetry, clients: telemetryClients } = createTelemetry();
   const hostPressure = createHostPressure();
   const retry = createRetryPolicy({ ledger, telemetry, stats, hostPressure });
   const parsePool = createParsePool();
@@ -117,7 +117,13 @@ async function main(): Promise<void> {
     'crawl run finished',
   );
   await parsePool.close();
-  await shutdown({ telemetry, archiveSink, ledger, chClient });
+  await shutdown({
+    telemetry,
+    archiveSink,
+    ledger,
+    chClient,
+    telemetryClients,
+  });
 }
 
 main().catch((err: unknown) => {

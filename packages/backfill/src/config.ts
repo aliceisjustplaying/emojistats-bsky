@@ -106,6 +106,10 @@ export const ARCHIVE_SYNC_COMMAND = process.env.ARCHIVE_SYNC_COMMAND;
 // Telemetry to ClickHouse (backfill_progress / backfill_repo_events): the
 // dashboard's data source, shared across crawl processes and boxes.
 export const TELEMETRY_INTERVAL_MS = num('TELEMETRY_INTERVAL_MS', 10_000);
+export const TELEMETRY_EVENT_BATCH_ROWS = num(
+  'TELEMETRY_EVENT_BATCH_ROWS',
+  1_000,
+);
 export const BACKFILL_RUN_ID = process.env.BACKFILL_RUN_ID ?? 'dev';
 export const CRAWL_SHARDS = num('CRAWL_SHARDS', 1);
 export const CRAWL_SHARD_INDEX = num('CRAWL_SHARD_INDEX', 0);

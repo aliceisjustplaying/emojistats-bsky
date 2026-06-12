@@ -37,6 +37,12 @@ batches, gzip-compressed ClickHouse uploads. Future tuning should start from
 ClickHouse upload stability or shard skew, not from blindly increasing global
 concurrency.
 
+Telemetry follow-up: status progress, repo events, and durable post loads now
+use separate ClickHouse clients. Repo events also flush in capped chunks
+(`TELEMETRY_EVENT_BATCH_ROWS`, default 1000). Event telemetry remains lossy,
+but it should no longer share an HTTP connection pool with the durable loader
+or block the progress snapshot retry path.
+
 ## Chapter 0 — how we got here (pre-launch working notes, added day 2)
 
 The white whale: backfill emojistats from the first Bluesky post and serve

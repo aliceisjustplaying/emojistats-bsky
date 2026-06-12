@@ -5,6 +5,7 @@ import { createArchiveSink } from 'archive';
 import type { StoragePolicy } from 'archive/policy';
 import type { ArchiveSink } from 'archive/types';
 
+import { createClickHouseClient } from './clickhouse.js';
 import {
   ARCHIVE_DIR,
   ARCHIVE_MAX_FILE_AGE_MS,
@@ -37,12 +38,23 @@ export async function openArchiveSink(
     : null;
 }
 
-export function createTelemetry(chClient: ClickHouseClient): CrawlTelemetry {
-  return new CrawlTelemetry(chClient, {
-    runId: BACKFILL_RUN_ID,
-    shard: SHARD_LABEL,
-    intervalMs: TELEMETRY_INTERVAL_MS,
-  });
+export function createTelemetry(): {
+  telemetry: CrawlTelemetry;
+  clients: ClickHouseClient[];
+} {
+  const progressClient = createClickHouseClient('emojistats-backfill-progress');
+  const eventClient = createClickHouseClient('emojistats-backfill-events');
+  return {
+    telemetry: new CrawlTelemetry(
+      { progress: progressClient, events: eventClient },
+      {
+        runId: BACKFILL_RUN_ID,
+        shard: SHARD_LABEL,
+        intervalMs: TELEMETRY_INTERVAL_MS,
+      },
+    ),
+    clients: [progressClient, eventClient],
+  };
 }
 
 export interface TelemetryWiring {
@@ -135,6 +147,7 @@ export interface ShutdownDeps {
   archiveSink: ArchiveSink | null;
   ledger: Ledger;
   chClient: ClickHouseClient;
+  telemetryClients?: ClickHouseClient[];
 }
 
 // Telemetry first (final tick + buffered events), then the sink — close()
@@ -146,6 +159,7 @@ export async function shutdown(deps: ShutdownDeps): Promise<void> {
   if (deps.archiveSink !== null) await deps.archiveSink.close();
   deps.ledger.setMeta('crawl_dirty', '0');
   deps.ledger.close();
+  for (const client of deps.telemetryClients ?? []) await client.close();
   await deps.chClient.close();
   // pino-pretty flushes in a worker thread; if some handle still pins the event
   // loop after that, force the promised exit (keeping a non-zero code from an
