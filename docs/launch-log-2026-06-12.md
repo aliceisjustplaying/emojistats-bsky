@@ -484,6 +484,12 @@ batch cannot freeze status counts. Dashboard freshness now uses the stalest
 shard, not the newest shard, so a single fresh crawler cannot hide five stale
 status rows.
 
+Second-order fix: five shards were spending minutes in the synchronous
+claim/refill loop before the first stats timer got a chance to fire. The
+scheduler now yields every 1,000 scanned claim rows and telemetry emits an
+initial startup snapshot before `scheduler.run()`, so long host-skewed claim
+scans cannot make status counts look dead.
+
 ## ~17:45 — bottleneck #10: cooldowns that still occupied scheduler slots
 
 The morel cooldown fix did collapse 429s, but it exposed a second-order

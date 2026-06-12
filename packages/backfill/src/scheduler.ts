@@ -85,6 +85,7 @@ const CLAIM_SCAN_MULTIPLIER = 16;
 const CLAIM_SCAN_MIN = 250_000;
 const CLAIM_SCAN_MAX = 250_000;
 const CLAIM_REFILL_MIN = GLOBAL_CONCURRENCY;
+const CLAIM_LOOP_YIELD_EVERY = 1_000;
 
 export function createScheduler(deps: SchedulerDeps): Scheduler {
   const { ledger, stats, control, hostPressure, processRepo } = deps;
@@ -149,6 +150,11 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
         setTimeout(resolve, Math.min(500, deadline - Date.now()));
       });
     }
+  };
+  const yieldToTimers = async (): Promise<void> => {
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
   };
 
   // Idle policy: pending rows are always claimable, so an idle ledger means only
@@ -242,6 +248,8 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
         let scheduled = 0;
         let read = 0;
         for (; read < claimBacklog.length; read += 1) {
+          if (read > 0 && read % CLAIM_LOOP_YIELD_EVERY === 0)
+            await yieldToTimers();
           const repo = claimBacklog[read];
           if (repo === undefined) break;
           if (scheduled >= claimCapacity) break;

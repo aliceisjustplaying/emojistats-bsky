@@ -213,6 +213,9 @@ idempotent.
   remains lossy dashboard/event telemetry. Dashboard freshness is the stalest
   shard, so status counts are current only when freshness is below the idle
   threshold.
+- Telemetry emits once at startup and the scheduler yields during large claim
+  scans. If a shard is active but its progress row is stale, check for a
+  CPU-bound claim/refill loop before assuming ClickHouse is down.
 - The archive is at-least-once across crashes (see above): re-fetched repos
   re-append. Rows staged in the open file at crash time are recovered at the
   sink's next startup and finalized as their own parquet file; a hard crash

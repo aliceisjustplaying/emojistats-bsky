@@ -81,6 +81,7 @@ export class CrawlTelemetry {
     this.#timer = setInterval(() => {
       void this.#tick();
     }, this.#intervalMs);
+    void this.#tick();
     // Telemetry must never keep the process alive on its own.
     this.#timer.unref();
   }
