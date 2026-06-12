@@ -5,6 +5,17 @@ import type { IngestSource, RawPostEvent } from '../types.js';
 
 const RECONNECT_MIN_DELAY_MS = 1_000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
+/**
+ * Liveness: the firehose is never naturally quiet (network-wide post volume
+ * is tens per second), so a connection with zero events for this long is a
+ * silently-dead socket — half-open TCP emits neither 'close' nor 'error',
+ * and the event-driven reconnect never fires. Observed twice on 2026-06-12:
+ * eventsSeen frozen, cursorLagSeconds climbing 1:1 with wall clock for
+ * hours. The watchdog forces the reconnect the dead socket never asks for;
+ * cursor replay makes it lossless.
+ */
+const STALL_TIMEOUT_MS = 45_000;
+const STALL_CHECK_INTERVAL_MS = 15_000;
 
 interface BskyPostRecord {
   text?: string;
@@ -23,6 +34,8 @@ export class JetstreamSource implements IngestSource {
   private reconnectTimer: NodeJS.Timeout | undefined;
   private reconnectDelayMs = RECONNECT_MIN_DELAY_MS;
   private stopped = false;
+  private stallTimer: NodeJS.Timeout | undefined;
+  private lastEventAt = 0;
 
   constructor(
     private readonly endpoint: string,
@@ -48,6 +61,10 @@ export class JetstreamSource implements IngestSource {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
     }
+    if (this.stallTimer !== undefined) {
+      clearInterval(this.stallTimer);
+      this.stallTimer = undefined;
+    }
     const jetstream = this.jetstream;
     if (!jetstream) return;
     const ws = jetstream.ws;
@@ -71,6 +88,7 @@ export class JetstreamSource implements IngestSource {
 
     jetstream.on('open', () => {
       this.reconnectDelayMs = RECONNECT_MIN_DELAY_MS;
+      this.lastEventAt = Date.now();
       logger.info('Connected to Jetstream');
       this.startResolve?.();
       this.startResolve = undefined;
@@ -90,6 +108,7 @@ export class JetstreamSource implements IngestSource {
       'app.bsky.feed.post',
       (event: CommitCreateEvent<'app.bsky.feed.post'>) => {
         const record = event.commit.record as BskyPostRecord;
+        this.lastEventAt = Date.now();
         this.onEvent?.({
           did: event.did,
           rkey: event.commit.rkey,
@@ -102,6 +121,28 @@ export class JetstreamSource implements IngestSource {
     );
 
     jetstream.start();
+    this.armStallWatchdog();
+  }
+
+  private armStallWatchdog(): void {
+    if (this.stallTimer !== undefined) return;
+    this.stallTimer = setInterval(() => {
+      const current = this.jetstream;
+      if (
+        this.stopped ||
+        current === undefined ||
+        this.reconnectTimer !== undefined ||
+        Date.now() - this.lastEventAt < STALL_TIMEOUT_MS
+      )
+        return;
+      logger.warn(
+        `Jetstream silent for ${Math.round((Date.now() - this.lastEventAt) / 1000)}s; ` +
+          'forcing reconnect (half-open socket)',
+      );
+      this.lastEventAt = Date.now();
+      this.scheduleReconnect(current);
+    }, STALL_CHECK_INTERVAL_MS);
+    this.stallTimer.unref();
   }
 
   private scheduleReconnect(previous: Jetstream<'app.bsky.feed.post'>): void {
