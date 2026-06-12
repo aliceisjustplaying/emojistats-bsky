@@ -537,8 +537,9 @@ function StatusBreakdown({ overview }: { overview: BackfillOverview | null }) {
       <CardHeader>
         <CardTitle className="text-sm">Repo status breakdown</CardTitle>
         <CardDescription>
-          every enumerated repo walks the ledger to a terminal status — nothing
-          is silently skipped
+          every enumerated repo walks the ledger to a terminal status;
+          loaded&nbsp;→&nbsp;verified happens in a separate periodic digest
+          pass, so verified lags loaded by design
         </CardDescription>
       </CardHeader>
       <CardContent>
