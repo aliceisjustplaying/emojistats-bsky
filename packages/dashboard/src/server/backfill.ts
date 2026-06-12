@@ -69,9 +69,6 @@ export interface BackfillOverview {
 type SnapshotRow = Record<BackfillRepoStatus, string> & {
   shard: string;
   latest_ts: string;
-  posts_loaded: string;
-  bytes_downloaded: string;
-  rows_per_sec: number;
   in_flight: string;
 };
 
@@ -108,7 +105,7 @@ async function fetchOverview(): Promise<BackfillOverview | null> {
   const runId = runRows[0]?.run_id;
   if (runId === undefined) return null;
 
-  const [snapshot, rate, lastErrorRows] = await Promise.all([
+  const [snapshot, totals, rate, lastErrorRows] = await Promise.all([
     chQuery<SnapshotRow>(
       `
       SELECT
@@ -117,9 +114,6 @@ async function fetchOverview(): Promise<BackfillOverview | null> {
         -- inside the argMax calls (ILLEGAL_AGGREGATION)
         max(ts) AS latest_ts,
         ${STATUS_ARGMAX_SQL},
-        argMax(posts_loaded, ts) AS posts_loaded,
-        argMax(bytes_downloaded, ts) AS bytes_downloaded,
-        argMax(rows_per_sec, ts) AS rows_per_sec,
         argMax(in_flight, ts) AS in_flight
       FROM backfill_progress
       WHERE run_id = {run:String}
@@ -127,6 +121,21 @@ async function fetchOverview(): Promise<BackfillOverview | null> {
     `,
       { run: runId },
     ),
+    // Posts/bytes/row-rate come from the append-only events table, NOT the
+    // crawler's in-process gauges: those reset to zero on every service
+    // restart (a fleet-tuning afternoon made "data downloaded" lurch
+    // backwards repeatedly), and since batched loading the instantaneous
+    // rows_per_sec gauge reads 0 between 15 s flushes. Events survive both.
+    chQuery<{ posts: string; bytes: string; recent_posts: string }>(`
+      SELECT
+        sumIf(posts, event = 'loaded') AS posts,
+        sum(car_bytes) AS bytes,
+        sumIf(
+          posts,
+          event = 'loaded' AND ts >= now() - INTERVAL ${RATE_WINDOW_MINUTES} MINUTE
+        ) AS recent_posts
+      FROM backfill_repo_events
+    `),
     chQuery<{ resolved_delta: string }>(
       `
       SELECT sum(d) AS resolved_delta
@@ -155,20 +164,17 @@ async function fetchOverview(): Promise<BackfillOverview | null> {
   const statusCounts = Object.fromEntries(
     REPO_STATUSES.map((status) => [status, 0]),
   ) as Record<BackfillRepoStatus, number>;
-  let postsLoaded = 0;
-  let bytesDownloaded = 0;
-  let rowsPerSec = 0;
   let inFlight = 0;
   let newestTs = 0;
   for (const row of snapshot) {
     for (const status of REPO_STATUSES)
       statusCounts[status] += num(row[status]);
-    postsLoaded += num(row.posts_loaded);
-    bytesDownloaded += num(row.bytes_downloaded);
-    rowsPerSec += num(row.rows_per_sec);
     inFlight += num(row.in_flight);
     newestTs = Math.max(newestTs, chTsToDate(row.latest_ts).getTime());
   }
+  const postsLoaded = num(totals[0]?.posts);
+  const bytesDownloaded = num(totals[0]?.bytes);
+  const rowsPerSec = num(totals[0]?.recent_posts) / (RATE_WINDOW_MINUTES * 60);
 
   const totalEnumerated = REPO_STATUSES.reduce(
     (acc, status) => acc + statusCounts[status],
