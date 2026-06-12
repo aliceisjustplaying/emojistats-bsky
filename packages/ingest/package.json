@@ -15,7 +15,7 @@
     "db:migrate": "bunx tsx src/clickhouse/migrate.ts",
     "rebuild": "bunx tsx src/clickhouse/rebuild.ts",
     "test": "bunx tsx --test src/normalizer.test.ts",
-    "typecheck": "bunx tsc --noEmit"
+    "typecheck": "tsgo --noEmit"
   },
   "dependencies": {
     "archive": "workspace:*",

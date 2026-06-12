@@ -10,7 +10,7 @@
     "generate-routes": "tsr generate",
     "build": "vite build",
     "preview": "vite preview",
-    "typecheck": "tsr generate && tsc --noEmit"
+    "typecheck": "tsr generate && tsgo --noEmit"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.1.18",

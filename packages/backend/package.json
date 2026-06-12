@@ -6,7 +6,7 @@
   "scripts": {
     "start": "bunx tsx src/index.ts",
     "dev": "bunx tsx --watch src/index.ts",
-    "typecheck": "bunx tsc --noEmit"
+    "typecheck": "tsgo --noEmit"
   },
   "dependencies": {
     "@clickhouse/client": "^1.20.0",
