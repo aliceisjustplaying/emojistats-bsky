@@ -83,6 +83,7 @@ const hostCapFor = (host: string): number =>
 
 const CLAIM_SCAN_MULTIPLIER = 16;
 const CLAIM_SCAN_MAX = 250_000;
+const CLAIM_REFILL_MIN = Math.min(512, GLOBAL_CONCURRENCY);
 
 export function createScheduler(deps: SchedulerDeps): Scheduler {
   const { ledger, stats, control, hostPressure, processRepo } = deps;
@@ -205,10 +206,16 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
           await Promise.race(active);
           continue;
         }
-        const claimCapacity = Math.min(
-          maxOutstanding - active.size,
-          flags.limit - stats.claimed,
-        );
+        const available = maxOutstanding - active.size;
+        const remainingLimit = flags.limit - stats.claimed;
+        if (
+          active.size > 0 &&
+          available < Math.min(CLAIM_REFILL_MIN, remainingLimit)
+        ) {
+          await Promise.race(active);
+          continue;
+        }
+        const claimCapacity = Math.min(available, remainingLimit);
         if (claimBacklog.length === 0) {
           claimBacklog = ledger.listClaimable(
             Math.min(

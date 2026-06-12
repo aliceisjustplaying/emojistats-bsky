@@ -488,6 +488,11 @@ classification (RepoNotFound / RepoTakendown / empty repos), and journald was
 being asked to ingest a line per repo. Those events remain in
 `backfill_repo_events`; the per-repo service logs are debug-only now.
 
+Last canary wrinkle: after the active pool filled, fast terminal repos caused
+one-slot refills, which made the scheduler rescan the backlog once per repo.
+Refills now batch at 512 available slots, cutting claim-loop churn while keeping
+the downloader pool mostly full.
+
 ## Running ETA honesty table (for the retro)
 
 | When | Basis | Claim |
