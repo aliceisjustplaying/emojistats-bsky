@@ -69,6 +69,19 @@ async function main(): Promise<void> {
   }
   ledger.setMeta('crawl_dirty', '1');
 
+  // Re-crawl accounting for the 2026-06-13 archive widening: repos with
+  // loaded_at BEFORE this timestamp were archived text-only (facets/reply/
+  // embed/labels missing) and need a re-fetch to recover those fields.
+  // Set once, on the first run of widened code; never moved.
+  if (ledger.getMeta('archive_extras_since') === undefined) {
+    const since = new Date().toISOString();
+    ledger.setMeta('archive_extras_since', since);
+    logger.info(
+      { since },
+      'archive metadata widening active: repos loaded before this need re-crawl for extras',
+    );
+  }
+
   if (flags.finalSweep) {
     const reset = ledger.resetUnreachableAttempts();
     logger.warn(

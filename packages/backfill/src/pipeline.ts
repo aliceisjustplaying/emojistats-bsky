@@ -2,7 +2,7 @@
 
 import type { StoragePolicy } from 'archive/policy';
 import type { ArchiveSink } from 'archive/types';
-import { applyTextPolicy } from 'ingest/rows';
+import { toClickhouseRow } from 'ingest/rows';
 
 import { RetryableError } from './fetcher.js';
 import type { HostHealth } from './host-health.js';
@@ -150,10 +150,10 @@ export function createRepoPipeline(
         }
 
         // Cost-revised storage (plan 0001): ClickHouse keeps text for emoji
-        // posts only; rows without emojis ship with text stripped. 'all' is the
-        // upgrade path (applyTextPolicy passes rows through untouched).
+        // posts only; rows without emojis ship with text stripped. The pick in
+        // toClickhouseRow also drops the archive-only metadata columns.
         try {
-          await load!.addRow(applyTextPolicy(row, policy));
+          await load!.addRow(toClickhouseRow(row, policy));
         } catch (err) {
           throw loaderChunkFailed(err);
         }

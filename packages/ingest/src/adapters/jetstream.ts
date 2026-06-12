@@ -21,6 +21,11 @@ interface BskyPostRecord {
   text?: string;
   langs?: string[];
   createdAt?: string;
+  /** Archived verbatim (PostExtras); Jetstream delivers lexicon JSON, blob refs only. */
+  facets?: unknown;
+  reply?: unknown;
+  embed?: unknown;
+  labels?: unknown;
 }
 
 function epochUsToDateTime(cursor: number): string {
@@ -116,6 +121,12 @@ export class JetstreamSource implements IngestSource {
           langs: record.langs,
           createdAt: record.createdAt,
           timeUs: event.time_us,
+          extras: {
+            facets: record.facets,
+            reply: record.reply,
+            embed: record.embed,
+            labels: record.labels,
+          },
         });
       },
     );

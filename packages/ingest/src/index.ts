@@ -26,7 +26,7 @@ import { CursorStore } from './cursor.js';
 import { DedupeStore } from './dedupe.js';
 import logger from './logger.js';
 import { normalizePost } from './normalizer.js';
-import { toPostRow } from './rows.js';
+import { toArchiveRow } from './rows.js';
 import type { Anomaly } from './types.js';
 import { ClickHouseWriter } from './writer.js';
 
@@ -166,7 +166,7 @@ await source.start((event) => {
     // tail after the cursor advanced. Bounded and accepted, and strictly
     // smaller than the old window, which acked at receive time.
     const settled: Promise<void> = archive
-      .append(toPostRow(post, 'live'))
+      .append(toArchiveRow(post, 'live'))
       .catch((error: unknown) => {
         logger.fatal(
           `Archive append failed, refusing to outlive the only home of full text: ${(error as Error).message}`,

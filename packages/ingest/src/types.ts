@@ -9,6 +9,22 @@ export interface RawPostEvent {
   createdAt?: string;
   /** Receive-time proxy in epoch microseconds (Jetstream time_us). */
   timeUs: number;
+  extras?: PostExtras;
+}
+
+/**
+ * Post-record metadata preserved verbatim for the parquet archive (and only
+ * there — ClickHouse never sees it). Values are the decoded record fields as
+ * the wire gave them: lexicon JSON from Jetstream, @atcute/cbor wrappers from
+ * CAR parsing — both JSON.stringify to the `$link`/`$bytes` convention. Blob
+ * BYTES can never appear here; atproto records carry only blob refs
+ * (CID + mimeType + size).
+ */
+export interface PostExtras {
+  facets?: unknown;
+  reply?: unknown;
+  embed?: unknown;
+  labels?: unknown;
 }
 
 export type Source = 'live' | 'backfill';
@@ -29,6 +45,8 @@ export interface NormalizedPost {
   /** Normalized glyphs, one entry per occurrence (repeats kept), capped at EMOJI_MAX_PER_POST. */
   emojis: string[];
   anomalies: Anomaly[];
+  /** Passed through untouched; consumed only by toArchiveRow. */
+  extras: PostExtras;
 }
 
 /** Row shape for ClickHouse `posts` (JSONEachRow). created_at is 'YYYY-MM-DD HH:MM:SS' in UTC. */

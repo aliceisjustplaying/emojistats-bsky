@@ -14,6 +14,16 @@ export interface ArchiveRow {
   emojis: string[];
   text: string;
   src: 'live' | 'backfill';
+  /**
+   * Record metadata as raw JSON ('' = absent on the record), serialized from
+   * the decoded wire value — CIDs as {"$link": ...}, blob REFS only (atproto
+   * records never inline blob bytes). Added 2026-06-13; rows archived before
+   * then have '' everywhere and need a repo re-fetch to recover these fields.
+   */
+  facets_json: string;
+  reply_json: string;
+  embed_json: string;
+  labels_json: string;
 }
 
 export interface ArchiveStats {

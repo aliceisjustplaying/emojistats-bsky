@@ -76,8 +76,29 @@ export const STAGING_TABLE_DDL = `CREATE TABLE IF NOT EXISTS staging (
   langs VARCHAR[] NOT NULL,
   emojis VARCHAR[] NOT NULL,
   text VARCHAR NOT NULL,
-  src VARCHAR NOT NULL
+  src VARCHAR NOT NULL,
+  facets_json VARCHAR,
+  reply_json VARCHAR,
+  embed_json VARCHAR,
+  labels_json VARCHAR
 )`;
+/**
+ * Widens a staging table created before the metadata columns existed (the
+ * appender binds by column position, so the order here must stay: original
+ * seven, then these, matching the CREATE above).
+ *
+ * Re-crawl accounting contract: NULL = row archived before widening (extras
+ * were never looked at — ALTER backfills NULL, and old parquet files read as
+ * NULL under union_by_name); '' = extras captured and the record had no such
+ * field. New appends always write non-NULL. The repo-level marker for
+ * re-crawls is the ledger meta key 'archive_extras_since' (see crawl.ts).
+ */
+export const STAGING_TABLE_MIGRATIONS = [
+  `ALTER TABLE staging ADD COLUMN IF NOT EXISTS facets_json VARCHAR`,
+  `ALTER TABLE staging ADD COLUMN IF NOT EXISTS reply_json VARCHAR`,
+  `ALTER TABLE staging ADD COLUMN IF NOT EXISTS embed_json VARCHAR`,
+  `ALTER TABLE staging ADD COLUMN IF NOT EXISTS labels_json VARCHAR`,
+];
 
 interface ManifestEntry {
   file: string;
@@ -86,7 +107,12 @@ interface ManifestEntry {
   minCreatedAt: string;
   maxCreatedAt: string;
   finalizedAt: string;
+  /** Archive schema version; absent = v1 (text-only, no metadata columns). */
+  v: number;
 }
+
+/** v2 = facets/reply/embed/labels columns present (2026-06-13). */
+const ARCHIVE_SCHEMA_VERSION = 2;
 
 function sqlQuote(path: string): string {
   return path.replaceAll("'", "''");
@@ -153,6 +179,9 @@ class DuckDBArchiveSink implements ArchiveSink {
     const sink = new DuckDBArchiveSink(opts, instance, connection);
     try {
       await connection.run(STAGING_TABLE_DDL);
+      for (const migration of STAGING_TABLE_MIGRATIONS) {
+        await connection.run(migration);
+      }
       await sink.seedSequence();
       // Drain what a previous run left behind (stale partials, unsynced
       // files) before the recovery rotate adds this run's first file, so
@@ -264,6 +293,10 @@ class DuckDBArchiveSink implements ArchiveSink {
     appender.appendList(listValue(row.emojis), LIST_VARCHAR);
     appender.appendVarchar(row.text);
     appender.appendVarchar(row.src);
+    appender.appendVarchar(row.facets_json);
+    appender.appendVarchar(row.reply_json);
+    appender.appendVarchar(row.embed_json);
+    appender.appendVarchar(row.labels_json);
     appender.endRow();
     this.unflushed += 1;
     this.rowsInStaging += 1;
@@ -388,7 +421,8 @@ class DuckDBArchiveSink implements ArchiveSink {
 
     await rm(tmpPath, { force: true });
     await this.connection.run(
-      `COPY (SELECT did, rkey, created_at, langs, emojis, text, src FROM staging) ` +
+      `COPY (SELECT did, rkey, created_at, langs, emojis, text, src, ` +
+        `facets_json, reply_json, embed_json, labels_json FROM staging) ` +
         `TO '${sqlQuote(tmpPath)}' (FORMAT PARQUET, COMPRESSION ZSTD)`,
     );
     await rename(tmpPath, finalPath);
@@ -401,6 +435,7 @@ class DuckDBArchiveSink implements ArchiveSink {
       minCreatedAt: String(summary['min_ca']),
       maxCreatedAt: String(summary['max_ca']),
       finalizedAt: new Date().toISOString(),
+      v: ARCHIVE_SCHEMA_VERSION,
     });
 
     await this.connection.run('DELETE FROM staging');
@@ -426,6 +461,7 @@ class DuckDBArchiveSink implements ArchiveSink {
       } catch (err) {
         this.syncFailure ??= err as Error;
       }
+      return undefined;
     });
   }
 

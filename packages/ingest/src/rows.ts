@@ -1,11 +1,13 @@
 import { clickhouseText, type StoragePolicy } from 'archive/policy';
+import type { ArchiveRow } from 'archive/types';
 
 import type { NormalizedPost, PostRow, Source } from './types.js';
 
 /**
  * THE NormalizedPost → row conversion — live writer, backfill pipeline and
- * archive appends all go through here; never copy it. The full-text form is
- * also the ArchiveRow shape (same fields, same created_at contract).
+ * archive appends all go through here; never copy it. The archive form is a
+ * strict superset (toArchiveRow); ClickHouse rows must go through
+ * toClickhouseRow so the metadata columns can never leak into JSONEachRow.
  */
 export function toPostRow(post: NormalizedPost, src: Source): PostRow {
   return {
@@ -18,6 +20,42 @@ export function toPostRow(post: NormalizedPost, src: Source): PostRow {
     emojis: post.emojis,
     src,
   };
+}
+
+/** '' = field absent on the record; the archive never stores the string "null". */
+function extraJson(value: unknown): string {
+  if (value === undefined || value === null) return '';
+  return JSON.stringify(value);
+}
+
+/** Full-fidelity archive form: PostRow plus the record metadata as raw JSON. */
+export function toArchiveRow(post: NormalizedPost, src: Source): ArchiveRow {
+  return {
+    ...toPostRow(post, src),
+    facets_json: extraJson(post.extras.facets),
+    reply_json: extraJson(post.extras.reply),
+    embed_json: extraJson(post.extras.embed),
+    labels_json: extraJson(post.extras.labels),
+  };
+}
+
+/**
+ * The exact JSONEachRow shape for ClickHouse `posts` — an explicit pick, not a
+ * spread, so widening ArchiveRow can never silently grow the insert payload.
+ */
+export function toClickhouseRow(row: PostRow, policy: StoragePolicy): PostRow {
+  return applyTextPolicy(
+    {
+      did: row.did,
+      rkey: row.rkey,
+      created_at: row.created_at,
+      text: row.text,
+      langs: row.langs,
+      emojis: row.emojis,
+      src: row.src,
+    },
+    policy,
+  );
 }
 
 /**

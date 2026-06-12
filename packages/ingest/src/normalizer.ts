@@ -77,5 +77,6 @@ export function normalizePost(event: RawPostEvent): NormalizedPost {
     langs,
     emojis,
     anomalies,
+    extras: event.extras ?? {},
   };
 }

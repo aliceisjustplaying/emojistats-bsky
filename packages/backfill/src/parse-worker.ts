@@ -12,7 +12,7 @@
  */
 import { parentPort } from 'node:worker_threads';
 
-import type { PostRow } from 'ingest/types';
+import type { ArchiveRow } from 'archive/types';
 
 import { rkeyHash64 } from './digest.js';
 import { repoPostRows } from './extract.js';
@@ -37,7 +37,8 @@ export interface RepoJobResult {
   carBytes: number;
   recordsTotal: number;
   duplicatePostsSkipped: number;
-  rows: PostRow[];
+  /** Full-fidelity archive rows; ClickHouse strips them via toClickhouseRow. */
+  rows: ArchiveRow[];
   postsWithEmojis: number;
   emojiOccurrences: number;
   /** 16-hex-digit XOR fold of rkeyHash64 over rows, zero-padded. */
@@ -78,7 +79,7 @@ async function handle(job: RepoJob): Promise<RepoJobReply> {
   try {
     const fetched = await fetchRepoCar(job.pdsHost, job.did);
     const parsed = parseRepoCar(fetched.body);
-    const rows: PostRow[] = [];
+    const rows: ArchiveRow[] = [];
     let postsWithEmojis = 0;
     let emojiOccurrences = 0;
     let digest = 0n;
