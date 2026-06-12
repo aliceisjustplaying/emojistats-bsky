@@ -228,6 +228,14 @@ export function parseRepoCar(stream: ReadableStream<Uint8Array>): ParsedRepo {
     try {
       for await (const entry of repo) {
         state.recordsTotal += 1;
+        // Cooperative yield. This walk is synchronous CPU under the hood and
+        // microtask awaits never release the event loop, so a like-heavy whale
+        // repo otherwise starves every socket and timer in the process — on
+        // launch night that meant ClickHouse client timeouts, frozen telemetry
+        // and 128 stalled fetch slots. A macrotask break every 2000 records
+        // bounds the blocking to tens of milliseconds.
+        if (state.recordsTotal % 2000 === 0)
+          await new Promise<void>((resolve) => setImmediate(resolve));
         if (state.rev === null && scanner.commit !== null)
           state.rev = scanner.commit.rev;
         if (entry.collection !== POST_COLLECTION) continue;
