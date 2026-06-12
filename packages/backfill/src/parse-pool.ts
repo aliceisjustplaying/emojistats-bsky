@@ -37,8 +37,12 @@ function rehydrate(err: RepoJobError): Error {
         transient: err.transient,
         retryAfterMs: err.retryAfterMs,
       });
-    default:
+    case 'error':
       return new Error(err.message);
+    default: {
+      const exhaustive: never = err;
+      return exhaustive;
+    }
   }
 }
 

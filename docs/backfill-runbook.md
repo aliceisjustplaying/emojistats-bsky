@@ -56,13 +56,16 @@ idempotent.
 
 ## Running the crawl
 
-- `bun run crawl` claims pending repos (host-rotated so one mega-PDS never
-  monopolizes a batch), fetches CARs, extracts posts, archives full rows,
-  loads ClickHouse, and updates the ledger. `--limit N` caps claims for a
-  bounded run; `--did <did>` forces specific repos through the pipeline.
+- `bun run crawl` claims pending repos (host-spread and claim-time capped so one
+  cooling or already-full PDS cannot monopolize the scheduler's active slots),
+  fetches CARs, extracts posts, archives full rows, loads ClickHouse, and
+  updates the ledger. `--limit N` caps claims for a bounded run; `--did <did>`
+  forces specific repos through the pipeline.
 - Politeness knobs: `GLOBAL_CONCURRENCY` (default 32), `PER_HOST_CONCURRENCY`
   (default 2), `PER_HOST_CONCURRENCY_BSKY` (default 8 for the
-  `*.bsky.network` mushroom fleet). 429/Retry-After is always honored on top.
+  `*.bsky.network` mushroom fleet). 429/Retry-After is always honored on top:
+  a 429 arms a per-host cooldown, later claims skip that host while it cools,
+  and rate-limit retries do not burn the repo's reachability attempts.
 - `TEXT_IN_CLICKHOUSE` (default `emoji`) controls what reaches ClickHouse:
   emoji-less posts get their `text` written as `''`; the archive always gets
   the full text regardless. `all` is the upgrade path if disk economics change.

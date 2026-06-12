@@ -185,6 +185,7 @@ export class ClickHouseRepoLoader implements RepoLoader {
       try {
         await this.#insertBatch(rows, tags);
         for (const w of waiters) w.resolve();
+        return undefined;
       } catch (err) {
         const wrapped = err instanceof Error ? err : new Error(String(err));
         for (const w of waiters) w.reject(wrapped);
@@ -194,7 +195,7 @@ export class ClickHouseRepoLoader implements RepoLoader {
     this.#runByGen.set(gen, run);
     // The chain must survive a failed flush (every involved repo received the
     // rejection through its finish/addRow path).
-    this.#flushChain = run.catch(() => {});
+    this.#flushChain = run.catch(() => undefined);
     return run;
   }
 

@@ -13,6 +13,11 @@ interface FooterProps {
 }
 
 function Footer({ stats }: FooterProps) {
+  const ratio = Number(stats.ratio);
+  const ratioLabel = Number.isFinite(ratio)
+    ? `${(ratio * 100).toFixed(2)}%`
+    : 'N/A';
+
   return (
     <footer className="w-full bg-gray-200 dark:bg-gray-900 p-1 flex flex-row justify-end items-center">
       <span className="w-full sm:w-auto text-xs md:text-sm text-center px-1 sm:px-2 text-gray-900 dark:text-gray-100">
@@ -24,7 +29,7 @@ function Footer({ stats }: FooterProps) {
       {/* <span className="w-full sm:w-auto text-center">Posts with Emojis: {stats.postsWithEmojis}</span>
         <span className="w-full sm:w-auto text-center">Posts without Emojis: {stats.postsWithoutEmojis}</span> */}
       <span className="w-full sm:w-auto text-xs md:text-sm text-center px-1 sm:px-2 text-gray-900 dark:text-gray-100">
-        Ratio: {(Number(stats.ratio) * 100).toFixed(2)}%
+        Ratio: {ratioLabel}
       </span>
       <span className="w-full sm:w-auto text-xs md:text-sm text-center px-1 sm:px-2 text-gray-900 dark:text-gray-100">
         by{' '}

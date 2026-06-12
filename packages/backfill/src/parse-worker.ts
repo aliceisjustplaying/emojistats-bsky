@@ -115,5 +115,6 @@ const port = parentPort;
 port.on('message', (job: RepoJob) => {
   void handle(job).then((reply) => {
     port.postMessage(reply);
+    return undefined;
   });
 });

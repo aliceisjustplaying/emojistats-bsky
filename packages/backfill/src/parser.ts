@@ -235,7 +235,9 @@ export function parseRepoCar(stream: ReadableStream<Uint8Array>): ParsedRepo {
         // and 128 stalled fetch slots. A macrotask break every 2000 records
         // bounds the blocking to tens of milliseconds.
         if (state.recordsTotal % 2000 === 0)
-          await new Promise<void>((resolve) => setImmediate(resolve));
+          await new Promise<void>((resolve) => {
+            setImmediate(resolve);
+          });
         if (state.rev === null && scanner.commit !== null)
           state.rev = scanner.commit.rev;
         if (entry.collection !== POST_COLLECTION) continue;

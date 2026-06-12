@@ -12,6 +12,7 @@
     "crawl": "bunx tsx src/crawl.ts",
     "verify": "bunx tsx src/verify.ts",
     "status": "bunx tsx src/status.ts",
+    "test": "bunx tsx --test src/*.test.ts",
     "typecheck": "tsgo --noEmit"
   },
   "dependencies": {

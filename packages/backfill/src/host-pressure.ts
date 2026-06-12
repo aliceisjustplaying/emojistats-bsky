@@ -31,6 +31,10 @@ export interface HostPressure {
   record429(host: string): void;
   /** Remaining cooldown for the host; 0 when it is fine to fetch. */
   coolingMs(host: string): number;
+  /** True while a host-level cooldown is active. */
+  isCooling(host: string): boolean;
+  /** Earliest active host cooldown wake-up, or undefined when none are active. */
+  nextWake(): number | undefined;
 }
 
 export function createHostPressure(): HostPressure {
@@ -40,6 +44,18 @@ export function createHostPressure(): HostPressure {
     record429(host: string): void {
       const now = Date.now();
       const prev = state.get(host);
+      if (prev !== undefined && now < prev.until) {
+        const cooldown = Math.min(
+          COOLDOWN_BASE_MS * 2 ** (prev.strikes - 1),
+          COOLDOWN_MAX_MS,
+        );
+        state.set(host, {
+          strikes: prev.strikes,
+          until: Math.max(prev.until, now + cooldown),
+          lastStrike: now,
+        });
+        return;
+      }
       const strikes =
         prev !== undefined && now - prev.lastStrike < STRIKE_DECAY_MS
           ? prev.strikes + 1
@@ -65,6 +81,22 @@ export function createHostPressure(): HostPressure {
       const cooling = state.get(host);
       if (cooling === undefined) return 0;
       return Math.max(0, cooling.until - Date.now());
+    },
+
+    isCooling(host: string): boolean {
+      const cooling = state.get(host);
+      return cooling !== undefined && cooling.until > Date.now();
+    },
+
+    nextWake(): number | undefined {
+      const now = Date.now();
+      let wake: number | undefined;
+      for (const cooling of state.values()) {
+        if (cooling.until <= now) continue;
+        wake =
+          wake === undefined ? cooling.until : Math.min(wake, cooling.until);
+      }
+      return wake;
     },
   };
 }

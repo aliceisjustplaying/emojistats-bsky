@@ -6,6 +6,12 @@ import type { IngestSource, RawPostEvent } from '../types.js';
 const RECONNECT_MIN_DELAY_MS = 1_000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
 
+interface BskyPostRecord {
+  text?: string;
+  langs?: string[];
+  createdAt?: string;
+}
+
 function epochUsToDateTime(cursor: number): string {
   return new Date(cursor / 1000).toISOString();
 }
@@ -83,7 +89,7 @@ export class JetstreamSource implements IngestSource {
     jetstream.onCreate(
       'app.bsky.feed.post',
       (event: CommitCreateEvent<'app.bsky.feed.post'>) => {
-        const { record } = event.commit;
+        const record = event.commit.record as BskyPostRecord;
         this.onEvent?.({
           did: event.did,
           rkey: event.commit.rkey,

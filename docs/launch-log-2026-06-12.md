@@ -453,6 +453,23 @@ doesn't trigger the crash path at all (queued for post-cutover); (3) when a
 load number looks insane, `system.processes` answers in five seconds what
 theorizing answers in an hour.
 
+## ~17:45 — bottleneck #10: cooldowns that still occupied scheduler slots
+
+The morel cooldown fix did collapse 429s, but it exposed a second-order
+scheduler bug: every shard could still pre-claim 3,072 repos from the deepest
+host before the first 429 landed. The cooldown sleep lived inside the
+per-host limiter, so it did not hold download slots, but each parked repo
+still counted against the scheduler's `active` set. Result: every crawler sat
+at `inFlight=3072`, `fetching=0`, `rowsPerSec=0`, and `topHosts=[morel:3072]`
+while millions of other claimable repos waited behind it.
+
+Fix: claim-time host admission now skips hosts that are cooling or already
+queued to their per-host cap, and scans deeper into the ledger (up to 50k rows)
+to find runnable work. Concurrent 429s during one active cooldown also count
+as one burst instead of immediately escalating strikes to the 10-minute max.
+The invariant is now explicit: scheduler `active` slots are for runnable work,
+not parked cooldown sleepers.
+
 ## Running ETA honesty table (for the retro)
 
 | When | Basis | Claim |
