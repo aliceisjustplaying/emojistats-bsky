@@ -402,6 +402,32 @@ Also this afternoon, off the hot path: identity hygiene — pix's entire git
 history rewritten (git-filter-repo) to scrub a legacy name from config and
 emails, force-pushed; the fleet's deploy trees re-synced to match.
 
+## ~16:00 — bottleneck #9: the morel wall (and the false accusation)
+
+Indie-cap verdict came back looking like a disaster: 55k 429s in 8 minutes
+(200× ambient). Plot twist on grouping by host: the indie PDSes were
+innocent (brid.gy: 188) — **morel**, a bsky mushroom, was throwing 60k.
+Mechanism: morel holds ~2× the pending backlog of any other mushroom, so as
+smaller queues drain, claims concentrate on it until six boxes × 32
+concurrent hit one host's rate limiter. Any static cap eventually walls like
+this — the tail always concentrates onto the deepest host. Worse, every 429
+burned one of the repo's five retry attempts: the storm was quietly
+converting a temporary rate limit into ~158k repos parked behind the
+final-sweep fence.
+
+Fix shipped (cause, not symptom): **429-driven per-host cooldown** — each
+429 arms an exponential cooldown (30 s → 10 min) for that host, and the
+scheduler parks the host's whole queue *inside its per-host limiter*, which
+by construction never pins global slots; every other host keeps flowing.
+Plus a `markThrottled` ledger path: 429s park the repo for the backoff but
+no longer burn attempts — rate limiting is evidence of OUR pressure, not the
+repo's reachability. The 158k storm victims got their attempts reset and
+rejoined the queue.
+
+Retro note: the "indie caps are too aggressive" hypothesis felt obviously
+right for ~10 minutes and was wrong; one GROUP BY pds_host saved a pointless
+revert. Group before you blame.
+
 ## Running ETA honesty table (for the retro)
 
 | When | Basis | Claim |
