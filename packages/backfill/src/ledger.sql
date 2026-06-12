@@ -21,7 +21,14 @@ CREATE TABLE IF NOT EXISTS repos (
   enumerated_at     INTEGER NOT NULL,
   fetched_at        INTEGER,
   loaded_at         INTEGER,
-  retry_after       INTEGER
+  retry_after       INTEGER,
+  -- Persisted shard bucket (bucketOf(did) in ledger.ts, mod BUCKET_MODULUS).
+  -- Computing this per row inside the claim query was a full-table scan that
+  -- grew with enumeration and pegged the crawler's main thread on launch
+  -- night. ledger.ts adds the column + backfills it for ledgers that predate
+  -- it (additive migration — the one our no-compat rule tolerates, because
+  -- re-enumerating six 45M-row ledgers mid-crawl is the worse evil).
+  bucket            INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_repos_status ON repos (status, retry_after);

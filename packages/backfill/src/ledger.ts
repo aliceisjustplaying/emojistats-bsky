@@ -57,17 +57,36 @@ export interface SqliteLedgerOptions {
 }
 
 /**
- * Deterministic DID → shard bucket, evaluable inside SQLite. Mixes three
- * character positions of the DID's base32 tail (single positions skew on
- * power-of-two shard counts; odd multipliers keep every position contributing).
- * COALESCE guards degenerate short DIDs — unicode('') is NULL and a NULL bucket
- * would silently drop the row from every shard.
+ * Deterministic DID → shard bucket. Mixes three character positions of the
+ * DID's base32 tail (single positions skew on power-of-two shard counts; odd
+ * multipliers keep every position contributing); guards degenerate short DIDs
+ * so no row can hash to nowhere. The result is PERSISTED in repos.bucket —
+ * launch night taught us that evaluating this per row inside the claim query
+ * is a full-table scan that grows with enumeration and eats the main thread.
+ *
+ * The modulus is fixed at write time: changing the fleet's shard count means
+ * `UPDATE repos SET bucket = ...` with the new modulus (minutes), and the
+ * constructor refuses mismatched shard counts so it can't happen silently.
  */
-const SHARD_BUCKET_SQL = `(
-  COALESCE(unicode(substr(did, -1)), 0)
-  + COALESCE(unicode(substr(did, -2, 1)), 0) * 31
-  + COALESCE(unicode(substr(did, -3, 1)), 0) * 961
-)`;
+export const BUCKET_MODULUS = 6;
+
+export function bucketOf(did: string): number {
+  const n = did.length;
+  const c1 = n >= 1 ? did.charCodeAt(n - 1) : 0;
+  const c2 = n >= 2 ? did.charCodeAt(n - 2) : 0;
+  const c3 = n >= 3 ? did.charCodeAt(n - 3) : 0;
+  return (c1 + c2 * 31 + c3 * 961) % BUCKET_MODULUS;
+}
+
+/** SQL twin of bucketOf, used once per ledger open to backfill missing buckets. */
+const BUCKET_BACKFILL_SQL = `
+  UPDATE repos SET bucket = (
+    COALESCE(unicode(substr(did, -1)), 0)
+    + COALESCE(unicode(substr(did, -2, 1)), 0) * 31
+    + COALESCE(unicode(substr(did, -3, 1)), 0) * 961
+  ) % ${BUCKET_MODULUS}
+  WHERE bucket IS NULL
+`;
 
 export class SqliteLedger implements Ledger {
   private readonly db: Database.Database;
@@ -75,7 +94,8 @@ export class SqliteLedger implements Ledger {
   private readonly stmtMarkTombstoned: Database.Statement;
   private readonly stmtGetMeta: Database.Statement;
   private readonly stmtSetMeta: Database.Statement;
-  private readonly stmtListClaimable: Database.Statement;
+  private readonly stmtListClaimablePending: Database.Statement;
+  private readonly stmtListClaimableRetry: Database.Statement;
   private readonly stmtMarkFetching: Database.Statement;
   private readonly stmtMarkLoaded: Database.Statement;
   private readonly stmtMarkRetry: Database.Statement;
@@ -107,6 +127,12 @@ export class SqliteLedger implements Ledger {
         `shardIndex must be in [0, ${shards}), got ${shardIndex}`,
       );
     }
+    if (shards > 1 && shards !== BUCKET_MODULUS) {
+      throw new Error(
+        `shards=${shards} does not match the persisted bucket modulus ` +
+          `${BUCKET_MODULUS}; recompute repos.bucket before changing the fleet size`,
+      );
+    }
     // Validated integers baked into the prepared statements. The filter scopes
     // claims AND reporting (statusCounts / totalPostsLoaded / loadedSince /
     // iterateByStatus): a sharded instance sees only its own slice, so per-shard
@@ -114,7 +140,7 @@ export class SqliteLedger implements Ledger {
     // pinned open by other shards' rows. Writes stay unfiltered — they are
     // keyed by DID. shards=1 (the default; status/verify/enumerate construct it
     // that way) compiles the filter away, keeping global tools global.
-    const shardPredicate = `${SHARD_BUCKET_SQL} % ${shards} = ${shardIndex}`;
+    const shardPredicate = `bucket = ${shardIndex}`;
     const shardAnd = shards > 1 ? `AND ${shardPredicate}` : '';
     const shardWhere = shards > 1 ? `WHERE ${shardPredicate}` : '';
 
@@ -124,10 +150,27 @@ export class SqliteLedger implements Ledger {
     this.db.pragma('synchronous = NORMAL');
     this.db.exec(fs.readFileSync(SCHEMA_PATH, 'utf8'));
 
+    // Additive migration for ledgers from before the persisted bucket column;
+    // the backfill UPDATE is a one-time full scan (seconds), then a no-op.
+    const hasBucket = (
+      this.db.pragma('table_info(repos)') as Array<{ name: string }>
+    ).some((col) => col.name === 'bucket');
+    if (!hasBucket) this.db.exec('ALTER TABLE repos ADD COLUMN bucket INTEGER');
+    this.db.exec(BUCKET_BACKFILL_SQL);
+    // (status, bucket, did): claims become an index seek in did order — DIDs
+    // are random base32, so did order doubles as statistically fair host
+    // rotation. (bucket, status): shard-scoped status aggregation.
+    this.db.exec(
+      'CREATE INDEX IF NOT EXISTS idx_repos_claim ON repos (status, bucket, did)',
+    );
+    this.db.exec(
+      'CREATE INDEX IF NOT EXISTS idx_repos_bucket_status ON repos (bucket, status)',
+    );
+
     // Account migrations during enumeration: a later op may move a still-pending
     // DID to a new PDS. Rows already past 'pending' are never clobbered.
     this.stmtUpsertPending = this.db.prepare(`
-      INSERT INTO repos (did, pds_host, status, enumerated_at) VALUES (?, ?, 'pending', ?)
+      INSERT INTO repos (did, pds_host, status, enumerated_at, bucket) VALUES (?, ?, 'pending', ?, ?)
       ON CONFLICT (did) DO UPDATE SET
         pds_host = excluded.pds_host,
         enumerated_at = excluded.enumerated_at
@@ -137,7 +180,7 @@ export class SqliteLedger implements Ledger {
     // Already-loaded rows keep their data (emojitracker semantics: posts count
     // as they happened, even if the account is later deleted at the PLC layer).
     this.stmtMarkTombstoned = this.db.prepare(`
-      INSERT INTO repos (did, pds_host, status, enumerated_at) VALUES (?, '', 'tombstoned', ?)
+      INSERT INTO repos (did, pds_host, status, enumerated_at, bucket) VALUES (?, '', 'tombstoned', ?, ?)
       ON CONFLICT (did) DO UPDATE SET status = 'tombstoned', retry_after = NULL
       WHERE repos.status NOT IN ('loaded', 'verified')
     `);
@@ -148,22 +191,25 @@ export class SqliteLedger implements Ledger {
       ON CONFLICT (key) DO UPDATE SET value = excluded.value
     `);
 
-    // Strict host rotation (row 1 of every host, then row 2, ...) so a claim
-    // batch never concentrates on one mega-host. The window function scans all
-    // due rows; acceptable for batch-claims every few seconds, and the due set
-    // shrinks as the crawl progresses. Unreachable rows are offered only while
-    // attempts < MAX_ATTEMPTS — past the budget they park (never flipped to
-    // 'failed': host down ≠ data gone) as the explicit final-sweep list, and
-    // the scheduler's idle policy ends the run instead of hammering dead hosts.
-    this.stmtListClaimable = this.db.prepare(`
-      SELECT * FROM (
-        SELECT repos.*, row_number() OVER (PARTITION BY pds_host) AS host_rank
-        FROM repos
-        WHERE (status = 'pending'
-               OR (status = 'unreachable' AND retry_after <= ? AND attempts < ?))
-        ${shardAnd}
-      )
-      ORDER BY host_rank, pds_host
+    // Claims are an index seek on (status, bucket, did) in did order — DIDs
+    // are random base32, so a did-ordered batch is a statistically fair host
+    // mix and the per-host limiters do the actual anti-hogging. (The previous
+    // strict-rotation window function ranked EVERY claimable row per call: a
+    // full-table scan that grew with enumeration and ate the main thread.)
+    // Unreachable rows are offered only while attempts < MAX_ATTEMPTS — past
+    // the budget they park (never flipped to 'failed': host down ≠ data gone)
+    // as the explicit final-sweep list, and the scheduler's idle policy ends
+    // the run instead of hammering dead hosts.
+    this.stmtListClaimablePending = this.db.prepare(`
+      SELECT * FROM repos
+      WHERE status = 'pending' ${shardAnd}
+      ORDER BY did
+      LIMIT ?
+    `);
+    this.stmtListClaimableRetry = this.db.prepare(`
+      SELECT * FROM repos
+      WHERE status = 'unreachable' AND retry_after <= ? AND attempts < ? ${shardAnd}
+      ORDER BY did
       LIMIT ?
     `);
 
@@ -234,11 +280,11 @@ export class SqliteLedger implements Ledger {
   }
 
   upsertPending(did: string, pdsHost: string): void {
-    this.stmtUpsertPending.run(did, pdsHost, Date.now());
+    this.stmtUpsertPending.run(did, pdsHost, Date.now(), bucketOf(did));
   }
 
   markTombstoned(did: string): void {
-    this.stmtMarkTombstoned.run(did, Date.now());
+    this.stmtMarkTombstoned.run(did, Date.now(), bucketOf(did));
   }
 
   getMeta(key: string): string | undefined {
@@ -251,11 +297,16 @@ export class SqliteLedger implements Ledger {
   }
 
   listClaimable(limit: number): RepoRow[] {
-    const rows = this.stmtListClaimable.all(
-      Date.now(),
-      MAX_ATTEMPTS,
-      limit,
-    ) as RepoTableRow[];
+    const rows = this.stmtListClaimablePending.all(limit) as RepoTableRow[];
+    if (rows.length < limit) {
+      rows.push(
+        ...(this.stmtListClaimableRetry.all(
+          Date.now(),
+          MAX_ATTEMPTS,
+          limit - rows.length,
+        ) as RepoTableRow[]),
+      );
+    }
     return rows.map(toRepoRow);
   }
 
