@@ -129,9 +129,10 @@ export interface Ledger {
 }
 
 /**
- * One repo's in-flight load: addRow buffers and inserts a chunk whenever
- * LOADER_CHUNK_ROWS accumulate; finish flushes the final partial chunk. The
- * ledger must flip to 'loaded' only after finish() resolves.
+ * One repo's in-flight load: addRow hands rows to the loader's shared
+ * cross-repo buffer; finish resolves only once every batch that carried this
+ * repo's rows is durably inserted. The ledger must flip to 'loaded' only
+ * after finish() resolves.
  */
 export interface RepoLoad {
   addRow(row: PostRow): Promise<void>;
@@ -139,16 +140,11 @@ export interface RepoLoad {
 }
 
 /**
- * Streaming chunked ClickHouse inserts with per-chunk
- * insert_deduplication_token = `${did}:${rev}:${chunkRows}:${chunkIdx}` —
- * which is why rev must be known when the handle opens, before the first chunk
- * insert. Tokens are stable across re-fetches: rows arrive in MST walk order
- * (deterministic for a given commit), so identical (did, rev) re-fetches at
- * the same chunk size produce byte-identical chunks under identical tokens.
- * The chunk size is part of the token because it shapes the chunks: changing
- * it mid-crawl changes every token, causing harmless re-inserts (collapsed by
- * ReplacingMergeTree) instead of silently skipping chunks that now cover
- * different rows.
+ * Batched cross-repo ClickHouse inserts (see loader.ts for the durability
+ * bookkeeping and why per-repo inserts were a parts storm). Loads are
+ * idempotent: re-fetches re-insert rows that ReplacingMergeTree(did, rkey)
+ * collapses, and within one process identical retried batches dedup via
+ * insert_deduplication_token.
  */
 export interface RepoLoader {
   openRepo(did: string, rev: string | null): RepoLoad;

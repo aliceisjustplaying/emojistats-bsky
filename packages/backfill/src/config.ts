@@ -55,7 +55,12 @@ export const RETRY_BASE_MS = num('RETRY_BASE_MS', 60_000);
 export const RETRY_MAX_MS = num('RETRY_MAX_MS', 3_600_000);
 export const MAX_ATTEMPTS = num('MAX_ATTEMPTS', 5);
 
-export const LOADER_CHUNK_ROWS = num('LOADER_CHUNK_ROWS', 100_000);
+// Cross-repo insert batching (see loader.ts): flush the shared buffer at
+// LOADER_BATCH_ROWS rows or when the oldest buffered row is LOADER_FLUSH_MS
+// old, whichever comes first. Sized so each box inserts ~4×/min instead of
+// ~4×/s — the per-month partition fan-out made tiny inserts a parts storm.
+export const LOADER_BATCH_ROWS = num('LOADER_BATCH_ROWS', 200_000);
+export const LOADER_FLUSH_MS = num('LOADER_FLUSH_MS', 15_000);
 
 export const USER_AGENT =
   process.env.BACKFILL_USER_AGENT ??
