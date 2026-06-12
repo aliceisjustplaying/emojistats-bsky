@@ -12,6 +12,8 @@
     "crawl": "bunx tsx src/crawl.ts",
     "verify": "bunx tsx src/verify.ts",
     "status": "bunx tsx src/status.ts",
+    "healthcheck": "bunx tsx src/healthcheck.ts",
+    "listrepos-diff": "bunx tsx src/listrepos-diff.ts",
     "test": "bunx tsx --test src/*.test.ts",
     "typecheck": "tsgo --noEmit"
   },
