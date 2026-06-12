@@ -16,6 +16,7 @@ import {
   RetryableError,
   TerminalFetchError,
 } from './fetcher.js';
+import type { HostPressure } from './host-pressure.js';
 import logger from './logger.js';
 import type { CrawlStats } from './run-state.js';
 import type { CrawlTelemetry } from './telemetry.js';
@@ -115,10 +116,11 @@ export interface RetryPolicyDeps {
   ledger: Ledger;
   telemetry: CrawlTelemetry;
   stats: CrawlStats;
+  hostPressure: HostPressure;
 }
 
 export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
-  const { ledger, telemetry, stats } = deps;
+  const { ledger, telemetry, stats, hostPressure } = deps;
 
   function handleRepoError(repo: RepoRow, err: unknown): void {
     const message = err instanceof Error ? err.message : String(err);
@@ -180,6 +182,27 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
     const retryAfterHint =
       err instanceof RetryableError ? (err.retryAfterMs ?? 0) : 0;
     const retryAfterMs = Math.max(backoff, retryAfterHint);
+    // 429 is evidence of OUR pressure, not of the repo being unreachable:
+    // it arms the host cooldown and must not burn the attempts budget —
+    // during the morel storm, attempts-burning 429s mass-parked repos that
+    // a politer pace fetched fine. The repo still backs off (flat base; the
+    // host cooldown is what actually meters the pressure).
+    if (/http 429/.test(message)) {
+      hostPressure.record429(repo.pdsHost);
+      ledger.markThrottled(
+        repo.did,
+        message,
+        Math.max(RETRY_BASE_MS, retryAfterHint),
+      );
+      stats.retried += 1;
+      telemetry.recordEvent({
+        did: repo.did,
+        pdsHost: repo.pdsHost,
+        event: 'retry',
+        error: message,
+      });
+      return;
+    }
     ledger.markRetry(repo.did, message, retryAfterMs);
     stats.retried += 1;
     telemetry.recordEvent({

@@ -10,6 +10,7 @@ import {
   PER_HOST_CONCURRENCY,
   PER_HOST_CONCURRENCY_BSKY,
 } from './config.js';
+import type { HostPressure } from './host-pressure.js';
 import logger from './logger.js';
 import type { CrawlControl, CrawlStats } from './run-state.js';
 import type { Ledger, RepoRow } from './types.js';
@@ -65,11 +66,12 @@ export interface SchedulerDeps {
   ledger: Ledger;
   stats: CrawlStats;
   control: CrawlControl;
+  hostPressure: HostPressure;
   processRepo: (repo: RepoRow) => Promise<void>;
 }
 
 export function createScheduler(deps: SchedulerDeps): Scheduler {
-  const { ledger, stats, control, processRepo } = deps;
+  const { ledger, stats, control, hostPressure, processRepo } = deps;
 
   const globalLimit = pLimit(GLOBAL_CONCURRENCY);
   // Keyed by the ledger's pds_host string verbatim — including the
@@ -101,10 +103,13 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
 
   // Per-host limiter outermost so a slow host's queue never pins global slots;
   // the global limiter inside is what actually caps simultaneous downloads.
+  // The 429 cooldown wait sits between them on purpose: a cooling host parks
+  // its own queue (cheap — host slots are free) without holding global slots.
   const trackRepo = (repo: RepoRow): void => {
-    const task = hostLimitFor(repo.pdsHost)(() =>
-      globalLimit(() => processRepo(repo)),
-    );
+    const task = hostLimitFor(repo.pdsHost)(async () => {
+      await hostPressure.waitWhileCooling(repo.pdsHost);
+      return globalLimit(() => processRepo(repo));
+    });
     const tracked: Promise<void> = task
       .catch((err: unknown) => {
         logger.error(

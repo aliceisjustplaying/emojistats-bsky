@@ -16,6 +16,7 @@ import {
   LEDGER_DB_PATH,
   TEXT_IN_CLICKHOUSE,
 } from './config.js';
+import { createHostPressure } from './host-pressure.js';
 import { SqliteLedger } from './ledger.js';
 import {
   createTelemetry,
@@ -70,7 +71,8 @@ async function main(): Promise<void> {
   const control: CrawlControl = { stopClaiming: false };
 
   const telemetry = createTelemetry(chClient);
-  const retry = createRetryPolicy({ ledger, telemetry, stats });
+  const hostPressure = createHostPressure();
+  const retry = createRetryPolicy({ ledger, telemetry, stats, hostPressure });
   const parsePool = createParsePool();
   const processRepo = createRepoPipeline({
     ledger,
@@ -83,7 +85,13 @@ async function main(): Promise<void> {
     stats,
     control,
   });
-  const scheduler = createScheduler({ ledger, stats, control, processRepo });
+  const scheduler = createScheduler({
+    ledger,
+    stats,
+    control,
+    hostPressure,
+    processRepo,
+  });
 
   startTelemetry(telemetry, {
     ledger,

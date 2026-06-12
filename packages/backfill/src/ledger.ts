@@ -99,6 +99,7 @@ export class SqliteLedger implements Ledger {
   private readonly stmtMarkFetching: Database.Statement;
   private readonly stmtMarkLoaded: Database.Statement;
   private readonly stmtMarkRetry: Database.Statement;
+  private readonly stmtMarkThrottled: Database.Statement;
   private readonly stmtMarkTerminal: Database.Statement;
   private readonly stmtMarkVerified: Database.Statement;
   private readonly stmtStatusCounts: Database.Statement;
@@ -231,6 +232,15 @@ export class SqliteLedger implements Ledger {
       WHERE did = ?
     `);
 
+    // 429 path: parks for the backoff like markRetry but does NOT burn an
+    // attempt — rate limiting is evidence of our pressure (handled by the
+    // host cooldown), not of the repo being gone. Burning attempts during a
+    // 429 storm mass-parked repos behind the final-sweep fence.
+    this.stmtMarkThrottled = this.db.prepare(`
+      UPDATE repos SET status = 'unreachable', error = ?, retry_after = ?
+      WHERE did = ?
+    `);
+
     // COALESCE keeps the last recorded error when markTerminal is called without one
     // (e.g. 'failed' after exhausting retries — the markRetry error is the diagnosis).
     this.stmtMarkTerminal = this.db.prepare(`
@@ -330,6 +340,10 @@ export class SqliteLedger implements Ledger {
 
   markRetry(did: string, error: string, retryAfterMs: number): void {
     this.stmtMarkRetry.run(error, Date.now() + retryAfterMs, did);
+  }
+
+  markThrottled(did: string, error: string, retryAfterMs: number): void {
+    this.stmtMarkThrottled.run(error, Date.now() + retryAfterMs, did);
   }
 
   // Rare path (retries only) — not worth a prepared-statement field.

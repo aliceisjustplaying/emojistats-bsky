@@ -97,6 +97,8 @@ export interface Ledger {
   markFetching(did: string): boolean;
   markLoaded(did: string, counts: RepoCounts): void;
   markRetry(did: string, error: string, retryAfterMs: number): void;
+  /** Parks like markRetry but without burning an attempt — the 429 path. */
+  markThrottled(did: string, error: string, retryAfterMs: number): void;
   markTerminal(
     did: string,
     status: Extract<
