@@ -373,6 +373,35 @@ the pool can't re-bind when enumeration fans out), via nix, fleet rebuilt.
 429 overshoot degrades softly (60 s retry park), so the experiment is cheap
 to walk back. Ten-minute verdict pending as of this entry.
 
+## ~14:30 — verdicts and the dashboard learns to remember
+
+The 32/host + 1536-slot verdict: **32,743 repos/min** sustained, 429s at
+~0.15% (the politeness margin was real), ClickHouse yawning — 778 inserts in
+10 minutes averaging 36k rows, p95 792 ms, zero delayed/rejected inserts, ≤10
+parts per partition, zero merge backlog, 1.3 of 12 GiB used, box 80% idle.
+The enumeration catch-up compounds it: 35M+ DIDs and climbing, each newly
+discovered mushroom adding another 32-wide lane per box. Dashboard ETA
+dropped under 16 h while we watched.
+
+The error-rate scare that wasn't: ~17% of claims "erroring" decomposed into
+RepoTakendown / RepoNotFound / RepoDeactivated — the newly enumerated tail
+being *classified*, which is the system working — plus 2,414 `example.test`
+junk DIDs that PLC really does contain.
+
+Dashboard truthfulness round: "data downloaded" and the download rate came
+from the crawler's in-process gauges, which reset on every restart (a
+fleet-tuning afternoon made the counter lurch backwards) and read 0 between
+batched flushes. Both now come from the append-only events table — 336 GiB
+fetched all-time, 107.85M posts — and survive any restart. Bonus bug for the
+collection: the fix initially aliased `sumIf(posts, ...) AS posts`, and
+ClickHouse's alias-shadows-column rule turned it into ILLEGAL_AGGREGATION —
+the same trap the adjacent query documents for `ts`. The page 500'd for
+four minutes and the comment block grew by one war story.
+
+Also this afternoon, off the hot path: identity hygiene — pix's entire git
+history rewritten (git-filter-repo) to scrub a legacy name from config and
+emails, force-pushed; the fleet's deploy trees re-synced to match.
+
 ## Running ETA honesty table (for the retro)
 
 | When | Basis | Claim |
