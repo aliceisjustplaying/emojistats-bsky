@@ -82,6 +82,7 @@ const hostCapFor = (host: string): number =>
   isBskyInfra(host) ? PER_HOST_CONCURRENCY_BSKY : PER_HOST_CONCURRENCY;
 
 const CLAIM_SCAN_MULTIPLIER = 16;
+const CLAIM_SCAN_MIN = 250_000;
 const CLAIM_SCAN_MAX = 250_000;
 const CLAIM_REFILL_MIN = Math.min(512, GLOBAL_CONCURRENCY);
 
@@ -220,7 +221,11 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
           claimBacklog = ledger.listClaimable(
             Math.min(
               CLAIM_SCAN_MAX,
-              Math.max(claimCapacity, claimCapacity * CLAIM_SCAN_MULTIPLIER),
+              Math.max(
+                claimCapacity,
+                claimCapacity * CLAIM_SCAN_MULTIPLIER,
+                CLAIM_SCAN_MIN,
+              ),
             ),
           );
         }

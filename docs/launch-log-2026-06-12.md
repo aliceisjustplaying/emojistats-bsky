@@ -493,6 +493,11 @@ one-slot refills, which made the scheduler rescan the backlog once per repo.
 Refills now batch at 512 available slots, cutting claim-loop churn while keeping
 the downloader pool mostly full.
 
+The actual live measurement was even sharper: the cap was raised to 250k, but
+the multiplier still requested only 49k rows for a 3,072-slot refill. That
+exposed ~324 runnable slots in this skewed tail. A 250k scan exposes ~2,711
+runnable slots in ~1s, so the scheduler now has a hard 250k scan floor.
+
 ## Running ETA honesty table (for the retro)
 
 | When | Basis | Claim |
