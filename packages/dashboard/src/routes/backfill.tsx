@@ -199,6 +199,16 @@ function BackfillPage() {
       </header>
 
       <Hero overview={overview} />
+
+      {/* the payoff goes right under the hero — this is the fun part */}
+      <div className="grid gap-4 lg:grid-cols-2">
+        <TopEmojis topEmojis={fun.topEmojis} emojiPosts={fun.emojiPosts} />
+        <OldestPost
+          oldestPostAt={fun.oldestPostAt}
+          generatedAt={fun.generatedAt}
+        />
+      </div>
+
       <HistoryHistogram
         months={histogram.months}
         totalPosts={histogram.totalPosts}
@@ -210,14 +220,6 @@ function BackfillPage() {
       <div className="grid items-start gap-4 lg:grid-cols-2">
         <HostsTable hosts={hosts} />
         <IssuesFeed generatedAt={issues.generatedAt} issues={issues.issues} />
-      </div>
-
-      <div className="grid gap-4 lg:grid-cols-2">
-        <TopEmojis topEmojis={fun.topEmojis} emojiPosts={fun.emojiPosts} />
-        <OldestPost
-          oldestPostAt={fun.oldestPostAt}
-          generatedAt={fun.generatedAt}
-        />
       </div>
 
       <footer className="pt-2 text-center text-xs text-muted-foreground">
