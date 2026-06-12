@@ -864,3 +864,36 @@ network, none of them the hardware.
   still paging the PLC directory at 25ms/page (~45M DIDs to go).
 - Zero-touch first boot proven on crawl0: pre-baked age key → sops decrypts →
   tailscale auto-enrolls with the right tag → emoji pin resolves. No hands.
+
+## Night watch — 2026-06-12 23:30 → (Alice asleep, goal mode)
+
+The all-host sweeps landed while the crawlers were stopped. Four boxes
+(crawl0/1/2/5) finished within minutes of one another — once we noticed all
+four were independently paging `bsky.network`, the *relay*, whose listRepos
+is the entire network (~42M repos, 3+ hours), to classify a grand total of
+one stray ledger row. A surgical iptables REJECT aborted the walks (a failed
+walk classifies nothing by design); the relay is now first on the skip list
+(2c803e5). Lesson for the blogpost: never diff an aggregator, and
+deepest-first ordering means the cheapest-looking host in the tail can be
+the most expensive walk in the run.
+
+Sweep haul across the four finished boxes: 11,818 hosts diffed, 156.9M
+listed rows churned, 18,789,628 condemned beyond morel (8.5M of those
+PLC-only ghosts). With morel's 18.4M that is ~37M repos that will never
+cost a getRepo. Largest single hauls after the mushroom band: stropharia
+(238k), then a long plateau of ~135-140k per mushroom.
+
+Archive widening shipped mid-sweep (8c4be10): facets/reply/embed/labels as
+raw-JSON parquet columns, NULL = pre-widening row, '' = field absent,
+manifest v2, ledger meta archive_extras_since per shard. Measured cost
+basis: 52 B/post text-only; widened estimate ~200 B/post, ~530GB projected
+against the 1TiB box. ClickHouse untouched via explicit toClickhouseRow
+pick. Live ingest cut over at 23:32 UTC, zero-gap cursor replay.
+
+First incident of the night: the live worker died once at 23:37 on its
+first stall-watchdog reconnect — @skyware/jetstream extends TinyEmitter,
+and an old cast called the nonexistent removeAllListeners. Fix (59e697f)
+detaches only open/close/error; codex review (gpt-5.5, xhigh) caught that
+detaching the collection listener too could advance the cursor past an
+unprocessed post — kept attached, late posts are at-least-once traffic.
+Two review rounds, approved, deployed 23:48.
