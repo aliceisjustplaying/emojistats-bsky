@@ -93,6 +93,12 @@ const DEAD_HOST_PARK_CHUNK = 10_000;
 /** Re-park dead hosts this often: catches enumeration trickle + restart leftovers. */
 const DEAD_HOST_SWEEP_MS = 300_000;
 
+const yieldToTimers = async (): Promise<void> => {
+  await new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+};
+
 export function createScheduler(deps: SchedulerDeps): Scheduler {
   const { ledger, stats, control, hostPressure, hostHealth, processRepo } =
     deps;
@@ -171,12 +177,6 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
       });
     }
   };
-  const yieldToTimers = async (): Promise<void> => {
-    await new Promise<void>((resolve) => {
-      setImmediate(resolve);
-    });
-  };
-
   // Parking runs BESIDE the claim loop, not inside it: a 1.9M-row host is
   // hundreds of chunks of synchronous sqlite, and v1 awaited that from the
   // scheduler loop — claims froze for the whole park. The pause between
@@ -227,6 +227,7 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
             { host, parked, reason },
             'dead host: claimable repos parked as unreachable (final-sweep list)',
           );
+        return undefined;
       })
       // A failed chunk (e.g. SQLITE_BUSY past the timeout) must not kill the
       // chain for later hosts or surface as an unhandled rejection — the

@@ -3,6 +3,8 @@
 // Prints top stacks by self-time. Cracked bottlenecks #4, #11 and the park
 // race in minutes each — profile before fixing.
 
+import process from 'node:process';
+
 interface CallFrame {
   functionName: string;
   url: string;
@@ -26,7 +28,7 @@ if (target === undefined)
 const list = (await fetch(`http://${target}/json/list`).then((r) =>
   r.json(),
 )) as Array<{ webSocketDebuggerUrl: string }>;
-const ws = new WebSocket(list[0]!.webSocketDebuggerUrl);
+const ws = new WebSocket(list[0].webSocketDebuggerUrl);
 let id = 0;
 const pending = new Map<number, (result: unknown) => void>();
 const send = (method: string, params = {}): Promise<unknown> =>

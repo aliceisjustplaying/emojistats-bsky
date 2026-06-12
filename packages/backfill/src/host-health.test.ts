@@ -2,14 +2,14 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, it, mock } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
 
 import { MAX_ATTEMPTS } from './config.js';
 import { classifyDeadness, createHostHealth } from './host-health.js';
 import { bucketOf, SqliteLedger } from './ledger.js';
 
-describe('deadness classification', () => {
-  it('matches only failure modes that cannot be per-repo transient', () => {
+void describe('deadness classification', () => {
+  void it('matches only failure modes that cannot be per-repo transient', () => {
     assert.equal(
       classifyDeadness(
         'getRepo did@pds.trump.com: fetch failed: getaddrinfo ENOTFOUND pds.trump.com',
@@ -31,8 +31,8 @@ describe('deadness classification', () => {
   });
 });
 
-describe('host health tripping', () => {
-  it('trips only after 30 consecutive classified failures spanning 30s', (t) => {
+void describe('host health tripping', () => {
+  void it('trips only after 30 consecutive classified failures spanning 30s', (t) => {
     const health = createHostHealth();
     let now = 1_000_000;
     t.mock.method(Date, 'now', () => now);
@@ -51,7 +51,7 @@ describe('host health tripping', () => {
     assert.deepEqual(health.deadHosts(), ['dead.example']);
   });
 
-  it('any success resets the consecutive count', (t) => {
+  void it('any success resets the consecutive count', (t) => {
     const health = createHostHealth();
     let now = 1_000_000;
     t.mock.method(Date, 'now', () => now);
@@ -65,14 +65,14 @@ describe('host health tripping', () => {
     assert.deepEqual(health.takeNewlyTripped(), []);
   });
 
-  it('unclassified failures never count toward deadness', () => {
+  void it('unclassified failures never count toward deadness', () => {
     const health = createHostHealth();
     for (let i = 0; i < 100; i += 1)
       health.recordFailure('slow.example', 'fetch timeout after 300000ms');
     assert.equal(health.isDead('slow.example'), false);
   });
 
-  it('an HTTP response resets a DNS/451 streak; pure network errors do not', (t) => {
+  void it('an HTTP response resets a DNS/451 streak; pure network errors do not', (t) => {
     const health = createHostHealth();
     let now = 1_000_000;
     t.mock.method(Date, 'now', () => now);
@@ -93,7 +93,7 @@ describe('host health tripping', () => {
     assert.equal(health2.isDead('dead.example'), true);
   });
 
-  it('deadness is sticky against late stray successes', (t) => {
+  void it('deadness is sticky against late stray successes', (t) => {
     const health = createHostHealth();
     let now = 1_000_000;
     t.mock.method(Date, 'now', () => now);
@@ -107,7 +107,7 @@ describe('host health tripping', () => {
   });
 });
 
-describe('ledger.parkDeadHostChunk', () => {
+void describe('ledger.parkDeadHostChunk', () => {
   let dir: string;
   beforeEach(() => {
     dir = mkdtempSync(path.join(tmpdir(), 'ledger-park-'));
@@ -116,7 +116,7 @@ describe('ledger.parkDeadHostChunk', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('parks pending and in-budget unreachable rows of the host, nothing else', () => {
+  void it('parks pending and in-budget unreachable rows of the host, nothing else', () => {
     const ledger = new SqliteLedger(path.join(dir, 'ledger.sqlite'));
     ledger.upsertPending('did:plc:aaa1', 'dead.example');
     ledger.upsertPending('did:plc:aaa2', 'dead.example');
@@ -171,7 +171,7 @@ describe('ledger.parkDeadHostChunk', () => {
     ledger.close();
   });
 
-  it('dead-host registry round-trips and enumeration inserts born-parked rows', () => {
+  void it('dead-host registry round-trips and enumeration inserts born-parked rows', () => {
     const ledger = new SqliteLedger(path.join(dir, 'registry.sqlite'));
     assert.deepEqual(ledger.getDeadHosts(), []);
     ledger.addDeadHost('dead.example');
@@ -198,7 +198,7 @@ describe('ledger.parkDeadHostChunk', () => {
     ledger.close();
   });
 
-  it('is shard-scoped like every other claim-path write', () => {
+  void it('is shard-scoped like every other claim-path write', () => {
     // Find dids landing in bucket 0 and elsewhere so the test is deterministic.
     const dids: string[] = [];
     for (let i = 0; dids.length < 2 && i < 1000; i += 1) {
@@ -209,14 +209,14 @@ describe('ledger.parkDeadHostChunk', () => {
     const [inShard, outShard] = dids;
     const dbPath = path.join(dir, 'sharded.sqlite');
     const writer = new SqliteLedger(dbPath);
-    writer.upsertPending(inShard!, 'dead.example');
-    writer.upsertPending(outShard!, 'dead.example');
+    writer.upsertPending(inShard, 'dead.example');
+    writer.upsertPending(outShard, 'dead.example');
     writer.close();
 
     const shard0 = new SqliteLedger(dbPath, { shards: 6, shardIndex: 0 });
     assert.equal(shard0.parkDeadHostChunk('dead.example', 'host dead', 100), 1);
-    assert.equal(shard0.getRepo(inShard!)!.status, 'unreachable');
-    assert.equal(shard0.getRepo(outShard!)!.status, 'pending');
+    assert.equal(shard0.getRepo(inShard)!.status, 'unreachable');
+    assert.equal(shard0.getRepo(outShard)!.status, 'pending');
     shard0.close();
   });
 });
