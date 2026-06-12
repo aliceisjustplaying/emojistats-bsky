@@ -244,7 +244,7 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
           scheduled += 1;
           trackRepo(repo);
         }
-        if (scheduled === 0) {
+        if (scheduled < claimCapacity) {
           const wake = hostPressure.nextWake();
           if (active.size > 0) {
             await Promise.race(active);

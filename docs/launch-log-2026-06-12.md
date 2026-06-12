@@ -470,6 +470,13 @@ as one burst instead of immediately escalating strikes to the 10-minute max.
 The invariant is now explicit: scheduler `active` slots are for runnable work,
 not parked cooldown sleepers.
 
+Canary caught one more edge: if the deeper scan found some runnable work but
+not enough to fill all 3,072 outstanding slots, the loop immediately scanned
+again. That was a new event-loop starvation mode: only a few hundred fetches
+active, but the main thread burning CPU in repeated claim scans and telemetry
+silent. The scheduler now yields whenever a scan cannot fill the requested
+capacity, even if it scheduled some work.
+
 ## Running ETA honesty table (for the retro)
 
 | When | Basis | Claim |
