@@ -343,10 +343,14 @@ export const getBackfillHistogram = createServerFn().handler(
     // history at the crawl boundary. "What's in the database per month" IS the
     // coverage this chart exists to show — historical months only ever fill
     // via the crawl anyway.
+    // Reads posts_hourly, not raw posts: a month GROUP BY over the raw table
+    // is a full scan that grows with the crawl (it OOM'd mid-backfill at 8M
+    // rows; it would never survive 2.9B). Aggregate counts over-count dups
+    // until the rebuild timers settle them — the footer says as much.
     const rows = await chQuery<{ month: string; posts: string }>(`
-      SELECT toStartOfMonth(created_at) AS month, count() AS posts
-      FROM posts
-      WHERE created_at >= toDateTime('2023-01-01 00:00:00', 'UTC')
+      SELECT toStartOfMonth(hour) AS month, sum(posts) AS posts
+      FROM posts_hourly
+      WHERE hour >= toDateTime('2023-01-01 00:00:00', 'UTC')
       GROUP BY month
       ORDER BY month
     `);
@@ -459,24 +463,22 @@ export const getBackfillFun = createServerFn().handler(
     if (funCache !== null && Date.now() - funCache.at < FUN_CACHE_MS) {
       return funCache.data;
     }
+    // Aggregate tables only — arrayJoin over raw posts is a full scan that
+    // grows with the crawl (OOM'd mid-backfill; unsurvivable at 2.9B rows).
     const [topEmojis, oldest] = await Promise.all([
       chQuery<{ emoji: string; occurrences: string }>(`
-        SELECT emoji, count() AS occurrences
-        FROM (
-          SELECT arrayJoin(emojis) AS emoji
-          FROM posts
-          WHERE notEmpty(emojis)
-        )
+        SELECT emoji, sum(occurrences) AS occurrences
+        FROM emoji_total
         GROUP BY emoji
         ORDER BY occurrences DESC
         LIMIT 10
       `),
       chQuery<{ oldest: string; n: string; emoji_posts: string }>(`
         SELECT
-          min(created_at) AS oldest,
-          count() AS n,
-          countIf(notEmpty(emojis)) AS emoji_posts
-        FROM posts
+          min(hour) AS oldest,
+          sum(posts) AS n,
+          sum(posts_with_emojis) AS emoji_posts
+        FROM posts_hourly
       `),
     ]);
     const data: BackfillFun = {
