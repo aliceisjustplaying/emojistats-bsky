@@ -20,6 +20,10 @@ export function createClickHouseClient(): ClickHouseClient {
     database: CLICKHOUSE_DATABASE,
     application: 'emojistats-backfill',
     request_timeout: 30_000,
+    // CAR parsing blocks the event loop past the 2.5s socket TTL; without
+    // this the client reuses server-closed sockets and inserts hang forever
+    // (launch night: fetching=128, zero completions, telemetry frozen).
+    keep_alive: { eagerly_destroy_stale_sockets: true },
   });
 }
 

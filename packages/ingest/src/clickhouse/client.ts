@@ -15,6 +15,10 @@ export function createClickHouseClient(): ClickHouseClient {
     database: CLICKHOUSE_DATABASE,
     application: 'emojistats-ingest',
     request_timeout: 30_000,
+    // Same mitigation as the backfill client: an event loop blocked past the
+    // 2.5s socket TTL makes the client reuse server-closed sockets, hanging
+    // the request. Destroy stale sockets instead of gambling on them.
+    keep_alive: { eagerly_destroy_stale_sockets: true },
   });
 }
 

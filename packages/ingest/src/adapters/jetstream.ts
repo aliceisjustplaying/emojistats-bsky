@@ -102,7 +102,9 @@ export class JetstreamSource implements IngestSource {
     // partysocket (inside Jetstream) schedules its own retry before emitting 'close';
     // close() defuses it so this backoff is the only reconnect driver.
     previous.close();
-    previous.removeAllListeners();
+    // Jetstream extends EventEmitter at runtime but its declared type stopped
+    // surfacing the inherited members under newer tsc — cast for this call.
+    (previous as unknown as NodeJS.EventEmitter).removeAllListeners();
     // The dying socket can still emit a late 'error' (often with an empty
     // message), and an EventEmitter with no 'error' listener turns that into
     // an uncaught exception — which took the whole worker down. Keep a drain

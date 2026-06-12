@@ -232,6 +232,7 @@ async function main(): Promise<void> {
       password: CLICKHOUSE_PASSWORD,
       database: CLICKHOUSE_DATABASE,
       application: 'emojistats-rebuild',
+      keep_alive: { eagerly_destroy_stale_sockets: true },
       request_timeout: 4 * 3_600_000,
       // Keeps the HTTP socket alive across a full-history INSERT…SELECT.
       clickhouse_settings: {

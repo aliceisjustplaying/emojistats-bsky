@@ -29,6 +29,7 @@ export function createClickHouseClient(): ClickHouseClient {
     password: CLICKHOUSE_PASSWORD,
     database: CLICKHOUSE_DATABASE,
     application: 'emojistats-api',
+    keep_alive: { eagerly_destroy_stale_sockets: true },
     request_timeout: 30_000,
   });
 }
