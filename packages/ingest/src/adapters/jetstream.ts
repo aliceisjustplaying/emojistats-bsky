@@ -160,14 +160,24 @@ export class JetstreamSource implements IngestSource {
     // partysocket (inside Jetstream) schedules its own retry before emitting 'close';
     // close() defuses it so this backoff is the only reconnect driver.
     previous.close();
-    // Jetstream extends EventEmitter at runtime but its declared type stopped
-    // surfacing the inherited members under newer tsc — cast for this call.
-    (previous as unknown as NodeJS.EventEmitter).removeAllListeners();
-    // The dying socket can still emit a late 'error' (often with an empty
-    // message), and an EventEmitter with no 'error' listener turns that into
-    // an uncaught exception — which took the whole worker down. Keep a drain
-    // attached for the instance's remaining lifetime.
-    previous.on('error', (error) => {
+    // Jetstream extends tiny-emitter's TinyEmitter, which has NO
+    // removeAllListeners — the old cast to NodeJS.EventEmitter crashed the
+    // worker on the first stall-watchdog reconnect (2026-06-12 23:37 UTC).
+    // TinyEmitter.off(name) without a callback drops every handler for that
+    // event. Only the lifecycle events are detached: the collection
+    // listener (onCreate) MUST stay attached while the socket drains,
+    // because Jetstream advances its cursor before emitting each commit — a
+    // detached listener would let a late in-flight post move the saved
+    // cursor past a record nobody processed (silent loss on replay).
+    // Keeping it attached just means late posts flow through onEvent as
+    // normal at-least-once traffic (review credit: codex/gpt-5.5).
+    for (const event of ['open', 'close', 'error']) {
+      previous.off(event);
+    }
+    // Late 'error' emits from the dying socket are harmless under
+    // TinyEmitter (no listeners means a no-op, never a throw), but keep a
+    // debug drain so they remain visible while the instance winds down.
+    previous.on('error', (error: Error) => {
       logger.debug(
         `Late error from closed Jetstream socket: ${error.message || '(empty)'}`,
       );
