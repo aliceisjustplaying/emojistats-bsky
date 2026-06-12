@@ -208,6 +208,11 @@ idempotent.
   dashboard stops updating and crawler logs show `Timeout error` on
   `backfill_progress` or 200k-row inserts, the fleet is over ClickHouse's
   current write capacity; lower runtime concurrency before raising fetch caps.
+- `backfill_progress` is not lossy: each crawler retains its newest status
+  snapshot and retries it until ClickHouse accepts it. `backfill_repo_events`
+  remains lossy dashboard/event telemetry. Dashboard freshness is the stalest
+  shard, so status counts are current only when freshness is below the idle
+  threshold.
 - The archive is at-least-once across crashes (see above): re-fetched repos
   re-append. Rows staged in the open file at crash time are recovered at the
   sink's next startup and finalized as their own parquet file; a hard crash

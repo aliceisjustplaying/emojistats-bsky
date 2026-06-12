@@ -7,10 +7,11 @@ import { REPO_STATUSES, type RepoStatus } from './types.js';
  * Crawl telemetry → ClickHouse (backfill_progress / backfill_repo_events),
  * the dashboard's data source across processes and boxes.
  *
- * DOCTRINE DIFFERENCE from the archive: telemetry is NOT precious. A failed
- * insert logs a warning and drops the batch — it never crashes or stalls the
- * crawl. The ledger remains the durable accounting; these tables are a lossy
- * progress feed.
+ * DOCTRINE DIFFERENCE from the archive: repo events are NOT precious. A failed
+ * event insert logs a warning and drops the batch — it never crashes or stalls
+ * the crawl. Progress snapshots are the dashboard's current status surface, so
+ * the newest one is retained and retried until ClickHouse accepts it. The
+ * ledger remains the durable accounting.
  */
 
 export interface ProgressSnapshot {
@@ -59,9 +60,11 @@ export class CrawlTelemetry {
   readonly #shard: string;
   readonly #intervalMs: number;
   #events: RepoEventRow[] = [];
+  #pendingProgress: Record<string, string | number> | undefined;
   #getSnapshot: (() => ProgressSnapshot) | undefined;
   #timer: NodeJS.Timeout | undefined;
-  #flushing = false;
+  #progressFlushing = false;
+  #eventFlushing = false;
 
   constructor(client: ClickHouseClient, options: CrawlTelemetryOptions) {
     this.#client = client;
@@ -84,8 +87,8 @@ export class CrawlTelemetry {
 
   /**
    * Warn-only startup check: backfill_progress must carry a column per status
-   * in REPO_STATUSES, or #progressRow inserts will fail and ticks get dropped.
-   * Never throws — telemetry is lossy by doctrine.
+   * in REPO_STATUSES, or progress inserts will fail and retry forever. Never
+   * throws because a schema problem should be visible without crashing a crawl.
    */
   async assertProgressColumns(): Promise<void> {
     try {
@@ -131,61 +134,81 @@ export class CrawlTelemetry {
       clearInterval(this.#timer);
       this.#timer = undefined;
     }
-    // Let an in-flight tick finish so the final flush doesn't interleave with it.
-    while (this.#flushing) {
+    this.#captureProgress();
+    void this.#flushProgress();
+    void this.#flushEvents();
+    // Let in-flight flushes finish so the final flush doesn't interleave.
+    while (this.#progressFlushing || this.#eventFlushing) {
       await new Promise((resolve) => {
         setTimeout(resolve, 50);
       });
     }
-    await this.#flush();
+    await Promise.all([this.#flushProgress(), this.#flushEvents()]);
   }
 
   async #tick(): Promise<void> {
-    // Never stall: if the previous insert is still in flight, skip this tick
-    // (events stay buffered and ride out with the next one).
-    if (this.#flushing) return;
-    this.#flushing = true;
+    this.#captureProgress();
+    void this.#flushProgress();
+    void this.#flushEvents();
+  }
+
+  #captureProgress(): void {
+    const snapshot = this.#getSnapshot?.();
+    if (snapshot !== undefined)
+      this.#pendingProgress = this.#progressRow(snapshot);
+  }
+
+  async #flushProgress(): Promise<void> {
+    if (this.#progressFlushing) return;
+    this.#progressFlushing = true;
     try {
-      await this.#flush();
+      while (this.#pendingProgress !== undefined) {
+        const progress = this.#pendingProgress;
+        try {
+          await this.#client.insert({
+            table: 'backfill_progress',
+            values: [progress],
+            format: 'JSONEachRow',
+          });
+          if (this.#pendingProgress === progress)
+            this.#pendingProgress = undefined;
+        } catch (err) {
+          logger.warn(
+            { err: err instanceof Error ? err.message : String(err) },
+            'telemetry: backfill_progress insert failed; will retry latest snapshot',
+          );
+          return;
+        }
+      }
     } finally {
-      this.#flushing = false;
+      this.#progressFlushing = false;
     }
   }
 
-  async #flush(): Promise<void> {
-    const snapshot = this.#getSnapshot?.();
-    if (snapshot !== undefined) {
+  async #flushEvents(): Promise<void> {
+    if (this.#eventFlushing) return;
+    if (this.#events.length === 0) return;
+    this.#eventFlushing = true;
+    const events = this.#events;
+    this.#events = [];
+    try {
       try {
         await this.#client.insert({
-          table: 'backfill_progress',
-          values: [this.#progressRow(snapshot)],
+          table: 'backfill_repo_events',
+          values: events,
           format: 'JSONEachRow',
         });
       } catch (err) {
         logger.warn(
-          { err: err instanceof Error ? err.message : String(err) },
-          'telemetry: backfill_progress insert failed; dropping tick',
+          {
+            dropped: events.length,
+            err: err instanceof Error ? err.message : String(err),
+          },
+          'telemetry: backfill_repo_events insert failed; dropping batch',
         );
       }
-    }
-
-    if (this.#events.length === 0) return;
-    const events = this.#events;
-    this.#events = [];
-    try {
-      await this.#client.insert({
-        table: 'backfill_repo_events',
-        values: events,
-        format: 'JSONEachRow',
-      });
-    } catch (err) {
-      logger.warn(
-        {
-          dropped: events.length,
-          err: err instanceof Error ? err.message : String(err),
-        },
-        'telemetry: backfill_repo_events insert failed; dropping batch',
-      );
+    } finally {
+      this.#eventFlushing = false;
     }
   }
 

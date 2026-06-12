@@ -477,6 +477,13 @@ some crawler processes after repeated batch-insert failures. Immediate action:
 rollback live runtime caps to 4096/96/16 and raise the backfill ClickHouse
 request timeout to a configurable 180s default.
 
+Follow-up: repo events stay lossy, but progress snapshots no longer are. The
+crawler retains the newest `backfill_progress` row and retries it until
+ClickHouse accepts it, and event inserts run separately so a stuck/lossy event
+batch cannot freeze status counts. Dashboard freshness now uses the stalest
+shard, not the newest shard, so a single fresh crawler cannot hide five stale
+status rows.
+
 ## ~17:45 — bottleneck #10: cooldowns that still occupied scheduler slots
 
 The morel cooldown fix did collapse 429s, but it exposed a second-order

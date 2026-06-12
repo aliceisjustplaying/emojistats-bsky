@@ -172,12 +172,12 @@ async function fetchOverview(): Promise<BackfillOverview | null> {
     REPO_STATUSES.map((status) => [status, 0]),
   ) as Record<BackfillRepoStatus, number>;
   let inFlight = 0;
-  let newestTs = 0;
+  let oldestTs = Number.POSITIVE_INFINITY;
   for (const row of snapshot) {
     for (const status of REPO_STATUSES)
       statusCounts[status] += num(row[status]);
     inFlight += num(row.in_flight);
-    newestTs = Math.max(newestTs, chTsToDate(row.latest_ts).getTime());
+    oldestTs = Math.min(oldestTs, chTsToDate(row.latest_ts).getTime());
   }
   const postsLoaded = num(totals[0]?.posts_total);
   const bytesDownloaded = num(totals[0]?.bytes_total);
@@ -195,7 +195,7 @@ async function fetchOverview(): Promise<BackfillOverview | null> {
   const reposPerMin = num(rate[0]?.resolved_delta) / RATE_WINDOW_MINUTES;
   const freshnessSeconds = Math.max(
     0,
-    Math.round((Date.now() - newestTs) / 1000),
+    Math.round((Date.now() - oldestTs) / 1000),
   );
 
   return {
