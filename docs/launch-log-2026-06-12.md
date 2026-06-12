@@ -477,6 +477,12 @@ active, but the main thread burning CPU in repeated claim scans and telemetry
 silent. The scheduler now yields whenever a scan cannot fill the requested
 capacity, even if it scheduled some work.
 
+That still left a core burning on repeated 50k scans. The measured shape of
+the ledger was skewed: 50k DID-ordered rows only exposed 14 hosts; 250k exposed
+138, enough to fill the active pool under the per-host caps. Final fix for this
+round: claim scans are deeper but amortized through an in-memory backlog, so
+one ledger scan feeds many scheduler refills.
+
 ## Running ETA honesty table (for the retro)
 
 | When | Basis | Claim |

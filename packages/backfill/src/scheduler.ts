@@ -82,7 +82,7 @@ const hostCapFor = (host: string): number =>
   isBskyInfra(host) ? PER_HOST_CONCURRENCY_BSKY : PER_HOST_CONCURRENCY;
 
 const CLAIM_SCAN_MULTIPLIER = 16;
-const CLAIM_SCAN_MAX = 50_000;
+const CLAIM_SCAN_MAX = 250_000;
 
 export function createScheduler(deps: SchedulerDeps): Scheduler {
   const { ledger, stats, control, hostPressure, processRepo } = deps;
@@ -107,6 +107,7 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
   };
 
   const active = new Set<Promise<void>>();
+  let claimBacklog: RepoRow[] = [];
 
   // Per-host limiter outermost so a slow host's queue never pins global slots;
   // the global limiter inside is what actually caps simultaneous downloads.
@@ -208,13 +209,15 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
           maxOutstanding - active.size,
           flags.limit - stats.claimed,
         );
-        const batch = ledger.listClaimable(
-          Math.min(
-            CLAIM_SCAN_MAX,
-            Math.max(claimCapacity, claimCapacity * CLAIM_SCAN_MULTIPLIER),
-          ),
-        );
-        if (batch.length === 0) {
+        if (claimBacklog.length === 0) {
+          claimBacklog = ledger.listClaimable(
+            Math.min(
+              CLAIM_SCAN_MAX,
+              Math.max(claimCapacity, claimCapacity * CLAIM_SCAN_MULTIPLIER),
+            ),
+          );
+        }
+        if (claimBacklog.length === 0) {
           if (active.size > 0) {
             await Promise.race(active);
             continue;
@@ -225,7 +228,10 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
           continue;
         }
         let scheduled = 0;
-        for (const repo of batch) {
+        let read = 0;
+        for (; read < claimBacklog.length; read += 1) {
+          const repo = claimBacklog[read];
+          if (repo === undefined) break;
           if (scheduled >= claimCapacity) break;
           if (stats.claimed >= flags.limit) break;
           // Cooling hosts are skipped without claiming: the rows stay
@@ -244,6 +250,8 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
           scheduled += 1;
           trackRepo(repo);
         }
+        claimBacklog =
+          scheduled >= claimCapacity ? claimBacklog.slice(read) : [];
         if (scheduled < claimCapacity) {
           const wake = hostPressure.nextWake();
           if (active.size > 0) {
