@@ -3,32 +3,38 @@
 ## Current backfill status
 
 The full-network backfill is running on the `emoji` server plus six crawler
-boxes. Current stable deploy: `90b9de7` (`Compress ClickHouse backfill
-uploads`) on all seven machines.
+boxes. Current deploy: `7401920` plus the 2026-06-12 afternoon working tree
+(bottlenecks #11/#12: ledger-stats worker, claim-backlog retention, AIMD
+host pressure, dead-host registry, async archive sync), shipped by rsync to
+`/workspace/src/emojistats-bsky` on all seven machines — commit pending
+operator validation.
 
-Live crawler runtime settings, as of 2026-06-12 13:40 UTC:
+Live crawler runtime settings (runtime drop-in, to be baked into pix —
+2026-06-12 ~17:00 UTC):
 
 - `GLOBAL_CONCURRENCY=4096`
-- `PER_HOST_CONCURRENCY_BSKY=96`
+- `PER_HOST_CONCURRENCY_BSKY=96` (AIMD ceiling now, not a fixed rate)
 - `PER_HOST_CONCURRENCY=16`
 - `LOADER_BATCH_ROWS=50000`
+- `NODE_OPTIONS=--max-old-space-size=12288` (8192 on the 32GB crawl3)
 
-Current stable estimate is about **3.8 days remaining**, measured from
-ledger-derived `backfill_progress` terminal-status deltas, not lossy
-`backfill_repo_events`. The latest stable sample was ~10,122 terminal repos/min
-with ~55.69M pending. The backfill target for this pause point is "under 4 days
-and not crash-looping"; the original "under 1 day" target is not currently met.
+Post-fix per-box resolution is 3-9k repos/min mid-ramp (vs ~0.4k in the
+mid-day stall era); see docs/launch-log-2026-06-12.md for the bottleneck
+archaeology and the measured ETA.
 
 Important operational notes:
 
 - `backfill_progress` is the status source of truth for the dashboard and is
-  retried until accepted.
-- `backfill_repo_events` is best-effort telemetry and can drop batches during
-  ClickHouse pressure.
-- Do not raise global concurrency above 4096 without a new measurement window.
-  The 6144 canary reduced throughput and made ClickHouse upload resets worse.
-- Do not return to 5120/128/20. That canary produced ClickHouse timeouts,
-  frozen telemetry and crawler restarts.
+  retried until accepted. ETA is computed from RESOLVED-status deltas —
+  everything terminal except `unreachable`, because dead-host parking moves
+  millions of rows into `unreachable` legitimately.
+- `backfill_repo_events` is best-effort telemetry and can drop batches.
+- ~40% of PLC DIDs are junk (one squatted domain held 17.9M rows). Dead
+  hosts are auto-detected, persisted in ledger meta `dead_hosts`,
+  bulk-parked onto the final-sweep list, and enumeration inserts their rows
+  born-parked. `bun run healthcheck -- --park` does the same proactively.
+- Never compute ledger aggregates on the crawl main thread (bottleneck #11);
+  they live in the ledger-stats worker.
 
 ## Development & deployment
 

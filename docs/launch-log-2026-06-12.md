@@ -591,6 +591,242 @@ the multiplier still requested only 49k rows for a 3,072-slot refill. That
 exposed ~324 runnable slots in this skewed tail. A 250k scan exposes ~2,711
 runnable slots in ~1s, so the scheduler now has a hard 250k scan floor.
 
+## ~14:00 — the afternoon recon: five bottlenecks were wearing one trenchcoat
+
+Fresh session, mandate: "ETA under 1 day, telemetry 100% accurate, stop
+bleeding €0.54/h." A 9-agent parallel recon (one per crawl box, one on
+ClickHouse, one on the crawler code, one on the dashboard) plus live probes
+produced a verdict nobody had written down yet: **ClickHouse was innocent all
+along.** 91% idle, zero failed inserts in 3h from localhost, p95 246ms. The
+"socket hang up" storms were the *crawler's own frozen event loop* letting
+server-closed sockets rot — cause and effect had been reversed for a day.
+
+What was actually stacking, in causal order:
+
+1. **The operator restart loop.** 109 crawler service starts on crawl3 in 8
+   hours (23 on crawl0, 18 on crawl1, 21 on crawl4 in 3h — every one a clean
+   SIGTERM from a tuning session on pix2). Ramp to full slots takes 10-15
+   min; restarts came every ~6. The fleet spent the entire day in cold-start.
+   Each restart also requeued 2-5k in-flight repos and (on OOM crashes)
+   paid ~6 min of silent reconciliation.
+2. **The claim-backlog discard.** scheduler.ts dropped the whole 250k-row
+   backlog whenever host caps cut a refill short, then immediately re-ran
+   the fully synchronous 250k-row better-sqlite3 scan. On a tail where 38%
+   of pending sat on 3 hosts, refills were always short — so the main thread
+   ran back-to-back scans forever (observed: 99.9% main-thread CPU on three
+   boxes, "skipped" +104k in 35s, pino→journald skew of 23s). Same genus as
+   launch night's listClaimable boss fight: O(big) on the main thread, hidden
+   until the tail concentrated.
+3. **Heap OOMs at node's default 4GB** on 64GB boxes: 4096 slots of buffered
+   CARs + a loader that couldn't flush through the frozen loop = GC death
+   spiral (mutator utilization 0.029), five crashes on crawl4 alone.
+4. **The archive freeze.** Every ~1M rows the sink ran DuckDB COPY + an
+   inline-awaited rclone upload to the Storage Box ON the shared append
+   chain — every pipeline slot in the process blocked behind a minutes-long
+   sftp upload. Bursts and stalls, metronome-regular.
+5. **The morel duty cycle.** Exponential cooldowns (30s→10min, strikes never
+   decaying under sustained pressure) converged to ~1% duty on the deepest
+   host: seconds of full-cap fetching, one 429, ten dark minutes. And the
+   "4096 fetching" gauge was claims, not connections — `ss` showed **246**
+   established TCP sockets under a "full" pool.
+
+And one piece of pure queue arithmetic: **38% of all pending was three
+hosts**. morel (~12M fleet-wide, rate-limited), pds.trump.com (~11M, DNS
+NXDOMAIN — the domain is just gone), plc.surge.sh (~1.7M, HTTP 451 on every
+request). Two of the three could never produce a single byte; their rows
+existed only to poison every claim window.
+
+## ~14:20 — the fix wave (deploy `90b9de7`+working-tree, canary crawl1)
+
+- **Backlog keeps its tail** across partial refills; busy/cooling-host rows
+  are *retained* for later refills instead of dropped; scans that schedule
+  nothing arm a 1s rescan floor. The all-skip regime that melted the main
+  thread now costs at most one scan per second.
+- **Refill threshold** GLOBAL/16 instead of GLOBAL — the pool refills in
+  256-slot sips instead of draining to half before each 4096-slot gulp.
+- **AIMD per-host pressure** replaces exponential darkness: a 429 burst
+  halves the host's cap (floor 1) and arms a 5s cooldown (max 2 min);
+  every 20 successes raise the cap by 1; ten quiet minutes restore it. The
+  cap converges to just under what each host actually tolerates — "as close
+  to the rate limit as possible while respecting it" is now literal code.
+- **Dead-host detection + bulk park**: 30 consecutive ENOTFOUND/451 failures
+  over ≥30s with zero successes declares the host dead for the run; its
+  claimable rows bulk-move (chunked, event-loop-yielding) to out-of-budget
+  `unreachable` — the explicit final-sweep list. pds.trump.com and
+  plc.surge.sh tripped within 90 seconds of the canary start. First park
+  implementation was quadratic (the `status IN` subselect kept re-visiting
+  already-parked rows); phase-split into a shrinking `pending` range +
+  one-shot for unreachable stragglers.
+- **Retry-arm index**: `(status, bucket, retry_after)` + ORDER BY
+  retry_after, killing the planner's habit of walking the entire parked
+  unreachable set per scan to satisfy ORDER BY did. 81s build on a 23GB
+  ledger, done offline.
+- **Archive sync off-chain**: COPY/rename/manifest stay serialized; the
+  rclone upload runs on a background chain; failures stay fatal-loud
+  (surface on the next sink call; startup sweep already retried unsynced
+  files after crashes). Appends no longer freeze during uploads.
+- **Loader flush 15s→5s** (slot occupancy ≈ flush latency; CH p95 was 246ms)
+  and **--max-old-space-size=12288** (8192 on the 32GB crawl3).
+- **WAL checkpoint** while stopped: crawl0's ledger WAL had grown to 7.65GB
+  (crawl5: 4GB) under the restart churn.
+- **Dashboard honesty round 3**: ETA now covers pending+fetching only, with
+  parked unreachable shown separately ("retry waves + final sweep, outside
+  the ETA"); per-shard freshness chips (amber >60s, red >300s) replace the
+  silent freeze where one dead shard's counts fossilized into the breakdown;
+  rate window 5→10 min so one silent shard can't zero the fleet rate while
+  its remaining still counts.
+- Also found and restarted: the live Jetstream ingest on emoji had been hung
+  for 13+ minutes (eventsSeen frozen, cursor lag growing 1:1 with wall
+  clock, writer healthy — the websocket died without reconnecting). Cursor
+  replay made the restart lossless. A reconnect watchdog is still owed.
+
+## ~15:45 — bottleneck #11: the telemetry tick was eating the event loop
+
+The canary after the fix wave was still wrong: claims at hundreds/min,
+"claim pass" instrumentation never even logging — one pass over a 250k
+backlog wasn't finishing in NINE MINUTES. Two CPU profiles via the
+inspector (the launch-night CDP trick, now a 30-line bun script) closed the
+case in four minutes flat:
+
+    91.5%  Statement.get ← totalPostsLoaded ← #captureProgress ← telemetry #tick
+     8.5%  Statement.all ← statusCounts    ← #captureProgress ← telemetry #tick
+
+The 10-second telemetry tick was running `SUM(posts_total)` plus a
+`GROUP BY status` over the shard's ~11M ledger rows — synchronously, on the
+main thread, every 10 seconds, costing ~10s per tick. It had been there
+since the telemetry was built: invisible on a small ledger, lethal on a
+67M-row one — the same O(n)-on-a-growing-n time bomb as launch night's
+claim scan, hiding inside the *reporting* path. It also explains the
+fleet-wide decay pattern everyone chased all day (each box degraded as
+enumeration grew its ledger), the "ClickHouse socket hang up" red herring
+(server idle-closing sockets the frozen loop never serviced), and why every
+restart looked briefly healthy: ticks were cheap until the row count bit.
+
+Two accomplices found on the way, both also real:
+
+- The claim pass yielded via setImmediate every 1,000 rows; under I/O load
+  each yield parks behind the whole poll queue (seconds), so "politeness"
+  turned a millisecond walk into minutes. Yields are time-based now (only
+  after 50ms of continuous walking).
+- The first bulk-park implementation re-scanned every already-parked row on
+  every chunk (status IN ('pending','unreachable') + attempts filter =
+  quadratic), and v2 ran the park inside the claim loop, freezing claims for
+  its duration. It now runs as a background chain beside the loop, and the
+  monsters get parked offline (single bucket-scoped UPDATE, 2m33s for 2.77M
+  rows) during rollout stop windows anyway.
+
+Fix for #11: a dedicated ledger-stats worker thread (readonly WAL reader)
+computes the aggregates on its own core every 10s; the main thread reads a
+cached snapshot. The telemetry contract is unchanged — same columns, same
+shard scoping — it just stopped costing the crawl anything.
+
+Also new this round: `pds.test` auto-tripped the dead-host detector (DNS,
+30 consecutive) — the machinery generalizes past the two monsters it was
+built for. And the `bun run healthcheck` sweep (report `--park`) brings the
+original "healthcheck every PDS first" design back as an operator tool:
+probe every host owning pending rows, park the provably-dead up front.
+
+## ~16:00–17:00 — rollout, and the registry closes the loop
+
+Canary verdict after #11 fell: claims 46k/min in the first burst, then a
+plateau that turned out to be one more layer — the in-process bulk park was
+RACING enumeration. The PLC export was still streaming pds.trump.com's spam
+wave in at thousands of rows a second; the park drained 'pending' at ~18k
+rows/s while enumeration refilled it, so the park never terminated and ate
+the main thread (profile #3: 99% parkDeadHostChunk). Structural fix, not a
+pacing tweak: the dead-host verdict now persists in ledger meta
+(`dead_hosts`), enumeration reads it (refreshing once a minute) and inserts
+those hosts' rows BORN parked. Plus adaptive park pacing (pause ≥3× chunk
+duration) and a 5-minute sweep for stragglers. Within minutes of the fleet
+rollout, crawl2's registry had already self-discovered two junk hosts nobody
+had named (`pds.invalid`, `follow-sqky.one-plz.cool`) — the machinery
+generalizes.
+
+Rollout mechanics worth keeping for the retro: per box, ~80s offline build
+of the retry index, a single bucket-scoped offline UPDATE to park the two
+monsters (8s–2.5min depending on slice), WAL checkpoint (crawl0's WAL had
+hit 7.65GB under the day's churn), heap drop-in, staggered restarts. The
+rollout script kept "failing" with everything actually done — `systemctl
+is-active` returns nonzero for an `activating` enumerate, and `set -e` did
+the rest. Three boxes of babysitting later the lesson is old and familiar:
+exit codes are part of the interface.
+
+Post-rollout per-shard resolution (6-min window, mid-ramp): shard0 3.8k,
+shard1 6.9k, shard2 6.4k, shard4 3.3k, shard5 9.1k repos/min with full
+in-flight pools — versus ~400/min/box at midday. The morning's "ClickHouse
+is flaky" narrative ended the day as: ClickHouse never had a bad minute;
+every symptom traced to the crawler's own main thread.
+
+## Retro — what 2026-06-12 actually taught us
+
+1. **O(n) on a growing n is a time bomb, and it ticks twice.** Launch night
+   it was the claim scan; today it was the telemetry tick's aggregates. Both
+   were invisible at dry-run scale, both grew with enumeration, both
+   presented as *other systems* failing (sockets, ClickHouse). The class of
+   bug, not the instance, is the lesson: anything per-tick or per-claim that
+   touches the ledger must be O(LIMIT) or off-thread.
+2. **Profile before fixing — now 3 for 3.** Four plausible theories cost two
+   hours on launch night; today the inspector-over-bun-websocket profiler
+   (30 lines, kept in /tmp, deserves a home in the repo) cracked each
+   regression in under five minutes. The claim-pass instrumentation that
+   "proved" the code wasn't running was the tell that found stale assumptions.
+3. **Yielding is not free.** setImmediate every 1,000 rows under I/O load =
+   the pass parks behind the entire poll queue per yield. Politeness knobs
+   need budgets in TIME, not iterations.
+4. **The directory is ~40% junk and that's a scheduling problem, not a
+   correctness one.** ~45M real users vs ~85M PLC DIDs; one squatted domain
+   held 17.9M rows. Host-level verdicts (dead list, born-parked inserts,
+   healthcheck sweep) turned 20M+ rows of poison into final-sweep inventory.
+5. **Static rate-limit caps always wall on the deepest host.** AIMD per-host
+   caps replaced cap whack-a-mole: each host converges to just under its
+   tolerance, automatically, including hosts nobody is watching.
+6. **Restarts are not free even when they're "clean".** 109 restarts in 8h
+   kept the fleet permanently cold. Ramp time (10-15 min) has to be priced
+   into any tuning loop, or the measurements that drive the tuning are
+   garbage — the day's middle hours were tuning on noise.
+7. **Reporting must never share a thread with the work.** The dashboard was
+   the only honest component twice over — but the act of *feeding* it was
+   what froze the crawl. Telemetry now costs the crawl nothing, and the
+   dashboard says when any shard's numbers are stale instead of freezing
+   them silently.
+8. **Cross-process state wants a registry, not a race.** Two processes with
+   opposite opinions about the same rows (enumerate inserting pending,
+   crawler parking them) will fight forever at millions of rows. A tiny
+   meta-key contract ended it in 20 lines.
+
+## ~19:00 — field trip: what microcosm's hubble + lightrail teach us
+
+Read both repos (tangled.org/microcosm.blue) against our pain points.
+
+- **Hubble is pre-launch**: the main binary is a stub, no serving API exists
+  anywhere in the repo — the runbook's "point stragglers at Hubble" stays
+  aspirational. But its one-shot tools have RUN a full morel dump, and the
+  number is a gift: **"all of morel" was 490,694 CARs / 246.5 GB**. Morel's
+  real repo population is half a million — our 18M+ morel-pending rows are
+  ~97% PLC-spam DIDs that never created a repo and would all RepoNotFound.
+- **The transferable trick, from both repos**: microcosm never crawls PLC.
+  Discovery = relay listHosts → per-host `listRepos`; a DID absent from the
+  host's listRepos is never fetched (hubble hacking.md even spells it out:
+  classify against the relay, "RepoNotFound implies an old inactive repo").
+  Inverted for us: ONE `listRepos` walk of morel (~1k pages at their proven
+  10 rps = ~2 minutes) yields morel's true repo set; every pending morel DID
+  not in it can be classified terminally with zero getRepo calls. The same
+  sweep generalizes to any spam-bloated host. This deletes the largest
+  remaining ETA unknown.
+- Ground-truth politeness numbers from people who crawled everything:
+  10 rps self-limit per bsky mushroom (used for the full morel dump), 1 rps
+  for brid.gy (whose getRepo they found outright broken — "--skip
+  atproto.brid.gy"), 2-consecutive-transient-failures halves per-host
+  concurrency with the reduced cap persisted across restarts, and terminal
+  400s deliberately never count toward backoff streaks.
+- Validations of choices we already made: no-events idle timeout instead of
+  ws ping/pong for firehose liveness (lightrail: 180s; ours: 45s), cursor
+  replay on reconnect, per-repo `rev` recorded for surgical future resyncs
+  (our ledger already stores it), probe-before-crawl host gating (our
+  healthcheck sweep), host-fair queues with cooldown skip.
+- Their retry ladder is saner than infinite waves: not-found retries at
+  6h/24h/24h then STOPS. Worth adopting for the final sweep.
+
 ## Running ETA honesty table (for the retro)
 
 | When | Basis | Claim |
@@ -602,6 +838,22 @@ runnable slots in ~1s, so the scheduler now has a hard 250k scan floor.
 | post batching, 128 slots | healthy but self-capped | 5.8 days |
 | post 768 slots | healthy measurement | ~31 hours |
 | post 32/host + full enumeration | measurement pending | TBD |
+| mid-day restart-churn era | tuning on noise | 3.8–6+ days |
+| post #11 + dead-host park, mid-ramp | 6-min windows, 6 boxes | ~29h and falling |
+| 17:15 UTC, all 6 boxes converted | 8-min resolved-delta window | **~26h** (35.4k repos/min, 55.6M remaining), AIMD still ramping |
+
+17:15 snapshot per shard (rpm / in-flight): shard0 3.4k/6.9k, shard1
+8.4k/7.7k, shard2 4.9k/7.1k, shard3 9.6k/7.2k (the 32GB box, fastest!),
+shard4 2.4k/7.0k, shard5 6.7k/8.1k. emoji box load ~3.9 of 4 vCPU with the
+post flood — ClickHouse finally has a job. The live Jetstream ingest also
+got a liveness watchdog (45s of silence forces a reconnect): it had
+silently half-open-died twice today, the second time for three hours —
+caught because the dashboard's freshness honesty extends to cursor lag.
+
+One more for the bottleneck ledger, then: #12 was the telemetry tick
+(found by profile), and the count now stands at twelve across two days,
+every single one of them ours, none of them ClickHouse, none of them the
+network, none of them the hardware.
 
 ## 02:15 — IT HUMS (first time, briefly)
 

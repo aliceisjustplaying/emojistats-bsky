@@ -100,9 +100,20 @@ Settings that were tried and should not be repeated without a new hypothesis:
   forces specific repos through the pipeline.
 - Politeness knobs: `GLOBAL_CONCURRENCY` (default 32), `PER_HOST_CONCURRENCY`
   (default 2), `PER_HOST_CONCURRENCY_BSKY` (default 16 for the
-  `*.bsky.network` mushroom fleet). 429/Retry-After is always honored on top:
-  a 429 arms a per-host cooldown, later claims skip that host while it cools,
-  and rate-limit retries do not burn the repo's reachability attempts.
+  `*.bsky.network` mushroom fleet). These are CEILINGS: per-host pressure is
+  AIMD (host-pressure.ts) — a 429 burst halves that host's effective cap
+  (floor 1) and arms a short cooldown (5s, max 2 min); every 20 successes
+  raise the cap by one; ten quiet minutes restore the ceiling. Each host
+  converges to just under what it actually tolerates instead of oscillating
+  between full-blast and ten dark minutes. Rate-limit retries still never
+  burn the repo's reachability attempts.
+- Dead hosts: 30 consecutive ENOTFOUND/HTTP-451 failures over ≥30s declare a
+  host dead for the run (host-health.ts). Its claimable rows bulk-park as
+  out-of-budget `unreachable` (the final-sweep list), the verdict persists in
+  ledger meta `dead_hosts`, and enumeration inserts that host's future rows
+  born-parked so the spam tail (pds.trump.com: ~18M rows) never refights the
+  crawler. `bun run healthcheck` (`--park`) is the proactive version: probes
+  every host owning pending rows and parks the provably-dead up front.
 - `TEXT_IN_CLICKHOUSE` (default `emoji`) controls what reaches ClickHouse:
   emoji-less posts get their `text` written as `''`; the archive always gets
   the full text regardless. `all` is the upgrade path if disk economics change.
@@ -161,6 +172,16 @@ Settings that were tried and should not be repeated without a new hypothesis:
   `TELEMETRY_INTERVAL_MS` (default 10s), tagged `run_id` + `shard`, plus
   per-repo `backfill_repo_events` rows on every transition: `loaded`, `empty`,
   `retry`, `tombstoned`, `deactivated`, `takendown`, `quarantined`, `failed`.
+- The per-tick aggregates (status counts, posts total) come from a dedicated
+  readonly ledger-stats worker thread (ledger-stats-worker.ts), refreshed
+  every tick and read as a cached snapshot. NEVER compute them on the main
+  thread: on a 67M-row ledger that was ~10s of synchronous sqlite per 10s
+  tick — bottleneck #11, the fleet-wide event-loop freeze of 2026-06-12 that
+  masqueraded as ClickHouse "socket hang up".
+- Dashboard ETA covers `pending + fetching` only; `unreachable` is shown
+  separately as parked work (retry waves + final sweep). Bulk-parking a dead
+  host legitimately moves millions of rows pending → unreachable in minutes;
+  that is accounting, not data loss.
 - ClickHouse is the shared bus, so the dashboard (`packages/dashboard`,
   `/backfill` route) shows all shards and boxes in one place, and the
   throughput history survives restarts.
