@@ -490,8 +490,8 @@ being asked to ingest a line per repo. Those events remain in
 
 Last canary wrinkle: after the active pool filled, fast terminal repos caused
 one-slot refills, which made the scheduler rescan the backlog once per repo.
-Refills now batch at 512 available slots, cutting claim-loop churn while keeping
-the downloader pool mostly full.
+Refills now wait for one global-concurrency batch of available slots, cutting
+claim-loop churn while keeping the downloader pool mostly full.
 
 The actual live measurement was even sharper: the cap was raised to 250k, but
 the multiplier still requested only 49k rows for a 3,072-slot refill. That

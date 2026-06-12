@@ -84,7 +84,7 @@ const hostCapFor = (host: string): number =>
 const CLAIM_SCAN_MULTIPLIER = 16;
 const CLAIM_SCAN_MIN = 250_000;
 const CLAIM_SCAN_MAX = 250_000;
-const CLAIM_REFILL_MIN = Math.min(512, GLOBAL_CONCURRENCY);
+const CLAIM_REFILL_MIN = GLOBAL_CONCURRENCY;
 
 export function createScheduler(deps: SchedulerDeps): Scheduler {
   const { ledger, stats, control, hostPressure, processRepo } = deps;
