@@ -1,10 +1,10 @@
-/** Per-repo pipeline: fetch (I/O) → parse in a worker (CPU) → archive + load (I/O). */
+/** Per-repo pipeline: fetch+parse in a worker (its own loop and core) → archive + load (I/O here). */
 
 import type { StoragePolicy } from 'archive/policy';
 import type { ArchiveSink } from 'archive/types';
 import { applyTextPolicy } from 'ingest/rows';
 
-import { fetchRepoCar, QuarantineError, RetryableError } from './fetcher.js';
+import { RetryableError } from './fetcher.js';
 import logger from './logger.js';
 import type { ParsePool } from './parse-pool.js';
 import type { RetryPolicy } from './retry.js';
@@ -22,28 +22,6 @@ export interface RepoPipelineDeps {
   retry: RetryPolicy;
   stats: CrawlStats;
   control: CrawlControl;
-}
-
-/** Drains a (CAR_MAX_BYTES-guarded) body stream into one transferable buffer. */
-async function bufferCar(
-  body: ReadableStream<Uint8Array>,
-): Promise<ArrayBuffer> {
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  const reader = body.getReader();
-  while (true) {
-    const result = await reader.read();
-    if (result.done) break;
-    chunks.push(result.value);
-    total += result.value.byteLength;
-  }
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return out.buffer;
 }
 
 export function createRepoPipeline(
@@ -140,16 +118,13 @@ export function createRepoPipeline(
         });
         return;
       }
-      const fetched = await fetchRepoCar(repo.pdsHost, repo.did);
+      // Fetch AND parse happen inside a repo worker: concurrent whale-stream
+      // buffering churned this thread's heap as badly as the parsing did, so
+      // both live off-thread now. A failure inside the worker (fetch or
+      // quarantine) means NO rows have been written anywhere — materializing
+      // rows before any append removed the old partial-coverage caveat.
       const fetchTimeUs = Date.now() * 1000;
-      // Buffer the (CAR_MAX_BYTES-guarded) body and hand it to a parse worker
-      // by transfer — all CPU happens off-thread, this thread only does I/O.
-      // The CAR is resident either way (the MST reader needs random access);
-      // the worker frees it when the job ends. A quarantine inside the worker
-      // means NO rows have been written anywhere — materializing rows before
-      // any append removed the old partial-coverage caveat.
-      const car = await bufferCar(fetched.body);
-      const parsed = await parsePool.parse(repo.did, car, fetchTimeUs);
+      const parsed = await parsePool.run(repo.did, repo.pdsHost, fetchTimeUs);
 
       const postsTotal = parsed.rows.length;
       const load =
@@ -177,7 +152,7 @@ export function createRepoPipeline(
 
       const repoCounts: RepoCounts = {
         rev: parsed.rev,
-        carBytes: fetched.bytesRead(),
+        carBytes: parsed.carBytes,
         recordsTotal: parsed.recordsTotal,
         postsTotal,
         postsWithEmojis: parsed.postsWithEmojis,

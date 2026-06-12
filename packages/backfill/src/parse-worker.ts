@@ -1,9 +1,14 @@
 /**
- * Parse worker: receives a fully-buffered CAR (zero-copy ArrayBuffer transfer),
- * walks it with the existing parser and sends back materialized post rows plus
- * the counters the pipeline needs. All CPU lives here so the main thread stays
- * pure I/O — launch night proved one whale repo on the main thread starves
- * every socket and timer in the process.
+ * Repo worker: fetches a repo CAR and parses it, entirely off the main
+ * thread. Each worker owns its fetch buffers and its parse CPU on its own
+ * event loop/heap — launch night proved that both whale-CAR parsing AND
+ * concurrent whale-stream buffering on the main thread starve every socket
+ * and timer in the process. The main thread dispatches jobs (politeness
+ * limiters live there) and receives materialized rows.
+ *
+ * Inside one worker, fetches overlap on the event loop while parses
+ * serialize naturally (sync CPU) — so N workers give N parallel parses and
+ * plenty of download concurrency without any extra coordination.
  */
 import { parentPort } from 'node:worker_threads';
 
@@ -11,18 +16,25 @@ import type { PostRow } from 'ingest/types';
 
 import { rkeyHash64 } from './digest.js';
 import { repoPostRows } from './extract.js';
-import { QuarantineError, RetryableError } from './fetcher.js';
+import {
+  fetchRepoCar,
+  QuarantineError,
+  RetryableError,
+  TerminalFetchError,
+  type TerminalFetchStatus,
+} from './fetcher.js';
 import { parseRepoCar } from './parser.js';
 
-export interface ParseJob {
+export interface RepoJob {
   seq: number;
   did: string;
-  car: ArrayBuffer;
+  pdsHost: string;
   fetchTimeUs: number;
 }
 
-export interface ParseResult {
+export interface RepoJobResult {
   rev: string | null;
+  carBytes: number;
   recordsTotal: number;
   duplicatePostsSkipped: number;
   rows: PostRow[];
@@ -32,25 +44,40 @@ export interface ParseResult {
   rkeyDigestHex: string;
 }
 
-export type ParseReply =
-  | { seq: number; ok: ParseResult }
+export type RepoJobError =
+  | { kind: 'quarantine'; message: string }
   | {
-      seq: number;
-      err: { kind: 'quarantine' | 'retryable' | 'error'; message: string };
-    };
+      kind: 'retryable';
+      message: string;
+      transient: boolean;
+      retryAfterMs: number | undefined;
+    }
+  | { kind: 'terminal'; message: string; status: TerminalFetchStatus }
+  | { kind: 'error'; message: string };
 
-function singleChunkStream(car: ArrayBuffer): ReadableStream<Uint8Array> {
-  return new ReadableStream<Uint8Array>({
-    start(controller) {
-      controller.enqueue(new Uint8Array(car));
-      controller.close();
-    },
-  });
+export type RepoJobReply =
+  | { seq: number; ok: RepoJobResult }
+  | { seq: number; err: RepoJobError };
+
+function describeError(err: unknown): RepoJobError {
+  const message = err instanceof Error ? err.message : String(err);
+  if (err instanceof QuarantineError) return { kind: 'quarantine', message };
+  if (err instanceof TerminalFetchError)
+    return { kind: 'terminal', message, status: err.status };
+  if (err instanceof RetryableError)
+    return {
+      kind: 'retryable',
+      message,
+      transient: err.transient,
+      retryAfterMs: err.retryAfterMs,
+    };
+  return { kind: 'error', message };
 }
 
-async function handle(job: ParseJob): Promise<ParseReply> {
+async function handle(job: RepoJob): Promise<RepoJobReply> {
   try {
-    const parsed = parseRepoCar(singleChunkStream(job.car));
+    const fetched = await fetchRepoCar(job.pdsHost, job.did);
+    const parsed = parseRepoCar(fetched.body);
     const rows: PostRow[] = [];
     let postsWithEmojis = 0;
     let emojiOccurrences = 0;
@@ -67,6 +94,7 @@ async function handle(job: ParseJob): Promise<ParseReply> {
       seq: job.seq,
       ok: {
         rev: parsed.rev,
+        carBytes: fetched.bytesRead(),
         recordsTotal: parsed.recordsTotal,
         duplicatePostsSkipped: parsed.duplicatePostsSkipped,
         rows,
@@ -76,14 +104,7 @@ async function handle(job: ParseJob): Promise<ParseReply> {
       },
     };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    const kind =
-      err instanceof QuarantineError
-        ? 'quarantine'
-        : err instanceof RetryableError
-          ? 'retryable'
-          : 'error';
-    return { seq: job.seq, err: { kind, message } };
+    return { seq: job.seq, err: describeError(err) };
   }
 }
 
@@ -91,7 +112,7 @@ if (parentPort === null) {
   throw new Error('parse-worker must run inside a worker thread');
 }
 const port = parentPort;
-port.on('message', (job: ParseJob) => {
+port.on('message', (job: RepoJob) => {
   void handle(job).then((reply) => {
     port.postMessage(reply);
   });
