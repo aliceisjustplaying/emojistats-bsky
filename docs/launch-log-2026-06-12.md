@@ -83,7 +83,46 @@ unproxied, Caddy/ZeroSSL on-box) via Cloudflare API.
   verified in the MBR before reboot. The rescue system formatted its own
   disks and rebooted into the result — RAM-rooted systems are a gift.
 
-## 02:15 — IT HUMS
+## 02:30–04:00 — the night of the four bottlenecks
+
+The hum died within the hour. Repos/min collapsed, ETA ballooned to 70 days,
+the dashboard went idle. What followed was a 90-minute onion-peeling session —
+four real defects stacked on top of each other, each one masking the next:
+
+1. **bsky.social rated as a third-party PDS.** Every pre-migration account's
+   PLC tail points at the entryway; the third-party politeness cap (2 slots
+   per box!) gated a 168-deep queue. One classification fix: entryway = bsky
+   infra tier.
+2. **DNS threadpool starvation.** getaddrinfo runs on libuv's default 4
+   threads; retry waves dialing dead PDSes (rip boobee.blue, 4k errors/30min)
+   parked all four in DNS timeouts. UV_THREADPOOL_SIZE=64.
+3. **Stale keep-alive sockets to ClickHouse.** The client WARNs and reuses a
+   server-closed socket; the insert hangs forever; telemetry's single-flight
+   tick latches shut. keep_alive.eagerly_destroy_stale_sockets=true on every
+   client.
+4. **The real boss: whale-repo CAR parsing on the main thread.** repoFromStream
+   buffers and indexes the whole CAR synchronously before yielding entry one —
+   10-30s of unyieldable CPU per whale, and every restart re-front-loaded 256
+   requeued whales at once. The event loop never breathed: sockets starved
+   (3 MB/s across "128 active downloads", 21 actual TLS connections), CH
+   responses sat unread past their timeouts, setInterval never fired. Each fix
+   above was real, and none of them could matter until this one fell.
+
+The fix that fell the boss: **a worker_threads parse pool** (parse-worker.ts +
+parse-pool.ts). Fetch buffers the guarded CAR and transfers it zero-copy to a
+worker (availableParallelism−2 per box); the worker walks the MST, normalizes
+rows, folds the rkey digest; the main thread is pure I/O again. Side effect:
+one busy core became seven per box. Correctness check: David's deliberately
+cursed repo (retr0.id — stale PLC pointer, byte-identical duplicate records)
+re-parsed off-thread to the identical 30,058 posts and the identical rkey
+digest 1b3f7ddc33926fd0 it produced in-process. Bonus: rows now materialize
+before any append, so a quarantined parse writes nothing anywhere — the old
+partial-coverage caveat died with the streaming interleave.
+
+Honorable mention: `pkill -f nixos-anywhere` over SSH matches its own command
+line and kills itself. It got me twice. `pkill -f "anywhere[.]sh"`.
+
+## 02:15 — IT HUMS (first time, briefly)
 
 - emoji: live ingest reconnected to Jetstream, dashboard public behind Caddy
   TLS at backfill.mosphere.at, parquet shipping to the Storage Box live/.
