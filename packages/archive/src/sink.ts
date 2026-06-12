@@ -17,8 +17,17 @@
  *   see sweepFinalized), and when syncCommand is set every finalized file
  *   still on disk is re-synced oldest-first, so a file whose sync failed is
  *   drained on the next start instead of stranding on one disk forever.
+ * - syncCommand runs on its own serialized chain (one upload at a time, in
+ *   finalize order), never on the append chain: an upload to a slow Storage
+ *   Box takes minutes and would otherwise stall every append() behind
+ *   enqueue(). A sync failure is recorded and thrown from the NEXT
+ *   append()/rotate()/close() instead of the finalize that enqueued it;
+ *   close() drains the chain before resolving, so a clean shutdown is
+ *   synced-or-loud. Deferring is crash-safe: a crash mid-upload leaves the
+ *   file in finalized/ and the create() sweep retries it.
  * - Every failure (staging write, COPY, manifest append, syncCommand) is
- *   thrown to the caller. Nothing is dropped silently (doctrine in types.ts).
+ *   thrown to the caller — for a background sync, the next caller. Nothing
+ *   is dropped silently (doctrine in types.ts).
  */
 
 import { execFile } from 'node:child_process';
@@ -99,6 +108,8 @@ class DuckDBArchiveSink implements ArchiveSink {
   private removedTmpFiles = 0;
   private closed = false;
   private chain: Promise<void> = Promise.resolve();
+  private syncChain: Promise<void> = Promise.resolve();
+  private syncFailure: Error | undefined;
 
   private readonly maxRowsPerFile: number;
   private readonly maxFileAgeMs: number;
@@ -196,9 +207,20 @@ class DuckDBArchiveSink implements ArchiveSink {
 
   close(): Promise<void> {
     return this.enqueue(async () => {
-      this.assertOpen();
+      // Not assertOpen: a recorded sync failure must not skip the finalize
+      // (staged rows still deserve their parquet) — it is rethrown after the
+      // drain below.
+      if (this.closed) {
+        throw new Error('archive sink is closed');
+      }
       try {
         await this.finalizeStaged();
+        // Drain in-flight uploads: a clean shutdown means synced-or-loud,
+        // never synced-maybe-later.
+        await this.syncChain;
+        if (this.syncFailure) {
+          throw this.syncFailure;
+        }
       } finally {
         this.closed = true;
         this.appender?.closeSync();
@@ -221,6 +243,12 @@ class DuckDBArchiveSink implements ArchiveSink {
   private assertOpen(): void {
     if (this.closed) {
       throw new Error('archive sink is closed');
+    }
+    // A background sync failure is fatal to the run: it surfaces here, on
+    // the first sink call after it was recorded, and stays sticky so the
+    // crawler's drain path cannot miss it.
+    if (this.syncFailure) {
+      throw this.syncFailure;
     }
   }
 
@@ -302,13 +330,14 @@ class DuckDBArchiveSink implements ArchiveSink {
    * Startup sweep, prefix-scoped like seedSequence:
    *
    * - Deletes stale `.parquet.tmp` partials. finalizeStaged orders COPY →
-   *   rename → manifest → DELETE FROM staging → CHECKPOINT → sync, so a
-   *   surviving .tmp means the rename never happened: its rows were never
-   *   manifested and never deleted from staging. The recovery rotate that
-   *   follows re-emits them; the partial itself is pure litter.
+   *   rename → manifest → DELETE FROM staging → CHECKPOINT, then enqueues
+   *   the sync, so a surviving .tmp means the rename never happened: its
+   *   rows were never manifested and never deleted from staging. The
+   *   recovery rotate that follows re-emits them; the partial itself is
+   *   pure litter.
    * - When syncCommand is set, re-runs it for every finalized file still on
-   *   disk, oldest-first. A sync failure leaves the file finalized locally
-   *   (loud, not lossy) but nothing used to retry it — this sweep is that
+   *   disk, oldest-first. A failed or never-started background sync leaves
+   *   the file finalized locally (loud, not lossy) — this sweep is the
    *   retry. A failure here throws out of create(): refusing to start beats
    *   stranding text rows on one disk, because the archive is the only
    *   durable home of non-emoji post text (plan 0001).
@@ -380,7 +409,24 @@ class DuckDBArchiveSink implements ArchiveSink {
     this.openedAt = undefined;
     this.finalizedFiles += 1;
 
-    await this.runSyncCommand(finalPath);
+    this.enqueueSync(finalPath);
+  }
+
+  /**
+   * Hands a finalized file to the background sync chain. The failure is
+   * captured into syncFailure rather than rejecting the chain so later
+   * uploads still queue behind it (their files would otherwise sit until
+   * the next startup sweep for no reason); first failure wins because the
+   * run is dead either way once assertOpen rethrows it.
+   */
+  private enqueueSync(finalPath: string): void {
+    this.syncChain = this.syncChain.then(async () => {
+      try {
+        await this.runSyncCommand(finalPath);
+      } catch (err) {
+        this.syncFailure ??= err as Error;
+      }
+    });
   }
 
   private async appendManifest(entry: ManifestEntry): Promise<void> {

@@ -38,7 +38,10 @@ export interface ArchiveSinkOptions {
   /**
    * Optional shell command run after each finalize with {file} substituted by
    * the finalized path — the deploy-time hook for rclone/scp to the Storage Box.
-   * Non-zero exit must surface as an error (the archive is the only text home).
+   * Runs in the background (uploads take minutes; appends must not wait), one
+   * at a time in finalize order. Non-zero exit must surface as an error (the
+   * archive is the only text home) — it is thrown from the next sink call, and
+   * close() drains all pending syncs before resolving.
    *
    * Startup re-runs the command for every finalized file still on disk (the
    * sweep that drains files a sync-failed run left behind), so the command
