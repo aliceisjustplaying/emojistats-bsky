@@ -402,9 +402,11 @@ families above once the dust settles.*
   wall-clock plus simplicity. Another entry for the short-skeptical-questions ledger.
 - **The spam kill, quantified.** Morel applies completed fleet-wide (~18.4M ledger
   rows per box checked against morel's 496,480 real repos), and the all-host sweeps
-  had condemned ~28.5M more rows by 23:11 — **~46.5M+ rows that will never cost a
-  getRepo**, for roughly a thousand listRepos requests per host and ~2.5 paused
-  hours. Estimated value: 2–5 days of fleet runtime (~€30–70). Honesty caveats kept
+  were reporting ~28.5M more condemned by 23:11 — an in-flight estimate the final
+  audit later revised down to 18.8M across the four boxes that finished (see the
+  night entry below); call it **~37M+ rows that will never cost a getRepo**, for
+  roughly a thousand listRepos requests per host and ~2.5 paused hours. Estimated
+  value: 2–5 days of fleet runtime (~€30–70). Honesty caveats kept
   attached: the projected ~10–14h remaining ETA was a *projection, not a
   measurement* (no crawler had restarted by slice end), and when the victory lap got
   loud Alice tempered it — "we still only loaded about 17% of the posts" — which is
@@ -430,8 +432,45 @@ families above once the dust settles.*
   that concurrent writers push back up (enumeration kept refilling morel's pending)
   deadlocks — key on an explicit completion event; and the pre-compaction
   `SESSION-STATE.md` ritual made a mid-ops /compact seamless.
-- *Watch state at cutoff (23:27 UTC): widened-schema build in lint cleanup; fleet
-  still stopped; restart, 6144 canary and the post-sweep honest ETA all pending.*
+### 2026-06-12 night (23:30 → 00:00 UTC)
+
+The pix2 session wrote its own launch-log chapter for this window ("Night watch")
+— the standing record-everything instruction running unattended. Retro deltas on
+top of it:
+
+- **The relay incident, and the lesson under it.** Four sweep boxes finished
+  within minutes of each other — because all four were independently paging
+  `bsky.network`, the *relay*, whose listRepos is the entire network (~42M repos,
+  a 3+ hour walk), to classify exactly one stray ledger row each. A surgical
+  firewall REJECT aborted the walks (a failed walk classifies nothing, by design —
+  the fail-safe earned its keep), and the relay went first on the skip list
+  (`2c803e5`). The general shape: **deepest-first ordering assumes the tail is
+  cheap, but an aggregator in a member list is the most expensive item in the run
+  wearing the least remaining work.** Never diff an aggregator. Final audited
+  haul for the four finished boxes: 11,818 hosts diffed, 18,789,628 condemned
+  beyond morel (~37M+ total with morel); the earlier ~28.5M in-flight figure did
+  not survive the final accounting — flagged, mechanism unestablished.
+- **The footgun's second coming.** The live worker died once at 23:37 on its
+  first stall-watchdog reconnect: `@skyware/jetstream` extends TinyEmitter, and an
+  old cast called the *nonexistent* `removeAllListeners`. This is the launch-eve
+  Jetstream listener bug's sibling — same API family, new failure mode (then: a
+  drained emitter escalating a late error; now: a method that was never there).
+  When a library's emitter isn't Node's EventEmitter, every inherited-habit call
+  is a latent TypeError; the type cast had been hiding it.
+- **A new collaboration pattern worth naming: guarded night mode.** Alice's
+  standing order to the pix2 session before sleeping: keep watch on a ~10-minute
+  cycle, roll the 6144 canary fleet-wide only if it proves out, fix new
+  bottlenecks but *be very conservative with code changes* and require a Codex
+  pre-deploy review (max 3 rounds) before anything ships. The TinyEmitter fix went
+  through exactly that gate — and round-2 Codex caught a real subtlety: detaching
+  the message listener too would let the cursor advance past an unprocessed post;
+  it stayed attached, late posts become at-least-once traffic. Autonomy with an
+  adversarial reviewer in the deploy path is a meaningfully different (and
+  cheaper-to-trust) night mode than autonomy alone.
+- *Watch state at cutoff (~00:00 UTC): crawl0/1/2/5 swept, restarted on the
+  widened schema and claiming; crawl3/4 sweeps still running with restart chains
+  armed; live ingest archiving extras since 23:32; 6144 canary verdict and the
+  post-sweep honest ETA still pending.*
 
 ## The ETA honesty record
 
