@@ -103,11 +103,17 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
 
   // Per-host limiter outermost so a slow host's queue never pins global slots;
   // the global limiter inside is what actually caps simultaneous downloads.
-  // The 429 cooldown wait sits between them on purpose: a cooling host parks
-  // its own queue (cheap — host slots are free) without holding global slots.
+  // A host that started cooling after this repo was claimed gets requeued
+  // immediately — never slept on: sleeping here held the whole in-flight pool
+  // hostage to the deepest host's cooldown (observed fetching: 2 of 3,072).
   const trackRepo = (repo: RepoRow): void => {
-    const task = hostLimitFor(repo.pdsHost)(async () => {
-      await hostPressure.waitWhileCooling(repo.pdsHost);
+    const task = hostLimitFor(repo.pdsHost)(() => {
+      const coolMs = hostPressure.coolingMs(repo.pdsHost);
+      if (coolMs > 0) {
+        ledger.markThrottled(repo.did, `host cooling: ${repo.pdsHost}`, coolMs);
+        stats.retried += 1;
+        return Promise.resolve();
+      }
       return globalLimit(() => processRepo(repo));
     });
     const tracked: Promise<void> = task
@@ -204,15 +210,27 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
           await sleep(wait);
           continue;
         }
+        let claimedFromBatch = 0;
         for (const repo of batch) {
           if (stats.claimed >= flags.limit) break;
+          // Cooling hosts are skipped without claiming: the rows stay
+          // pending and re-offer once the cooldown lapses, and the in-flight
+          // pool only ever holds repos that can actually fetch right now.
+          if (hostPressure.coolingMs(repo.pdsHost) > 0) {
+            stats.skipped += 1;
+            continue;
+          }
           if (!ledger.markFetching(repo.did)) {
             stats.skipped += 1;
             continue;
           }
           stats.claimed += 1;
+          claimedFromBatch += 1;
           trackRepo(repo);
         }
+        // A non-empty batch can claim nothing when its head is all cooling
+        // hosts; without this pause that is a tight loop on the ledger.
+        if (claimedFromBatch === 0) await sleep(1_000);
       }
     }
 
