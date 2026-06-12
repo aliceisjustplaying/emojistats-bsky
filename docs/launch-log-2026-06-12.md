@@ -428,6 +428,31 @@ Retro note: the "indie caps are too aggressive" hypothesis felt obviously
 right for ~10 minutes and was wrong; one GROUP BY pds_host saved a pointless
 revert. Group before you blame.
 
+Cooldown verdict (10-min window, fleet-wide): **429s collapsed 55,376 → 124**
+— below even the morning's ambient level. The feedback loop replaces cap
+whack-a-mole for good: whichever mushroom is deepest next week gets exactly
+the pressure it tolerates, automatically.
+
+## ~16:30 — the restart tax (emoji load 24, ETA "4.1 days", both lies)
+
+Minutes after the cooldown deploy, emoji hit load 24 on 8 cores and the
+dashboard ETA ballooned to 4.1 days. Cause, found via system.processes in one
+query: six concurrent streams of `SELECT … groupBitXor(SHA256(rkey)) FROM
+posts FINAL` — the **post-crash reconciliation**. The fleet restart counted
+as an unclean shutdown on every box, so all six were digest-re-verifying
+their last hour of loads (~1.8M repos in 1,000-DID chunks) before resuming
+the crawl. The paranoid-correctness machinery, working as designed, just six
+boxes at once against an 8-core warehouse. The ETA spike was pure artifact:
+boxes don't crawl while reconciling, so remaining ÷ (paused rate) read 4.1
+days for what was really a ~25-minute pause.
+
+Lessons banked: (1) every mid-crawl fleet restart pays a reconcile tax —
+stagger restarts box by box instead of all six at once; (2) the batched
+loader's shutdown should register as clean so a plain `systemctl restart`
+doesn't trigger the crash path at all (queued for post-cutover); (3) when a
+load number looks insane, `system.processes` answers in five seconds what
+theorizing answers in an hour.
+
 ## Running ETA honesty table (for the retro)
 
 | When | Basis | Claim |
