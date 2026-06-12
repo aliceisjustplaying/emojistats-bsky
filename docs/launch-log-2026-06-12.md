@@ -185,6 +185,155 @@ downtime) — its 5 GB cap is now the ceiling everything else queues behind.
 The night started at 70 days and a frozen dashboard; it ends self-healing,
 verified, and 25× faster.
 
+---
+
+# Day 2 — 2026-06-12, daytime
+
+## ~09:30 — the dashboard dies again (bottleneck #6: the parts storm)
+
+Morning report: dashboard 500s with `MEMORY_LIMIT_EXCEEDED ... maximum: 5.00
+GiB`. Not the dashboard's queries this time (those were capped at 1.2 GB
+yesterday) — the *server-wide* limit. Under the night's insert pressure the
+OvercommitTracker shoots whichever query asks next, i.e. whatever the browser
+triggers.
+
+Triage detour worth blogging honestly: I first declared BOTH memory and disk
+emergencies — disk had gone 31% → 49% in three hours, and I extrapolated
+"dead in 8–12 hours, the corpus needs hundreds of GB, we need a volume NOW."
+Wrong. Decomposing instead of extrapolating: the entire emojistats database
+was **230 MiB** (posts: 208 MiB for 8.6M rows ≈ 25 B/post — the schema
+estimate was always fine). The disk eater was the posts table directory
+holding **14 GB for 208 MiB of live data**: `du` vs `system.tables.total_bytes`
+disagreeing 70×.
+
+The mechanism, and it's a beauty: the loader inserted **per repo** (average
+repo: ~64 posts), and `posts` is partitioned by month. A repo's posts span its
+account's whole lifetime, so each tiny insert shatters into one part per month
+touched — ~46 at full history. ~24 inserts/s fleet-wide × ~46 partitions =
+hundreds of parts created per second against a memory-starved merge scheduler.
+**244,883 parts** for 208 MiB of data. Parts metadata lives in RAM: that's
+what was pinning the 5 GB cap. One pathology, both symptoms — the launch-night
+dry run could never see it because dry runs don't run long enough to shatter
+a quarter-million parts.
+
+## ~10:00 — the rescale (and honest cost talk)
+
+Decision point with Alice (who is, correctly, watching the bill: the crawl
+fleet costs ~€0.54/h): memory is the fire, disk is fine once de-bloated.
+Hetzner only offered 16 GB **with** 320 GB disk (€30/mo vs €8) — and a
+gotcha for the retro: **Hetzner can never shrink a disk**, so "resize back
+later" doesn't exist; the path down is a fresh smaller box + migration. The
+end-state ClickHouse data (~75 GB at 25 B/post × 2.9B posts) needs ≥160 GB of
+disk anyway, so the realistic endgame is ~€15/mo, not €8.
+
+Shutdown was clean (stop services → stop clickhouse → poweroff); the fleet
+was already paused for the parts drain — which, fun fact, made **zero
+progress in 3 minutes of idle merging**: a quarter-million parts is too many
+for the merge scheduler to even schedule against a 5 GB cap.
+
+## ~10:30 — surgery on the serving box
+
+- Partition grow: no growpart/parted on NixOS — `sfdisk -N 2 --force
+  --no-reread` + `partx -u` + `resize2fs`. 75 G → 300 G online.
+- CH cap 5 → 12 GiB in the nix flake (pix repo). Trap for the retro:
+  `nixos-rebuild switch` does NOT restart clickhouse on extraServerConfig
+  changes — verify `system.server_settings`, then restart by hand.
+- The 244k-part table: waiting for merges would have taken hours. With 208 MiB
+  of live data the right move is a rebuild: `CREATE TABLE posts_rebuild AS
+  posts` + `INSERT SELECT` (37 s; MVs don't fire on table-to-table copies) +
+  parity gate (`uniqExact(did, rkey)` identical on both sides: 9,619,608 —
+  the 503-row count delta was ReplacingMergeTree finally collapsing replay
+  duplicates) + `EXCHANGE TABLES` + drop. 244,883 parts → **63**. The 14 GB
+  came back ~8 minutes later (Atomic DBs drop lazily). All six MVs survived
+  the exchange (`dependencies_table` check) and ticked on live replay.
+- Footgun logged: `max(hour)` of the aggregates is useless as a freshness
+  signal — clock-skewed clients put posts in the future. Use current-hour
+  sums ticking instead.
+
+## ~11:00 — the loader stops being the arsonist
+
+Root fix, not just cleanup: the loader now batches inserts **across repos** —
+one shared buffer, flushed at 200k rows or 15 s. Insert rate drops from ~4/s
+to ~4/min per box; part creation divides by the number of repos per flush.
+
+The interesting engineering bit: durability bookkeeping. `finish()` must not
+resolve until every batch carrying that repo's rows has landed (the ledger
+flips to 'loaded' on it). First draft had a race — "buffer empty" ≠ "my rows
+are durable" (the flush holding them might be in flight, or MY batch failed
+while a LATER one succeeded). Final design: the buffer carries a generation
+number; each repo records the generations its rows landed in; finish() awaits
+exactly those flushes. A failed flush rejects every batch-mate — they re-park
+as retryable and the re-fetch collapses into ReplacingMergeTree like any
+at-least-once replay. Verified with a mock-client harness: coalescing, whale
+spanning generations, failure attribution, retry-token stability, empty-repo
+short-circuit.
+
+## ~11:30 — relaunch, and the canary flies
+
+crawl1 canary: ~1,330 repos/min on one box (5× the whole fleet's overnight
+rate). Fleet rollout: 5,393/min → 6,684/min ramping, parts steady ~200, CH
+RSS 1.57 GiB of 12, disk back to 25 G, dashboard 200 in 0.3 s.
+
+## ~12:00 — Alice asks the two best questions of the project
+
+**"Last night you said 1–1.5 days. How were you off by almost an order of
+magnitude?"** Because every ETA I gave was an extrapolation of a differently
+broken system, stated with more confidence than the measurement deserved:
+70 d (frozen fleet), 3 wk (ledger fixed, parts storm brewing), 10–20 d (parts
+storm active). The original 1–1.5 d was capacity math that assumed healthy
+software on day one. Retro rule: ETAs come from sustained measured throughput
+only; extrapolations get labeled as extrapolations, out loud.
+
+**"My friends crawl the whole network in 3–4 days with less compute."** The
+single most useful debugging input of the day. It meant: nothing about the
+network forbids that pace, so the gap is ours. Hunting it found bottleneck #7:
+`GLOBAL_CONCURRENCY=128` — the launch-night value from when fetch+parse lived
+on the main thread — AND the new batching loader parking each pipeline slot
+for up to 15 s awaiting its durability flush. Slots: 50% asleep. The two
+fixes (yesterday's worker pool, today's batching) had quietly invalidated the
+constant between them. 768 slots: one box → ~3,750 repos/min, load 1.1 of 8
+cores. Fleet → **23,646 repos/min**. Baked into nix, not drop-ins.
+
+## ~13:00 — the 33M mystery (bottleneck #8, the silent one)
+
+Alice, back from a break: "dashboard says 33M total repos; the network is
+~44M." The dashboard was honest again — the **PLC enumeration service died
+during launch night** (twice, last at 03:11, exit 1, in the ledger-contention
+era when claim queries were holding the SQLite lock for seconds) and the unit
+was `Restart=no`, manual-start. The DID universe had been frozen at
+33,311,489 for nine hours while the crawl happily worked the stale set.
+Run manually, it resumed from its cursor checkpoint flawlessly at ~3.5k
+ops/s. Fix: `Restart=on-failure` in nix (cursor checkpointing makes restarts
+free), restarted fleet-wide, catches up to the PLC head in ~2 h.
+
+Bonus finding: the rate had settled to ~10k/min because the fleet is now
+**host-diversity bound** — only ~238 of 768 slots downloading, hot mushrooms
+(puffball: 899-deep queue) capped at 16 connections of politeness. The
+missing 11M DIDs are newer accounts on newer mushrooms: enumeration catching
+up IS the throughput fix. Compounding errors note for the retro: the frozen
+enumeration also silently capped host diversity all day — bottlenecks #7 and
+#8 masked each other.
+
+## ~13:30 — owner's call: crank it
+
+With 429s ambient (~0.1% per shard) and CH at 10% of cap, Alice calls it:
+"PDSes are fast." `PER_HOST_CONCURRENCY_BSKY` 16 → 32, global 768 → 1536 (so
+the pool can't re-bind when enumeration fans out), via nix, fleet rebuilt.
+429 overshoot degrades softly (60 s retry park), so the experiment is cheap
+to walk back. Ten-minute verdict pending as of this entry.
+
+## Running ETA honesty table (for the retro)
+
+| When | Basis | Claim |
+|---|---|---|
+| pre-launch | capacity napkin | 1–1.5 days |
+| launch night, frozen | broken measurement | 70 days |
+| post ledger fix | sick measurement | ~3 weeks |
+| post parts storm, pre-fix | sick measurement | 10–20 days |
+| post batching, 128 slots | healthy but self-capped | 5.8 days |
+| post 768 slots | healthy measurement | ~31 hours |
+| post 32/host + full enumeration | measurement pending | TBD |
+
 ## 02:15 — IT HUMS (first time, briefly)
 
 - emoji: live ingest reconnected to Jetstream, dashboard public behind Caddy
