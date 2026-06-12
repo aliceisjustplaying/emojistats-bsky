@@ -497,6 +497,11 @@ under-fill the worker. Claim refills now ask SQLite to exclude hosts that are
 already full or cooling, so the next claim window reaches repos that can use
 open slots.
 
+Fourth-order fix: the ClickHouse client was still logging idle `socket hang up`
+errors on long inserts, including at least one posts batch retry. The backfill
+client now enables HTTP progress headers, matching the rebuild client, so
+large inserts keep the HTTP connection active while ClickHouse works.
+
 ## ~17:45 — bottleneck #10: cooldowns that still occupied scheduler slots
 
 The morel cooldown fix did collapse 429s, but it exposed a second-order

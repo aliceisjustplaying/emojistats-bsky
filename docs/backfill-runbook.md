@@ -220,6 +220,10 @@ idempotent.
   A pending ledger window dominated by a few capped hosts should not leave the
   crawler under-filled; check `topHosts`, `inFlight`, and first-window
   `pds_host` distribution together.
+- The backfill ClickHouse client enables HTTP progress headers. Repeated
+  `socket hang up` on large `posts` or telemetry inserts means the server or
+  load balancer is still closing active requests, not that the batch should be
+  treated as lost.
 - The archive is at-least-once across crashes (see above): re-fetched repos
   re-append. Rows staged in the open file at crash time are recovered at the
   sink's next startup and finalized as their own parquet file; a hard crash

@@ -21,6 +21,13 @@ export function createClickHouseClient(): ClickHouseClient {
     database: CLICKHOUSE_DATABASE,
     application: 'emojistats-backfill',
     request_timeout: CLICKHOUSE_REQUEST_TIMEOUT_MS,
+    // Keeps the HTTP socket alive while ClickHouse works through large
+    // JSONEachRow inserts; otherwise the load balancer can close an idle
+    // request and force an identical retry.
+    clickhouse_settings: {
+      send_progress_in_http_headers: 1,
+      http_headers_progress_interval_ms: '10000',
+    },
     // CAR parsing blocks the event loop past the 2.5s socket TTL; without
     // this the client reuses server-closed sockets and inserts hang forever
     // (launch night: fetching=128, zero completions, telemetry frozen).
