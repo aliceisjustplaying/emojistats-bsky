@@ -467,6 +467,16 @@ loaded-row digest reconciliation moves to explicit verification/offline
 operator mode. Normal deploys no longer turn every shard restart into a
 warehouse-wide `posts FINAL` scan.
 
+## ~12:55 — dashboard freeze was ClickHouse client timeout
+
+The 5120/128/20 canary filled fetch slots, but the 200k-row batched inserts
+started crossing the backfill client's fixed 30s request timeout. That looked
+like a dead dashboard because `backfill_progress` and `backfill_repo_events`
+also ride the same ClickHouse client and began dropping ticks; it also aborted
+some crawler processes after repeated batch-insert failures. Immediate action:
+rollback live runtime caps to 4096/96/16 and raise the backfill ClickHouse
+request timeout to a configurable 180s default.
+
 ## ~17:45 — bottleneck #10: cooldowns that still occupied scheduler slots
 
 The morel cooldown fix did collapse 429s, but it exposed a second-order

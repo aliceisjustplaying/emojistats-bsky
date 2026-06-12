@@ -3,6 +3,7 @@ import { createClient, type ClickHouseClient } from '@clickhouse/client';
 import {
   CLICKHOUSE_DATABASE,
   CLICKHOUSE_PASSWORD,
+  CLICKHOUSE_REQUEST_TIMEOUT_MS,
   CLICKHOUSE_URL,
   CLICKHOUSE_USER,
 } from './config.js';
@@ -19,7 +20,7 @@ export function createClickHouseClient(): ClickHouseClient {
     password: CLICKHOUSE_PASSWORD,
     database: CLICKHOUSE_DATABASE,
     application: 'emojistats-backfill',
-    request_timeout: 30_000,
+    request_timeout: CLICKHOUSE_REQUEST_TIMEOUT_MS,
     // CAR parsing blocks the event loop past the 2.5s socket TTL; without
     // this the client reuses server-closed sockets and inserts hang forever
     // (launch night: fetching=128, zero completions, telemetry frozen).

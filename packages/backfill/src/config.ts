@@ -35,6 +35,10 @@ export const CLICKHOUSE_DATABASE =
 export const CLICKHOUSE_USER = process.env.CLICKHOUSE_USER ?? 'emojistats';
 export const CLICKHOUSE_PASSWORD =
   process.env.CLICKHOUSE_PASSWORD ?? 'emojistats';
+export const CLICKHOUSE_REQUEST_TIMEOUT_MS = num(
+  'CLICKHOUSE_REQUEST_TIMEOUT_MS',
+  180_000,
+);
 
 export const LEDGER_DB_PATH =
   process.env.LEDGER_DB_PATH ??

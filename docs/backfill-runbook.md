@@ -204,6 +204,10 @@ idempotent.
   ReplacingMergeTree on `(did, rkey)` collapses anything older at merge time.
   Aggregates over-count duplicates until rebuilt — by design, they are
   disposable caches rebuilt from `posts` after the backfill.
+- Backfill writes use `CLICKHOUSE_REQUEST_TIMEOUT_MS` (default 180s). If the
+  dashboard stops updating and crawler logs show `Timeout error` on
+  `backfill_progress` or 200k-row inserts, the fleet is over ClickHouse's
+  current write capacity; lower runtime concurrency before raising fetch caps.
 - The archive is at-least-once across crashes (see above): re-fetched repos
   re-append. Rows staged in the open file at crash time are recovered at the
   sink's next startup and finalized as their own parquet file; a hard crash
