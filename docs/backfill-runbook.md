@@ -19,6 +19,43 @@ idempotent.
   The archive is the ONLY durable home of full post text (ClickHouse keeps text
   for emoji posts only), so this hop is part of the critical path, not a backup.
 
+## Current live operating point
+
+Checkpoint: 2026-06-12 13:40 UTC, deploy `90b9de7`, all six crawlers and
+`emoji` updated.
+
+Live crawler settings:
+
+- `GLOBAL_CONCURRENCY=4096`
+- `PER_HOST_CONCURRENCY_BSKY=96`
+- `PER_HOST_CONCURRENCY=16`
+- `LOADER_BATCH_ROWS=50000`
+
+Current stable sample from `backfill_progress`:
+
+- pending: 55,689,931
+- terminal delta rate: ~10,122 repos/min
+- ETA: ~3.82 days
+- 429s in the same 5-minute window: mostly `morel` (147) and
+  `atproto.brid.gy` (19)
+
+This is the pause-point target: under 4 days and not crash-looping. It is not
+the original under-1-day goal. `backfill_repo_events` is still lossy during
+ClickHouse pressure, so ETA must be measured from terminal-status deltas in
+`backfill_progress`.
+
+Settings that were tried and should not be repeated without a new hypothesis:
+
+- `5120/128/20` filled fetch slots but pushed 200k-row ClickHouse inserts past
+  the old client timeout, froze telemetry, and caused crawler restarts.
+- `6144/96/16` did not improve throughput; the progress-delta rate fell to
+  ~13.7k/min in the canary and ClickHouse upload resets got worse.
+- Enabling ClickHouse HTTP progress headers alone did not fix `socket hang up`
+  on inserts because the server-side symptom was `CANNOT_READ_ALL_DATA`, an
+  upload body cut mid-request.
+- `backfill_repo_events` counts are not a rate source while ClickHouse is under
+  write pressure; dropped event batches make that table undercount.
+
 ## Before the crawl
 
 - ClickHouse schema migrated (`bun run db:migrate` in `packages/ingest`) — this
@@ -62,7 +99,7 @@ idempotent.
   updates the ledger. `--limit N` caps claims for a bounded run; `--did <did>`
   forces specific repos through the pipeline.
 - Politeness knobs: `GLOBAL_CONCURRENCY` (default 32), `PER_HOST_CONCURRENCY`
-  (default 2), `PER_HOST_CONCURRENCY_BSKY` (default 8 for the
+  (default 2), `PER_HOST_CONCURRENCY_BSKY` (default 16 for the
   `*.bsky.network` mushroom fleet). 429/Retry-After is always honored on top:
   a 429 arms a per-host cooldown, later claims skip that host while it cools,
   and rate-limit retries do not burn the repo's reachability attempts.
@@ -227,6 +264,8 @@ idempotent.
 - Backfill ClickHouse requests are gzip-compressed. If ClickHouse logs
   `CANNOT_READ_ALL_DATA`, lower `LOADER_BATCH_ROWS` before raising crawl
   concurrency; the failure is an upload-body reset, not an accepted insert.
+  The current stable live value is `LOADER_BATCH_ROWS=50000`; the original
+  200k batch size is too large for the current HTTP path under load.
 - The archive is at-least-once across crashes (see above): re-fetched repos
   re-append. Rows staged in the open file at crash time are recovered at the
   sink's next startup and finalized as their own parquet file; a hard crash

@@ -4,6 +4,39 @@ Raw notes for the eventual writeup. Times are local (CEST). The goal: stand up
 one serving box + six crawl boxes from bare Hetzner hardware to a running
 full-network Bluesky backfill, overnight, with correctness guarantees built in.
 
+## Current checkpoint — 2026-06-12 13:40 UTC
+
+Stable pause point reached, not final target reached.
+
+- Deployed commit: `90b9de7` on `emoji` and `crawl0..5`.
+- Live crawler settings: `GLOBAL_CONCURRENCY=4096`,
+  `PER_HOST_CONCURRENCY_BSKY=96`, `PER_HOST_CONCURRENCY=16`,
+  `LOADER_BATCH_ROWS=50000`.
+- Stable progress-delta sample from `backfill_progress`: 55,689,931 pending,
+  ~10,122 terminal repos/min, ETA ~3.82 days.
+- 429s were moderate in the same window: 147 from `morel`, 19 from
+  `atproto.brid.gy`.
+- Remaining rough edge: telemetry/event inserts still show occasional
+  `socket hang up`; `backfill_progress` retries the newest snapshot, but
+  `backfill_repo_events` is lossy and must not be used for ETA.
+
+Things tried that did not reduce the bottleneck enough:
+
+- `5120/128/20`: too hot. It filled slots, but large ClickHouse inserts crossed
+  the client timeout, telemetry froze, and some crawlers restarted.
+- `6144/96/16`: not useful. It lowered measured progress-delta throughput to
+  ~13.7k/min and worsened upload resets.
+- ClickHouse progress headers alone: useful for long server-side work, but not
+  sufficient here because the server logged `CANNOT_READ_ALL_DATA`, meaning the
+  client upload body was cut mid-request.
+- `backfill_repo_events` as a rate source: invalid under write pressure because
+  event batches are allowed to drop.
+
+The current safe operating point is 4096 global, 96/16 per-host, 50k post
+batches, gzip-compressed ClickHouse uploads. Future tuning should start from
+ClickHouse upload stability or shard skew, not from blindly increasing global
+concurrency.
+
 ## Chapter 0 — how we got here (pre-launch working notes, added day 2)
 
 The white whale: backfill emojistats from the first Bluesky post and serve
