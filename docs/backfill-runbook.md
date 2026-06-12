@@ -216,6 +216,10 @@ idempotent.
 - Telemetry emits once at startup and the scheduler yields during large claim
   scans. If a shard is active but its progress row is stale, check for a
   CPU-bound claim/refill loop before assuming ClickHouse is down.
+- Claim refills exclude hosts whose local queue is already full or cooling.
+  A pending ledger window dominated by a few capped hosts should not leave the
+  crawler under-filled; check `topHosts`, `inFlight`, and first-window
+  `pds_host` distribution together.
 - The archive is at-least-once across crashes (see above): re-fetched repos
   re-append. Rows staged in the open file at crash time are recovered at the
   sink's next startup and finalized as their own parquet file; a hard crash

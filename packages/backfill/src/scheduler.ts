@@ -108,6 +108,12 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     const limit = hostLimitFor(host);
     return limit.activeCount + limit.pendingCount;
   };
+  const unavailableHosts = (): string[] =>
+    [...hostLimits.keys()].filter(
+      (host) =>
+        hostQueued(host) >= hostCapFor(host) ||
+        hostPressure.coolingMs(host) > 0,
+    );
 
   const active = new Set<Promise<void>>();
   let claimBacklog: RepoRow[] = [];
@@ -233,6 +239,7 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
                 CLAIM_SCAN_MIN,
               ),
             ),
+            unavailableHosts(),
           );
         }
         if (claimBacklog.length === 0) {

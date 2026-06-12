@@ -92,7 +92,7 @@ export interface Ledger {
    * attempts are still within MAX_ATTEMPTS — past the budget the row parks
    * (still 'unreachable') for the final sweep. Ordered to spread hosts.
    */
-  listClaimable(limit: number): RepoRow[];
+  listClaimable(limit: number, excludedHosts?: readonly string[]): RepoRow[];
   /** Guarded transition to 'fetching'; false if someone else claimed it. */
   markFetching(did: string): boolean;
   markLoaded(did: string, counts: RepoCounts): void;

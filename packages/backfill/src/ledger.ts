@@ -90,6 +90,7 @@ const BUCKET_BACKFILL_SQL = `
 
 export class SqliteLedger implements Ledger {
   private readonly db: Database.Database;
+  private readonly shardAnd: string;
   private readonly stmtUpsertPending: Database.Statement;
   private readonly stmtMarkTombstoned: Database.Statement;
   private readonly stmtGetMeta: Database.Statement;
@@ -109,6 +110,10 @@ export class SqliteLedger implements Ledger {
   private readonly stmtGetRepo: Database.Statement;
   private readonly stmtByStatus: Database.Statement;
   private readonly stmtResetUnreachable: Database.Statement;
+  private readonly claimableExclusionStatements = new Map<
+    number,
+    { pending: Database.Statement; retry: Database.Statement }
+  >();
 
   constructor(
     dbPath: string = LEDGER_DB_PATH,
@@ -144,6 +149,7 @@ export class SqliteLedger implements Ledger {
     const shardPredicate = `bucket = ${shardIndex}`;
     const shardAnd = shards > 1 ? `AND ${shardPredicate}` : '';
     const shardWhere = shards > 1 ? `WHERE ${shardPredicate}` : '';
+    this.shardAnd = shardAnd;
 
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
@@ -306,13 +312,57 @@ export class SqliteLedger implements Ledger {
     this.stmtSetMeta.run(key, value);
   }
 
-  listClaimable(limit: number): RepoRow[] {
-    const rows = this.stmtListClaimablePending.all(limit) as RepoTableRow[];
+  private claimableStatementsForExclusions(count: number): {
+    pending: Database.Statement;
+    retry: Database.Statement;
+  } {
+    const cached = this.claimableExclusionStatements.get(count);
+    if (cached !== undefined) return cached;
+    const placeholders = Array.from({ length: count }, () => '?').join(', ');
+    const hostExclusion =
+      count === 0 ? '' : `AND pds_host NOT IN (${placeholders})`;
+    const statements = {
+      pending: this.db.prepare(`
+        SELECT * FROM repos
+        WHERE status = 'pending' ${this.shardAnd} ${hostExclusion}
+        ORDER BY did
+        LIMIT ?
+      `),
+      retry: this.db.prepare(`
+        SELECT * FROM repos
+        WHERE status = 'unreachable' AND retry_after <= ? AND attempts < ? ${this.shardAnd} ${hostExclusion}
+        ORDER BY did
+        LIMIT ?
+      `),
+    };
+    this.claimableExclusionStatements.set(count, statements);
+    return statements;
+  }
+
+  listClaimable(
+    limit: number,
+    excludedHosts: readonly string[] = [],
+  ): RepoRow[] {
+    const uniqueExcludedHosts = [...new Set(excludedHosts)].filter(
+      (host) => host.length > 0,
+    );
+    const statements =
+      uniqueExcludedHosts.length === 0
+        ? {
+            pending: this.stmtListClaimablePending,
+            retry: this.stmtListClaimableRetry,
+          }
+        : this.claimableStatementsForExclusions(uniqueExcludedHosts.length);
+    const rows = statements.pending.all(
+      ...uniqueExcludedHosts,
+      limit,
+    ) as RepoTableRow[];
     if (rows.length < limit) {
       rows.push(
-        ...(this.stmtListClaimableRetry.all(
+        ...(statements.retry.all(
           Date.now(),
           MAX_ATTEMPTS,
+          ...uniqueExcludedHosts,
           limit - rows.length,
         ) as RepoTableRow[]),
       );

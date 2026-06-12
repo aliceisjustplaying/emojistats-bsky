@@ -490,6 +490,13 @@ scheduler now yields every 1,000 scanned claim rows and telemetry emits an
 initial startup snapshot before `scheduler.run()`, so long host-skewed claim
 scans cannot make status counts look dead.
 
+Third-order fix: the first 250k pending rows on every shard had become
+dominated by `pds.trump.com`, `morel`, and `plc.surge.sh`. Once those hosts
+were capped or cooling, the scheduler could scan a large window and still
+under-fill the worker. Claim refills now ask SQLite to exclude hosts that are
+already full or cooling, so the next claim window reaches repos that can use
+open slots.
+
 ## ~17:45 — bottleneck #10: cooldowns that still occupied scheduler slots
 
 The morel cooldown fix did collapse 429s, but it exposed a second-order
