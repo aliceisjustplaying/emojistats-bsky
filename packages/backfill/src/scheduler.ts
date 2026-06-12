@@ -77,10 +77,18 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
   // Each row carries exactly one canonical form, so partitions stay coherent,
   // and endsWith below is scheme-tolerant by construction.
   const hostLimits = new Map<string, LimitFunction>();
+  // bsky.social is the entryway fronting every mushroom: millions of early
+  // accounts' PLC tails still point there (the fetcher follows the DID doc on
+  // claim). With the third-party cap of 2 it became the whole fleet's
+  // bottleneck — two slots gating a 168-deep queue per box on launch night.
+  const isBskyInfra = (host: string): boolean =>
+    host.endsWith('.bsky.network') ||
+    host === 'bsky.social' ||
+    host.endsWith('//bsky.social');
   const hostLimitFor = (host: string): LimitFunction => {
     let limit = hostLimits.get(host);
     if (limit === undefined) {
-      const cap = host.endsWith('.bsky.network')
+      const cap = isBskyInfra(host)
         ? PER_HOST_CONCURRENCY_BSKY
         : PER_HOST_CONCURRENCY;
       limit = pLimit(cap);
