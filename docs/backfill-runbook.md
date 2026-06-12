@@ -224,6 +224,9 @@ idempotent.
   `socket hang up` on large `posts` or telemetry inserts means the server or
   load balancer is still closing active requests, not that the batch should be
   treated as lost.
+- Backfill ClickHouse requests are gzip-compressed. If ClickHouse logs
+  `CANNOT_READ_ALL_DATA`, lower `LOADER_BATCH_ROWS` before raising crawl
+  concurrency; the failure is an upload-body reset, not an accepted insert.
 - The archive is at-least-once across crashes (see above): re-fetched repos
   re-append. Rows staged in the open file at crash time are recovered at the
   sink's next startup and finalized as their own parquet file; a hard crash

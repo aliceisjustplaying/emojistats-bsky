@@ -502,6 +502,11 @@ errors on long inserts, including at least one posts batch retry. The backfill
 client now enables HTTP progress headers, matching the rebuild client, so
 large inserts keep the HTTP connection active while ClickHouse works.
 
+Fifth-order fix: ClickHouse server logs showed `CANNOT_READ_ALL_DATA`, meaning
+the HTTP request body was being cut mid-upload. The backfill client now gzip
+compresses request bodies, and the live canary lowered post batch size so
+uploads are smaller while we monitor retry rate.
+
 ## ~17:45 — bottleneck #10: cooldowns that still occupied scheduler slots
 
 The morel cooldown fix did collapse 429s, but it exposed a second-order
