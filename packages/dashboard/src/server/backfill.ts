@@ -126,10 +126,17 @@ async function fetchOverview(): Promise<BackfillOverview | null> {
     // restart (a fleet-tuning afternoon made "data downloaded" lurch
     // backwards repeatedly), and since batched loading the instantaneous
     // rows_per_sec gauge reads 0 between 15 s flushes. Events survive both.
-    chQuery<{ posts: string; bytes: string; recent_posts: string }>(`
+    // Aliases must not collide with source columns (posts, car_bytes): the
+    // alias would shadow the column inside the sibling aggregates
+    // (ILLEGAL_AGGREGATION), same trap as latest_ts above.
+    chQuery<{
+      posts_total: string;
+      bytes_total: string;
+      recent_posts: string;
+    }>(`
       SELECT
-        sumIf(posts, event = 'loaded') AS posts,
-        sum(car_bytes) AS bytes,
+        sumIf(posts, event = 'loaded') AS posts_total,
+        sum(car_bytes) AS bytes_total,
         sumIf(
           posts,
           event = 'loaded' AND ts >= now() - INTERVAL ${RATE_WINDOW_MINUTES} MINUTE
@@ -172,8 +179,8 @@ async function fetchOverview(): Promise<BackfillOverview | null> {
     inFlight += num(row.in_flight);
     newestTs = Math.max(newestTs, chTsToDate(row.latest_ts).getTime());
   }
-  const postsLoaded = num(totals[0]?.posts);
-  const bytesDownloaded = num(totals[0]?.bytes);
+  const postsLoaded = num(totals[0]?.posts_total);
+  const bytesDownloaded = num(totals[0]?.bytes_total);
   const rowsPerSec = num(totals[0]?.recent_posts) / (RATE_WINDOW_MINUTES * 60);
 
   const totalEnumerated = REPO_STATUSES.reduce(
