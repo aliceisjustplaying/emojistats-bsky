@@ -11,6 +11,7 @@ import { resolveStoragePolicy } from 'archive/policy';
 import { createClickHouseClient, pingClickHouse } from './clickhouse.js';
 import {
   ARCHIVE_ENABLED,
+  CRASH_RECONCILE_ON_STARTUP,
   CRAWL_SHARD_INDEX,
   CRAWL_SHARDS,
   LEDGER_DB_PATH,
@@ -54,8 +55,12 @@ async function main(): Promise<void> {
 
   const archiveSink = await openArchiveSink(policy);
 
-  if (ledger.getMeta('crawl_dirty') === '1') {
+  if (CRASH_RECONCILE_ON_STARTUP && ledger.getMeta('crawl_dirty') === '1') {
     await reconcileRecentLoads(ledger, chClient);
+  } else if (ledger.getMeta('crawl_dirty') === '1') {
+    logger.warn(
+      'unclean shutdown detected: skipping loaded-row reconciliation; stale fetching rows will requeue',
+    );
   }
   ledger.setMeta('crawl_dirty', '1');
 

@@ -20,6 +20,14 @@ function num(name: string, fallback: number): number {
   return value;
 }
 
+function bool(name: string, fallback: boolean): boolean {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  if (raw === 'true') return true;
+  if (raw === 'false') return false;
+  throw new Error(`Invalid boolean env var ${name}: ${raw}`);
+}
+
 export const CLICKHOUSE_URL =
   process.env.CLICKHOUSE_URL ?? 'http://localhost:8123';
 export const CLICKHOUSE_DATABASE =
@@ -61,6 +69,10 @@ export const MAX_ATTEMPTS = num('MAX_ATTEMPTS', 5);
 // ~4×/s — the per-month partition fan-out made tiny inserts a parts storm.
 export const LOADER_BATCH_ROWS = num('LOADER_BATCH_ROWS', 200_000);
 export const LOADER_FLUSH_MS = num('LOADER_FLUSH_MS', 15_000);
+export const CRASH_RECONCILE_ON_STARTUP = bool(
+  'CRASH_RECONCILE_ON_STARTUP',
+  false,
+);
 
 export const USER_AGENT =
   process.env.BACKFILL_USER_AGENT ??

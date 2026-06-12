@@ -453,6 +453,20 @@ doesn't trigger the crash path at all (queued for post-cutover); (3) when a
 load number looks insane, `system.processes` answers in five seconds what
 theorizing answers in an hour.
 
+## ~12:45 — restart tax removed from the hot path
+
+The next tuning cycle reproduced the same failure mode: all crawler boxes had
+fetch/memory headroom and almost no 429s, but emoji ClickHouse sat at 100% CPU
+serving six concurrent `posts FINAL` digest reconciliations. That made the
+post-rollout rate sample useless (~18.8k terminal repos/min, ~41h ETA) because
+the fleet was mostly proving old loads instead of claiming new repos.
+
+Change: `CRASH_RECONCILE_ON_STARTUP` now defaults false. Startup still requeues
+stale `fetching` rows, which is the important at-least-once recovery path, but
+loaded-row digest reconciliation moves to explicit verification/offline
+operator mode. Normal deploys no longer turn every shard restart into a
+warehouse-wide `posts FINAL` scan.
+
 ## ~17:45 — bottleneck #10: cooldowns that still occupied scheduler slots
 
 The morel cooldown fix did collapse 429s, but it exposed a second-order

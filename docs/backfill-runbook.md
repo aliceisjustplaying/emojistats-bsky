@@ -188,11 +188,15 @@ idempotent.
 
 - The ledger is the only checkpoint. Kill any process at any moment — power
   loss included — and nothing is lost; in-flight repos simply re-fetch.
+- Normal crawler startup does not run the loaded-row ClickHouse digest audit:
+  `CRASH_RECONCILE_ON_STARTUP=false` by default because `posts FINAL` over the
+  hot table can pin the serving box during deploys. Turn it on only for an
+  explicit recovery audit; `bun run verify` is the normal acceptance gate.
 - Dirty flag: the crawler sets `crawl_dirty=1` in ledger meta at startup and
-  `0` on clean exit. On a dirty start it reconciles the last hour of `loaded`
-  rows against actual ClickHouse counts and requeues any mismatch — this
-  covers the narrow window where an insert was acked into the OS page cache
-  but never reached disk before the crash.
+  `0` on clean exit. When `CRASH_RECONCILE_ON_STARTUP=true`, a dirty start
+  reconciles the last hour of `loaded` rows against actual ClickHouse counts
+  and requeues any mismatch — this covers the narrow window where an insert
+  was acked into the OS page cache but never reached disk before the crash.
 - Repos stuck in `fetching` from a killed run are requeued automatically at
   the next startup.
 - ClickHouse loads are idempotent twice over: per-chunk
