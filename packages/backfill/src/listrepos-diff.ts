@@ -214,19 +214,14 @@ async function diffHost(
       if (apply) {
         for (let i = 0; i < condemned.length; i += WRITE_CHUNK) {
           const batch = condemned.slice(i, i + WRITE_CHUNK);
-          ledger.transaction(() => {
-            for (const { did, terminal, error } of batch) {
-              // Re-check inside the transaction: a row the crawler claimed
-              // (status now 'fetching') settles through the normal path.
-              const current = ledger.getRepo(did);
-              if (
-                current?.status !== 'pending' &&
-                current?.status !== 'unreachable'
-              )
-                continue;
-              ledger.markTerminal(did, terminal, error);
-              counts.classified += 1;
-            }
+          // IMMEDIATE + a single conditional UPDATE per row: a deferred
+          // read-then-write batch next to a live crawler dies on the
+          // no-wait snapshot-upgrade SQLITE_BUSY (it killed all six morel
+          // applies twice). The WHERE clause is the claim-race guard.
+          ledger.transactionImmediate(() => {
+            for (const { did, terminal, error } of batch)
+              if (ledger.markTerminalIfClaimable(did, terminal, error))
+                counts.classified += 1;
           });
           await sleep(50);
         }

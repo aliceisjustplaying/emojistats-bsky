@@ -366,6 +366,19 @@ export class SqliteLedger implements Ledger {
     return this.db.transaction(fn)();
   }
 
+  /**
+   * BEGIN IMMEDIATE variant for batches that might read before writing
+   * while ANOTHER process holds the write lock. A deferred transaction that
+   * upgrades read->write gets SQLITE_BUSY instantly BY DESIGN (its snapshot
+   * would be stale; busy_timeout is deliberately ignored for the upgrade) —
+   * that is what kept killing listrepos-diff --apply next to a live
+   * crawler. IMMEDIATE takes the write lock at BEGIN, where busy_timeout
+   * applies.
+   */
+  transactionImmediate<T>(fn: () => T): T {
+    return this.db.transaction(fn).immediate();
+  }
+
   upsertPending(did: string, pdsHost: string): void {
     this.stmtUpsertPending.run(did, pdsHost, Date.now(), bucketOf(did));
   }
@@ -503,6 +516,27 @@ export class SqliteLedger implements Ledger {
 
   upsertParked(did: string, pdsHost: string, error: string): void {
     this.stmtUpsertParked.run(did, pdsHost, error, Date.now(), bucketOf(did));
+  }
+
+  /**
+   * Conditional terminal mark (listrepos-diff): writes only while the row
+   * is still claimable, in ONE statement — no read-then-write upgrade, so
+   * it composes with transactionImmediate under live-crawler contention.
+   * Returns whether the row was classified.
+   */
+  markTerminalIfClaimable(
+    did: string,
+    status: 'failed' | 'takendown' | 'deactivated',
+    error: string,
+  ): boolean {
+    return (
+      this.db
+        .prepare(
+          `UPDATE repos SET status = ?, error = ?, retry_after = NULL
+           WHERE did = ? AND status IN ('pending', 'unreachable')`,
+        )
+        .run(status, error, did).changes === 1
+    );
   }
 
   /**

@@ -158,6 +158,16 @@ describe('ledger.parkDeadHostChunk', () => {
       ledger.listClaimable(10).map((r) => r.did),
       ['did:plc:bbb1'],
     );
+    // Conditional classify: claimable rows flip, progressed rows are immune.
+    assert.equal(
+      ledger.markTerminalIfClaimable('did:plc:bbb1', 'failed', 'spam'),
+      true,
+    );
+    assert.equal(
+      ledger.markTerminalIfClaimable('did:plc:aaa3', 'failed', 'spam'),
+      false,
+    );
+    assert.equal(ledger.getRepo('did:plc:aaa3')!.status, 'loaded');
     ledger.close();
   });
 
