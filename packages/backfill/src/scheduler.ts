@@ -406,7 +406,19 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
             stats.skipped += 1;
             continue;
           }
-          if (!ledger.markFetching(repo.did)) {
+          let claimedRow: boolean;
+          try {
+            claimedRow = ledger.markFetching(repo.did);
+          } catch (err) {
+            // SQLITE_BUSY past the timeout (an operator tool holding the
+            // write lock) must not kill the run — the row stays pending and
+            // a later scan re-offers it. Anything else is a real DB fault
+            // and still crashes loudly (and now actually exits).
+            if ((err as { code?: string }).code !== 'SQLITE_BUSY') throw err;
+            stats.skipped += 1;
+            continue;
+          }
+          if (!claimedRow) {
             stats.skipped += 1;
             continue;
           }

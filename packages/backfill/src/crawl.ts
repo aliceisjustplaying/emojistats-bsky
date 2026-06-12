@@ -50,6 +50,9 @@ async function main(): Promise<void> {
   const ledger: Ledger = new SqliteLedger(LEDGER_DB_PATH, {
     shards: CRAWL_SHARDS,
     shardIndex: CRAWL_SHARD_INDEX,
+    // Generous: operator tools (listrepos-diff --apply) legitimately hold
+    // the write lock in bursts; the crawler waiting beats the crawler dying.
+    busyTimeoutMs: 30_000,
   });
   const chClient = createClickHouseClient();
   await pingClickHouse(chClient);
@@ -152,5 +155,12 @@ main().catch((err: unknown) => {
     { err: err instanceof Error ? (err.stack ?? err.message) : String(err) },
     'crawl crashed',
   );
-  process.exitCode = 1;
+  // HARD exit, not process.exitCode: live timers (stats, telemetry, worker
+  // threads) keep the event loop alive after main() dies, leaving a zombie
+  // that ticks telemetry, claims nothing, and never lets systemd restart
+  // it. Observed 2026-06-12 19:56-21:12 on crawl1: a SQLITE_BUSY escaping
+  // the claim loop froze the box for 76 minutes while every dashboard
+  // showed it "alive". The ledger is crash-safe by design; exiting is the
+  // recovery path.
+  process.exit(1);
 });
