@@ -668,7 +668,7 @@ function IssuesFeed({
         {issues.length === 0 ? (
           <p className="text-sm text-muted-foreground">no issues recorded</p>
         ) : (
-          <ul className="space-y-2.5">
+          <ul className="max-h-80 space-y-2.5 overflow-y-auto pr-1">
             {issues.map((issue) => (
               <li
                 key={`${issue.did}-${issue.ts}`}
