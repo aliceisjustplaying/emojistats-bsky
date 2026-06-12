@@ -373,6 +373,66 @@ stream.**
   exactly why scaling out *after* the code is sound is nearly free speed. The cheap
   general rule: get one box to a measured, boring steady state, then multiply it.
 
+## Still unfolding — overnight watch additions
+
+*Dated entries appended by the retro watch while the crawl runs; folded into the
+families above once the dust settles.*
+
+### 2026-06-12 evening (21:08–23:27 UTC, pix2 session)
+
+- **The zombie crawler (and commit `d70f6f8`).** A baseline check before the 6144
+  canary found crawl1's claims frozen at exactly 597,250 — since 19:56:34, ~80
+  minutes earlier — with the service "active" and three other boxes crashed the same
+  way. Mechanism: a SQLITE_BUSY exception (contention with the concurrently-running
+  listrepos-diff applies) escaped `ledger.markFetching()` and killed
+  `scheduler.run()`; the crash handler set `process.exitCode = 1` — which is not
+  `process.exit(1)` — so timers kept the event loop alive: a healthy-looking process
+  that claims nothing, the worst failure shape a daemon can have. Fix: hard-exit on
+  crash so systemd restarts it, tolerate BUSY on the claim path, busy timeout on the
+  crawler's own ledger handle. Family resemblance noted for the ledger: this is the
+  third "alive isn't working" instance (the hung-but-active Jetstream socket, the
+  cosmetic `failed` units after a deliberate stop, now the exitCode zombie) —
+  **process state is not progress; only the work counters tell the truth.**
+- **Alice's fleet-stop call.** Claude was mid-command restarting all six crawlers on
+  the fix (which would have resumed the crawler↔apply SQLite contention); Alice
+  interrupted: "wouldnt it be faster to shut down all crawlers, do the listrepos
+  update then restart them rather than waste time on sqlite crashes." It was strictly
+  better — zero contention, faster sweeps, one restart on clean ledgers, downtime
+  ~€1.50. The agent was optimizing for uptime; the operator optimized for total
+  wall-clock plus simplicity. Another entry for the short-skeptical-questions ledger.
+- **The spam kill, quantified.** Morel applies completed fleet-wide (~18.4M ledger
+  rows per box checked against morel's 496,480 real repos), and the all-host sweeps
+  had condemned ~28.5M more rows by 23:11 — **~46.5M+ rows that will never cost a
+  getRepo**, for roughly a thousand listRepos requests per host and ~2.5 paused
+  hours. Estimated value: 2–5 days of fleet runtime (~€30–70). Honesty caveats kept
+  attached: the projected ~10–14h remaining ETA was a *projection, not a
+  measurement* (no crawler had restarted by slice end), and when the victory lap got
+  loud Alice tempered it — "we still only loaded about 17% of the posts" — which is
+  correct: the sweep stops the *waste*; it doesn't make loading real repos faster.
+  Distinguish "stopped wasting" from "got faster" when reporting wins.
+- **Now-or-never: the archive schema widened mid-crawl.** Alice asked whether the
+  parquet archive stores all post metadata. Honest answer: no — the plan-0001 cost
+  call kept only did/rkey/created_at/langs/emojis/text/src; facets, reply refs,
+  embeds and self-labels were being dropped, and for the ~17% already crawled they
+  are unrecoverable without refetching. Capacity was measured before deciding
+  (310.6M archived posts ≈ 52 B/post compressed; widened ≈ 200 B/post; ~530 GB
+  projected against ~1 TiB free), and the schema grew four JSON columns end-to-end
+  (archive, ingest, parse workers, live path), with an `archive_extras_since` marker
+  in the ledgers so the un-widened early slice is identifiable for a future
+  re-fetch. The restart chain was deliberately killed so no crawler resumes on the
+  old schema — automation consciously sacrificed to a changed deploy artifact.
+  Lesson, sharpened from the prelude's storage-split history: **in a one-shot
+  pipeline, what you don't write down is a future full re-fetch; schema scope
+  decisions deserve the same paranoia as durability ones.**
+- Smaller keepers: launching long sweeps via `nohup ... &` over ssh died with the
+  session — the durable NixOS pattern is a transient systemd unit with PATH stolen
+  from a unit that already works; completion detection via a threshold on a counter
+  that concurrent writers push back up (enumeration kept refilling morel's pending)
+  deadlocks — key on an explicit completion event; and the pre-compaction
+  `SESSION-STATE.md` ritual made a mid-ops /compact seamless.
+- *Watch state at cutoff (23:27 UTC): widened-schema build in lint cleanup; fleet
+  still stopped; restart, 6144 canary and the post-sweep honest ETA all pending.*
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
@@ -493,6 +553,14 @@ Each of these earned its place in this run; origin in parentheses.
   (the rsync drift).
 - Verify your alerts against ground truth before trusting them; a monitor you just
   wrote is unverified code (the FATAL false alarms).
+- Process state is not progress: "active" services hang, `exitCode`-without-`exit`
+  makes zombies, deliberate stops read "failed" — trust work counters, not unit
+  state (the Jetstream hang, the zombie crawler).
+- In a one-shot pipeline, schema scope is now-or-never — what you don't write down
+  is a future full re-fetch; measure bytes/row from real output before answering
+  "will it fit" (the archive widening at 17%).
+- Distinguish "stopped wasting" from "got faster" when reporting a win; commit to a
+  falsifiable post-change measurement (the spam-kill victory lap).
 - Write down negative results where the next operator will look ("settings tried
   that should not repeat" in the runbook — Alice asked for it explicitly: document
   what was tried and didn't work, so it doesn't get retried later).
@@ -537,6 +605,12 @@ Each of these earned its place in this run; origin in parentheses.
 - Before teardown, put a number on the all-NVMe hindsight if cheap: compare
   ledger-maintenance op timings (index builds, bulk parks, WAL checkpoints) between
   the NVMe boxes (crawl0/1) and the SATA boxes (crawl2–5) from their journals.
+- Post-sweep restart: compute the first honest post-sweep ETA (the ~10–14h figure
+  was a projection), run the parked 6144 canary fairly, and report posts/min next to
+  repos/min so "stopped wasting" vs "got faster" is answerable.
+- The un-widened archive slice: repos loaded before `archive_extras_since` lack
+  facets/replies/embeds/labels — decide whether/when to re-fetch them (possibly as
+  part of the final sweep).
 - Once the listrepos sweep completes: decide whether adding boxes truly cuts time.
   Decision rule: measure first — `GROUP BY pds_host` over remaining pending plus
   per-shard slot utilization. Politeness-bound (boxes part-idle, hosts at their AIMD
