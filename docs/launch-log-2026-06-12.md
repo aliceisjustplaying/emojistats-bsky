@@ -166,6 +166,25 @@ upstream of the truth); O(n) on a growing n is a time bomb with a fuse
 exactly as long as your dry run; and the dashboard's "idle" badge was the
 single most honest component of the entire system all night.
 
+## ~06:30 — shift handover
+
+Steady state as the sun comes up: **~1,450 repos/min resolving, 8.6M posts in
+the database, 85k repos terminal, 27M of ~45M DIDs enumerated** (enumeration
+finishes mid-morning). One experiment failed honestly: doubling the bsky host
+cap to 32 drew 429s from the mushrooms AND pushed ClickHouse's 8 GB box into
+refusing inserts — reverted within twenty minutes; 16 is the system's natural
+operating point until ClickHouse gets more headroom. The insert pressure also
+exposed the dashboard's raw-posts scans (the page 500'd mid-crawl): the
+histogram and fun cards now read posts_hourly/emoji_total — 0.2s renders,
+immune to the posts table growing 300×.
+
+ETA truth: ~3 weeks at the instantaneous rate, trending down as enumeration
+fans out hosts and the queue exits the whale era. The one cheap lever for
+single-digit days: more memory for ClickHouse (the CX33 resize is minutes of
+downtime) — its 5 GB cap is now the ceiling everything else queues behind.
+The night started at 70 days and a frozen dashboard; it ends self-healing,
+verified, and 25× faster.
+
 ## 02:15 — IT HUMS (first time, briefly)
 
 - emoji: live ingest reconnected to Jetstream, dashboard public behind Caddy
