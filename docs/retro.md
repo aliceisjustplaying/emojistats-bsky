@@ -507,6 +507,37 @@ top of it:
   answers itself — the decision rule's ">~2 days at stake" bar is nowhere near
   met; the listRepos sweeps already bought what extra hardware would have.
 
+### 2026-06-13 deep night (01:30–03:52 UTC)
+
+Fleet healthy and draining on schedule through here (40–45k repos/min, ETA walking
+down 10.6h → 8.6h → 9.2h as host-capped shards trade off; remaining ~22M by 03:01,
+shard1 the smallest at ~3M). Two non-routine notes:
+
+- **An earlier fix changed the operational posture, not just the failure mode.**
+  crawl4's RSS crept toward its 12 GB cap three times overnight (whale repos in its
+  shard's working set — JS heap well under cap, the rest off-heap parse buffers),
+  reaching 12.0 G at 03:01. The decision was to *ride it out, not preemptively
+  restart* — and the reasoning is the interesting part: because the zombie-crawler
+  hard-exit fix now self-heals an OOM cleanly (systemd restart + fetching requeue,
+  ~1 min, no data loss), a preventive bounce costs the same downtime *and* throws
+  away 4096 in-flight fetches for nothing. The safety net made "do nothing" the
+  correct, cheaper move. It was vindicated by ~03:52: crawl4 rode through the whale
+  and receded to 11.5 G with **zero restarts**. (Concurrency stayed off-limits the
+  whole time — the 6144 lesson held under live temptation.) *A robust recovery path
+  doesn't just contain failures; it should change what you do when one looms — often
+  to less.*
+- **The watcher needs watching.** At 03:10 the pix2 guard loop emitted a malformed
+  tool call and silently stalled — the loop chain broke, and it sat doing nothing
+  for ~40 minutes until Alice asked "did you get stuck accidentally" at 03:51. The
+  agent flagged it honestly ("it's 03:51, not 03:10; my malformed call broke the
+  loop chain"). This is the night's running theme — *alive and silent* — turned one
+  level up: the monitor failed the same way the crawlers did, and again a human
+  caught it before any automation. An autonomous watch loop is itself a single point
+  of failure that wants an independent heartbeat. (Honest mirror: the laptop-side
+  retro watch that produced these entries was interrupted for the same hours and
+  also resumed only when Alice nudged it — both night-watchers tonight were
+  restarted by the sleeping operator, which is exactly the gap the lesson names.)
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
