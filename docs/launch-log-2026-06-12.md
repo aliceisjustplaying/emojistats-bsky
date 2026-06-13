@@ -1048,3 +1048,20 @@ alerts <60s on crash. Other 5 healthy, emoji clean.
 Per-shard resolved/min (04:44-04:55): s0 4815, s1 13586, s2 7810, s3 4887,
 s4 4017, s5 4188 = 39,303/min. Remaining 17,699,202. ETA ~7.5h →
 ~12:25 UTC. shard1 smallest 1.88M dropping fast.
+
+### 05:00 UTC — crawl1 WEDGE (deadlock) + recovery
+
+Watchdog bvr8c8nie alerted crawl1 stats-stale-181s. Diagnosis: process
+active, restarts=0, RSS 5.5G (NOT memory), but 0% CPU across 3 samples,
+main thread idle in do_epoll_wait, 69 threads in futex_do_wait, telemetry
+frozen 191s+. A genuine DEADLOCK — distinct from the crashed-scheduler
+zombie the hard-exit fix catches (no exception here; the event loop just
+wedged, likely a parse-worker reply that never came leaving the scheduler
+waiting at concurrency limit). Manual systemctl restart recovered it
+cleanly: unclean-shutdown reconcile → 6 workers → 3,183 stale fetching
+repos requeued (at-least-once, zero loss) → claiming within ~30s.
+Detection-to-recovery ~6min. Hardening this cycle: watchdog upgraded to
+AUTO-RESTART a confirmed wedge (stale>180s AND main-proc CPU<5% AND no
+auto-restart of that box in 15min) so a deadlock self-heals even if the
+monitoring loop is stranded. Root-cause fix (parse-pool reply timeout) is
+a code change left for Alice — too invasive to do unsupervised at 5am.
