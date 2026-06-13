@@ -9,7 +9,12 @@ import {
   MAX_TOP_LANGUAGES,
 } from '../config.js';
 
-import { EmojiCount, EmojiStats, StatsProvider } from './stats.js';
+import {
+  EmojiCount,
+  EmojiStats,
+  StatsProvider,
+  formatEmojiPostRatio,
+} from './stats.js';
 import { LanguageStat } from './types.js';
 
 /*
@@ -196,13 +201,10 @@ export const clickHouseStatsProvider: StatsProvider = {
         fetchGlobalCounters(),
       ]);
 
-      const ratio =
-        counters.postsWithoutEmojis > 0
-          ? (
-              (counters.postsWithEmojis || 0) /
-              (counters.postsWithoutEmojis || 1)
-            ).toFixed(4)
-          : 'N/A';
+      const ratio = formatEmojiPostRatio(
+        counters.processedPosts,
+        counters.postsWithEmojis,
+      );
 
       return {
         processedPosts: counters.processedPosts,

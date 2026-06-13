@@ -28,3 +28,12 @@ export interface StatsProvider {
   getTopEmojisForLanguage(language: string): Promise<EmojiCount[]>;
   close(): Promise<void>;
 }
+
+export function formatEmojiPostRatio(
+  processedPosts: number,
+  postsWithEmojis: number,
+): string {
+  return processedPosts > 0
+    ? (postsWithEmojis / processedPosts).toFixed(4)
+    : 'N/A';
+}
