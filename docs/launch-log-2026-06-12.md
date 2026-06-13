@@ -1020,3 +1020,10 @@ Per-shard resolved/min (03:35-03:51): s0 4854, s1 13055, s2 7787,
 s3 5153, s4 4373, s5 5620 = 40,842/min. Remaining 20,178,323 (under 20.2M,
 down from 22.2M). ETA ~8.2h → ~12:05 UTC. shard1 smallest 2.50M and
 dropping fast; still above the 500k retire threshold.
+
+### 04:03 UTC — ETA cycle
+
+All six healthy, zero restarts fleet-wide, crawl4 stable 11.6G. emoji
+clean (405 parts, 0 delayed). Per-shard resolved/min (03:51-04:03):
+s0 5392, s1 10258, s2 8684, s3 5377, s4 4454, s5 5183 = 39,348/min.
+Remaining 19,731,710. ETA ~8.4h → ~12:25 UTC. shard1 smallest 2.39M.
