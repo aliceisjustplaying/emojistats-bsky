@@ -1084,6 +1084,56 @@ she looked at the actual public page and didn't believe the numbers.
   the *insight* ("read the headers"), the *distrust* (looking at the real page and disbelieving 66% / "idle"),
   and the *ground truth* the agent couldn't see from the logs (shards 1 and 2 aren't slow, they're gone).
 
+### 2026-06-13 late evening (22:25–23:02 UTC) — arming the end-game (and a final-sweep that would never exit)
+
+The hour after the takeover was spent *arming* the end-game sequence rather than running it —
+the backfill is still draining, so this is all preparation to fire the moment it does. Four
+commits (`1b72628`, `bc20465`, `8abf22e`, `411ea08`), and the most important one is a bug the
+agent found by reading the `--final-sweep` code instead of trusting the runbook that described it.
+
+- **The recrawl "sleeper": launch the moment the backfill drains, not when a human notices
+  (`8abf22e`, `bc20465`, `1b72628`).** The backfill ends when each ledger's finite enumeration
+  has no `pending`/`fetching` rows left to claim — an event no one wants to babysit at 4am. The
+  agent built `wait-for-backfill-drain.ts` (a JS waiter that reuses the crawler's *own* ClickHouse
+  client and secret-env, explicitly to avoid "brittle shell SQL"), so a oneshot can block on drain
+  and then start exactly one recrawl worker. `bc20465` adds **ledgerless recrawl shards** — the
+  mechanism that lets the *deleted* crawl1/crawl2 be re-crawled from their backed-up DID lists with
+  no live ledger to claim against — and `1b72628` adds `prepare-v1-recrawl.ts` to build the `v:1`
+  pre-widening metadata re-crawl list. The keeper: the end-game of a multi-day batch job is a
+  *scheduling* problem as much as a data one — the cheapest way to not waste the hours after drain
+  is to make the next phase trigger on the completion event, not on someone watching a dashboard.
+- **A load-bearing process correction from Alice: "we run nixos, all changes go through the pix
+  repo."** The agent's first instinct was to arm the sleeper with ad-hoc `systemd-run` transient
+  units directly on the boxes (NixOS keeps `/etc/systemd/system` read-only, so transient units are
+  the obvious dodge). Alice stopped it cold — "we run nixos all changes go through the pix repo" —
+  and the agent reversed: killed the ad-hoc units, removed the host-local scripts, moved the launcher
+  into the pix flake. This is the *exact* recurrence the run keeps producing — the verify-timer that
+  only a rebuild could truly remove, the runtime drop-ins that lived only in `/run` — now as a
+  near-miss caught before it could rot: anything armed outside the flake is a landmine for the next
+  `nixos-rebuild`, and the discipline is to refuse the convenient out-of-band fix even at 11pm.
+- **`411ea08` — `--final-sweep` would have run forever, and the runbook didn't say so.** The handoff's
+  end-game sequence *starts* with `--final-sweep`. Checking the actual implementation (not the runbook
+  prose) the agent found it resets **all** `unreachable` rows back to claimable — including the
+  dead-host registry rows (Bridgy, DNS-dead, legal). The scheduler still excludes those hosts, so the
+  idle policy sees a permanent population of in-budget-but-unclaimable rows and the sweep *never
+  reaches idle and never exits*. The fix is narrow: pass `dead_hosts` into the reset so registry rows
+  stay parked out-of-budget and the sweep rearms only hosts the scheduler will actually claim;
+  `--revive-host` stays the one explicit path to un-park a recovered dead host. A regression test pins
+  the exact failure (one dead-host parked row + one normal parked row → only the normal one becomes
+  claimable). Two keepers: a command's *termination* is part of its contract — "resets unreachable
+  rows" hid an infinite loop in the interaction with the exclusion set; and the blacklist-needs-its-
+  inverse rule from the afternoon (`--revive-host`) had a second edge no one had checked — the
+  *sweep* could silently undo the registry too. Evidence: `ledger.ts`/`scheduler.ts` host-aware reset,
+  `host-health.test.ts`, commit `411ea08`.
+- **Two reconciliations with Alice, both ending in honesty.** She caught the dashboard ETA reading
+  ~1.4h against the agent's "2–4h" — the agent confirmed the page is terminal-repo *drain* velocity
+  (right for the active tail) and its own number was a padded ops estimate, not a contradiction. And
+  she pinned the data-completeness question — backfill (historical repo snapshots) and Jetstream (live
+  posts) only "meet" as *all data* if live ingest stayed up **and** a final PLC/listRepos catch-up
+  picks up accounts discovered after enumeration began; the agreed order is drain → final-sweep →
+  recrawl/catch-up. As of 23:02 UTC the session went quiet with the end-game armed but not yet fired:
+  no `--final-sweep`, verify convergence, `v:1` recrawl or cutover has run.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
