@@ -533,7 +533,13 @@ shard1 the smallest at ~3M). Two non-routine notes:
   loop chain"). This is the night's running theme — *alive and silent* — turned one
   level up: the monitor failed the same way the crawlers did, and again a human
   caught it before any automation. An autonomous watch loop is itself a single point
-  of failure that wants an independent heartbeat. (Honest mirror: the laptop-side
+  of failure that wants an independent heartbeat. The mitigation was already half in
+  place and is the real lesson: the *persistent* fleet watchdog (a separate
+  always-on monitor that alerts <60s on crash or staleness) logged zero alerts
+  through the entire 40-minute gap — so only proactive ETA/RSS *observation* paused,
+  not guarding; the crawl never went unwatched. Layer the safety net so the
+  cadence-driven loop dying can't blind you — the always-on watchdog is the floor,
+  the per-cycle wakeup is just the nice-to-have on top. (Honest mirror: the laptop-side
   retro watch that produced these entries was interrupted for the same hours and
   also resumed only when Alice nudged it — both night-watchers tonight were
   restarted by the sleeping operator, which is exactly the gap the lesson names.)
