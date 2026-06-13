@@ -56,7 +56,12 @@ async function main(): Promise<void> {
   });
   const chClient = createClickHouseClient();
   await pingClickHouse(chClient);
-  const loader: RepoLoader = new ClickHouseRepoLoader(chClient);
+  const loader: RepoLoader = new ClickHouseRepoLoader(chClient, {
+    // Self-heal a poisoned socket pool: a stale keepalive socket makes every
+    // insert ECONNRESET/time-out and jams the loader until restart, so the
+    // retry path rebuilds the client on connection-level failures.
+    recreateClient: () => createClickHouseClient(),
+  });
 
   const archiveSink = await openArchiveSink(policy);
 
@@ -180,6 +185,9 @@ async function main(): Promise<void> {
   );
   await parsePool.close();
   await ledgerStats.close();
+  // Closes only a client the loader REBUILT after a poisoned pool; the injected
+  // chClient is still closed by shutdown() below.
+  await loader.close();
   await shutdown({
     telemetry,
     archiveSink,

@@ -34,6 +34,39 @@ function isPermanentInsertError(err: unknown): boolean {
   return typeof code === 'string' && PERMANENT_CH_ERROR_CODES.has(code);
 }
 
+/**
+ * Connection-level failures (vs ClickHouse *server* errors): the socket pool is
+ * the suspect — a stale/half-open keepalive socket the client keeps reusing
+ * (CH or a load balancer silently dropped an idle connection) — so retrying the
+ * identical insert on the SAME client just replays the dead socket. The launch
+ * observation that motivated this: a poisoned pool jams every concurrency slot
+ * (fetching pegged, loaded frozen, telemetry stale) and never self-heals until
+ * the process restarts, because `eagerly_destroy_stale_sockets` cannot run when
+ * CAR parsing has blocked the event loop. These errors trigger a full client
+ * rebuild (fresh pool) before the next attempt. Matches Node socket error codes
+ * AND the @clickhouse/client "reading from socket" timeout text.
+ */
+function isConnectionError(err: unknown): boolean {
+  const code = (err as { code?: unknown })?.code;
+  if (
+    typeof code === 'string' &&
+    [
+      'ECONNRESET',
+      'EPIPE',
+      'ECONNREFUSED',
+      'ETIMEDOUT',
+      'ENOTFOUND',
+      'EAI_AGAIN',
+      'ERR_SOCKET_CONNECTION_TIMEOUT',
+    ].includes(code)
+  )
+    return true;
+  const msg = err instanceof Error ? err.message : String(err);
+  return /socket hang up|reading from socket|socket disconnected|ECONNRESET|EPIPE/i.test(
+    msg,
+  );
+}
+
 interface Waiter {
   resolve: () => void;
   reject: (err: Error) => void;
@@ -73,7 +106,14 @@ interface Waiter {
  * either way.
  */
 export class ClickHouseRepoLoader implements RepoLoader {
-  readonly #client: ClickHouseClient;
+  #client: ClickHouseClient;
+  // Factory for a fresh client when the socket pool is poisoned (see
+  // isConnectionError + #rebuildClient). Null = rebuild disabled (tests, or a
+  // caller that did not opt in) — behavior is then identical to before.
+  readonly #recreateClient: (() => ClickHouseClient) | null;
+  // The constructor-injected client belongs to the caller (closed at shutdown);
+  // only clients THIS loader rebuilds are ours to close.
+  #clientIsOwn = false;
   readonly #batchRows: number;
   readonly #flushMs: number;
   readonly #table: string;
@@ -90,9 +130,15 @@ export class ClickHouseRepoLoader implements RepoLoader {
 
   constructor(
     client: ClickHouseClient,
-    options: { batchRows?: number; flushMs?: number; table?: string } = {},
+    options: {
+      batchRows?: number;
+      flushMs?: number;
+      table?: string;
+      recreateClient?: () => ClickHouseClient;
+    } = {},
   ) {
     this.#client = client;
+    this.#recreateClient = options.recreateClient ?? null;
     this.#batchRows = options.batchRows ?? LOADER_BATCH_ROWS;
     this.#flushMs = options.flushMs ?? LOADER_FLUSH_MS;
     this.#table = options.table ?? 'posts';
@@ -205,6 +251,40 @@ export class ClickHouseRepoLoader implements RepoLoader {
     return run;
   }
 
+  /**
+   * Swap the (likely poisoned) socket pool for a fresh one. The old client is
+   * closed in the BACKGROUND — close() on a pool full of dead sockets can hang,
+   * so it must never block the retry path — and only if this loader owns it
+   * (the caller-injected client is closed by the caller at shutdown). No-op when
+   * no factory was supplied, so opt-out callers keep the old behavior exactly.
+   */
+  #rebuildClient(): void {
+    if (this.#recreateClient === null) return;
+    const old = this.#client;
+    const owned = this.#clientIsOwn;
+    this.#client = this.#recreateClient();
+    this.#clientIsOwn = true;
+    logger.warn(
+      {},
+      'rebuilt ClickHouse insert client after a connection-level failure (stale socket pool)',
+    );
+    if (owned)
+      void Promise.resolve()
+        .then(() => old.close())
+        .catch(() => undefined);
+  }
+
+  /**
+   * Release the loader's ClickHouse client at shutdown — but ONLY a client this
+   * loader rebuilt (#clientIsOwn). The constructor-injected client stays the
+   * caller's to close (crawl.ts shutdown() closes chClient), so a never-rebuilt
+   * loader closes nothing here and the lifecycle is unchanged. Without this, a
+   * rebuilt pool would leak past graceful shutdown until forced exit.
+   */
+  async close(): Promise<void> {
+    if (this.#clientIsOwn) await this.#client.close();
+  }
+
   async #insertBatch(rows: PostRow[], tags: string[]): Promise<void> {
     const token = `batch:${createHash('sha1')
       .update(tags.join('\n'))
@@ -235,6 +315,10 @@ export class ClickHouseRepoLoader implements RepoLoader {
             { cause: err },
           );
         }
+        // Connection-level failure → the socket pool is suspect; rebuild it so
+        // the next attempt runs on a fresh pool instead of replaying the dead
+        // socket. Server-side errors keep the same client (it is fine).
+        if (isConnectionError(err)) this.#rebuildClient();
         const delayMs = INSERT_BACKOFF_BASE_MS * 2 ** (attempt - 1);
         logger.warn(
           {

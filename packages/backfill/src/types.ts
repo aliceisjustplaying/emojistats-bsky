@@ -177,4 +177,6 @@ export interface RepoLoad {
  */
 export interface RepoLoader {
   openRepo(did: string, rev: string | null): RepoLoad;
+  /** Release any loader-owned ClickHouse client (one rebuilt after a poisoned pool). */
+  close(): Promise<void>;
 }
