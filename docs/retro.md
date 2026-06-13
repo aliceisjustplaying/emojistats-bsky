@@ -495,6 +495,17 @@ top of it:
   order escalated the night mode to a 10-minute all-server cadence; the pix2
   session also flipped to a larger-context model at 00:55 to survive the longer
   guard duty — long autonomous ops sessions are themselves a resource to budget.
+- **The first honest post-sweep ETA — and "slower is faster", quantified.** At
+  01:04 UTC, measured from per-shard resolved deltas: 38.6k repos/min fleet-wide,
+  27.06M remaining, **~11.7h**; by 01:27, 42.1k/min and ~10.3h, trending down as
+  the real-repo backlog drains. The yesterday-evening ~10–14h projection turned
+  out honest. The canary revert's vindication is the number worth framing: shard1
+  back at 4096 resolves 8,769/min — nearly **2×** what it managed while
+  OOM-throttled at 6144. Over-concurrency wasn't just risky, it was *halving*
+  throughput while looking like an experiment worth running. Side effect for the
+  open items: with the remainder measured in hours, the add-more-boxes question
+  answers itself — the decision rule's ">~2 days at stake" bar is nowhere near
+  met; the listRepos sweeps already bought what extra hardware would have.
 
 ## The ETA honesty record
 
