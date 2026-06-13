@@ -8,7 +8,7 @@
 import os from 'node:os';
 import { Worker } from 'node:worker_threads';
 
-import { PARSE_WORKERS } from './config.js';
+import { PARSE_WORKERS, REPO_FETCH_TIMEOUT_MS } from './config.js';
 import {
   QuarantineError,
   RetryableError,
@@ -25,6 +25,25 @@ interface PendingJob {
   resolve: (result: RepoJobResult) => void;
   reject: (err: Error) => void;
 }
+
+/**
+ * Backstop for a dispatched job whose worker never posts a reply, leaking its
+ * GLOBAL_CONCURRENCY slot forever; enough leaks wedge the scheduler (inFlight
+ * pinned, 0 CPU, telemetry frozen — recurring on crawl1/crawl2, 2026-06-13).
+ * fetcher.ts already caps the getRepo fetch at REPO_FETCH_TIMEOUT_MS, so a
+ * stalled fetch normally rejects there and frees the slot cleanly; the leak is
+ * the residual case where that abort does NOT fire (dead socket the runtime
+ * never surfaces). This ceiling sits a full fetch-budget ABOVE that timeout so
+ * it never races the fetcher. Two cases can reach this ceiling: (a) a residual
+ * fetch stall where the fetcher's own 300s abort failed to fire (the leak this
+ * targets), or (b) a successful fetch (<= 300s) followed by a parse/materialize
+ * that exceeds the remaining ~300s. (b) is the only theoretical false-kill, and
+ * it is pathological — CBOR decode + MST walk + row build is CPU-bound seconds
+ * even for GB-scale CARs — and harmless besides, since the repo just requeues.
+ * On trip the job rejects RetryableError (repo requeues, at-least-once) and any
+ * late reply is dropped by the unknown-seq guard.
+ */
+const REPLY_TIMEOUT_MS = REPO_FETCH_TIMEOUT_MS + 300_000;
 
 function rehydrate(err: RepoJobError): Error {
   switch (err.kind) {
@@ -114,8 +133,35 @@ export function createParsePool(): ParsePool {
         rr = (rr + 1) % workers.length;
         const worker = workers[rr];
         seq += 1;
-        pendingByWorker.get(worker)!.set(seq, { resolve, reject });
-        worker.postMessage({ seq, did, pdsHost, fetchTimeUs });
+        const jobSeq = seq;
+        const pending = pendingByWorker.get(worker)!;
+        // Free the slot if the worker never replies (see REPLY_TIMEOUT_MS).
+        // The reply path and timeout both delete the pending entry before
+        // settling, so delete()===false means the reply already won — no
+        // double-settle. (Worker-death settles via the reject wrapper, which
+        // clears this timer.)
+        const timer = setTimeout(() => {
+          if (pending.delete(jobSeq)) {
+            reject(
+              new RetryableError(
+                `repo worker reply timeout after ${REPLY_TIMEOUT_MS}ms`,
+                { transient: true },
+              ),
+            );
+          }
+        }, REPLY_TIMEOUT_MS);
+        timer.unref();
+        pending.set(jobSeq, {
+          resolve: (result) => {
+            clearTimeout(timer);
+            resolve(result);
+          },
+          reject: (err) => {
+            clearTimeout(timer);
+            reject(err);
+          },
+        });
+        worker.postMessage({ seq: jobSeq, did, pdsHost, fetchTimeUs });
       });
     },
     async close() {
