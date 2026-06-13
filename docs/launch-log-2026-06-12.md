@@ -1289,3 +1289,58 @@ LESSONS:
     nixos-rebuild). FOR ALICE.
   - Misdiagnosis cure (again): inspect `system.processes` / ground truth BEFORE
     theorizing. Three wrong hypotheses cost minutes; one query named the culprit.
+
+### 20:06–20:55 UTC — crawl4's TWO bugs (a hang and a crash), both fixed + deployed
+crawl4 destabilized — and it turned out to be two DIFFERENT bugs wearing the same
+"box keeps restarting" costume. Separating them was the whole job.
+
+- **Bug A — poisoned ClickHouse socket pool (a hang).** ~19:40 crawl4's inserts
+  started failing `Timeout exceeded while reading from socket (30000 ms)` then
+  `socket hang up`/ECONNRESET — a stale/half-open keepalive socket (idle CH or an
+  LB dropped the connection). The loader retry reused the SAME client, replaying
+  the dead socket; post-bearing repos awaiting the flush held every concurrency
+  slot → fetching pegged at 4096, loaded FROZEN, telemetry stale (dashboard showed
+  shard4 "not reporting"), no self-heal until restart. The watchdog MISSED it: the
+  box kept logging stats (and finishing empty repos), so the log-freshness signal
+  read healthy. Distinguished from a crawler-down by: journal stats line 3s old +
+  per-shard telemetry age (only shard4 stale at 590s; CH itself fine) + the stuck
+  stats breakdown (fetching=4096, loaded flat, empty still climbing). Manual
+  restart fixed it instantly (fresh pool).
+  FIX (b825b5c): isConnectionError() classifies connection-level failures vs CH
+  server errors; on one, #rebuildClient() swaps in a fresh client before the next
+  retry (old client closed in background, only if loader-owned; loader.close()
+  added so a rebuilt pool doesn't leak past graceful shutdown). Codex 2 rounds.
+- **Bug B — listClaimable stack-overflow (a crash).** ~20:39 crawl4 then
+  crash-restarted twice, `status=1/FAILURE`. NOT OOM (mem 8G/62G, no OOM killer),
+  NOT the hang. The fatal: `RangeError: Maximum call stack size exceeded at
+  SqliteLedger.listClaimable`. Cause: the claim scan runs with the large
+  claim-backlog limit (~250k); in the end-game tail the pending query under-fills
+  (most pending sits on EXCLUDED hosts — the bridgy blacklist + 429-storm cooldowns
+  had enlarged the exclusion set), so the retry/unreachable query returns tens of
+  thousands of rows, and `rows.push(...retryRows)` spreads that array as function
+  arguments → exceeds the engine arg/stack limit → process crash. Pre-existing;
+  the blacklist + cooling tail tipped it over.
+  FIX (6a06ccd): append the retry rows in a loop, not a spread. Behavior-identical.
+  Codex reproduced it (old: RangeError; new: ok at 250k) — no findings.
+- **Deploy:** rolled 6a06ccd (both fixes) to all 4 boxes staggered, one at a time
+  with health checks; CH stayed idle (≤2.8), no synchronized-ramp spike. Fleet was
+  06a13b0/4c38d0f → 6a06ccd.
+LESSONS:
+  - "The box keeps restarting" is a SYMPTOM, not a diagnosis. A 0-CPU hang, an
+    exit-1 crash, and an OOM all look identical from the outside (NRestarts /
+    watchdog churn). Read the actual signature — `systemctl show ... Result`,
+    `status=`, the fatal log line, `dmesg` for OOM — before reaching for a fix.
+    Here two bugs an hour apart had completely different causes and fixes.
+  - `arr.push(...bigArray)` / `fn(...bigArray)` is a latent crash at scale — the
+    spread becomes function arguments and overflows ~65k+. Grep the hot paths for
+    spread-of-unbounded-arrays. (The same file still spreads `...uniqueExcludedHosts`
+    into `.all()`, but that is host-count-bounded; flagged, not fixed.)
+  - The watchdog's strength (log-freshness, to avoid false-restarts on 404 churn)
+    is also its blind spot: a chatty-but-stuck box (Bug A) sails through. The real
+    health signal is PROGRESS (loaded/resolved advancing), not log liveness. Open:
+    fix #2 — restart if loaded flat AND fetching pegged for >~4min even while
+    logging. (Deferred; manual restart + telemetry-staleness watch cover it now.)
+  - Still UNFIXED, same bug class: the telemetry CH client (writes backfill_progress)
+    can poison the same way (shard4 went stale independently). The loader fix
+    doesn't cover it; folding the rebuild into the telemetry client is the
+    follow-up if dashboard-staleness must be fully eliminated.
