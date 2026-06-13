@@ -1000,3 +1000,23 @@ at 7min; bvr8c8nie alerts <60s on any crash. Other 5 healthy, emoji clean.
 Per-shard resolved/min (02:50-03:01): s0 4789, s1 10141, s2 9384, s3 5538,
 s4 4659, s5 5704 = 40,215/min. Remaining 22,224,065. ETA ~9.2h →
 ~12:15 UTC. shard1 smallest 3.02M.
+
+### 03:10-03:51 UTC — monitoring-loop gap (honest note)
+
+A malformed tool call at the 03:10 wakeup ended the turn without
+scheduling the next wakeup, stalling the 10-min observation cadence for
+~40 min until Alice nudged. IMPORTANT: only OBSERVATION paused — the
+crawlers, ingest, and the persistent watchdog (bvr8c8nie) all kept
+running. Watchdog logged zero alerts through the gap = fleet stayed
+healthy. crawl4 rode through its whale and receded 12.0G → 11.5G with
+ZERO restarts (never OOMed). Hardening: the persistent watchdog is the
+real safety net (alerts <60s on crash/staleness regardless of loop
+state); the per-cycle wakeup is for proactive ETA/RSS tracking only.
+
+### 03:51 UTC — ETA cycle (post-gap)
+
+All six healthy, fresh, RSS normal (crawl4 11.5G receded). emoji clean.
+Per-shard resolved/min (03:35-03:51): s0 4854, s1 13055, s2 7787,
+s3 5153, s4 4373, s5 5620 = 40,842/min. Remaining 20,178,323 (under 20.2M,
+down from 22.2M). ETA ~8.2h → ~12:05 UTC. shard1 smallest 2.50M and
+dropping fast; still above the 500k retire threshold.
