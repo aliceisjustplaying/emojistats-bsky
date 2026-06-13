@@ -817,6 +817,41 @@ shard1 the smallest at ~3M). Two non-routine notes:
   abandon those ~30k real repos as a permanently incomplete backfill, even though nothing
   was "lost."
 
+### 2026-06-13 ~16:10 UTC — first box retired; the run in hard numbers
+
+- **First box retired — and the corrected runbook earned its keep.** crawl1, the first
+  of the two bridge-tail boxes, was retired cleanly at ~16:05, executing the exact safety
+  sequence the 15:30 second-opinion added. *Archive first:* `ARCHIVE_SYNC_COMMAND` is
+  `rclone move {file} → storagebox:emojistats-archive/shard1/`, so the durable full-text
+  copy already lives off the dedi (44 GiB / 763 objects) and zero parquet remain locally
+  *by design* — the thing that had to be checked-and-preserved was already safe, but only
+  because someone checked. *Then the stop:* a single graceful SIGTERM that drains
+  in-flight → `shutdown()` → `archiveSink.close()` finalizes the open parquet and runs the
+  sync hook (`Result=success`, `ExecMainStatus=0` — not the force-quit-at-130 that would
+  skip the flush). *Then the ledger:* WAL `checkpoint(TRUNCATE)` → consistent `.backup` →
+  integrity-check → copied off-box, because a raw copy of a WAL-mode SQLite file can miss
+  committed pages. Every one of those steps was a Codex correction from two entries up; in
+  the live retire each was load-bearing, and skipping any would have risked the exact
+  text-or-ledger the project exists to protect. The cleanest possible vindication of
+  reviewing the *runbook*, not just the diff.
+- **The run in hard numbers — and what "95% resolved" actually means.** Captured into
+  `docs/backfill-stats-2026-06-13.md` (committed `fe96256`, and copied to
+  `storagebox:_meta/` so the numbers travel with the archive for the mop-up): of **95.47M
+  repos enumerated, 91.16M (95.48%) are resolved**, 4.31M (4.5%) still to crawl. But
+  "resolved" and "data" are very different sizes, and that gap is the story, not a
+  shortfall. Only **37.6% (35.89M) carry any captured data** — and of those, 24.08M are
+  *empty* accounts (crawled, zero posts, entirely normal on Bluesky); the posts-bearing
+  core is just **~11.8M DIDs → 2.09B posts** (384.7M with at least one emoji) and **~208.8
+  GiB** of parquet text across 3,613 objects on the storagebox. The rest of the network is
+  tails: **25.4% terminal/no-data** (21M of it 404 `RepoNotFound`, plus 2.8M taken-down),
+  and **32.5% unreachable** — dominated by genuinely-dead hosts (`pds.trump.com` at ~4.7M
+  per shard is a DNS NXDOMAIN; `plc.surge.sh` is a 451 legal block), not crawl failures.
+  So the honest headline for the blogpost isn't "we got 95%": it's that a full-network
+  backfill is mostly *accounting for absence* — empty repos, deleted accounts, dead PDSes
+  — and the actual emoji corpus is ~12M active authors out of ~95M enumerated identities.
+  The 4.31M remaining is the four productive shards still draining (s0 864k, s3 1.05M, s4
+  1.23M, s5 1.14M) plus the two ~15k bridge tails now retiring into the deferred mop-up.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
