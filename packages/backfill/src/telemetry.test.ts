@@ -126,4 +126,44 @@ void describe('crawl telemetry', () => {
     assert.deepEqual(eventBatchSizes, [1000, 1]);
     assert.ok(progressTables.every((table) => table === 'backfill_progress'));
   });
+
+  void it('rebuilds the progress client after a connection error', async () => {
+    let oldClosed = 0;
+    const replacementRows: unknown[] = [];
+    const progressClient = {
+      insert: async () => {
+        const err = new Error('socket hang up') as Error & { code: string };
+        err.code = 'ECONNRESET';
+        throw err;
+      },
+      close: async () => {
+        oldClosed += 1;
+      },
+    } as unknown as ClickHouseClient;
+    const eventClient = {
+      insert: async () => undefined,
+      close: async () => undefined,
+    } as unknown as ClickHouseClient;
+    const telemetry = new CrawlTelemetry(
+      { progress: progressClient, events: eventClient },
+      {
+        runId: 'test',
+        shard: 'shard0',
+        intervalMs: 5,
+        recreateProgressClient: () =>
+          ({
+            insert: async (params: { values: unknown[] }) => {
+              replacementRows.push(...params.values);
+            },
+            close: async () => undefined,
+          }) as unknown as ClickHouseClient,
+      },
+    );
+
+    telemetry.start(() => snapshot(replacementRows.length + 1));
+    await waitFor(() => replacementRows.length > 0);
+    await telemetry.stop();
+
+    assert.equal(oldClosed, 1);
+  });
 });

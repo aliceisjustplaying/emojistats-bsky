@@ -1,6 +1,7 @@
 import type { ClickHouseClient } from '@clickhouse/client';
 
 import { TELEMETRY_EVENT_BATCH_ROWS } from './config.js';
+import { isConnectionError } from './loader.js';
 import logger from './logger.js';
 import { REPO_STATUSES, type RepoStatus } from './types.js';
 
@@ -48,6 +49,8 @@ export interface CrawlTelemetryOptions {
   runId: string;
   shard: string;
   intervalMs: number;
+  recreateProgressClient?: () => ClickHouseClient;
+  recreateEventClient?: () => ClickHouseClient;
 }
 
 /** 'YYYY-MM-DD HH:MM:SS' UTC, the JSONEachRow-friendly DateTime form. */
@@ -56,11 +59,13 @@ function chDateTime(ms: number): string {
 }
 
 export class CrawlTelemetry {
-  readonly #progressClient: ClickHouseClient;
-  readonly #eventClient: ClickHouseClient;
+  #progressClient: ClickHouseClient;
+  #eventClient: ClickHouseClient;
   readonly #runId: string;
   readonly #shard: string;
   readonly #intervalMs: number;
+  readonly #recreateProgressClient: (() => ClickHouseClient) | undefined;
+  readonly #recreateEventClient: (() => ClickHouseClient) | undefined;
   #events: RepoEventRow[] = [];
   #pendingProgress: Record<string, string | number> | undefined;
   #getSnapshot: (() => ProgressSnapshot) | undefined;
@@ -79,6 +84,8 @@ export class CrawlTelemetry {
     this.#runId = options.runId;
     this.#shard = options.shard;
     this.#intervalMs = options.intervalMs;
+    this.#recreateProgressClient = options.recreateProgressClient;
+    this.#recreateEventClient = options.recreateEventClient;
   }
 
   /** One backfill_progress row per tick; buffered repo events flush alongside it. */
@@ -155,6 +162,14 @@ export class CrawlTelemetry {
     await Promise.all([this.#flushProgress(), this.#flushEvents()]);
   }
 
+  async closeClients(): Promise<void> {
+    const clients =
+      this.#progressClient === this.#eventClient
+        ? [this.#progressClient]
+        : [this.#progressClient, this.#eventClient];
+    await Promise.all(clients.map((client) => client.close()));
+  }
+
   async #tick(): Promise<void> {
     this.#captureProgress();
     void this.#flushProgress();
@@ -182,6 +197,7 @@ export class CrawlTelemetry {
           if (this.#pendingProgress === progress)
             this.#pendingProgress = undefined;
         } catch (err) {
+          if (isConnectionError(err)) this.#rebuildProgressClient();
           logger.warn(
             { err: err instanceof Error ? err.message : String(err) },
             'telemetry: backfill_progress insert failed; will retry latest snapshot',
@@ -214,6 +230,7 @@ export class CrawlTelemetry {
             format: 'JSONEachRow',
           });
         } catch (err) {
+          if (isConnectionError(err)) this.#rebuildEventClient();
           logger.warn(
             {
               dropped: batch.length,
@@ -248,5 +265,27 @@ export class CrawlTelemetry {
       rows_per_sec: Math.round(snapshot.rowsPerSec * 100) / 100,
       in_flight: snapshot.inFlight,
     };
+  }
+
+  #rebuildProgressClient(): void {
+    if (this.#recreateProgressClient === undefined) return;
+    const old = this.#progressClient;
+    this.#progressClient = this.#recreateProgressClient();
+    logger.warn(
+      {},
+      'telemetry: rebuilt backfill_progress client after a connection-level failure',
+    );
+    if (old !== this.#eventClient) void old.close().catch(() => undefined);
+  }
+
+  #rebuildEventClient(): void {
+    if (this.#recreateEventClient === undefined) return;
+    const old = this.#eventClient;
+    this.#eventClient = this.#recreateEventClient();
+    logger.warn(
+      {},
+      'telemetry: rebuilt backfill_repo_events client after a connection-level failure',
+    );
+    if (old !== this.#progressClient) void old.close().catch(() => undefined);
   }
 }

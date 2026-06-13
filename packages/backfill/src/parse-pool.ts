@@ -24,6 +24,7 @@ import type {
 interface PendingJob {
   resolve: (result: RepoJobResult) => void;
   reject: (err: Error) => void;
+  timer: NodeJS.Timeout;
 }
 
 /**
@@ -86,6 +87,29 @@ export function createParsePool(): ParsePool {
   let rr = 0;
   let closed = false;
 
+  const failWorker = (
+    worker: Worker,
+    cause: string,
+    terminate = false,
+  ): void => {
+    const pending = pendingByWorker.get(worker);
+    pendingByWorker.delete(worker);
+    const i = workers.indexOf(worker);
+    for (const job of pending?.values() ?? []) {
+      clearTimeout(job.timer);
+      job.reject(
+        new RetryableError(`repo worker died: ${cause}`, {
+          transient: true,
+        }),
+      );
+    }
+    if (!closed && i !== -1) {
+      logger.error({ cause }, 'repo worker died; respawning');
+      workers[i] = spawn();
+    }
+    if (terminate) void worker.terminate();
+  };
+
   const spawn = (): Worker => {
     // The service runs under tsx; workers need the loader spelled out or the
     // .ts entry fails to resolve inside the thread.
@@ -98,28 +122,13 @@ export function createParsePool(): ParsePool {
       const job = pending?.get(reply.seq);
       if (job === undefined) return;
       pending!.delete(reply.seq);
+      clearTimeout(job.timer);
       if ('ok' in reply) job.resolve(reply.ok);
       else job.reject(rehydrate(reply.err));
     });
-    const fail = (cause: string) => {
-      const pending = pendingByWorker.get(worker);
-      pendingByWorker.delete(worker);
-      const i = workers.indexOf(worker);
-      for (const job of pending?.values() ?? []) {
-        job.reject(
-          new RetryableError(`repo worker died: ${cause}`, {
-            transient: true,
-          }),
-        );
-      }
-      if (!closed && i !== -1) {
-        logger.error({ cause }, 'repo worker died; respawning');
-        workers[i] = spawn();
-      }
-    };
-    worker.on('error', (err) => fail(err.message));
+    worker.on('error', (err) => failWorker(worker, err.message));
     worker.on('exit', (code) => {
-      if (code !== 0) fail(`exit code ${code}`);
+      if (code !== 0) failWorker(worker, `exit code ${code}`);
     });
     return worker;
   };
@@ -135,31 +144,21 @@ export function createParsePool(): ParsePool {
         seq += 1;
         const jobSeq = seq;
         const pending = pendingByWorker.get(worker)!;
-        // Free the slot if the worker never replies (see REPLY_TIMEOUT_MS).
-        // The reply path and timeout both delete the pending entry before
-        // settling, so delete()===false means the reply already won — no
-        // double-settle. (Worker-death settles via the reject wrapper, which
-        // clears this timer.)
+        // If a worker never replies, the worker itself is suspect: reject every
+        // job on it, terminate it, and respawn so hidden work cannot pile up.
         const timer = setTimeout(() => {
-          if (pending.delete(jobSeq)) {
-            reject(
-              new RetryableError(
-                `repo worker reply timeout after ${REPLY_TIMEOUT_MS}ms`,
-                { transient: true },
-              ),
-            );
-          }
+          if (!pending.has(jobSeq)) return;
+          failWorker(worker, `reply timeout after ${REPLY_TIMEOUT_MS}ms`, true);
         }, REPLY_TIMEOUT_MS);
         timer.unref();
         pending.set(jobSeq, {
           resolve: (result) => {
-            clearTimeout(timer);
             resolve(result);
           },
           reject: (err) => {
-            clearTimeout(timer);
             reject(err);
           },
+          timer,
         });
         worker.postMessage({ seq: jobSeq, did, pdsHost, fetchTimeUs });
       });

@@ -46,7 +46,7 @@ function isPermanentInsertError(err: unknown): boolean {
  * rebuild (fresh pool) before the next attempt. Matches Node socket error codes
  * AND the @clickhouse/client "reading from socket" timeout text.
  */
-function isConnectionError(err: unknown): boolean {
+export function isConnectionError(err: unknown): boolean {
   const code = (err as { code?: unknown })?.code;
   if (
     typeof code === 'string' &&

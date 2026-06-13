@@ -124,7 +124,7 @@ async function main(): Promise<void> {
   const stats = createCrawlStats();
   const control: CrawlControl = { stopClaiming: false };
 
-  const { telemetry, clients: telemetryClients } = createTelemetry();
+  const { telemetry } = createTelemetry();
   const hostPressure = createHostPressure();
   const hostHealth = createHostHealth();
   const retry = createRetryPolicy({
@@ -193,7 +193,6 @@ async function main(): Promise<void> {
     archiveSink,
     ledger,
     chClient,
-    telemetryClients,
   });
 }
 

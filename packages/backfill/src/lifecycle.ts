@@ -41,7 +41,6 @@ export async function openArchiveSink(
 
 export function createTelemetry(): {
   telemetry: CrawlTelemetry;
-  clients: ClickHouseClient[];
 } {
   const progressClient = createClickHouseClient('emojistats-backfill-progress');
   const eventClient = createClickHouseClient('emojistats-backfill-events');
@@ -52,9 +51,12 @@ export function createTelemetry(): {
         runId: BACKFILL_RUN_ID,
         shard: SHARD_LABEL,
         intervalMs: TELEMETRY_INTERVAL_MS,
+        recreateProgressClient: () =>
+          createClickHouseClient('emojistats-backfill-progress'),
+        recreateEventClient: () =>
+          createClickHouseClient('emojistats-backfill-events'),
       },
     ),
-    clients: [progressClient, eventClient],
   };
 }
 
@@ -151,7 +153,6 @@ export interface ShutdownDeps {
   archiveSink: ArchiveSink | null;
   ledger: Ledger;
   chClient: ClickHouseClient;
-  telemetryClients?: ClickHouseClient[];
 }
 
 // Telemetry first (final tick + buffered events), then the sink — close()
@@ -163,7 +164,7 @@ export async function shutdown(deps: ShutdownDeps): Promise<void> {
   if (deps.archiveSink !== null) await deps.archiveSink.close();
   deps.ledger.setMeta('crawl_dirty', '0');
   deps.ledger.close();
-  for (const client of deps.telemetryClients ?? []) await client.close();
+  await deps.telemetry.closeClients();
   await deps.chClient.close();
   // pino-pretty flushes in a worker thread; if some handle still pins the event
   // loop after that, force the promised exit (keeping a non-zero code from an

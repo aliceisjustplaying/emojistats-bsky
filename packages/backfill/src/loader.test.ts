@@ -24,6 +24,10 @@ function permanentInsertError(): Error {
   return Object.assign(new Error('insert boom'), { code: '53' });
 }
 
+function connectionError(): Error & { code: string } {
+  return Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+}
+
 void describe('ClickHouseRepoLoader durability', () => {
   void it('resolves finish() once the batch insert succeeds', async () => {
     let inserted = 0;
@@ -185,8 +189,6 @@ void describe('ClickHouseRepoLoader durability', () => {
   // next rebuild; the final rebuilt client is closed by loader.close().
   void it('closes superseded rebuilt clients but never the injected one', async () => {
     const closed: string[] = [];
-    const connErr = () =>
-      Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
     const mk = (name: string, insert: () => Promise<void>) =>
       ({
         insert,
@@ -196,10 +198,10 @@ void describe('ClickHouseRepoLoader durability', () => {
       }) as unknown as ClickHouseClient;
 
     const injected = mk('injected', async () => {
-      throw connErr();
+      throw connectionError();
     });
     const r1 = mk('r1', async () => {
-      throw connErr();
+      throw connectionError();
     });
     let r2inserts = 0;
     const r2 = mk('r2', async () => {
@@ -219,7 +221,9 @@ void describe('ClickHouseRepoLoader durability', () => {
     assert.equal(r2inserts, 1);
     await loader.close(); // closes the final owned client (r2)
     // Let the background close() of r1 settle.
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20);
+    });
     assert.ok(closed.includes('r1'), 'superseded rebuilt client r1 closed');
     assert.ok(
       closed.includes('r2'),
