@@ -1027,3 +1027,10 @@ All six healthy, zero restarts fleet-wide, crawl4 stable 11.6G. emoji
 clean (405 parts, 0 delayed). Per-shard resolved/min (03:51-04:03):
 s0 5392, s1 10258, s2 8684, s3 5377, s4 4454, s5 5183 = 39,348/min.
 Remaining 19,731,710. ETA ~8.4h → ~12:25 UTC. shard1 smallest 2.39M.
+
+### 04:32 UTC — ETA cycle
+
+All six healthy, zero restarts, crawl4 receded to 11.4G. emoji clean
+(368 parts, 0 delayed). Per-shard resolved/min (04:14-04:32): s0 4901,
+s1 9698, s2 12101, s3 5239, s4 3912, s5 5051 = 40,902/min. Remaining
+18,565,601 (under 18.6M). ETA ~7.6h → ~12:10 UTC. shard1 smallest 2.13M.
