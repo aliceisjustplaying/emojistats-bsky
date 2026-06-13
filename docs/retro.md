@@ -544,6 +544,45 @@ shard1 the smallest at ~3M). Two non-routine notes:
   also resumed only when Alice nudged it — both night-watchers tonight were
   restarted by the sleeping operator, which is exactly the gap the lesson names.)
 
+### 2026-06-13 pre-dawn (04:55–05:20 UTC)
+
+- **A fourth "alive and silent" failure — and the one the hard-exit fix can't
+  catch.** At 05:00 the watchdog flagged crawl1 stats-stale 181s. Diagnosis: process
+  active, restarts=0, RSS 5.5 G (*not* memory), but 0% CPU across three samples, main
+  thread parked in `do_epoll_wait`, 69 threads in `futex_do_wait` — a genuine
+  **deadlock**, not a crash. This is mechanistically distinct from the zombie the
+  hard-exit fix was built for: there, an exception killed `scheduler.run()` while
+  timers lived; here there is *no exception at all* — the event loop simply wedged,
+  most likely a parse-worker reply that never arrived, leaving the scheduler blocked
+  at its concurrency limit forever. `process.exit`-on-crash is useless against a hang
+  with nothing to throw. The running tally of this crawler's silent-failure family is
+  now four — crashed-scheduler zombie, hung Jetstream socket, GC spiral, event-loop
+  wedge — and **each needed a different detector**; only the stats-age watchdog
+  catches all four, because it keys on the one symptom they share (work counters stop
+  advancing) rather than any of their causes.
+- **The watchdog grew teeth — and closed last cycle's gap.** A manual restart cleared
+  the wedge cleanly (unclean-shutdown reconcile → 3,183 stale `fetching` repos
+  requeued, at-least-once, zero loss, claiming in ~30s; ~6 min detection-to-recovery).
+  The hardening is the keeper: the watchdog was upgraded from *alert-only* to
+  *auto-restart a confirmed wedge* (stale >180s AND main-process CPU <5% AND no
+  auto-restart of that box in 15 min). That guard condition is doing real work — it
+  distinguishes a wedge from a busy whale parse, and the cooldown prevents a crash-loop
+  — and critically it self-heals **even if the observation loop is stranded**, which is
+  the exact "watcher needs watching" hole from the 03:10 stall. The always-on watchdog
+  going from passive to active is the structural fix the earlier lesson was pointing at.
+- **Restraint held at 5am.** The root-cause fix (a reply timeout in the parse-worker
+  pool so a lost worker message can't block the scheduler indefinitely) was correctly
+  left for supervised hours — "too invasive to do unsupervised at 5am" — consistent
+  with the night-mode conservative-changes rule. The watchdog auto-restart is the safe
+  containment; the real fix waits for daylight and a Codex review.
+- crawl5's spike resolved without drama and confirmed the theory: `inFlight` ~7,995
+  against the 4096 fetching cap was a co-scheduled whale-CAR pileup resident in memory
+  (a bucket-5 whale cluster), *not* a slot-accounting bug — it held ~15.7 G for ~13
+  min, never OOMed, kept resolving at 8.3k/s, and the new auto-heal watchdog now covers
+  it if a further whale tips it over. In-flight exceeding the fetch cap is expected: the
+  cap governs concurrent *fetches*, not how many fetched-but-not-yet-drained CARs sit in
+  memory behind a busy parse pool.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
@@ -665,8 +704,11 @@ Each of these earned its place in this run; origin in parentheses.
 - Verify your alerts against ground truth before trusting them; a monitor you just
   wrote is unverified code (the FATAL false alarms).
 - Process state is not progress: "active" services hang, `exitCode`-without-`exit`
-  makes zombies, deliberate stops read "failed" — trust work counters, not unit
-  state (the Jetstream hang, the zombie crawler).
+  makes zombies, deliberate stops read "failed", and event loops deadlock with
+  nothing to throw — four distinct silent failures, all caught only by a monitor
+  keyed on whether work counters still advance, not on unit/process state. And make
+  that monitor *active* (auto-heal), not just an alerter, so it works when the
+  human and the observation loop are both asleep.
 - In a one-shot pipeline, schema scope is now-or-never — what you don't write down
   is a future full re-fetch; measure bytes/row from real output before answering
   "will it fit" (the archive widening at 17%).
