@@ -1,4 +1,9 @@
-import { CAR_MAX_BYTES, REPO_FETCH_TIMEOUT_MS, USER_AGENT } from './config.js';
+import {
+  CAR_MAX_BYTES,
+  REPO_FETCH_STALL_MS,
+  REPO_FETCH_TIMEOUT_MS,
+  USER_AGENT,
+} from './config.js';
 
 /**
  * Failure classification — drives the ledger transitions in crawl.ts:
@@ -46,6 +51,38 @@ export class QuarantineError extends Error {
     super(message, opts);
     this.name = 'QuarantineError';
   }
+}
+
+/**
+ * Settles `promise`, OR rejects after `ms` of no settlement — whichever first.
+ * The reject is driven by our OWN timer, so it fires even when the abort never
+ * reaches a half-open socket and the wrapped read()/fetch() hangs forever; the
+ * caller's job then completes and frees its concurrency slot. onTimeout fires
+ * the AbortController as a best-effort socket kill, but correctness does not
+ * depend on it landing. The late settlement of a hung promise is harmless: the
+ * outer promise has already settled, so the then/catch below are no-ops.
+ * Exported for tests.
+ */
+export function withProgressTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  phase: string,
+  onTimeout: () => void,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      onTimeout();
+      reject(new Error(`stalled: no progress for ${ms}ms during ${phase}`));
+    }, ms);
+    timer.unref();
+  });
+  // Promise.race attaches a handler to BOTH inputs, so a hung read()/fetch()
+  // that rejects late (after the timeout already won) is delivered to race's
+  // own settled-and-ignored handler — never an unhandled rejection.
+  return Promise.race([promise, timeout]).finally(() => {
+    clearTimeout(timer);
+  });
 }
 
 /**
@@ -111,13 +148,25 @@ async function classifyHttpError(
   response: Response,
   did: string,
   host: string,
+  abort: AbortController,
 ): Promise<Error> {
   const retryAfterMs = parseRetryAfter(response.headers.get('retry-after'));
 
   let xrpcError: string | undefined;
   let detail = '';
   try {
-    detail = (await response.text()).slice(0, 500);
+    // Guard the error-body read too: a non-OK response whose body half-opens
+    // would otherwise hang here (past the OK-path guard), re-leaking the slot.
+    // On stall this rejects into the catch below and we classify on status
+    // alone — correct for the 429/5xx and unknown-4xx branches that follow.
+    detail = (
+      await withProgressTimeout(
+        response.text(),
+        REPO_FETCH_STALL_MS,
+        'error-body',
+        () => abort.abort(),
+      )
+    ).slice(0, 500);
     const parsed: unknown = JSON.parse(detail);
     if (
       parsed !== null &&
@@ -167,10 +216,21 @@ export async function fetchRepoCar(
 
   let response: Response;
   try {
-    response = await fetch(url, {
-      headers: { 'user-agent': USER_AGENT, accept: 'application/vnd.ipld.car' },
-      signal,
-    });
+    // Connect + TLS + headers must show progress within the stall budget; a
+    // dead host that accepts the socket but never answers would otherwise hang
+    // here without the AbortSignal.timeout reliably firing.
+    response = await withProgressTimeout(
+      fetch(url, {
+        headers: {
+          'user-agent': USER_AGENT,
+          accept: 'application/vnd.ipld.car',
+        },
+        signal,
+      }),
+      REPO_FETCH_STALL_MS,
+      'connect/headers',
+      () => abort.abort(),
+    );
   } catch (err) {
     throw new RetryableError(`getRepo ${did}@${host}: ${describe(err)}`, {
       transient: true,
@@ -178,7 +238,7 @@ export async function fetchRepoCar(
     });
   }
 
-  if (!response.ok) throw await classifyHttpError(response, did, host);
+  if (!response.ok) throw await classifyHttpError(response, did, host, abort);
   if (response.body === null) {
     throw new RetryableError(`getRepo ${did}@${host}: response had no body`, {
       transient: true,
@@ -192,7 +252,16 @@ export async function fetchRepoCar(
     async pull(controller) {
       let result;
       try {
-        result = await upstream.read();
+        // Inactivity budget per chunk: a half-open socket mid-stream makes
+        // read() hang forever, and AbortSignal.timeout does not always break
+        // it. The progress timer guarantees this settles, so the slot is freed
+        // and the repo requeues (transient) instead of leaking into a wedge.
+        result = await withProgressTimeout(
+          upstream.read(),
+          REPO_FETCH_STALL_MS,
+          'body',
+          () => abort.abort(),
+        );
       } catch (err) {
         throw new RetryableError(
           `getRepo ${did}@${host}: body failed after ${total} bytes: ${describe(err)}`,
@@ -215,8 +284,18 @@ export async function fetchRepoCar(
       }
       controller.enqueue(result.value);
     },
-    cancel(reason) {
-      return upstream.cancel(reason).catch(() => undefined);
+    async cancel(reason) {
+      // Consumer-initiated cancel (e.g. a parse-side error before EOF). Abort
+      // the socket first so the cancel cannot block draining a half-open body,
+      // and bound it anyway so cleanup never holds the worker slot past the
+      // stall budget. All failures here are best-effort cleanup — swallowed.
+      abort.abort();
+      await withProgressTimeout(
+        upstream.cancel(reason),
+        REPO_FETCH_STALL_MS,
+        'body-cancel',
+        () => abort.abort(),
+      ).catch(() => undefined);
     },
   });
 

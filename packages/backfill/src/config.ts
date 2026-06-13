@@ -58,6 +58,18 @@ export const PER_HOST_CONCURRENCY = num('PER_HOST_CONCURRENCY', 2);
 // 429/Retry-After always wins, so err high and let the fleet push back.
 export const PER_HOST_CONCURRENCY_BSKY = num('PER_HOST_CONCURRENCY_BSKY', 16);
 export const REPO_FETCH_TIMEOUT_MS = num('REPO_FETCH_TIMEOUT_MS', 300_000);
+// Max time a getRepo may make NO forward progress — no response headers, or no
+// body bytes since the last chunk — before the socket is declared dead. This is
+// the wedge cure: AbortSignal.timeout does not reliably interrupt a half-open
+// socket (no FIN/RST, read() hangs forever), so a stalled fetch would hold its
+// GLOBAL_CONCURRENCY slot indefinitely; enough leaks freeze the scheduler. A
+// self-driven progress timer rejects the hung await regardless of whether the
+// abort reaches the socket, so every fetch settles within this window and the
+// slot is always freed. Inactivity-based (reset per chunk), so a slow-but-alive
+// host streaming steadily is never killed; only true silence trips it. Sits
+// well under the 180s wedge-watchdog threshold so stalls self-heal without a
+// restart. REPO_FETCH_TIMEOUT_MS remains the absolute wall-clock cap.
+export const REPO_FETCH_STALL_MS = num('REPO_FETCH_STALL_MS', 60_000);
 export const CAR_MAX_BYTES = num('CAR_MAX_BYTES', 1_073_741_824);
 // Parse worker threads (0 = auto: availableParallelism - 2, min 1). CAR
 // parsing is pure CPU; on the main thread it starves every socket and timer.
