@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import type { ClickHouseClient } from '@clickhouse/client';
 import type { StoragePolicy } from 'archive/policy';
 
@@ -152,24 +154,24 @@ export class ClickHouseWriter {
 
   /**
    * Deduplication token for one swapped batch. Stable across retries because
-   * the batch's row array is frozen at the swap — length, first row and last
-   * row can never differ between attempts — so a phantom-failure retry
+   * the batch's row array is frozen at the swap, so a phantom-failure retry
    * re-sends the exact block under the exact token and the server drops it
    * (table has non_replicated_deduplication_window = 10000, and a token-dropped
    * block also skips its MV pushes, protecting the aggregates).
    *
-   * Collisions inside the 10000-insert window would need two DIFFERENT
-   * batches sharing first (did, rkey), last (did, rkey) AND row count.
-   * Batches partition the stream — each row leaves the buffer exactly once —
-   * so a repeated lead row already requires a duplicate event slipping past
-   * the dedupe store; matching the tail and the count on top of that is not a
-   * realistic concern. The `live:` prefix keeps these disjoint from the
-   * backfill loader's `${did}:${rev}:${chunkIdx}` token space (loader.ts).
+   * Hashing every row identity makes different batches collision-resistant
+   * even when they share length and boundaries. The `live:` prefix keeps these
+   * disjoint from the backfill loader's token space (loader.ts).
    */
   private static batchToken(rows: PostRow[]): string {
-    const first = rows[0];
-    const last = rows[rows.length - 1];
-    return `live:${rows.length}:${first.did}/${first.rkey}:${last.did}/${last.rkey}`;
+    const hash = createHash('sha1');
+    for (const row of rows) {
+      hash.update(row.did);
+      hash.update('\0');
+      hash.update(row.rkey);
+      hash.update('\0');
+    }
+    return `live:${rows.length}:${hash.digest('hex')}`;
   }
 
   private async flushOnce(): Promise<boolean> {

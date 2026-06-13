@@ -66,29 +66,30 @@ interface PartsRow {
 export const getLiveStats = createServerFn().handler(
   async (): Promise<LiveStats> => {
     const [rates, freshness, totals, topEmojis, languages] = await Promise.all([
+      // Aggregate-table estimate: avoids production-cadence raw posts scans.
+      // posts_hourly is event-hour based, so this is an operational trend, not
+      // an exact ingest-rate counter.
       chQuery<RatesRow>(`
+        WITH
+          toStartOfHour(now()) AS current_hour,
+          greatest(dateDiff('second', current_hour, now()), 1) AS elapsed_s
         SELECT
-          countIf(ingested_at >= now() - INTERVAL 1 MINUTE) AS posts_1m,
-          count() AS posts_15m
-        FROM posts
-        WHERE ingested_at >= now() - INTERVAL 15 MINUTE
+          toUInt64(round(sumIf(posts, hour = current_hour) * 60 / elapsed_s)) AS posts_1m,
+          toUInt64(round(sumIf(posts, hour = current_hour) * 900 / elapsed_s)) AS posts_15m
+        FROM posts_hourly
+        WHERE hour = current_hour
       `),
       chQuery<FreshnessRow>(`
-        SELECT now() - max(ingested_at) AS freshness_s FROM posts
+        SELECT dateDiff('second', max(hour), now()) AS freshness_s
+        FROM posts_hourly
       `),
-      // Deliberately no FINAL: collapsing ReplacingMergeTree at read time is a
-      // full-table scan at billions of rows, and the only inflation in a raw
-      // count is transient at-least-once duplicates (replay windows, crash
-      // recovery) that background merges erase on their own. Ops-precision,
-      // not accounting-precision — exact numbers come from verify/rebuild,
-      // which do pay for FINAL.
       chQuery<TotalsRow>(`
         SELECT
-          count() AS posts,
-          countIf(notEmpty(emojis)) AS posts_with_emojis,
-          sum(length(emojis)) AS emoji_occurrences,
+          sum(posts) AS posts,
+          sum(posts_with_emojis) AS posts_with_emojis,
+          sum(emoji_occurrences) AS emoji_occurrences,
           (SELECT uniqExact(emoji) FROM emoji_total) AS distinct_glyphs
-        FROM posts
+        FROM posts_hourly
       `),
       chQuery<EmojiRow>(`
         SELECT emoji, sum(occurrences) AS occurrences, sum(posts) AS posts
