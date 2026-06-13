@@ -1,6 +1,7 @@
 /** Claim/scheduling loop: concurrency limits, the claimable scan and --did mode. */
 
-import { readFileSync } from 'node:fs';
+import { createReadStream } from 'node:fs';
+import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
 
 import pLimit, { type LimitFunction } from 'p-limit';
@@ -17,6 +18,8 @@ export interface CliFlags {
   limit: number;
   /** Process exactly these DIDs (must already be in the ledger), skipping the claimable scan. */
   dids: string[];
+  /** Stream additional exact-DID work from a file, one DID per line. */
+  didFile?: string;
   /** Final sweep: zero the attempts budget on parked unreachable rows so waves resume. */
   finalSweep: boolean;
   /**
@@ -55,28 +58,11 @@ export function parseFlags(): CliFlags {
       );
     }
   }
-  // Union of --did and --did-file (dedup: re-fetching a DID twice is harmless but
-  // wasteful, and a file may repeat the inline ones).
-  const dids = new Set(values.did ?? []);
-  const didFile = values['did-file'];
-  if (didFile !== undefined) {
-    for (const line of readFileSync(didFile, 'utf8').split('\n')) {
-      const did = line.trim();
-      if (did.length > 0) dids.add(did);
-    }
-    // An empty/blank --did-file must NOT silently fall through to a full
-    // claimable crawl (run() switches on dids.length) — that is the dangerous
-    // opposite of "re-fetch exactly this list", and it is precisely the
-    // convergence loop's SUCCESS state (LOOSE drained to nothing). Fail loudly;
-    // the caller's loop guard (`[ -s loose.txt ]`) is the right place to stop.
-    if (dids.size === 0)
-      throw new Error(
-        `--did-file ${didFile} contained no DIDs; refusing to fall through to a full claimable crawl`,
-      );
-  }
+  const dids = [...new Set(values.did ?? [])];
   return {
     limit,
-    dids: [...dids],
+    dids,
+    didFile: values['did-file'],
     finalSweep: values['final-sweep'] ?? false,
     reviveHosts: values['revive-host'] ?? [],
   };
@@ -134,6 +120,25 @@ const yieldToTimers = async (): Promise<void> => {
   });
 };
 
+async function* exactDids(flags: CliFlags): AsyncGenerator<string> {
+  const seenInline = new Set<string>();
+  for (const did of flags.dids) {
+    const trimmed = did.trim();
+    if (trimmed.length === 0 || seenInline.has(trimmed)) continue;
+    seenInline.add(trimmed);
+    yield trimmed;
+  }
+  if (flags.didFile === undefined) return;
+  const lines = createInterface({
+    input: createReadStream(flags.didFile, { encoding: 'utf8' }),
+    crlfDelay: Infinity,
+  });
+  for await (const line of lines) {
+    const did = line.trim();
+    if (did.length > 0) yield did;
+  }
+}
+
 export function createScheduler(deps: SchedulerDeps): Scheduler {
   const { ledger, stats, control, hostPressure, hostHealth, processRepo } =
     deps;
@@ -182,6 +187,15 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     const task = hostLimitFor(repo.pdsHost)(() => {
       const coolMs = hostPressure.coolingMs(repo.pdsHost);
       if (coolMs > 0) {
+        if (repo.preserveExisting === true) {
+          logger.warn(
+            { did: repo.did, host: repo.pdsHost, coolMs },
+            'preserved loaded/verified repo waiting for host cooldown',
+          );
+          return new Promise<void>((resolve) => {
+            setTimeout(resolve, coolMs);
+          }).then(() => globalLimit(() => processRepo(repo)));
+        }
         ledger.markThrottled(repo.did, `host cooling: ${repo.pdsHost}`, coolMs);
         stats.retried += 1;
         return Promise.resolve();
@@ -317,8 +331,12 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
   };
 
   async function run(flags: CliFlags): Promise<void> {
-    if (flags.dids.length > 0) {
-      for (const did of flags.dids) {
+    if (flags.dids.length > 0 || flags.didFile !== undefined) {
+      const maxOutstanding = GLOBAL_CONCURRENCY * 2;
+      let exactCount = 0;
+      for await (const did of exactDids(flags)) {
+        if (control.stopClaiming || stats.claimed >= flags.limit) break;
+        while (active.size >= maxOutstanding) await Promise.race(active);
         const repo = ledger.getRepo(did);
         if (repo === undefined) {
           logger.error(
@@ -327,14 +345,30 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
           );
           continue;
         }
-        if (!ledger.markFetching(did)) {
+        const preserveExisting =
+          repo.status === 'loaded' || repo.status === 'verified';
+        if (preserveExisting) {
+          logger.warn(
+            { did, status: repo.status },
+            'reprocessing loaded/verified repo without downgrading existing ledger state on failure',
+          );
+          repo.preserveExisting = true;
+        } else if (!ledger.markFetching(did)) {
           logger.warn(
             { did, status: repo.status },
             'forcing reprocess (--did) from a non-claimable status',
           );
         }
         stats.claimed += 1;
+        exactCount += 1;
         trackRepo(repo);
+      }
+      if (exactCount === 0) {
+        throw new Error(
+          flags.didFile === undefined
+            ? '--did contained no DIDs'
+            : `--did-file ${flags.didFile} contained no DIDs; refusing to fall through to a full claimable crawl`,
+        );
       }
     } else {
       // Repos stuck in 'fetching' from a killed run are otherwise unclaimable;

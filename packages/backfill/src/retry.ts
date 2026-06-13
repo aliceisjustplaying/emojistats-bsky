@@ -127,10 +127,29 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
 
   function handleRepoError(repo: RepoRow, err: unknown): void {
     const message = err instanceof Error ? err.message : String(err);
+    const preserveExisting = repo.preserveExisting === true;
+
+    const preserve = (event: string): void => {
+      stats.retried += 1;
+      telemetry.recordEvent({
+        did: repo.did,
+        pdsHost: repo.pdsHost,
+        event,
+        error: `preserved existing loaded/verified ledger state after recrawl failure: ${message}`,
+      });
+      logger.warn(
+        { did: repo.did, status: repo.status, err: message },
+        'preserved existing loaded/verified ledger state after recrawl failure',
+      );
+    };
 
     if (err instanceof TerminalFetchError) {
       // The host answered (404/tombstone/takedown are host SUCCESSES).
       hostHealth.recordSuccess(repo.pdsHost);
+      if (preserveExisting) {
+        preserve(err.status);
+        return;
+      }
       ledger.markTerminal(repo.did, err.status, message);
       stats.terminal += 1;
       telemetry.recordEvent({
@@ -149,6 +168,10 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
       // Hitting CAR_MAX_BYTES means the host delivered a >1GiB body — loud
       // proof of life that must clear any stall/deadness streak.
       hostHealth.recordSuccess(repo.pdsHost);
+      if (preserveExisting) {
+        preserve('quarantined');
+        return;
+      }
       ledger.markTerminal(repo.did, 'quarantined', message);
       stats.terminal += 1;
       telemetry.recordEvent({
@@ -171,6 +194,10 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
     const transient = err instanceof RetryableError && err.transient;
     const attempts = repo.attempts + 1;
     if (!transient && attempts >= MAX_ATTEMPTS) {
+      if (preserveExisting) {
+        preserve('failed');
+        return;
+      }
       ledger.markTerminal(repo.did, 'failed', message);
       stats.terminal += 1;
       telemetry.recordEvent({
@@ -199,6 +226,10 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
       // Rate limiting is proof of life — never deadness evidence.
       hostHealth.recordSuccess(repo.pdsHost);
       hostPressure.record429(repo.pdsHost);
+      if (preserveExisting) {
+        preserve('retry');
+        return;
+      }
       ledger.markThrottled(
         repo.did,
         message,
@@ -222,6 +253,10 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
       // backs the repo off WITHOUT burning its attempts budget.
       hostPressure.recordStall(repo.pdsHost);
       hostHealth.recordFailure(repo.pdsHost, message);
+      if (preserveExisting) {
+        preserve('retry');
+        return;
+      }
       ledger.markThrottled(
         repo.did,
         message,
@@ -237,6 +272,10 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
       return;
     }
     hostHealth.recordFailure(repo.pdsHost, message);
+    if (preserveExisting) {
+      preserve('retry');
+      return;
+    }
     ledger.markRetry(repo.did, message, retryAfterMs);
     stats.retried += 1;
     telemetry.recordEvent({

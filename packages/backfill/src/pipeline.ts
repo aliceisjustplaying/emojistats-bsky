@@ -102,6 +102,7 @@ export function createRepoPipeline(
 
   return async function processRepo(repo: RepoRow): Promise<void> {
     const startedAt = Date.now();
+    const preserveExisting = repo.preserveExisting === true;
     try {
       // bsky.social is the entryway, never a real sync host — a ledger pointer at
       // it is always a stale pre-mushroom op; resolve before wasting a request.
@@ -110,6 +111,19 @@ export function createRepoPipeline(
         (repo.attempts > 0 || staleKnown) &&
         (await retry.refreshHost(repo)) === 'tombstoned'
       ) {
+        if (preserveExisting) {
+          logger.warn(
+            { did: repo.did },
+            'recrawl saw PLC tombstone; preserving existing loaded/verified ledger state',
+          );
+          telemetry.recordEvent({
+            did: repo.did,
+            pdsHost: repo.pdsHost,
+            event: 'retry',
+            error: 'PLC tombstone discovered during preserved recrawl',
+          });
+          return;
+        }
         ledger.markTerminal(
           repo.did,
           'tombstoned',
@@ -184,6 +198,22 @@ export function createRepoPipeline(
       }
 
       if (postsTotal === 0) {
+        if (preserveExisting) {
+          telemetry.recordEvent({
+            did: repo.did,
+            pdsHost: repo.pdsHost,
+            event: 'retry',
+            records: repoCounts.recordsTotal,
+            carBytes: repoCounts.carBytes,
+            error:
+              'recrawl returned zero posts; preserving existing loaded/verified ledger state',
+          });
+          logger.warn(
+            { did: repo.did, ...repoCounts },
+            'recrawl returned zero posts; preserving existing loaded/verified ledger state',
+          );
+          return;
+        }
         // Zero posts is terminal 'empty', not 'loaded': the loaded→empty double
         // transition would leave a misleading loaded_at, and 'empty' rows carry
         // no counts by design — what the repo did contain is logged here.

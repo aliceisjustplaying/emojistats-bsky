@@ -52,6 +52,11 @@ export interface RepoRow {
   fetchedAt: number | null;
   loadedAt: number | null;
   retryAfter: number | null;
+  /**
+   * Exact-DID recrawls of already loaded/verified rows must refresh successful
+   * loads without downgrading durable good ledger state on a transient failure.
+   */
+  preserveExisting?: boolean;
 }
 
 /** Counts a fetched-and-parsed repo reports into the ledger when marked loaded. */

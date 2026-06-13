@@ -35,6 +35,8 @@
  *       breaks — --did is repeatable so extras become rejected positionals, and
  *       millions exceed ARG_MAX), then re-run verify; repeat until LOOSE shrinks
  *       to the genuinely-live tail (deletes-since-crawl).
+ *   (f) --orphans: optional ClickHouse-only DID report. This scans raw posts
+ *       for DISTINCT backfill DIDs and is deliberately off by default.
  *
  * Exit codes: 0 clean, 1 mismatches found, 2 could not run.
  *
@@ -163,7 +165,7 @@ async function chBackfillDids(ch: ClickHouseClient): Promise<Set<string>> {
 async function reconcile(
   db: Database.Database,
   ch: ClickHouseClient,
-  backfillDids: Set<string>,
+  backfillDids?: Set<string>,
 ): Promise<ReconcileResult> {
   const repos = db
     .prepare(
@@ -263,8 +265,14 @@ async function reconcile(
   // will be re-fetched and its rows collapse, but worth surfacing). Restricted
   // to backfill-attributed DIDs: the ledger query above only covers its own.
   const ledgerDids = new Set(repos.map((repo) => repo.did));
-  const orphans = [...backfillDids].filter((did) => !ledgerDids.has(did));
-  const orphanStats = await chStatsForDids(ch, orphans.slice(0, DID_LIST_CAP));
+  const orphans =
+    backfillDids === undefined
+      ? []
+      : [...backfillDids].filter((did) => !ledgerDids.has(did));
+  const orphanStats =
+    orphans.length === 0
+      ? new Map<string, ChDidStats>()
+      : await chStatsForDids(ch, orphans.slice(0, DID_LIST_CAP));
 
   logger.info(
     {
@@ -274,7 +282,8 @@ async function reconcile(
       promotedToVerified: promoted,
       alreadyVerified,
       mismatches: mismatches.length,
-      clickhouseOnlyDids: orphans.length,
+      clickhouseOnlyDids:
+        backfillDids === undefined ? 'skipped' : orphans.length,
     },
     'reconciliation: exact = counts and rkey digests match; loose = CH count >= ledger only (usual benign cause: live-only posts arriving during/after the crawl; pre-digest ledger rows can never exceed loose)',
   );
@@ -472,6 +481,7 @@ async function main(): Promise<void> {
       sample: { type: 'string' },
       'sample-loose': { type: 'string' },
       'emit-loose': { type: 'string' },
+      orphans: { type: 'boolean', default: false },
       // Skip the full ledger↔CH reconciliation (a) — for a fast, CH-light random
       // --sample run while the crawl is still loading (reconcile fires ~1 query
       // per 1000 loaded DIDs with FINAL, heavy on a busy ClickHouse). Incompatible
@@ -548,7 +558,9 @@ async function main(): Promise<void> {
     let looseRepos: LedgerRepo[] = [];
     let mismatches: Mismatch[] = [];
     if (!noReconcile) {
-      const backfillDids = await chBackfillDids(ch);
+      const backfillDids = values.orphans
+        ? await chBackfillDids(ch)
+        : undefined;
       ({ exact, loose, looseRepos, mismatches } = await reconcile(
         db,
         ch,
