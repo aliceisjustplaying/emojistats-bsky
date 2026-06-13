@@ -964,3 +964,11 @@ crawl4 RSS receded 11.4G → 10.5G with no restart (transient whale-repo
 parse, not heap pressure). All six fresh and resolving (crawl0 11.2k/s).
 emoji load down to 2.9/8 cores, 0 delayed inserts — ClickHouse fully
 caught up with headroom, not starved. Normal 600s cadence resumed.
+
+### 02:31 UTC — ETA cycle
+
+All six 4096, fresh, RSS healthy (crawl4 back to 10.9G normal range).
+emoji clean (0 delayed, 384 parts). Per-shard resolved/min (02:20-02:31):
+s0 7568, s1 10503, s2 11484, s3 6329, s4 4320, s5 5222 = 45,426/min (up
+from 41.6k). Remaining 23,439,443. ETA ~8.6h → ~11:10 UTC (improving).
+shard1 smallest at 3.32M, no box near drain.
