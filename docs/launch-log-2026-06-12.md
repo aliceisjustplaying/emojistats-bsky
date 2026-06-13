@@ -939,3 +939,11 @@ s2 10811, s3 4931, s4 4869, s5 5148 = 42,075/min fleet (up from 38.6k).
 Remaining 26,092,371. ETA ~10.3h → ~11:50 UTC. Trending faster as the
 real-repo backlog drains. No box near drain yet (smallest remaining
 shard0 at 3.85M).
+
+### 01:49 UTC — ETA cycle
+
+All six 4096, fresh, RSS steady (max crawl0 9.9G). emoji healthy (load
+14, 0 delayed, 356 parts). Per-shard resolved/min (01:38-01:49): s0 4330,
+s1 12311, s2 9109, s3 4375, s4 4584, s5 4792 = 39,501/min. Remaining
+25,193,109. ETA ~10.6h → ~12:25 UTC (steady). shard0 closest to drain at
+3.74M, no box near zero yet. shard1 consistently fastest (small-repo mix).
