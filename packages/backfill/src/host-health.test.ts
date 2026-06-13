@@ -295,6 +295,31 @@ void describe('ledger.parkDeadHostChunk', () => {
     ledger.close();
   });
 
+  void it('final sweep re-arms parked rows except dead-host registry rows', () => {
+    const ledger = new SqliteLedger(path.join(dir, 'final-sweep.sqlite'));
+    ledger.addDeadHost('dns.dead');
+    ledger.upsertParked('did:plc:dns1', 'dns.dead', 'host dead');
+    ledger.upsertParked('did:plc:alive1', 'alive.example', 'timed out');
+
+    const reset = ledger.resetUnreachableAttempts(ledger.getDeadHosts());
+    assert.equal(reset, 1);
+
+    const dead = ledger.getRepo('did:plc:dns1')!;
+    assert.equal(dead.status, 'unreachable');
+    assert.equal(dead.attempts, MAX_ATTEMPTS);
+    assert.equal(dead.retryAfter, null);
+
+    const alive = ledger.getRepo('did:plc:alive1')!;
+    assert.equal(alive.status, 'unreachable');
+    assert.equal(alive.attempts, 0);
+    assert.equal(alive.retryAfter, 0);
+    assert.deepEqual(
+      ledger.listClaimable(10).map((r) => r.did),
+      ['did:plc:alive1'],
+    );
+    ledger.close();
+  });
+
   void it('is shard-scoped like every other claim-path write', () => {
     // Find dids landing in bucket 0 and elsewhere so the test is deterministic.
     const dids: string[] = [];

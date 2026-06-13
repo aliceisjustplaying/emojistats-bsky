@@ -128,6 +128,10 @@ export class SqliteLedger implements Ledger {
     number,
     { pending: Database.Statement; retry: Database.Statement }
   >();
+  private readonly resetUnreachableExclusionStatements = new Map<
+    number,
+    Database.Statement
+  >();
 
   constructor(
     dbPath: string = LEDGER_DB_PATH,
@@ -332,7 +336,8 @@ export class SqliteLedger implements Ledger {
 
     // Final sweep (--final-sweep): parked unreachables become claimable again by
     // zeroing the budget listClaimable checks. Shard-scoped like every other
-    // read/claim path; error text is kept for the post-sweep report.
+    // read/claim path; error text is kept for the post-sweep report. The caller
+    // passes the dead-host registry so truly dead hosts stay parked.
     this.stmtResetUnreachable = this.db.prepare(`
       UPDATE repos SET attempts = 0, retry_after = 0
       WHERE status = 'unreachable' ${shardAnd}
@@ -436,6 +441,22 @@ export class SqliteLedger implements Ledger {
     };
     this.claimableExclusionStatements.set(count, statements);
     return statements;
+  }
+
+  private resetUnreachableStatementForExclusions(
+    count: number,
+  ): Database.Statement {
+    const cached = this.resetUnreachableExclusionStatements.get(count);
+    if (cached !== undefined) return cached;
+    const placeholders = Array.from({ length: count }, () => '?').join(', ');
+    const hostExclusion =
+      count === 0 ? '' : `AND pds_host NOT IN (${placeholders})`;
+    const statement = this.db.prepare(`
+      UPDATE repos SET attempts = 0, retry_after = 0
+      WHERE status = 'unreachable' ${this.shardAnd} ${hostExclusion}
+    `);
+    this.resetUnreachableExclusionStatements.set(count, statement);
+    return statement;
   }
 
   listClaimable(
@@ -633,8 +654,16 @@ export class SqliteLedger implements Ledger {
     this.stmtMarkVerified.run(did);
   }
 
-  resetUnreachableAttempts(): number {
-    return this.stmtResetUnreachable.run().changes;
+  resetUnreachableAttempts(excludedHosts: readonly string[] = []): number {
+    const uniqueExcludedHosts = [...new Set(excludedHosts)].filter(
+      (host) => host.length > 0,
+    );
+    if (uniqueExcludedHosts.length === 0) {
+      return this.stmtResetUnreachable.run().changes;
+    }
+    return this.resetUnreachableStatementForExclusions(
+      uniqueExcludedHosts.length,
+    ).run(...uniqueExcludedHosts).changes;
   }
 
   statusCounts(): Partial<Record<RepoStatus, number>> {

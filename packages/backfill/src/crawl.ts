@@ -88,10 +88,11 @@ async function main(): Promise<void> {
   }
 
   if (flags.finalSweep) {
-    const reset = ledger.resetUnreachableAttempts();
+    const deadHosts = ledger.getDeadHosts();
+    const reset = ledger.resetUnreachableAttempts(deadHosts);
     logger.warn(
-      { reset },
-      'final sweep: unreachable attempt budgets zeroed, retry waves resume',
+      { reset, deadHosts: deadHosts.length },
+      'final sweep: non-dead unreachable attempt budgets zeroed, retry waves resume',
     );
   }
 

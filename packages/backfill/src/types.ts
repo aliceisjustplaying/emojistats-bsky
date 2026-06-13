@@ -120,8 +120,12 @@ export interface Ledger {
     error?: string,
   ): void;
   markVerified(did: string): void;
-  /** Final sweep: zero attempts on parked unreachable rows (shard-scoped); returns rows reset. */
-  resetUnreachableAttempts(): number;
+  /**
+   * Final sweep: zero attempts on parked unreachable rows (shard-scoped);
+   * dead-host rows stay parked by passing the dead-host registry as exclusions.
+   * Returns rows reset.
+   */
+  resetUnreachableAttempts(excludedHosts?: readonly string[]): number;
   /**
    * Dead-host bulk park: moves up to `limit` PENDING rows on the host to
    * out-of-budget 'unreachable' (the final-sweep list). Returns rows changed;
