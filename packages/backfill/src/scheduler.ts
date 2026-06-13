@@ -20,6 +20,8 @@ export interface CliFlags {
   dids: string[];
   /** Stream additional exact-DID work from a file, one DID per line. */
   didFile?: string;
+  /** Stream exact-DID work from a tab/space-separated DID + PDS host file. */
+  didHostFile?: string;
   /** Final sweep: zero the attempts budget on parked unreachable rows so waves resume. */
   finalSweep: boolean;
   /**
@@ -41,6 +43,10 @@ export function parseFlags(): CliFlags {
       // repeatable so extras land as rejected positionals, and millions blow past
       // ARG_MAX). Merged into dids; same exact-DID path, no claimable scan.
       'did-file': { type: 'string' },
+      // For v1-metadata recrawls, lets a worker use a lightweight local ledger
+      // populated from source-ledger DID+host rows instead of copying the source
+      // SQLite DB to every recrawl worker.
+      'did-host-file': { type: 'string' },
       // Explicit, not automatic: resetting budgets on every restart would let a
       // crash loop hammer dead hosts forever; a sweep is an operator decision.
       'final-sweep': { type: 'boolean', default: false },
@@ -63,6 +69,7 @@ export function parseFlags(): CliFlags {
     limit,
     dids,
     didFile: values['did-file'],
+    didHostFile: values['did-host-file'],
     finalSweep: values['final-sweep'] ?? false,
     reviveHosts: values['revive-host'] ?? [],
   };
@@ -120,22 +127,47 @@ const yieldToTimers = async (): Promise<void> => {
   });
 };
 
-async function* exactDids(flags: CliFlags): AsyncGenerator<string> {
+interface ExactRepo {
+  did: string;
+  pdsHost?: string;
+}
+
+async function* exactRepos(flags: CliFlags): AsyncGenerator<ExactRepo> {
   const seenInline = new Set<string>();
   for (const did of flags.dids) {
     const trimmed = did.trim();
     if (trimmed.length === 0 || seenInline.has(trimmed)) continue;
     seenInline.add(trimmed);
-    yield trimmed;
+    yield { did: trimmed };
   }
-  if (flags.didFile === undefined) return;
-  const lines = createInterface({
-    input: createReadStream(flags.didFile, { encoding: 'utf8' }),
-    crlfDelay: Infinity,
-  });
-  for await (const line of lines) {
-    const did = line.trim();
-    if (did.length > 0) yield did;
+  if (flags.didFile !== undefined) {
+    const lines = createInterface({
+      input: createReadStream(flags.didFile, { encoding: 'utf8' }),
+      crlfDelay: Infinity,
+    });
+    for await (const line of lines) {
+      const did = line.trim();
+      if (did.length > 0) yield { did };
+    }
+  }
+  if (flags.didHostFile !== undefined) {
+    const lines = createInterface({
+      input: createReadStream(flags.didHostFile, { encoding: 'utf8' }),
+      crlfDelay: Infinity,
+    });
+    for await (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.length === 0) continue;
+      const [did, pdsHost] = trimmed.split(/\s+/, 2);
+      if (did === undefined || pdsHost === undefined || pdsHost.length === 0) {
+        logger.warn(
+          { line: trimmed },
+          'skipping malformed --did-host-file row',
+        );
+        continue;
+      }
+      yield { did, pdsHost };
+    }
   }
 }
 
@@ -337,17 +369,23 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
   };
 
   async function run(flags: CliFlags): Promise<void> {
-    if (flags.dids.length > 0 || flags.didFile !== undefined) {
+    if (
+      flags.dids.length > 0 ||
+      flags.didFile !== undefined ||
+      flags.didHostFile !== undefined
+    ) {
       const maxOutstanding = GLOBAL_CONCURRENCY * 2;
       let exactCount = 0;
-      for await (const did of exactDids(flags)) {
+      for await (const exact of exactRepos(flags)) {
+        const { did, pdsHost } = exact;
         if (control.stopClaiming || stats.claimed >= flags.limit) break;
         while (active.size >= maxOutstanding) await Promise.race(active);
+        if (pdsHost !== undefined) ledger.upsertPending(did, pdsHost);
         const repo = ledger.getRepo(did);
         if (repo === undefined) {
           logger.error(
             { did },
-            'did not present in ledger; run enumerate first',
+            'did not present in ledger; run enumerate first or use --did-host-file',
           );
           continue;
         }
@@ -371,9 +409,7 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
       }
       if (exactCount === 0) {
         throw new Error(
-          flags.didFile === undefined
-            ? '--did contained no DIDs'
-            : `--did-file ${flags.didFile} contained no DIDs; refusing to fall through to a full claimable crawl`,
+          `exact recrawl input contained no DIDs; refusing to fall through to a full claimable crawl`,
         );
       }
     } else {

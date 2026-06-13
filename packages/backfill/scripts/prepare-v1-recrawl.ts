@@ -7,11 +7,13 @@ import Database from 'better-sqlite3';
 
 interface RecrawlRow {
   did: string;
+  pdsHost: string;
   posts: number;
 }
 
 interface PartStats {
   file: string;
+  hostFile: string;
   repos: number;
   posts: number;
 }
@@ -68,10 +70,12 @@ if (!Number.isFinite(markerMs)) {
 const prefix = shard === undefined ? 'all' : `shard${shard}`;
 const stats: PartStats[] = Array.from({ length: parts }, (_unused, i) => ({
   file: path.join(outDir, `v1-recrawl-${prefix}-part${i}.txt`),
+  hostFile: path.join(outDir, `v1-recrawl-${prefix}-part${i}.tsv`),
   repos: 0,
   posts: 0,
 }));
 const streams = stats.map((part) => createWriteStream(part.file));
+const hostStreams = stats.map((part) => createWriteStream(part.hostFile));
 
 function nextPart(): number {
   let best = 0;
@@ -85,7 +89,7 @@ const shardFilter = shard === undefined ? '' : 'AND bucket = @shard';
 const rows = db
   .prepare(
     `
-    SELECT did, COALESCE(posts_total, 0) AS posts
+    SELECT did, pds_host AS pdsHost, COALESCE(posts_total, 0) AS posts
     FROM repos
     WHERE status IN ('loaded', 'verified')
       AND loaded_at IS NOT NULL
@@ -99,12 +103,13 @@ const rows = db
 for (const row of rows) {
   const part = nextPart();
   streams[part].write(`${row.did}\n`);
+  hostStreams[part].write(`${row.did}\t${row.pdsHost}\n`);
   stats[part].repos += 1;
   stats[part].posts += row.posts;
 }
 
 await Promise.all(
-  streams.map(
+  [...streams, ...hostStreams].map(
     (stream) =>
       new Promise<void>((resolve, reject) => {
         stream.end((err?: Error | null) => {
