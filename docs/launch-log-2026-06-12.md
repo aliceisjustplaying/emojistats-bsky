@@ -1114,3 +1114,5 @@ All six active+fresh, bulk healthy. emoji clean (403 parts, 0 delayed). Per-shar
 All six active+fresh, all resolving. emoji clean (399 parts, 0 delayed). Per-shard resolved/min (09:25-09:36): s0 3787, s1 2068, s2 6803, s3 5128, s4 3766, s5 3969 = 25,521/min. Remaining 9,843,117 (under 10M). ETA ~6.4h → ~16:00 UTC. shard1 384k, shard2 474k (real repos draining, NOT retiring). Holding.
 ### 09:47 UTC — ETA cycle
 All six active+fresh. emoji clean (412 parts, 0 delayed). Per-shard resolved/min (09:36-09:47): s0 3757, s1 1073, s2 5113, s3 8952, s4 3840, s5 3770 = 26,505/min. Remaining 9,556,051. ETA ~6.0h → ~15:50 UTC. shard1 373k, shard2 421k. Holding.
+### 09:58 UTC — ETA cycle
+All six active+fresh; crawl3 12.2G (whale, resolving). emoji clean (413 parts, 0 delayed). Per-shard resolved/min (09:47-09:58): s0 3887, s1 4937, s2 4399, s3 4130, s4 3116, s5 3483 = 23,952/min. Remaining 9,296,585. ETA ~6.5h → ~16:30 UTC. shard1 319k, shard2 372k. Holding.
