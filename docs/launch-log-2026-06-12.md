@@ -972,3 +972,11 @@ emoji clean (0 delayed, 384 parts). Per-shard resolved/min (02:20-02:31):
 s0 7568, s1 10503, s2 11484, s3 6329, s4 4320, s5 5222 = 45,426/min (up
 from 41.6k). Remaining 23,439,443. ETA ~8.6h → ~11:10 UTC (improving).
 shard1 smallest at 3.32M, no box near drain.
+
+### 02:42 UTC — crawl4 RSS watch (again)
+
+crawl4 11.6G RSS, second whale spike (02:11 was 11.4G), nearing 12G cap —
+fresh + resolving, no restart. crawl4's shard evidently holds several
+whale repos. If it OOMs, the hard-exit fix self-heals (systemd restart +
+fetching requeue, ~1min blip, watchdog alerts). Other 5 healthy, emoji
+clean. Cadence shortened to 7min to watch crawl4.
