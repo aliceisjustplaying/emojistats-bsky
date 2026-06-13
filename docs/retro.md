@@ -683,6 +683,84 @@ shard1 the smallest at ~3M). Two non-routine notes:
   timeout), avoid (host cool/park) — each catching what the one before it could not.
   (Codex-reviewed, 2 rounds, which caught a kind-carryover and a quarantine-reset gap;
   tests cover stall classification, the 6/120s park, the resets, and the AIMD.)
+  **[Corrected at 15:30 — see the next entry. Two claims above are wrong: the
+  `atproto.brid.gy` bridge is 429-rate-limited, not a silent stall (the existing
+  429 back-off already handles it, and the lone canary box logged zero stalls
+  against it); and host-parked rows are *not* auto-re-crawled by the final-sweep,
+  so "nothing is lost" overstated it. The general stall fix still stands; the bridge
+  was a misdiagnosis and the deferred-re-crawl guarantee does not currently hold.]**
+
+### 2026-06-13 afternoon (15:30 UTC) — a second-opinion review, and two corrections to the entry above
+
+- **The bridge was 429, not a stall; and "park = deferred re-crawl" doesn't hold.**
+  Two claims in the entry above need walking back, both surfaced within the hour by
+  evidence. First: I cited `atproto.brid.gy` as the stalling host the cool-and-park
+  fix was built for. A direct probe settled it — the bridge returns HTTP 429 in 0.23s,
+  fast rate-limiting, *not* a half-open stall; crawl1 (the only box carrying
+  cooling-on-stall) logged zero stall events against it, because the existing 429 AIMD
+  back-off already parks it in cooldown. The general stall fix is still correct — dead
+  half-open sockets exist and did wedge the fleet — but the bridge was the operator's
+  initial misdiagnosis, corrected by probe, and the cool-and-park code comments that
+  cite the bridge as a stall example are themselves misleading. Second, and worse: I
+  repeated that hard-parked hosts land in `unreachable` and get re-crawled by the
+  deferred final-sweep, "so nothing is lost." A second-opinion review showed that is
+  false for *host*-parked rows — `--final-sweep` (`resetUnreachableAttempts`) only
+  resets budget-exhausted unreachables, but the scheduler re-seeds and re-parks dead
+  hosts on startup, so a host parked dead (DNS/legal — and cooling-on-stall's hard
+  park) stays excluded *forever* unless a dead-host-clear path is added. The repos
+  aren't dropped from the ledger, but the system does not bring them back on its own.
+  "Park = deferred re-crawl" should read "park = excluded until that gap is fixed."
+- **The incident worth keeping: an adversarial review of the *narrative*, not the
+  diff, caught the overclaims.** The day's code shipped sound — loader silent-loss,
+  fetcher wedge, cool-and-park all held up under review. What didn't hold was the
+  operator's *state report* (`docs/state-report-2026-06-13.md`), a confident write-up
+  of "what's safe to do now." A Codex second-opinion pass over that report, read
+  against the actual code, returned three HIGH corrections to the operational story,
+  none about the code: (a) host-parked ≠ re-crawled, above; (b) `scp ledger.sqlite` to
+  save a retiring box's record is unsafe — the ledger is WAL-mode, a raw copy can miss
+  committed WAL pages, so correct prep is stop-crawler → SQLite checkpoint/`.backup` →
+  copy; (c) the report omitted the per-dedi local parquet archive entirely — that's the
+  durable full-text home, written before the ClickHouse load, and retiring a box
+  without verifying its archive-sync state risks losing text. It also walked back
+  "verify proves zero-loss" to "verify is strong evidence, not proof" (loose
+  `CH count > ledger` passes get promoted, `--sample` is random-only, and re-fetching a
+  current CAR can't prove rows deleted since the original crawl). The transferable
+  lesson is sharp: review the claims a system makes about *itself* — its runbook, its
+  "safe to retire," its "nothing is lost" — with the same adversarial energy you give a
+  code diff. Confident summaries overreach exactly on guarantees, and guarantees are
+  where a backfill lives or dies. The decision that fell out of it: holding the
+  cool-and-park rollout to a single canary box was *right* for a reason not fully in
+  hand at the time — its hard-park would strand the bridge repos given the final-sweep
+  gap, not defer them — so the version skew (crawl1 ahead of the other five) is a
+  deliberate, reversible hold, not drift.
+- **A detector keyed on a proxy: the watchdog false-positives on a busy box.**
+  Separately, crawl0 spent the afternoon flapping "wedge → RECOVERED" without ever being
+  wedged. The auto-heal watchdog keys staleness on the gap since the last `crawl stats`
+  log line (>180s = suspect); but a box churning a failure-heavy host — `kt.tngl.oyster.cafe`
+  404ing every request — emits stats on a cadence that drifts to 130–180s while it is
+  fully alive (newest log line 6–16s old, event loop running), because its repos resolve
+  to `failed`, not `loaded`. The decisive test cut through it: `loaded` advanced 0 in 25s
+  *not* because the box was frozen but because it was producing failures, not loads — so
+  the stale-stats signal and the real-progress signal disagreed, and the stats signal was
+  the wrong one. `cpu=0` doesn't disambiguate either (it samples the near-idle main
+  thread — the same reason the 6144 canary read cpu=0 while perfectly healthy). And the
+  false restart isn't free: it resets host-health and kicks off the very ramp/churn the
+  fleet has been fighting. This sharpens the earlier "key the detector on the symptom
+  every failure shares — work counters stop advancing" lesson: stats-emission cadence was
+  a *proxy* for progress that legitimately varies with workload, so the real fix is to key
+  the watchdog on an actual progress delta (`loaded`/`postRows`), not on whether a log line
+  showed up. A liveness check is only as good as the signal it trusts.
+- **Small and clean: deploy one box at a time.** Earlier in the day all six boxes were
+  `reset --hard` to a new build and restarted at once; the simultaneous cold-ramp drove
+  ClickHouse to load 16 with 30s insert-timeouts and produced a transient CH-overload
+  wedge on crawl0 that cleared only once the fleet settled. A backfill's datastore is a
+  shared resource; a fleet-wide synchronized restart is a self-inflicted thundering herd.
+  Stagger deploys with gaps. (Fleet at 15:30: crawl0/3/4/5 productive and wedge-free since
+  the fetcher fix, crawl1/crawl2 idle on the 429 bridge tail ~15k each and slated to
+  retire, ClickHouse healthy at 2.06B rows. The pending operator decisions — retire the
+  two idle boxes after a safe ledger copy-off, finish or revert the cool-and-park rollout,
+  and when to run the verify→re-crawl convergence pass that is the only *provable* zero —
+  are the live edge of the project now.)
 
 ## The ETA honesty record
 
