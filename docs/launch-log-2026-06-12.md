@@ -980,3 +980,11 @@ fresh + resolving, no restart. crawl4's shard evidently holds several
 whale repos. If it OOMs, the hard-exit fix self-heals (systemd restart +
 fetching requeue, ~1min blip, watchdog alerts). Other 5 healthy, emoji
 clean. Cadence shortened to 7min to watch crawl4.
+
+### 02:50 UTC — crawl4 plateaued (stable)
+
+crawl4 holding 11.6G RSS across two cycles — plateaued, not climbing,
+restarts=0, fresh, resolving. Sustainable elevated state (heavier shard
+working set; JS heap well under 12G cap, remainder off-heap parse buffers),
+not a spiral. Other 5 healthy, emoji clean. Resumed 600s cadence,
+crawl4 stays first-check. bvr8c8nie catches any crash <60s.
