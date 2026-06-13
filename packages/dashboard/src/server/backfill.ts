@@ -23,6 +23,10 @@ const ISSUE_EVENTS = [
   'takendown',
   'deactivated',
 ] as const;
+const TERMINAL_EVENTS = ['loaded', 'empty', ...ISSUE_EVENTS] as const;
+const V1_RECRAWL_TARGET_REPOS = 3_208_370;
+const V1_RECRAWL_TARGET_POSTS = 478_676_984;
+const V1_RECRAWL_RUN_PREFIX = 'v1-recrawl';
 
 /**
  * Window for the rolling repos-per-minute estimate. Must span multiple shard
@@ -417,8 +421,10 @@ export const getBackfillHistogram = createServerFn().handler(
 
 export interface BackfillHost {
   host: string;
+  total: number;
   loaded: number;
-  errors: number;
+  empty: number;
+  issues: number;
   bytes: number;
   avgPostsPerRepo: number;
 }
@@ -427,29 +433,149 @@ export const getBackfillHosts = createServerFn().handler(
   async (): Promise<Array<BackfillHost>> => {
     const rows = await chQuery<{
       host: string;
+      total: string;
       loaded: string;
-      errors: string;
+      empty: string;
+      issues: string;
       bytes: string;
       avg_posts: number | null;
     }>(`
       SELECT
         pds_host AS host,
+        countIf(event IN (${TERMINAL_EVENTS.map((e) => `'${e}'`).join(', ')})) AS total,
         countIf(event = 'loaded') AS loaded,
-        countIf(event IN (${ISSUE_EVENTS.map((e) => `'${e}'`).join(', ')})) AS errors,
+        countIf(event = 'empty') AS empty,
+        countIf(event IN (${ISSUE_EVENTS.map((e) => `'${e}'`).join(', ')})) AS issues,
         sum(car_bytes) AS bytes,
         avgIf(posts, event = 'loaded') AS avg_posts
       FROM backfill_repo_events
       GROUP BY pds_host
-      ORDER BY loaded DESC, errors DESC
+      ORDER BY total DESC, loaded DESC
       LIMIT 12
     `);
     return rows.map((row) => ({
       host: row.host,
+      total: num(row.total),
       loaded: num(row.loaded),
-      errors: num(row.errors),
+      empty: num(row.empty),
+      issues: num(row.issues),
       bytes: num(row.bytes),
       avgPostsPerRepo: num(row.avg_posts),
     }));
+  },
+);
+
+export interface BackfillRecrawlStatus {
+  generatedAt: string;
+  targetRepos: number;
+  targetPosts: number;
+  runId: string | null;
+  active: boolean;
+  shards: number;
+  freshnessSeconds: number | null;
+  reposProcessed: number;
+  remainingRepos: number;
+  reposPerMin: number;
+  etaHours: number | null;
+}
+
+export const getBackfillRecrawlStatus = createServerFn().handler(
+  async (): Promise<BackfillRecrawlStatus> => {
+    const runRows = await chQuery<{ run_id: string }>(
+      `
+      SELECT run_id
+      FROM backfill_progress
+      WHERE startsWith(run_id, {prefix:String})
+      ORDER BY ts DESC
+      LIMIT 1
+    `,
+      { prefix: V1_RECRAWL_RUN_PREFIX },
+    );
+    const runId = runRows[0]?.run_id;
+    if (runId === undefined) {
+      return {
+        generatedAt: new Date().toISOString(),
+        targetRepos: V1_RECRAWL_TARGET_REPOS,
+        targetPosts: V1_RECRAWL_TARGET_POSTS,
+        runId: null,
+        active: false,
+        shards: 0,
+        freshnessSeconds: null,
+        reposProcessed: 0,
+        remainingRepos: V1_RECRAWL_TARGET_REPOS,
+        reposPerMin: 0,
+        etaHours: null,
+      };
+    }
+
+    const [snapshot, rate] = await Promise.all([
+      chQuery<SnapshotRow>(
+        `
+        SELECT
+          shard,
+          max(ts) AS latest_ts,
+          ${STATUS_ARGMAX_SQL},
+          argMax(in_flight, ts) AS in_flight
+        FROM backfill_progress
+        WHERE run_id = {run:String}
+        GROUP BY shard
+      `,
+        { run: runId },
+      ),
+      chQuery<{ repos_per_min: string }>(
+        `
+        SELECT sum(rpm) AS repos_per_min
+        FROM (
+          SELECT
+            (argMax(${RESOLVED_SUM_SQL}, ts) - argMin(${RESOLVED_SUM_SQL}, ts))
+            / greatest(dateDiff('second', min(ts), max(ts)) / 60, 1) AS rpm
+          FROM backfill_progress
+          WHERE run_id = {run:String}
+            AND ts >= now() - INTERVAL ${RATE_WINDOW_MINUTES} MINUTE
+          GROUP BY shard
+        )
+      `,
+        { run: runId },
+      ),
+    ]);
+
+    const statusCounts = Object.fromEntries(
+      REPO_STATUSES.map((status) => [status, 0]),
+    ) as Record<BackfillRepoStatus, number>;
+    let newestTs = 0;
+    for (const row of snapshot) {
+      for (const status of REPO_STATUSES)
+        statusCounts[status] += num(row[status]);
+      newestTs = Math.max(newestTs, chTsToDate(row.latest_ts).getTime());
+    }
+
+    const totalEnumerated = REPO_STATUSES.reduce(
+      (acc, status) => acc + statusCounts[status],
+      0,
+    );
+    const remaining = statusCounts.pending + statusCounts.fetching;
+    const processed = Math.max(0, totalEnumerated - remaining);
+    const reposPerMin = num(rate[0]?.repos_per_min);
+    const freshnessSeconds =
+      newestTs > 0
+        ? Math.max(0, Math.round((Date.now() - newestTs) / 1000))
+        : null;
+    return {
+      generatedAt: new Date().toISOString(),
+      targetRepos: V1_RECRAWL_TARGET_REPOS,
+      targetPosts: V1_RECRAWL_TARGET_POSTS,
+      runId,
+      active:
+        freshnessSeconds !== null &&
+        freshnessSeconds < IDLE_AFTER_SECONDS &&
+        remaining > 0,
+      shards: snapshot.length,
+      freshnessSeconds,
+      reposProcessed: processed,
+      remainingRepos: Math.max(0, totalEnumerated - processed),
+      reposPerMin,
+      etaHours: reposPerMin > 0 ? remaining / reposPerMin / 60 : null,
+    };
   },
 );
 

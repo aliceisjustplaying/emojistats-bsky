@@ -32,9 +32,14 @@ import {
   getBackfillHosts,
   getBackfillIssues,
   getBackfillOverview,
+  getBackfillRecrawlStatus,
   getBackfillTimeline,
 } from '#/server/backfill';
-import type { BackfillOverview, BackfillRepoStatus } from '#/server/backfill';
+import type {
+  BackfillOverview,
+  BackfillRecrawlStatus,
+  BackfillRepoStatus,
+} from '#/server/backfill';
 
 const overviewQueryOptions = queryOptions({
   queryKey: ['backfill-overview'],
@@ -57,6 +62,12 @@ const histogramQueryOptions = queryOptions({
 const hostsQueryOptions = queryOptions({
   queryKey: ['backfill-hosts'],
   queryFn: () => getBackfillHosts(),
+  refetchInterval: 60_000,
+});
+
+const recrawlQueryOptions = queryOptions({
+  queryKey: ['backfill-recrawl'],
+  queryFn: () => getBackfillRecrawlStatus(),
   refetchInterval: 15_000,
 });
 
@@ -82,6 +93,7 @@ export const Route = createFileRoute('/backfill')({
       context.queryClient.ensureQueryData(timelineQueryOptions),
       context.queryClient.ensureQueryData(histogramQueryOptions),
       context.queryClient.ensureQueryData(hostsQueryOptions),
+      context.queryClient.ensureQueryData(recrawlQueryOptions),
       context.queryClient.ensureQueryData(issuesQueryOptions),
       context.queryClient.ensureQueryData(funQueryOptions),
     ]);
@@ -171,6 +183,7 @@ function BackfillPage() {
   const { data: timeline } = useSuspenseQuery(timelineQueryOptions);
   const { data: histogram } = useSuspenseQuery(histogramQueryOptions);
   const { data: hosts } = useSuspenseQuery(hostsQueryOptions);
+  const { data: recrawl } = useSuspenseQuery(recrawlQueryOptions);
   const { data: issues } = useSuspenseQuery(issuesQueryOptions);
   const { data: fun } = useSuspenseQuery(funQueryOptions);
 
@@ -202,6 +215,7 @@ function BackfillPage() {
       </header>
 
       <Hero overview={overview} />
+      <RecrawlStatus status={recrawl} overview={overview} />
 
       {/* the payoff goes right under the hero — this is the fun part */}
       <div className="grid gap-4 lg:grid-cols-2">
@@ -640,8 +654,10 @@ function HostsTable({
 }: {
   hosts: Array<{
     host: string;
+    total: number;
     loaded: number;
-    errors: number;
+    empty: number;
+    issues: number;
     bytes: number;
     avgPostsPerRepo: number;
   }>;
@@ -650,7 +666,7 @@ function HostsTable({
     <Card>
       <CardHeader>
         <CardTitle className="text-sm">Top PDS hosts</CardTitle>
-        <CardDescription>by repos loaded</CardDescription>
+        <CardDescription>by terminal repos seen</CardDescription>
       </CardHeader>
       <CardContent>
         {hosts.length === 0 ? (
@@ -660,37 +676,39 @@ function HostsTable({
             <thead>
               <tr className="border-b text-left text-xs text-muted-foreground">
                 <th className="pb-2 font-medium">host</th>
+                <th className="pb-2 text-right font-medium">total</th>
                 <th className="pb-2 text-right font-medium">loaded</th>
-                <th className="pb-2 text-right font-medium">errors</th>
-                <th className="hidden pb-2 text-right font-medium sm:table-cell">
-                  avg posts
-                </th>
-                <th className="pb-2 text-right font-medium">data</th>
+                <th className="pb-2 text-right font-medium">empty</th>
+                <th className="pb-2 text-right font-medium">issues</th>
               </tr>
             </thead>
             <tbody className="tabular-nums">
               {hosts.map((row) => (
                 <tr key={row.host} className="border-b border-border/50">
-                  <td className="max-w-36 truncate py-1.5 font-mono text-xs sm:max-w-48">
-                    {row.host}
+                  <td className="max-w-32 truncate py-1.5 font-mono text-xs sm:max-w-48">
+                    <p className="truncate">{row.host}</p>
+                    <p className="truncate font-sans text-[11px] text-muted-foreground">
+                      {formatBytes(row.bytes)} · avg{' '}
+                      {integer.format(Math.round(row.avgPostsPerRepo))} posts
+                    </p>
+                  </td>
+                  <td className="py-1.5 text-right font-medium">
+                    {compact.format(row.total)}
                   </td>
                   <td className="py-1.5 text-right">
-                    {integer.format(row.loaded)}
+                    {compact.format(row.loaded)}
+                  </td>
+                  <td className="py-1.5 text-right text-muted-foreground">
+                    {compact.format(row.empty)}
                   </td>
                   <td
                     className={`py-1.5 text-right ${
-                      row.errors > 0
+                      row.issues > 0
                         ? 'text-amber-600'
                         : 'text-muted-foreground'
                     }`}
                   >
-                    {integer.format(row.errors)}
-                  </td>
-                  <td className="hidden py-1.5 text-right sm:table-cell">
-                    {integer.format(Math.round(row.avgPostsPerRepo))}
-                  </td>
-                  <td className="py-1.5 text-right">
-                    {formatBytes(row.bytes)}
+                    {compact.format(row.issues)}
                   </td>
                 </tr>
               ))}
@@ -699,6 +717,83 @@ function HostsTable({
         )}
       </CardContent>
     </Card>
+  );
+}
+
+function RecrawlStatus({
+  status,
+  overview,
+}: {
+  status: BackfillRecrawlStatus;
+  overview: BackfillOverview | null;
+}) {
+  const prepared = status.runId === null;
+  const currentRemaining =
+    overview === null
+      ? null
+      : overview.statusCounts.pending + overview.statusCounts.fetching;
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <CardTitle className="text-sm">v2 metadata recrawl</CardTitle>
+            <CardDescription>
+              {prepared
+                ? 'prepared; waiting for current crawl + final sweep'
+                : `${status.runId} · ${status.active ? 'active' : 'idle'}`}
+            </CardDescription>
+          </div>
+          <Badge variant={status.active ? 'outline' : 'secondary'}>
+            {prepared ? 'ready' : status.active ? 'running' : 'seen'}
+          </Badge>
+        </div>
+      </CardHeader>
+      <CardContent>
+        <div className="grid gap-3 text-sm sm:grid-cols-4">
+          <RecrawlMetric
+            label="target repos"
+            value={integer.format(status.targetRepos)}
+          />
+          <RecrawlMetric
+            label="target posts"
+            value={integer.format(status.targetPosts)}
+          />
+          <RecrawlMetric
+            label={prepared ? 'current crawl left' : 'recrawl left'}
+            value={
+              prepared
+                ? currentRemaining === null
+                  ? '—'
+                  : integer.format(currentRemaining)
+                : integer.format(status.remainingRepos)
+            }
+          />
+          <RecrawlMetric
+            label={prepared ? 'recrawl eta' : 'eta'}
+            value={prepared ? 'not started' : formatEta(status.etaHours)}
+          />
+        </div>
+        {prepared ? null : (
+          <p className="mt-3 text-xs text-muted-foreground tabular-nums">
+            {integer.format(status.reposProcessed)} repos processed ·{' '}
+            {integer.format(Math.round(status.reposPerMin))}/min ·{' '}
+            {status.freshnessSeconds === null
+              ? 'no telemetry age'
+              : `updated ${formatDuration(status.freshnessSeconds)} ago`}
+          </p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function RecrawlMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <p className="text-xs text-muted-foreground">{label}</p>
+      <p className="font-mono text-base font-semibold tabular-nums">{value}</p>
+    </div>
   );
 }
 
