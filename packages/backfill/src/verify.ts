@@ -14,6 +14,27 @@
  *       invariant is superset, not equality: nothing is ever deleted from CH
  *       (emojitracker semantics), so only rkeys MISSING from CH fail; rkeys CH
  *       has that the fresh CAR lacks are posts deleted since the crawl.
+ *   (d) --sample-loose N | all: DIRECTED re-fetch. Reconciliation (a) can only
+ *       lower-bound the LOOSE class (CH count >= ledger with a divergent digest)
+ *       — precisely the repos where a lost backfill row could be masked by an
+ *       offsetting live arrival, the one thing a 64-bit XOR cannot rule out.
+ *       This draws the re-fetch sample from THAT set, not at random, so every
+ *       repo checked is one the digest could not clear; `all` visits the whole
+ *       set (no random gaps), for small/medium runs — for millions use
+ *       --emit-loose with the crawler instead.
+ *       NOT A PROOF: a re-fetch only checks "every post STILL in the repo is in
+ *       ClickHouse". A post deleted upstream since the crawl is absent from both
+ *       the fresh CAR and (possibly) CH, so this cannot prove the ORIGINAL CAR
+ *       ⊆ CH — the residual (a row both lost from CH AND deleted upstream since)
+ *       is unrecoverable and undetectable by any re-fetch. It is the strongest
+ *       PRACTICAL integrity check, not a formal proof. Run it post-drain (CH
+ *       flushed, no new LOOSE repos racing reconciliation) for the cleanest read.
+ *   (e) --emit-loose PATH: write the LOOSE DID list (one per line) so the
+ *       at-scale convergence loop can re-fetch them at full concurrency:
+ *       `crawl --did-file PATH` re-loads them (a shell-expanded `--did $(cat)`
+ *       breaks — --did is repeatable so extras become rejected positionals, and
+ *       millions exceed ARG_MAX), then re-run verify; repeat until LOOSE shrinks
+ *       to the genuinely-live tail (deletes-since-crawl).
  *
  * Exit codes: 0 clean, 1 mismatches found, 2 could not run.
  *
@@ -22,7 +43,7 @@
  * the only write it performs is the loaded → verified promotion, mirroring
  * Ledger.markVerified.
  */
-import { existsSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 
 import type { ClickHouseClient } from '@clickhouse/client';
@@ -75,6 +96,12 @@ interface Mismatch {
 interface ReconcileResult {
   exact: number;
   loose: number;
+  // The LOOSE class itself (CH count >= ledger, divergent digest, expected > 0):
+  // the only repos a digest reconciliation cannot prove, and therefore the only
+  // ones a re-fetch needs to visit. Carried out so --sample-loose / --emit-loose
+  // can target them directly. Empty-ledger (expected = 0) repos are excluded —
+  // there is nothing there to have lost.
+  looseRepos: LedgerRepo[];
   mismatches: Mismatch[];
 }
 
@@ -152,6 +179,7 @@ async function reconcile(
 
   const mismatches: Mismatch[] = [];
   const passedLoadedDids: string[] = [];
+  const looseRepos: LedgerRepo[] = [];
   let exact = 0;
   let loose = 0;
   let alreadyVerified = 0;
@@ -202,7 +230,10 @@ async function reconcile(
       // also perturbs the digest. CH count > ledger can't be set-checked from a
       // 64-bit XOR digest alone, so it stays a lower-bound pass; only CH <
       // ledger (handled below) or the balanced-but-divergent case (above) fail.
+      // This is the residual blind spot — collect it (when there is data to
+      // have lost) so --sample-loose / --emit-loose can re-fetch exactly here.
       loose += 1;
+      if (expected > 0) looseRepos.push(repo);
     } else {
       mismatches.push({
         did: repo.did,
@@ -262,7 +293,7 @@ async function reconcile(
             'backfill row masked by a live arrival) — run --sample on this DID',
     );
   }
-  return { exact, loose, mismatches };
+  return { exact, loose, looseRepos, mismatches };
 }
 
 /** (b) per-status counts + explicit terminal DID lists. */
@@ -317,24 +348,48 @@ const refetchPostRows: RefetchPostRows = async (did, pdsHost) => {
   return rows;
 };
 
-async function sampleVerify(
+/** Random draw across all loaded/verified repos (the undirected --sample pool). */
+function selectRandomRepos(
   db: Database.Database,
-  ch: ClickHouseClient,
   sampleSize: number,
-): Promise<number> {
-  const refetch = refetchPostRows;
-  const sampled = db
+): LedgerRepo[] {
+  return db
     .prepare(
-      "SELECT did, status, posts_total, pds_host, rev FROM repos WHERE status IN ('loaded', 'verified') ORDER BY RANDOM() LIMIT ?",
+      "SELECT did, status, posts_total, pds_host, rev, rkey_digest FROM repos WHERE status IN ('loaded', 'verified') ORDER BY RANDOM() LIMIT ?",
     )
     .all(sampleSize) as LedgerRepo[];
+}
+
+/**
+ * Unbiased pick of up to `n` from a pool (partial Fisher-Yates). Returns the
+ * whole pool when n >= size — so `--sample-loose all` (n = Infinity) visits the
+ * entire ambiguous set with no random gaps (the strongest practical check; see
+ * the re-fetch caveat in the header — not a formal proof). Sampled DIDs are
+ * emitted in the per-repo log lines below, so any run is auditable.
+ */
+function pickSample(pool: LedgerRepo[], n: number): LedgerRepo[] {
+  if (n >= pool.length) return pool;
+  const arr = pool.slice();
+  for (let i = 0; i < n; i += 1) {
+    const j = i + Math.floor(Math.random() * (arr.length - i));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr.slice(0, n);
+}
+
+async function sampleVerifyRepos(
+  ch: ClickHouseClient,
+  repos: LedgerRepo[],
+  pool: string,
+): Promise<number> {
+  const refetch = refetchPostRows;
   logger.info(
-    { requested: sampleSize, sampled: sampled.length },
-    'sample verification: re-fetching random repos',
+    { sampled: repos.length, pool },
+    'sample verification: re-fetching repos for exact rkey-superset check',
   );
 
   let failures = 0;
-  for (const repo of sampled) {
+  for (const repo of repos) {
     try {
       const rows = await refetch(repo.did, repo.pds_host);
       const fetchedRkeys = new Set(rows.map((row) => row.rkey));
@@ -412,7 +467,19 @@ function* fetchedKeysDiff(a: Set<string>, b: Set<string>): Generator<string> {
 // --- entrypoint ---------------------------------------------------------------
 
 async function main(): Promise<void> {
-  const { values } = parseArgs({ options: { sample: { type: 'string' } } });
+  const { values } = parseArgs({
+    options: {
+      sample: { type: 'string' },
+      'sample-loose': { type: 'string' },
+      'emit-loose': { type: 'string' },
+      // Skip the full ledger↔CH reconciliation (a) — for a fast, CH-light random
+      // --sample run while the crawl is still loading (reconcile fires ~1 query
+      // per 1000 loaded DIDs with FINAL, heavy on a busy ClickHouse). Incompatible
+      // with --sample-loose / --emit-loose, which are derived FROM reconciliation.
+      'no-reconcile': { type: 'boolean', default: false },
+    },
+  });
+  const noReconcile = values['no-reconcile'] ?? false;
   const sampleSize = values.sample === undefined ? null : Number(values.sample);
   if (
     sampleSize !== null &&
@@ -422,6 +489,40 @@ async function main(): Promise<void> {
       { sample: values.sample },
       '--sample expects a positive integer',
     );
+    process.exitCode = 2;
+    return;
+  }
+  // --sample-loose N | all: directed re-fetch of the ambiguous LOOSE set.
+  // 'all' (=> Infinity) makes pickSample return the whole set (exhaustive).
+  let sampleLooseSize: number | null = null;
+  if (values['sample-loose'] !== undefined) {
+    if (values['sample-loose'] === 'all') {
+      sampleLooseSize = Number.POSITIVE_INFINITY;
+    } else {
+      sampleLooseSize = Number(values['sample-loose']);
+      // Number.isInteger(Infinity) is false, so 'Infinity'/'1e309' fall through
+      // to this error — only the literal 'all' opts into the exhaustive pass.
+      if (!Number.isInteger(sampleLooseSize) || sampleLooseSize < 1) {
+        logger.error(
+          { 'sample-loose': values['sample-loose'] },
+          "--sample-loose expects a positive integer or 'all'",
+        );
+        process.exitCode = 2;
+        return;
+      }
+    }
+  }
+  const emitLoose = values['emit-loose'];
+  if (noReconcile && (sampleLooseSize !== null || emitLoose !== undefined)) {
+    logger.error(
+      {},
+      '--no-reconcile cannot be combined with --sample-loose/--emit-loose (both derive from the reconciliation pass)',
+    );
+    process.exitCode = 2;
+    return;
+  }
+  if (noReconcile && sampleSize === null) {
+    logger.error({}, '--no-reconcile needs --sample N (nothing else to do)');
     process.exitCode = 2;
     return;
   }
@@ -442,13 +543,51 @@ async function main(): Promise<void> {
   try {
     await pingClickHouse(ch);
 
-    const backfillDids = await chBackfillDids(ch);
-    const { exact, loose, mismatches } = await reconcile(db, ch, backfillDids);
-    terminalStateReport(db);
+    let exact = 0;
+    let loose = 0;
+    let looseRepos: LedgerRepo[] = [];
+    let mismatches: Mismatch[] = [];
+    if (!noReconcile) {
+      const backfillDids = await chBackfillDids(ch);
+      ({ exact, loose, looseRepos, mismatches } = await reconcile(
+        db,
+        ch,
+        backfillDids,
+      ));
+      terminalStateReport(db);
+
+      if (emitLoose !== undefined) {
+        writeFileSync(
+          emitLoose,
+          looseRepos.map((repo) => repo.did).join('\n') + '\n',
+        );
+        logger.info(
+          { path: emitLoose, dids: looseRepos.length },
+          'wrote LOOSE DID list — re-fetch at scale with: crawl --did-file <path>, then re-run verify',
+        );
+      }
+    }
 
     let sampleFailures = 0;
     if (sampleSize !== null)
-      sampleFailures = await sampleVerify(db, ch, sampleSize);
+      sampleFailures += await sampleVerifyRepos(
+        ch,
+        selectRandomRepos(db, sampleSize),
+        'random',
+      );
+    if (sampleLooseSize !== null) {
+      if (looseRepos.length === 0)
+        logger.info(
+          {},
+          'no LOOSE repos to directed-sample — reconciliation left nothing ambiguous',
+        );
+      else
+        sampleFailures += await sampleVerifyRepos(
+          ch,
+          pickSample(looseRepos, sampleLooseSize),
+          'loose',
+        );
+    }
 
     if (mismatches.length > 0 || sampleFailures > 0) {
       logger.error(
@@ -456,10 +595,16 @@ async function main(): Promise<void> {
         'verification FAILED',
       );
       process.exitCode = 1;
+    } else if (noReconcile) {
+      // Reconciliation was skipped — do NOT claim ledger/CH agreement.
+      logger.info(
+        { sampleFailures: 0 },
+        'sample check passed: every re-fetched repo is a subset of ClickHouse — NOTE --no-reconcile skipped the full ledger↔CH pass, so this is an early indicator, not a verify',
+      );
     } else {
       logger.info(
         { exact, loose, failed: 0 },
-        'verification passed: ledger and ClickHouse agree',
+        'verification passed: reconciliation found no CH<ledger or balanced-divergent losses (LOOSE is a lower bound — use --sample-loose for the directed re-fetch check)',
       );
     }
   } finally {

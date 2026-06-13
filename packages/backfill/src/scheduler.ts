@@ -1,5 +1,6 @@
 /** Claim/scheduling loop: concurrency limits, the claimable scan and --did mode. */
 
+import { readFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 
 import pLimit, { type LimitFunction } from 'p-limit';
@@ -32,6 +33,11 @@ export function parseFlags(): CliFlags {
     options: {
       limit: { type: 'string' },
       did: { type: 'string', multiple: true },
+      // Re-fetch a DID list from a file, one per line — the at-scale companion to
+      // verify --emit-loose (a shell-expanded `--did $(cat)` breaks: --did is
+      // repeatable so extras land as rejected positionals, and millions blow past
+      // ARG_MAX). Merged into dids; same exact-DID path, no claimable scan.
+      'did-file': { type: 'string' },
       // Explicit, not automatic: resetting budgets on every restart would let a
       // crash loop hammer dead hosts forever; a sweep is an operator decision.
       'final-sweep': { type: 'boolean', default: false },
@@ -49,9 +55,28 @@ export function parseFlags(): CliFlags {
       );
     }
   }
+  // Union of --did and --did-file (dedup: re-fetching a DID twice is harmless but
+  // wasteful, and a file may repeat the inline ones).
+  const dids = new Set(values.did ?? []);
+  const didFile = values['did-file'];
+  if (didFile !== undefined) {
+    for (const line of readFileSync(didFile, 'utf8').split('\n')) {
+      const did = line.trim();
+      if (did.length > 0) dids.add(did);
+    }
+    // An empty/blank --did-file must NOT silently fall through to a full
+    // claimable crawl (run() switches on dids.length) — that is the dangerous
+    // opposite of "re-fetch exactly this list", and it is precisely the
+    // convergence loop's SUCCESS state (LOOSE drained to nothing). Fail loudly;
+    // the caller's loop guard (`[ -s loose.txt ]`) is the right place to stop.
+    if (dids.size === 0)
+      throw new Error(
+        `--did-file ${didFile} contained no DIDs; refusing to fall through to a full claimable crawl`,
+      );
+  }
   return {
     limit,
-    dids: values.did ?? [],
+    dids: [...dids],
     finalSweep: values['final-sweep'] ?? false,
     reviveHosts: values['revive-host'] ?? [],
   };
