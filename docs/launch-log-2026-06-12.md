@@ -1067,3 +1067,5 @@ monitoring loop is stranded. Root-cause fix (parse-pool reply timeout) is
 a code change left for Alice — too invasive to do unsupervised at 5am.
 ### 05:08 UTC — crawl1 recovered, crawl5 coping
 crawl1 fully healthy post-restart: 12.2k rows/sec, RSS 5.6G, claiming. crawl5 sustained-elevated 15.7G ~13min, resolving 8.3k/sec, restarts=0 — coping (bucket-5 whale cluster); auto-heal watchdog bzc0lok2t covers any OOM/wedge <3min so relaxed to 600s. Other 4 healthy, emoji clean (360 parts, 0 delayed).
+### 05:19 UTC — ETA cycle
+All six fresh+resolving, r=0. Whale-heavy window: crawl0 12.3G, crawl5 15.5G, crawl4 10.5G (all coping). emoji clean (378 parts, 0 delayed). Per-shard resolved/min (05:07-05:19): s0 3692, s1 13145, s2 6923, s3 5305, s4 4498, s5 4730 = 38,293/min. Remaining 16,902,687. ETA ~7.4h → ~12:40 UTC. shard1 smallest 1.67M.
