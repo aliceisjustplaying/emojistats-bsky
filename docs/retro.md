@@ -659,6 +659,31 @@ shard1 the smallest at ~3M). Two non-routine notes:
   discipline. (As of 14:08 UTC the crawl is still running: ~8.1M repos remaining, ETA
   ~17:00–17:45 UTC, shard1 147k / shard2 180k draining toward done, emoji ingest clean.)
 
+### 2026-06-13 mid-afternoon (15:01 UTC)
+
+- **The wedge saga's third act: the fetcher fix exposed a hole one level up — a bad
+  host nobody was learning from.** The 14:04 `withProgressTimeout` made every stalled
+  fetch *settle* (abort + retry), which stopped the scheduler wedging — but
+  settling-as-retryable just re-claims the same silent host on the next pass. A
+  half-open host that accepts the socket then never delivers (the rate-limited
+  `atproto.brid.gy` bridge, owning a drained shard's tail, was the live culprit) was
+  invisible to *both* back-off systems: host-pressure cools only on a 429, host-health
+  parks only on DNS `ENOTFOUND` / HTTP 451. So the host produced bounded "stalled: no
+  progress" errors forever at ~0 throughput — never cooled, never parked, burning
+  dedicated-box hours for nothing. The fix routes stalls into both layers: a soft AIMD
+  cool-down (the same `penalize()` path as a 429) and a hard park after 6 sustained
+  stalls across 120s of zero successes (its own thresholds, distinct from the DNS/legal
+  30/30s; any success or HTTP response resets the streak, and a kind-change restarts it
+  so DNS and stall streaks can't fuse). Stalls use `markThrottled` so no attempt budget
+  is burned, and parked rows go to `unreachable` — the deferred final-sweep re-crawl
+  list — so nothing is lost. The transferable shape: a per-request timeout buys
+  *liveness* but not *learning*; if the selector can re-pick a persistently-bad
+  resource, you also need per-resource back-off so the system stops choosing it. Three
+  layers now stand behind this one failure — restart (watchdog), settle (fetcher
+  timeout), avoid (host cool/park) — each catching what the one before it could not.
+  (Codex-reviewed, 2 rounds, which caught a kind-carryover and a quarantine-reset gap;
+  tests cover stall classification, the 6/120s park, the resets, and the AIMD.)
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
