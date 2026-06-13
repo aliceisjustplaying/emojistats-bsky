@@ -1245,3 +1245,47 @@ through). IMPORTANT distinction surfaced for Alice: "verify can't *prove* zero l
 ≠ "loss happened" — verify is the checker; the write path (now fixed) decides loss.
 DECISION PENDING (Alice): run `--sample` for a measured loss rate (likely ~0), the
 `created_at` tightening, or both.
+
+### 18:33–18:50 UTC — INCIDENT: the verify TIMER overloaded ClickHouse and wedged crawl3 (misdiagnosed twice first)
+Babysitting caught CH load climbing 11→20 (8-core box) with crawl3 in a wedge cycle
+(watchdog silent-197s/211s/189s/217s/295s, one AUTO-RESTART) + crawl0 a one-off
+wedge at 18:15. The diagnosis chain — and I got it wrong twice before the evidence
+landed:
+  1. First suspected my own deploys / the post-restart re-ramp (revive 17:33 +
+     bridgy blacklist 17:46 restarted all 4 within ~15min). Plausible (matches the
+     mid-day load-16 transient) but not the cause.
+  2. Then suspected cooling-on-stall (7adfdc4, newly fleet-wide) — EXONERATED:
+     `grep -c stall` = 0 stall events. Not it.
+  3. Then guessed post-ramp MERGE backlog — WRONG: system.merges = 0, system.parts
+     = 454 (healthy), CPU 86% us / 1% iowait (CPU-bound, not IO/merge).
+  4. The real cause, found by inspecting `system.processes`: heavy
+     `SELECT did, count(), hex(groupBitXor(...)) ... FINAL` reconcile queries
+     (40s + 11s elapsed, 348 selects/2min) — i.e. a FULL `verify` (with
+     reconcile) running against the LIVE ClickHouse. Source: a pre-existing
+     **`emojistats-verify.timer`** that fired 18:20:50 and ground for 23min on
+     crawl0 + crawl4 (crawl3/crawl5 had already "failed"). The FINAL digest
+     group-bys starved the crawler inserts → 30s socket insert-timeouts (23 on
+     crawl3 in 20min) → loader retry pileup → slot leak → wedge.
+FIX: `systemctl stop emojistats-verify.timer + .service` then `pkill -9 -f
+"src/verify.ts"` fleet-wide (verify had written nothing — it promotes loaded→
+verified only AFTER reconcile completes, so a mid-reconcile kill is a clean abort).
+CH load collapsed 20 → 0.4 (1-min); reconcile selects → 0. crawl3 took one more
+watchdog restart at 18:50 (status 143) clearing the tail of the wedge, then resumed
+advancing at idle CH.
+LESSONS:
+  - This is the verify-vs-crawl contention I had ALREADY engineered against with
+    `--no-reconcile` (CH-light sampling) — but a pre-existing TIMER ran the full
+    reconcile anyway. Operational truth (a periodic verify timer) outranked the
+    new flag. Should have grepped for the verify timer the moment CH load rose,
+    not after three wrong guesses.
+  - `systemctl stop` did NOT reap the verify procs (blocked in a 40s CH socket
+    read, deaf to SIGTERM) — needed `pkill -9`. "Service stopped" ≠ "process gone".
+  - `pgrep -f verify.ts` self-matches the shell running it (the pattern string is
+    in the command line) → false "2 procs" readings; trust `systemctl is-active`
+    + `system.processes` count + CH load instead.
+  - Sequence discipline: verify belongs POST-DRAIN, exactly as planned. A timer
+    firing it mid-crawl is the wrong order — durable fix is to remove/reschedule
+    `emojistats-verify.timer` in the pix flake (stop only holds until reboot/
+    nixos-rebuild). FOR ALICE.
+  - Misdiagnosis cure (again): inspect `system.processes` / ground truth BEFORE
+    theorizing. Three wrong hypotheses cost minutes; one query named the culprit.
