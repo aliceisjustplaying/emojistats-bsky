@@ -762,6 +762,61 @@ shard1 the smallest at ~3M). Two non-routine notes:
   and when to run the verify→re-crawl convergence pass that is the only *provable* zero —
   are the live edge of the project now.)
 
+### 2026-06-13 late afternoon (16:00 UTC) — the dead-host gap quantified; "retire" ≠ "finish"
+
+- **The "park = excluded forever" gap, measured — and it's the *stall*-park that's the
+  landmine, not DNS/legal.** The entry above flagged that hard-parked hosts aren't
+  auto-re-crawled; pushed on by Alice ("this seems bad on a first look"), the operator
+  read the code and the live ledger instead of trusting the relay, and the picture
+  sharpened in a way that both confirms and softens it. The mechanism is real:
+  `addDeadHost` persists a host's death, every startup (including a `--final-sweep` run)
+  re-seeds the dead list and `unavailableHosts()` excludes it from claim scans at the SQL
+  level, while `resetUnreachableAttempts` zeroes only each row's *budget*, never the host
+  verdict — so there is no path to un-dead a host. But the *impact* turns entirely on
+  which hosts are on that list, and the data says they're the right ones: shard0's 5.2M
+  `unreachable` rows are 4.68M on `pds.trump.com` (DNS NXDOMAIN — the domain is gone),
+  295k on `plc.surge.sh` (HTTP 451 legal block), a pile of `*.test`/localhost/ngrok junk,
+  and ~25k on *alive* `bsky.network` hosts — and those 25k are **under** max-attempts and
+  **not** dead-listed, so they aren't excluded and the sweep/retry waves do pick them up.
+  Not re-crawling a domain that no longer resolves isn't data loss; it's correct. So
+  "unreachable = re-crawl later" was wrong as a *blanket* claim, but only for rows that
+  are genuinely uncrawlable by anyone. **Where the gap actually bites is the stall-park
+  from two entries up:** DNS and legal deadness are permanent and that's fine, but a
+  *stall* can be transient — a host quiet for two minutes may be perfectly alive — and
+  `addDeadHost` would persist that as permanent death with no re-probe. Cooling-on-stall's
+  hard-park is therefore the one that would strand recoverable data, which is exactly why
+  holding its rollout was right, and why the prerequisite for ever shipping it is a
+  dead-host *clear* path (periodic re-probe, or TTL'd stall-deadness kept distinct from
+  permanent DNS/legal deadness). The lesson sharpened twice: a relayed finding deserves a
+  code-and-data check before it's allowed to alarm *or* reassure (the check downgraded
+  "the final sweep is broken" to "one un-shipped feature needs a reversal path"), and
+  "permanent" is the right default for some failure kinds and a bug for others — the
+  back-off system has to tell DNS/legal death apart from a transient stall.
+- **The watchdog false-positive fix shipped — keyed on silence, not on the stats line.**
+  Item 1 of the queue landed: the auto-heal watchdog now measures staleness by the newest
+  log line *of any kind* rather than the `crawl stats` line specifically, thresholds
+  raised (alert 120→180s, restart 180→240s). The reasoning is clean — a box that's alive
+  but failure-heavy (crawl0 churning 404s) keeps logging *something*, so it no longer
+  reads as wedged, while a genuine event-loop freeze emits nothing at all and is still
+  caught. It's a slightly different resolution than "key on a `loaded` delta" (which would
+  misread a box legitimately producing *failures*, not loads, on a bad-host tail) — total
+  log silence is the more faithful proxy for "the process is actually stuck." The right
+  liveness signal is the one that goes quiet *only* when the thing is truly dead.
+- **"Retire" a near-done shard means "defer to a cheaper mop-up," not "finish."** Alice
+  caught the conflation — retiring crawl1/crawl2 doesn't complete their work, it leaves
+  ~15k pending repos each with no crawler assigned, so the shard-1/2 backfill stays
+  *incomplete* until something finishes it. The honest framing is retire-and-mop-up:
+  preserve the ledgers, retire the two dedis, then point one cheap box (or a freed
+  productive box once it drains its own bulk) at shards 1 & 2 to grind the remainder. The
+  sizing insight is the sharp part: the tail's bottleneck is the bridge's 429 rate limit,
+  not crawler capacity — crawl1 drained ~300 of 15k in *hours* — so two full dedis finish
+  it no faster than one cheap box, just at multiples of the cost; weeks of dedi-time for
+  ~30k repos is absurd money for a tail. Match the mop-up to the real constraint (a rate
+  limit you wait on), not the nominal work (repos to fetch). The binding caveat: this is
+  only zero-loss if the mop-up is actually committed and run — retire-and-forget would
+  abandon those ~30k real repos as a permanently incomplete backfill, even though nothing
+  was "lost."
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
