@@ -1034,3 +1034,17 @@ All six healthy, zero restarts, crawl4 receded to 11.4G. emoji clean
 (368 parts, 0 delayed). Per-shard resolved/min (04:14-04:32): s0 4901,
 s1 9698, s2 12101, s3 5239, s4 3912, s5 5051 = 40,902/min. Remaining
 18,565,601 (under 18.6M). ETA ~7.6h → ~12:10 UTC. shard1 smallest 2.13M.
+
+### 04:55 UTC — crawl5 RSS spike to 15.8G (watching) + ETA
+
+crawl5 spiked to 15.8G RSS (past 12G cap, near the ~16G OOM line — higher
+than crawl4 ever reached), inFlight 7995 (~2x the 4096 fetching = whale-CAR
+pileup resident in memory). Held flat 15.8G across two readings 30s apart
+= plateaued not runaway; telemetry fresh, still resolving 4188/min,
+restarts=0. Hands-off per design: if a new whale tips it >16G the OOM
+self-heals (hard-exit + systemd restart, ~8000 in-flight requeue as
+pending, at-least-once, zero loss). Tightened to ~5min watch; bvr8c8nie
+alerts <60s on crash. Other 5 healthy, emoji clean.
+Per-shard resolved/min (04:44-04:55): s0 4815, s1 13586, s2 7810, s3 4887,
+s4 4017, s5 4188 = 39,303/min. Remaining 17,699,202. ETA ~7.5h →
+~12:25 UTC. shard1 smallest 1.88M dropping fast.
