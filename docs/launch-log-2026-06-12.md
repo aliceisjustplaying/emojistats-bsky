@@ -988,3 +988,15 @@ restarts=0, fresh, resolving. Sustainable elevated state (heavier shard
 working set; JS heap well under 12G cap, remainder off-heap parse buffers),
 not a spiral. Other 5 healthy, emoji clean. Resumed 600s cadence,
 crawl4 stays first-check. bvr8c8nie catches any crash <60s.
+
+### 03:01 UTC — ETA cycle; crawl4 at 12.0G cap (riding it out)
+
+crawl4 RSS reached 12.0G (its heap cap line), still fresh + resolving,
+restarts=0. Decision: do NOT preemptively restart — the hard-exit fix
+self-heals an OOM cleanly (systemd restart + fetching requeue, no data
+loss), so a preemptive bounce only wastes 4096 in-flight fetches for the
+same downtime; concurrency tuning is off-limits (6144 lesson). Watching
+at 7min; bvr8c8nie alerts <60s on any crash. Other 5 healthy, emoji clean.
+Per-shard resolved/min (02:50-03:01): s0 4789, s1 10141, s2 9384, s3 5538,
+s4 4659, s5 5704 = 40,215/min. Remaining 22,224,065. ETA ~9.2h →
+~12:15 UTC. shard1 smallest 3.02M.
