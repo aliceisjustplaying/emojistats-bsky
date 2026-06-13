@@ -56,6 +56,8 @@ export interface BackfillOverview {
   shards: number;
   /** Seconds since the stalest shard's newest telemetry row. */
   freshnessSeconds: number;
+  /** Seconds since the freshest shard's newest telemetry row. */
+  latestFreshnessSeconds: number;
   /** True while telemetry is arriving (freshness below the idle cutoff). */
   active: boolean;
   /** Seconds since each shard's newest telemetry row, stalest first. */
@@ -216,13 +218,16 @@ async function fetchOverview(): Promise<BackfillOverview | null> {
     }))
     .toSorted((a, b) => b.ageSeconds - a.ageSeconds);
   const freshnessSeconds = shardFreshness[0]?.ageSeconds ?? 0;
+  const latestFreshnessSeconds =
+    shardFreshness[shardFreshness.length - 1]?.ageSeconds ?? freshnessSeconds;
 
   return {
     generatedAt: new Date().toISOString(),
     runId,
     shards: snapshot.length,
     freshnessSeconds,
-    active: freshnessSeconds < IDLE_AFTER_SECONDS,
+    latestFreshnessSeconds,
+    active: latestFreshnessSeconds < IDLE_AFTER_SECONDS,
     shardFreshness,
     totalEnumerated,
     resolved,

@@ -240,7 +240,7 @@ function CrawlBadge({ overview }: { overview: BackfillOverview | null }) {
   return overview.active ? (
     <Badge variant="outline" className="tabular-nums">
       <span className="size-1.5 rounded-full bg-emerald-600" />
-      crawling · updated {formatDuration(overview.freshnessSeconds)} ago
+      crawling · updated {formatDuration(overview.latestFreshnessSeconds)} ago
     </Badge>
   ) : (
     <Badge variant="secondary" className="tabular-nums">
