@@ -457,14 +457,19 @@ export class SqliteLedger implements Ledger {
       limit,
     ) as RepoTableRow[];
     if (rows.length < limit) {
-      rows.push(
-        ...(statements.retry.all(
-          Date.now(),
-          MAX_ATTEMPTS,
-          ...uniqueExcludedHosts,
-          limit - rows.length,
-        ) as RepoTableRow[]),
-      );
+      // NB: do NOT `rows.push(...retryRows)` — the claim scan limit is the large
+      // claim-backlog buffer (~250k), so in the end-game tail (pending under-fills
+      // because most of it is on excluded cooling/dead hosts) the retry query can
+      // return tens of thousands of rows. Spreading that array as function
+      // arguments overflows the call-stack/arg limit (RangeError: Maximum call
+      // stack size exceeded) and crashes the process. Append in a loop instead.
+      const retryRows = statements.retry.all(
+        Date.now(),
+        MAX_ATTEMPTS,
+        ...uniqueExcludedHosts,
+        limit - rows.length,
+      ) as RepoTableRow[];
+      for (const retryRow of retryRows) rows.push(retryRow);
     }
     return rows.map(toRepoRow);
   }
