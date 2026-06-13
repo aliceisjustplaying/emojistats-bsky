@@ -14,6 +14,7 @@
     "status": "bunx tsx src/status.ts",
     "healthcheck": "bunx tsx src/healthcheck.ts",
     "listrepos-diff": "bunx tsx src/listrepos-diff.ts",
+    "prepare-v1-recrawl": "bunx tsx scripts/prepare-v1-recrawl.ts",
     "test": "bunx tsx --test src/*.test.ts",
     "typecheck": "tsgo --noEmit"
   },
