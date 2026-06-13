@@ -894,6 +894,99 @@ shard1 the smallest at ~3M). Two non-routine notes:
   `getRepo`→`listRecords` fallback, and never let an HTTP status override what the host is
   observably doing.
 
+### 2026-06-13 evening (17:00–21:00 UTC) — the handoff
+
+- **The dead-host exit-ramp shipped, and Bridgy got blacklisted — closing two threads
+  from this afternoon.** The 16:00 entry flagged that there was no path to un-dead a host,
+  which is what made cooling-on-stall's hard-park unsafe to ship. `--revive-host`
+  (`4c38d0f`) is that path: it drops a host from the ledger's `dead_hosts` registry
+  (`removeDeadHost`) *and* resets only that host's parked `unreachable` rows to claimable
+  (`resetUnreachableForHost`, shard-scoped, indexed), applied in `crawl.ts` *before*
+  `createScheduler` re-seeds the exclusion set — so the verdict is gone before the
+  re-seed, and it's selective by design (DNS/legal-dead hosts stay parked; only the named
+  host is re-armed, never the blanket reset). With a clear path in hand the Bridgy
+  decision became clean: `atproto.brid.gy` and `fed.brid.gy` went into every box's
+  `dead_hosts`, parking the ~15–18k bridged repos per shard as `unreachable` instead of
+  retrying a `getRepo` that the 16:25 probe proved will never answer. The preserved
+  shard-1/2 bridge-DID lists live on the storagebox at `_meta/bridge-parked/`, with a
+  one-line revive recorded for the day Bridgy ships `getRepo`. The keeper: blacklisting a
+  host must ship with its inverse, or "park" silently means "abandon."
+- **Incident: a verify *timer* overloaded ClickHouse and wedged crawl3 — after three
+  wrong guesses.** At 18:20 a pre-existing systemd `emojistats-verify.timer` fired a full
+  ledger↔ClickHouse reconcile against the *live* CH mid-crawl — hundreds of heavy `FINAL`
+  digest group-bys that starved the crawler inserts into 30s socket-timeouts, leaked slots
+  and wedged crawl3; CH load climbed 11→20 on the 8-core serving box. Diagnosis took three
+  misses first — the post-deploy re-ramp (plausible, matched the midday load-16 transient,
+  but no), cooling-on-stall (exonerated: zero stall events), a merge backlog (wrong:
+  `system.merges` = 0) — before one look at `system.processes` named it instantly (348
+  reconcile selects in two minutes). The fix was `systemctl stop` the timer + `pkill -9`
+  the verify procs (deaf to SIGTERM, blocked in a 40s CH socket read), and CH load
+  collapsed 20→0.4. Four lessons, most of them recurrences: inspect ground truth
+  (`system.processes`) *before* theorizing — one query beat three hypotheses; an
+  operational reality (a periodic timer) can outrank a careful new flag (`--no-reconcile`
+  was built exactly to dodge this contention, and the timer ran the full reconcile
+  anyway); a stopped service isn't a stopped process; and `verify` belongs strictly
+  *post-drain*, never against the same single CH the crawl is hammering. The durable fix
+  lives in the pix flake (the `systemctl stop` only holds until the next `nixos-rebuild`)
+  and is the handoff's highest-priority infra item.
+- **crawl4's two bugs — a hang and a crash in the same "box keeps restarting" costume.**
+  Within one hour crawl4 destabilized twice from two unrelated causes, and telling them
+  apart was the whole job. *Bug A (a hang):* a stale keepalive socket poisoned the
+  loader's ClickHouse client pool; the retry reused the dead client, repos awaiting the
+  flush held every concurrency slot, `fetching` pegged at 4096 while `loaded` froze — and
+  the watchdog sailed past it because the box kept logging stats. Fixed (`b825b5c`) by
+  classifying connection-level failures and rebuilding the client before the next retry.
+  *Bug B (a crash):* `listClaimable` threw `RangeError: Maximum call stack size exceeded`
+  — `rows.push(...retryRows)` spreads an array as function arguments, and in the end-game
+  tail (most pending behind excluded/blacklisted hosts) the retry query returned tens of
+  thousands of rows, overflowing the argument limit. Fixed (`6a06ccd`) by appending in a
+  loop. Three keepers: "the box keeps restarting" is a *symptom*, not a diagnosis — a
+  0-CPU hang, an exit-1 crash and an OOM are externally identical, so read the signature
+  (`Result=`, `status=`, the fatal log line, `dmesg`) before reaching for a fix;
+  `fn(...bigArray)` is a latent crash at scale that no small-input test catches (grep hot
+  paths for spread-of-unbounded-arrays); and the watchdog's log-freshness signal — chosen
+  to stop false-restarts on 404 churn — is blind to a chatty-but-stuck box, which is why
+  the real health signal is *progress* (`loaded` advancing), not log liveness. That last
+  one is the throughline of the whole run: the liveness detector went alert-only →
+  auto-restart → CPU-gated → log-freshness → (still open) progress-gated, and nearly every
+  crawler incident was a referendum on which signal tells the truth.
+- **The limit of verification, named honestly — and the tooling to push it as far as it
+  goes.** A clean result got pinned down (~18:00): you cannot prove set-subset from an
+  O(1) digest. `verify` records a per-repo `(count, XOR-rkey-digest)` at crawl time and
+  compares it to ClickHouse, but CH keeps growing from the live firehose, so "CH count ≥
+  ledger" is *normal*, and once counts differ a single 64-bit XOR can't tell a dropped
+  backfill row (masked by an offsetting live arrival) from a benign extra. (Filtering
+  `src='backfill'` doesn't save it — `src` isn't in the `ReplacingMergeTree(did,rkey)`
+  sort key, so a backfilled rkey later seen live collapses to the live row.) So "verify
+  can't *prove* zero loss" is a property of digests, not evidence that loss happened — and
+  the distinction matters: the write path decides loss, the checker only catches it. The
+  two real closures are source-prevention (the `a31b514` loader fix plugs the only known
+  drop mechanism) and re-fetch convergence, and the convergence tooling now exists
+  (`1385aea`): `verify --emit-loose` writes the ambiguous LOOSE DID list, `crawl
+  --did-file` re-fetches exactly those, repeat until LOOSE shrinks to the genuinely-live
+  tail; an early random sample returned zero losses. The honesty caveat is carried into
+  the handover too: even an exhaustive re-fetch only proves "every post *still* in the
+  repo is in CH" — an upstream deletion since the crawl is invisible to both sides — so
+  it's the strongest *practical* check, not a formal proof.
+- **Handoff.** As of ~21:00 UTC the project passes to another agent, with `HANDOVER.md` as
+  the operational baton (current state, open items in operator detail, tooling/gotchas
+  reference — and an explicit "do not edit `retro.md`, it's owned separately"). State:
+  crawl1 and crawl2 are retired and their boxes *deleted*; the four productive crawlers
+  (crawl0/3/4/5) are in the slow end-game tail with ~2.8M repos left and an ETA measured in
+  days, not hours; everything that shipped today was Codex-reviewed and deployed at
+  `48de289`. The open items the next agent inherits, in priority order: remove/reschedule
+  the `emojistats-verify.timer` in the pix flake (the highest-priority infra fix — a
+  `systemctl stop` only holds to the next rebuild); run the post-drain verify→`--did-file`
+  convergence pass for the zero-loss number; add the watchdog progress-signal (restart on
+  `loaded`-flat + `fetching`-pegged, even while logging); fold the CH-client rebuild into
+  the still-unfixed telemetry client; revive Bridgy if it ever ships `getRepo`; re-crawl
+  the ~17% pre-widening `v:1` archive metadata; and the end-game sequence proper —
+  `--final-sweep` → full verify → `v:1` re-crawl → public-site cutover. This retro stays a
+  living document; the run isn't over, it has changed hands. What it has already earned, in
+  one line: almost every hard hour of this backfill went not to the data but to telling a
+  *stuck* system from a *slow* one — and the durable wins were the detectors and back-off
+  rules that finally learned the difference.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
