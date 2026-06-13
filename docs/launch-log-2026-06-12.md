@@ -929,3 +929,13 @@ Remaining (pending+fetching): 27,062,492.
 Honest ETA: ~11.7h → roughly 12:45 UTC. Ahead of the 13h baseline; the
 listRepos sweeps (37M+ ghost rows condemned) are why the real-repo
 remainder is draining this fast.
+
+### 01:27 UTC — ETA cycle
+
+All six 4096, fresh, RSS steady (crawl0 10.3G / crawl4 9.9G / crawl5 9.7G
+against 12G caps — off-heap, stable). emoji healthy (load 14, 0 delayed,
+378 parts). Per-shard resolved/min (01:16-01:27): s0 5127, s1 11189,
+s2 10811, s3 4931, s4 4869, s5 5148 = 42,075/min fleet (up from 38.6k).
+Remaining 26,092,371. ETA ~10.3h → ~11:50 UTC. Trending faster as the
+real-repo backlog drains. No box near drain yet (smallest remaining
+shard0 at 3.85M).
