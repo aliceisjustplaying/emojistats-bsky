@@ -911,3 +911,21 @@ Lesson logged twice now: the failure mode of this crawler is never "down",
 it is "alive and silent" — so the watchdog must key on stats-line AGE, not
 unit state. A persistent fleet watchdog now alerts on >120s staleness,
 crash-restarts, and unit failures across all six boxes + ingest.
+
+### 01:04 UTC — post-revert health + ETA
+
+All six boxes 4096, all reporting fresh (<10s), RSS at the documented
+stable operating point (crawl0/4 ~10G against 12G caps — off-heap CAR
+buffers, not heap pressure; crawl3 ~8G against its 8G cap on the 32GB
+box, steady). emoji maximized and healthy: load ~15/8 cores, ClickHouse
+~700% CPU, 0 delayed inserts, posts 374 active parts.
+
+Canary fully vindicated: shard1 back at 4096 resolves 8,769/min — nearly
+2× the 4,170-5,615/min it managed while OOM-throttled at 6144.
+
+Per-shard resolved/min (00:45-01:04): s0 4842, s1 8769, s2 10830,
+s3 5266, s4 3911, s5 4963 = 38,581/min fleet.
+Remaining (pending+fetching): 27,062,492.
+Honest ETA: ~11.7h → roughly 12:45 UTC. Ahead of the 13h baseline; the
+listRepos sweeps (37M+ ghost rows condemned) are why the real-repo
+remainder is draining this fast.
