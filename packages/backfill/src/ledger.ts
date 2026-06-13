@@ -123,6 +123,7 @@ export class SqliteLedger implements Ledger {
   private readonly stmtGetRepo: Database.Statement;
   private readonly stmtByStatus: Database.Statement;
   private readonly stmtResetUnreachable: Database.Statement;
+  private readonly stmtResetUnreachableForHost: Database.Statement;
   private readonly claimableExclusionStatements = new Map<
     number,
     { pending: Database.Statement; retry: Database.Statement }
@@ -337,6 +338,20 @@ export class SqliteLedger implements Ledger {
       WHERE status = 'unreachable' ${shardAnd}
     `);
 
+    // Revive a single host (--revive-host): the targeted inverse of the
+    // dead-host park. INDEXED BY mirrors the park statements — without it the
+    // planner row-filters pds_host over the whole unreachable range. Only the
+    // named host's rows are touched, so genuinely-dead DNS/legal hosts stay
+    // parked while a recovered host (e.g. brid.gy once it serves getRepo) is
+    // re-armed.
+    this.stmtResetUnreachableForHost = this.db.prepare(`
+      UPDATE repos SET attempts = 0, retry_after = 0
+      WHERE did IN (
+        SELECT did FROM repos INDEXED BY idx_repos_host_status
+        WHERE pds_host = ? AND status = 'unreachable' ${shardAnd}
+      )
+    `);
+
     this.stmtStatusCounts = this.db.prepare(
       `SELECT status, COUNT(*) AS n FROM repos ${shardWhere} GROUP BY status`,
     );
@@ -512,6 +527,16 @@ export class SqliteLedger implements Ledger {
     } catch {
       return [];
     }
+  }
+
+  removeDeadHost(host: string): void {
+    const hosts = new Set(this.getDeadHosts());
+    if (!hosts.delete(host)) return;
+    this.setMeta(DEAD_HOSTS_META_KEY, JSON.stringify([...hosts].toSorted()));
+  }
+
+  resetUnreachableForHost(host: string): number {
+    return this.stmtResetUnreachableForHost.run(host).changes;
   }
 
   upsertParked(did: string, pdsHost: string, error: string): void {

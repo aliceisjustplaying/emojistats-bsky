@@ -262,6 +262,39 @@ void describe('ledger.parkDeadHostChunk', () => {
     ledger.close();
   });
 
+  void it('revive drops a host from the registry and re-arms only its rows', () => {
+    const ledger = new SqliteLedger(path.join(dir, 'revive.sqlite'));
+    ledger.addDeadHost('brid.gy');
+    ledger.addDeadHost('dns.dead');
+    // Two hosts' rows parked out-of-budget (born parked, attempts = MAX).
+    ledger.upsertParked('did:plc:bridge1', 'brid.gy', 'host skipped');
+    ledger.upsertParked('did:plc:dns1', 'dns.dead', 'host dead');
+    assert.equal(ledger.getRepo('did:plc:bridge1')!.attempts, MAX_ATTEMPTS);
+    assert.deepEqual(ledger.listClaimable(10), []);
+
+    // Revive brid.gy only: drop the verdict, then re-arm its rows.
+    ledger.removeDeadHost('brid.gy');
+    assert.deepEqual(ledger.getDeadHosts(), ['dns.dead']);
+    assert.equal(ledger.resetUnreachableForHost('brid.gy'), 1);
+
+    const bridge = ledger.getRepo('did:plc:bridge1')!;
+    assert.equal(bridge.status, 'unreachable');
+    assert.equal(bridge.attempts, 0);
+    // Re-armed → claimable again; the genuinely-dead host is untouched.
+    assert.deepEqual(
+      ledger.listClaimable(10).map((r) => r.did),
+      ['did:plc:bridge1'],
+    );
+    assert.equal(ledger.getRepo('did:plc:dns1')!.attempts, MAX_ATTEMPTS);
+
+    // Reviving a host with no parked rows resets nothing; removing an absent
+    // host from the registry is a no-op.
+    assert.equal(ledger.resetUnreachableForHost('no.such.host'), 0);
+    ledger.removeDeadHost('never.there');
+    assert.deepEqual(ledger.getDeadHosts(), ['dns.dead']);
+    ledger.close();
+  });
+
   void it('is shard-scoped like every other claim-path write', () => {
     // Find dids landing in bucket 0 and elsewhere so the test is deterministic.
     const dids: string[] = [];

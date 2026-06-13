@@ -126,6 +126,20 @@ export interface Ledger {
   /** Cross-process dead-host registry (ledger meta), written by the crawler, read by enumeration. */
   addDeadHost(host: string): void;
   getDeadHosts(): string[];
+  /**
+   * Revive path (--revive-host): drop a host from the dead registry so startup
+   * re-seeding and the scan filter stop excluding it. No-op if absent. MUST be
+   * paired with resetUnreachableForHost — removing the verdict alone leaves the
+   * host's rows parked out-of-budget (the final-sweep gap this closes).
+   */
+  removeDeadHost(host: string): void;
+  /**
+   * Companion to removeDeadHost: zero attempts/retry_after on the host's parked
+   * 'unreachable' rows (shard-scoped) so they become claimable again. Returns
+   * rows reset. Scoped to one host — never the blanket resetUnreachableAttempts,
+   * which would also revive genuinely-dead DNS/legal hosts.
+   */
+  resetUnreachableForHost(host: string): number;
   /** Enumeration insert path for dead-host rows: born parked (final-sweep list). */
   upsertParked(did: string, pdsHost: string, error: string): void;
   /** Follow an account migration discovered after enumeration (stale PLC pointer). */

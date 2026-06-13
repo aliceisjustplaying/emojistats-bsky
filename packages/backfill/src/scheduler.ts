@@ -18,6 +18,13 @@ export interface CliFlags {
   dids: string[];
   /** Final sweep: zero the attempts budget on parked unreachable rows so waves resume. */
   finalSweep: boolean;
+  /**
+   * Revive these hosts: drop each from the dead-host registry and reset its
+   * parked 'unreachable' rows to claimable. The targeted exit-ramp for a host
+   * that recovered (or was deliberately skipped, e.g. brid.gy) — unlike
+   * --final-sweep it does not re-arm genuinely-dead DNS/legal hosts.
+   */
+  reviveHosts: string[];
 }
 
 export function parseFlags(): CliFlags {
@@ -28,6 +35,8 @@ export function parseFlags(): CliFlags {
       // Explicit, not automatic: resetting budgets on every restart would let a
       // crash loop hammer dead hosts forever; a sweep is an operator decision.
       'final-sweep': { type: 'boolean', default: false },
+      // Repeatable: --revive-host a.example --revive-host b.example
+      'revive-host': { type: 'string', multiple: true },
     },
   });
 
@@ -44,6 +53,7 @@ export function parseFlags(): CliFlags {
     limit,
     dids: values.did ?? [],
     finalSweep: values['final-sweep'] ?? false,
+    reviveHosts: values['revive-host'] ?? [],
   };
 }
 

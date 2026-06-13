@@ -90,6 +90,32 @@ async function main(): Promise<void> {
     );
   }
 
+  // Revive must run BEFORE createScheduler: the scheduler seeds host-health and
+  // the scan-exclusion set from ledger.getDeadHosts() at construction, so the
+  // verdict has to be gone from the registry first or the host is re-excluded
+  // and its just-reset rows never get claimed (the final-sweep dead-host gap).
+  //
+  // Operational notes (codex review):
+  //   - Per-box: each shard owns its own ledger, so revive on every box whose
+  //     shard holds rows for the host. Pass the EXACT canonical pds_host string
+  //     stored in the ledger (e.g. 'atproto.brid.gy', no scheme for https).
+  //   - resetUnreachableForHost is a single unchunked UPDATE — fine here (runs
+  //     once at startup before the scheduler/telemetry loops), sub-second for a
+  //     ~100k-row host; a multi-million-row revive would block startup briefly.
+  //   - If enumeration runs CONCURRENTLY (it does not on the crawl boxes today —
+  //     no enumerate service/timer), its ≤60s dead-host cache could re-park rows
+  //     freshly enumerated in that window. upsertParked only clobbers 'pending',
+  //     never an already-revived 'unreachable' row, so the bulk is safe; re-run
+  //     revive afterward to catch any stragglers, or revive while it is idle.
+  for (const host of flags.reviveHosts) {
+    ledger.removeDeadHost(host);
+    const revived = ledger.resetUnreachableForHost(host);
+    logger.warn(
+      { host, revived },
+      'host revived: dropped from dead registry, unreachable rows reset to claimable',
+    );
+  }
+
   const stats = createCrawlStats();
   const control: CrawlControl = { stopClaiming: false };
 
