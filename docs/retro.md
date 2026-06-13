@@ -596,6 +596,69 @@ shard1 the smallest at ~3M). Two non-routine notes:
   window persisting — crawl0/5 at 14–15 G, coping; rate dipped to ~34k/min on the
   crawl2 restart, recovering; shard1 down to 1.29M, nearing the 500k retire line.)
 
+### 2026-06-13 daylight (06:37–14:08 UTC)
+
+- **The overnight deadlock finally got its root cause — one socket await down.**
+  The pre-dawn note deferred the real fix to "daylight and a Codex review"; it landed
+  in two layers. First (07:33) a pool-level backstop freed leaked concurrency slots on
+  stalled worker replies — but that only frees the *scheduler's* slot while the worker
+  keeps running, and the review itself flagged that a liveness patch can decay into
+  unbounded worker backlog. The durable fix (14:04) sits one layer down in the fetcher:
+  a half-open socket with no FIN/RST makes `fetch()`, the body `read()`, the error-body
+  `text()` and `cancel()` all hang forever, and `AbortSignal.timeout` does not reliably
+  interrupt a dead socket — so the job never settles, its `GLOBAL_CONCURRENCY` slot
+  leaks, enough leaks freeze the scheduler, the 180s watchdog restarts the box,
+  host-health resets, the same bad hosts re-stall → wedge/restart loop. `withProgressTimeout`
+  races every network await against a self-driven 60s inactivity timer and best-effort
+  abort()s the socket, so every fetch settles under the watchdog window and the slot is
+  always freed. The lesson is the shape of the fix: the watchdog auto-restart and the
+  pool backstop were both genuine containment, but they treated the *leak*; the cause
+  was a single unguarded class of awaits, and only stepping down to the fetcher closed
+  the loop. Backstop first to stop the bleeding, root-cause fix once supervised — both,
+  in that order.
+- **The "500k retire-flag" was a guess dressed as a threshold — and Alice caught it.**
+  At 09:00 the watch announced crawl1 ready to retire (shard1 pending under 500k), with
+  the gloss that "much of the residual is unreachable dead-host repos the final sweep
+  would classify terminal anyway." At 09:01 Alice pushed back; a one-query ledger check
+  showed the opposite — the top hosts in shard1's tail were all *healthy* Bluesky
+  mushroom PDSes (lionsmane/enoki/inkcap/oyster/shimeji…), 24–30k real fetchable repos
+  each. The "unreachable" claim had been inferred, never measured. That also reframed
+  the wedge mechanism: crawl1's tail is concentrated on a few big hosts, and 4096
+  concurrency hammering rate-limited mushrooms produces contention → slow responses →
+  stalled fetches → slot leak. The deadlock's fuel was our own concurrency against
+  *healthy* hosts, not dead ones. Two old lessons re-earned: don't infer where a ledger
+  query will measure, and a round-number flag (500k) silently encodes an unverified
+  assumption (residual = junk) — retire a shard when pending ≈ 0, not when a threshold
+  feels done. Alice's two-line pushback was load-bearing again.
+- **A whole-repo adversarial review caught a silent-data-loss bug while the crawl ran.**
+  Mid-flight, a Codex pass over the entire repo (`docs/adversarial-code-review-2026-06-13.md`,
+  ten findings) surfaced the one class of bug this whole project exists to prevent: the
+  loader evicted a flush generation's outcome on a fixed 128-generation window, and
+  `finish()` treated a missing entry as *success* — so a repo spanning more than 128
+  flushes whose `finish()` raced past that window over a **failed** flush was marked
+  `loaded` despite dropped rows. Silent loss, no error thrown, exactly the failure
+  family behind Alice's backfill PTSD. Fix: evict a generation only after its flush
+  succeeds and retain failed ones, so a late `finish()` always observes the failure and
+  parks the repo retryable, plus a regression test that fails on the old eviction. The
+  same review hardened verify — a balanced row count masking a divergent rkey digest (a
+  lost backfill row offset by a live-path arrival) used to be warned-and-promoted to
+  "verified"; now it fails as a digest mismatch. The point isn't the single bug; it's
+  that an independent adversarial reader, run as routine *even mid-crawl*, found a
+  correctness hole that no green test suite or ETA graph would ever surface.
+  Verification-first design has to include verifying the verifier.
+- **The slowdown that wasn't a bug.** From ~06:30 the fleet rate fell 40k → 37k → 29k →
+  23k → 20k/min and held there. A falling graph begs to be read as a regression; the
+  honest read was the opposite — normal backfill end-game. The easy repos are done; the
+  remaining ~8M skew to slower hosts, bigger CARs and more retries, and the bulk-healthy
+  shards (crawl0/3/4/5) slowed in lockstep with zero infra signal. Remote-host-bound,
+  nothing to fix, and the log said exactly that. The matching restraint: with one
+  wedge-fix already deployed and still unproven, the watch explicitly declined to ship a
+  second speculative timeout change unsupervised ("a 2nd speculative one unsupervised is
+  over-reaching") and held at 600s. Knowing which slowdowns to fix and which to wait
+  out — and not stacking a second guess on an unverified first — is the end-game
+  discipline. (As of 14:08 UTC the crawl is still running: ~8.1M repos remaining, ETA
+  ~17:00–17:45 UTC, shard1 147k / shard2 180k draining toward done, emoji ingest clean.)
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
