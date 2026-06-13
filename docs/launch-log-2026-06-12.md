@@ -957,3 +957,10 @@ s1 12009, s2 11027, s3 3877, s4 4406, s5 5585 = 41,555/min. Remaining
 WATCH: crawl4 RSS 11.4G (up from 9.8G), closest to its 12G heap cap all
 night — still fresh + resolving, no spiral, but flagged for close watch.
 Watchdog bvr8c8nie alerts within 60s on any staleness/restart.
+
+### 02:20 UTC — crawl4 watch closed
+
+crawl4 RSS receded 11.4G → 10.5G with no restart (transient whale-repo
+parse, not heap pressure). All six fresh and resolving (crawl0 11.2k/s).
+emoji load down to 2.9/8 cores, 0 delayed inserts — ClickHouse fully
+caught up with headroom, not starved. Normal 600s cadence resumed.
