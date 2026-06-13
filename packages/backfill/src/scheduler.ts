@@ -178,6 +178,24 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
   const active = new Set<Promise<void>>();
   let claimBacklog: RepoRow[] = [];
 
+  const waitForHostPace = async (repo: RepoRow): Promise<void> => {
+    for (;;) {
+      const coolMs = hostPressure.coolingMs(repo.pdsHost);
+      if (coolMs > 0) {
+        await new Promise((resolve) => {
+          setTimeout(resolve, coolMs);
+        });
+        continue;
+      }
+      if (repo.rateLimitReserved === true || hostPressure.reserve(repo.pdsHost))
+        break;
+      await new Promise((resolve) => {
+        setTimeout(resolve, Math.max(hostPressure.coolingMs(repo.pdsHost), 1));
+      });
+    }
+    return globalLimit(() => processRepo(repo));
+  };
+
   // Per-host limiter outermost so a slow host's queue never pins global slots;
   // the global limiter inside is what actually caps simultaneous downloads.
   // A host that started cooling after this repo was claimed gets requeued
@@ -185,43 +203,7 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
   // hostage to the deepest host's cooldown (observed fetching: 2 of 3,072).
   const trackRepo = (repo: RepoRow): void => {
     const task = hostLimitFor(repo.pdsHost)(() => {
-      const coolMs = hostPressure.coolingMs(repo.pdsHost);
-      if (coolMs > 0) {
-        if (repo.preserveExisting === true) {
-          logger.warn(
-            { did: repo.did, host: repo.pdsHost, coolMs },
-            'preserved loaded/verified repo waiting for host cooldown',
-          );
-          return new Promise<void>((resolve) => {
-            setTimeout(resolve, coolMs);
-          }).then(() => globalLimit(() => processRepo(repo)));
-        }
-        ledger.markThrottled(repo.did, `host cooling: ${repo.pdsHost}`, coolMs);
-        stats.retried += 1;
-        return Promise.resolve();
-      }
-      if (
-        repo.rateLimitReserved !== true &&
-        !hostPressure.reserve(repo.pdsHost)
-      ) {
-        if (repo.preserveExisting === true) {
-          logger.warn(
-            { did: repo.did, host: repo.pdsHost },
-            'preserved loaded/verified repo waiting for host rate-limit slot',
-          );
-          return new Promise<void>((resolve) => {
-            setTimeout(resolve, hostPressure.coolingMs(repo.pdsHost));
-          }).then(() => globalLimit(() => processRepo(repo)));
-        }
-        ledger.markThrottled(
-          repo.did,
-          `host rate-limit pacing: ${repo.pdsHost}`,
-          hostPressure.coolingMs(repo.pdsHost),
-        );
-        stats.retried += 1;
-        return Promise.resolve();
-      }
-      return globalLimit(() => processRepo(repo));
+      return waitForHostPace(repo);
     });
     const tracked: Promise<void> = task
       .catch((err: unknown) => {
