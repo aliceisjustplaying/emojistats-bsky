@@ -1075,3 +1075,5 @@ A malformed ScheduleWakeup at 05:19 stranded the proactive loop ~33min (2nd time
 All six healthy, crawl2 rebuilding post-OOM (RSS 6.4G, claiming). Whale boxes crawl0 14.2G / crawl5 14.5G coping. emoji clean (384 parts, 0 delayed). Per-shard resolved/min (05:52-06:04): s0 4012, s1 10973, s2 9713, s3 4718, s4 3793, s5 4126 = 37,335/min (recovered). Remaining 15,193,485. ETA ~6.8h → ~12:50 UTC. shard1 smallest 1.17M, ~1h from 500k retire-flag.
 ### 06:26 UTC — ETA cycle
 All six healthy, fresh. crawl5 stable 14.7G (coping), others 8-11G. emoji clean (369 parts, 0 delayed). Per-shard resolved/min (06:14-06:26): s0 4073, s1 12684, s2 10428, s3 4717, s4 3807, s5 4233 = 39,942/min. Remaining 14,331,948. ETA ~6.0h → ~12:25 UTC. shard1(crawl1) smallest 913k — APPROACHING 500k retire-flag, ETA to 500k ~07:00.
+### 06:37 UTC — ETA cycle
+All six healthy, fresh. crawl5 14.2G, crawl4 11.8G coping; others 8-10G. emoji clean (417 parts, 0 delayed). Per-shard resolved/min (06:25-06:37): s0 4047, s1 11578, s2 9971, s3 4607, s4 3321, s5 3992 = 37,516/min. Remaining 13,920,101. ETA ~6.2h → ~12:50 UTC. shard1(crawl1) 788k, dropping ~11.6k/min, crosses 500k ~07:05-07:10.
