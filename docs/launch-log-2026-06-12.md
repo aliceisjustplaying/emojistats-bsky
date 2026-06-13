@@ -1065,3 +1065,5 @@ AUTO-RESTART a confirmed wedge (stale>180s AND main-proc CPU<5% AND no
 auto-restart of that box in 15min) so a deadlock self-heals even if the
 monitoring loop is stranded. Root-cause fix (parse-pool reply timeout) is
 a code change left for Alice — too invasive to do unsupervised at 5am.
+### 05:08 UTC — crawl1 recovered, crawl5 coping
+crawl1 fully healthy post-restart: 12.2k rows/sec, RSS 5.6G, claiming. crawl5 sustained-elevated 15.7G ~13min, resolving 8.3k/sec, restarts=0 — coping (bucket-5 whale cluster); auto-heal watchdog bzc0lok2t covers any OOM/wedge <3min so relaxed to 600s. Other 4 healthy, emoji clean (360 parts, 0 delayed).
