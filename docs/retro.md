@@ -852,6 +852,48 @@ shard1 the smallest at ~3M). Two non-routine notes:
   The 4.31M remaining is the four productive shards still draining (s0 864k, s3 1.05M, s4
   1.23M, s5 1.14M) plus the two ~15k bridge tails now retiring into the deferred mop-up.
 
+### 2026-06-13 ~16:25 UTC — the Bridgy 429 that was never a rate limit
+
+- **The bridge tail wasn't throttling — `getRepo` is *disabled* on Bridgy Fed, dressed
+  as a 429.** Confirmed two ways: Bridgy's creator told Alice directly, and a probe
+  reproduces it. For a real bridged DID (`ap.brid.gy`, PDS `atproto.brid.gy`),
+  `com.atproto.sync.getRepo` returns **HTTP 429** with the body *"temporarily disabled
+  12 hrs after repo creation"* — Bridgy Fed serves the full-CAR export only for a repo's
+  first ~12 hours, then disables it. Bridgy doesn't persist full MSTs for bridged
+  accounts (it materializes records on demand), so there is no CAR to hand back — and it
+  signals that *permanent* absence with **429, a rate-limit code**, not a 404 or
+  `MethodNotImplemented`. Our crawler is getRepo-only, and a getRepo-only crawler reads
+  429 as "alive, back off, retry" — so it retried a permanently-disabled endpoint under
+  exponential backoff, forever, on every one of the ~30k bridged repos in the two shard
+  tails. A permanent wall returning a transient status: that mismatch is the entire time
+  sink. (Earlier entries called this tail "429 rate-limiting, real repos, just slow" —
+  half right: the repos are real, but it was never going to clear with patience.)
+- **And the data was reachable the whole time — just not via `getRepo`.** The same probe
+  shows `com.atproto.repo.describeRepo` → **200** (the account exists, lists
+  `app.bsky.feed.post` among its collections) and
+  `com.atproto.repo.listRecords?collection=app.bsky.feed.post` → **200**. The bridged
+  accounts aren't unreachable and their posts aren't lost; the one method we depend on is
+  the one method Bridgy disables. The mop-up implication is concrete: shards 1 & 2's
+  bridge tail is finishable by fetching those DIDs through `listRecords` (paginated per
+  collection) instead of `getRepo` — a path that returns data rather than one that
+  structurally never will. This retires the "weeks of dedi-time" estimate from the retire
+  entry, which assumed getRepo throttling. (Honest caveat: the probe confirms the
+  `listRecords` *path* works, not Bridgy's `listRecords` rate limits under real volume —
+  that's untested.)
+- **The lesson: a 429 is a status code, not ground truth — and atproto PDSes aren't
+  uniform.** Two transferable rules. First, treat "429 with zero successes *ever*, over a
+  long window" as categorically different from "429 with intermittent success": the
+  former is a wall (unsupported, disabled, blocked) wearing throttle's clothing, and the
+  back-off system should escalate it to terminal-for-this-method rather than retry it
+  forever — what the cool-and-park work gropes toward, but keyed on *outcome history* (has
+  this host/method ever succeeded?), not on the status code in isolation. Second, don't
+  assume protocol uniformity: an atproto "PDS" can implement a subset of the sync API, and
+  a five-minute capability probe (getRepo vs describeRepo vs listRecords) reveals it — we
+  paid in crawl-days for a fact a single `curl`, or one question to the bridge's author,
+  would have surfaced on day one. Capability-detect the host, carry a
+  `getRepo`→`listRecords` fallback, and never let an HTTP status override what the host is
+  observably doing.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
