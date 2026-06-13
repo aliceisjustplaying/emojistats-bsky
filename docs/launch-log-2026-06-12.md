@@ -897,3 +897,17 @@ detaches only open/close/error; codex review (gpt-5.5, xhigh) caught that
 detaching the collection listener too could advance the cursor past an
 unprocessed post — kept attached, late posts are at-least-once traffic.
 Two review rounds, approved, deployed 23:48.
+
+### Canary verdict — 6144 REJECTED (00:40 UTC)
+
+crawl1 OOM-crashed at 00:09 (SIGABRT 134, V8 heap) and by 00:40 was in a
+GC death spiral: 16.2GB RSS against a 12GB heap cap, 278% CPU all in
+collection, event loop starved, telemetry silent for 7+ minutes while the
+unit read "active" — Alice spotted the silent shard from her phone before
+the next scheduled check did. 6144 in-flight on shard1's post-heavy mix
+simply does not fit the heap; the two ambiguous resolved/min rounds were
+this memory pressure, not repo mix. Both canary boxes reverted to 4096.
+Lesson logged twice now: the failure mode of this crawler is never "down",
+it is "alive and silent" — so the watchdog must key on stats-line AGE, not
+unit state. A persistent fleet watchdog now alerts on >120s staleness,
+crash-restarts, and unit failures across all six boxes + ingest.
