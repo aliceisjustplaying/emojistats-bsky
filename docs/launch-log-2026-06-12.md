@@ -1124,3 +1124,5 @@ All six active+fresh; crawl2 18k/sec burning its tail. emoji clean (385 parts, 0
 All six active+fresh. emoji clean (388 parts, 0 delayed). Per-shard resolved/min (10:09-10:20): s0 3560, s1 4313, s2 4034, s3 4254, s4 3499, s5 4112 = 23,772/min. Remaining 8,778,878. ETA ~6.2h → ~16:30 UTC. shard1 218k, shard2 284k (approaching drained). Holding.
 ### 10:31 UTC — ETA cycle
 All six active+fresh. emoji clean (394 parts, 0 delayed). Per-shard resolved/min (10:20-10:31): s0 3143, s1 4062, s2 2863, s3 4182, s4 3210, s5 3562 = 21,022/min. Remaining 8,561,682. ETA ~6.8h → ~17:20 UTC. shard1 179k (closing on drained), shard2 260k. Holding.
+### 10:42 UTC — ETA cycle
+All six active+fresh; crawl2 30k/sec burning tail. emoji clean (420 parts, 0 delayed). Per-shard resolved/min (10:31-10:42): s0 2464, s1 2875, s2 4491, s3 4205, s4 3372, s5 3601 = 21,008/min. Remaining 8,341,666. ETA ~6.6h -> ~17:20 UTC. shard1 162k, shard2 209k. Holding.
