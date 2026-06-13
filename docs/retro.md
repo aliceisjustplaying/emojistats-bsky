@@ -582,6 +582,19 @@ shard1 the smallest at ~3M). Two non-routine notes:
   it if a further whale tips it over. In-flight exceeding the fetch cap is expected: the
   cap governs concurrent *fetches*, not how many fetched-but-not-yet-drained CARs sit in
   memory behind a busy parse pool.
+- **The hardening got field-tested within the hour — by the exact scenario it was
+  built for.** At 05:19 the proactive loop stalled again (second malformed-call gap of
+  the night), and at ~05:32 crawl2 actually hit its JS heap limit and crashed (SIGABRT
+  134). Both safety nets fired without a human or the observation loop: the hard-exit
+  fix self-healed the OOM (systemd restart → 7,935 stale `fetching` repos requeued
+  at-least-once → RSS reset 3.7 G → claiming 10k/s, zero loss), and the now-active
+  watchdog caught and alerted on it *through* the stranded loop. The two failures that
+  cost the most worry overnight — a silent crash and a dead observation loop — happened
+  simultaneously and the system absorbed both. That's the whole argument for layered,
+  active, cause-agnostic safety nets in one 13-minute window: the fix you ship at 5am
+  is only as good as the next failure proves it, and this one passed. (Whale-heavy
+  window persisting — crawl0/5 at 14–15 G, coping; rate dipped to ~34k/min on the
+  crawl2 restart, recovering; shard1 down to 1.29M, nearing the 500k retire line.)
 
 ## The ETA honesty record
 
