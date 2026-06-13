@@ -1128,3 +1128,120 @@ All six active+fresh. emoji clean (394 parts, 0 delayed). Per-shard resolved/min
 All six active+fresh; crawl2 30k/sec burning tail. emoji clean (420 parts, 0 delayed). Per-shard resolved/min (10:31-10:42): s0 2464, s1 2875, s2 4491, s3 4205, s4 3372, s5 3601 = 21,008/min. Remaining 8,341,666. ETA ~6.6h -> ~17:20 UTC. shard1 162k, shard2 209k. Holding.
 ### 10:55 UTC — ETA cycle
 All six active+fresh. emoji clean (433 parts, 0 delayed). Per-shard resolved/min (10:42-10:55): s0 2484, s1 2947, s2 3088, s3 4535, s4 3023, s5 3939 = 20,016/min. Remaining 8,122,287. ETA ~6.8h to ~17:45 UTC. shard1 147k, shard2 180k. Holding.
+
+---
+
+# Evening session — 2026-06-13 (~16:50–17:55 UTC)
+
+Raw notes resume here after a daytime gap (the 10:55–16:10 narrative — the wedge
+saga, cooling-on-stall, the watchdog-on-silence rewrite, crawl1's clean retire —
+is in `docs/retro.md`, written by the retro agent). This block captures the
+evening: the two bridge boxes deleted, the missing exit-ramp shipped, Bridgy
+finally walled off, and the verify blind spot named honestly.
+
+### 16:57 UTC — crawl1 + crawl2 deleted at Hetzner
+Both bridge-tail boxes retired and **permanently deleted** (crawl1 `88.99.148.95`,
+crawl2 `138.201.203.235`). Pre-delete paranoia paid off twice: (1) codex review of
+the decommission caught that `shardN/manifest.jsonl` was **local-only** — `rclone
+move` syncs the parquet but never the manifest that indexes them — so it was
+uploaded + md5-verified before deletion. (2) crawl2 stopped with **exit 143
+(SIGTERM, unclean)** vs crawl1's clean exit 0 → codex flagged a possible lost
+in-memory archive tail; resolved by checking `staging.duckdb` was empty (idle 3.5h,
+no recent appends), preserving it anyway, and confirming archive_rows ≥ ledger
+loaded posts_total (+6.5%/+6.7%) — completeness proven, not assumed. All unique
+data on `storagebox:emojistats-archive/` (parquet, manifests, 35GB ledgers,
+staging, the 14,765+14,894 parked bridge-DID lists, the stats/state/runbook docs).
+Fleet is now 4 productive boxes: crawl0/3/4/5.
+
+### 17:05 UTC — archive v2 sample + the 17% re-crawl question
+Pulled real post-cutover (`v:2`) rows from `storagebox:shard3/...000621.parquet` to
+confirm the metadata widening is healthy: a file of 1M rows had facets 160k / reply
+491k / embed 386k / labels 4k and **0 NULL** in the extras columns — i.e. every
+post-cutover row carries the columns (`''`=record had none, JSON=present), exactly
+the v2 contract. Example richest row: an external-link embed with thumb-blob ref +
+title + description, facets carrying both a `#mention` (handle→DID) and a `#link`,
+plus a self-label. The pre-widening ~17% (`v:1`, rows loaded before
+`archive_extras_since`) have facets/reply/embed/labels NOWHERE on our side — v1
+stored only text/langs/emojis, and ClickHouse keeps text for emoji-posts only. So
+recovering them is a **network re-fetch, not a local backfill**: identifiable via
+`archive_extras_since` + manifest `v:1`/`v:2` + per-repo `loaded_at`/`pds_host`/`rev`
+in the ledgers, recoverable only for still-online repos (deleted/takendown lose the
+metadata forever, but their text is already safe). Deferrable; additive.
+PITFALL (tooling): `@duckdb/node-api` native binding needs `libstdc++.so.6`, absent
+on the NixOS bun/node PATH — bun can't load it at all; run via
+`LD_LIBRARY_PATH=/nix/store/<gcc>-lib/lib bun script.mjs`.
+
+### 17:20 UTC — shipped `--revive-host`: the exit-ramp that was missing (4c38d0f)
+The final-sweep dead-host gap, closed. The asymmetry, caught in the act: we had
+built the dead-host registry (the *entry* — DNS/legal/stall hosts get parked + scan-
+excluded) and even shipped cooling-on-stall (`7adfdc4`) that hard-parks INTO it, but
+there was **no way out**. `--final-sweep` zeroes unreachable budgets, but
+`createScheduler` re-seeds the dead set from `ledger.getDeadHosts()` at startup and
+re-excludes the host → its just-reset rows never get claimed. "Park now, re-crawl
+later" was unhonorable. `--revive-host <host>` (repeatable): `removeDeadHost` (drop
+the verdict) + `resetUnreachableForHost` (re-arm only that host's parked rows,
+shard-scoped, INDEXED BY idx_repos_host_status), applied in crawl.ts BEFORE
+createScheduler so the re-seed can't undo it. Selective — genuinely-dead DNS/legal
+hosts stay parked; never the blanket `resetUnreachableAttempts`. Regression test
+pins it. **Codex (1 round):** ordering right, SQL right, co-rollout with `7adfdc4`
+safe; one narrow finding — concurrent enumeration's ≤60s dead-host cache could
+re-park freshly-enumerated rows — MOOT here (no enumerate service/timer runs on the
+crawl boxes; and `upsertParked` only clobbers `pending`, never an already-revived
+`unreachable` row). LESSON: an entry mechanism without an exit mechanism is a
+one-way trap — build both or neither.
+
+### 17:33 UTC — fleet deployed 06a13b0 → 4c38d0f; cooling-on-stall drift resolved
+Staggered git deploy (per-box `fetch && reset --hard origin/main`, verify rev,
+restart one at a time, watch each warm-up). All 4 on `4c38d0f`, NRestarts=0,
+loading (crawl4 11.9k rps), CH load steady ~11 (no synchronized-ramp spike — the
+stagger worked). This also resolved the version skew: `7adfdc4` (cooling-on-stall)
+had been deployed to crawl1 only, which was then deleted, so it was live NOWHERE;
+shipping it now (its only hazard — park-without-exit — is removed by revive) makes
+fleet == main. revive code is INERT until invoked, so zero behavior change from the
+deploy itself.
+
+### 17:46 UTC — Bridgy walled off on all 4 boxes; the diagnosis that was wrong twice
+The bridge (`atproto.brid.gy`) diagnosis evolved: "stall" (→ built cooling-on-stall)
+→ "429, alive, just slow" (→ retire) → the real truth: **it does not support
+`getRepo` at all** — the fast 429 is misleading; those repos can NEVER crawl until
+Bridgy adds support. So: blacklist, don't drain. PROCESS POTHOLE: at 17:05 a loose
+remark ("getting rid of bridgy on a different thread") led me to DROP the blacklist
+task; at 17:40 "what bridgy thread?" revealed there was none, and the live logs
+showed all 4 boxes still 429-churning brid.gy. LESSON: "someone else is handling it"
+is a lead, not a fact — verify the premise before dropping your own task.
+Implementation (no new code — the registry already does this): merged
+`atproto.brid.gy` + legacy `fed.brid.gy` into each box's `dead_hosts` meta, per-box
+(each box has its own ~75-89 host list — MERGE via SQL `UNION`, never overwrite),
+stop→merge→start. Result: each shard parked its own ~15-17k bridge tail at startup
+(`"parked":N,"reason":"startup"`), brid.gy excluded from claim scans, 0 wasted
+attempts going forward. The persisted meta also diverts future enumeration
+(`upsertParked`); `--revive-host atproto.brid.gy` is the exact reversal when Bridgy
+ships getRepo. Procedures written into `docs/backfill-runbook.md`.
+
+PITFALL (counts that lie): crawl3 showed **90,105 "pending" brid.gy** but only
+**16,831 in `bucket=3`** (its own shard, all parked → 0 pending). The other ~75k are
+buckets 0/1/2/4/5 — every box's ledger holds the FULL enumeration (~95M rows, all
+buckets) but only claims/parks `bucket = shardIndex`. Raw `pds_host` aggregates span
+all shards and look like a park shortfall. ALWAYS filter `AND bucket=<shardIndex>`
+for per-box truth. (Also: a naive `WHERE value LIKE` inside a correlated
+`json_each()` subquery resolves to the outer array string and returns a wrong 0 —
+alias the json_each row, `je.value`, to verify the merge.)
+
+### 17:50 UTC — the verify `CH > ledger` blind spot, named honestly (decision pending)
+Not a missed bug — an inherent limit. `verify` compares a fixed per-repo `(count,
+XOR-rkey-digest)` recorded at crawl time against ClickHouse, which keeps growing from
+the live firehose. So "CH count > ledger" is NORMAL (live arrivals), which means a
+dropped backfill row masked by ≥1 live arrival is invisible, and one XOR digest
+can't set-check once counts differ. Confirmed the table is
+`ReplacingMergeTree(ingested_at)` keyed `(did,rkey)` with **`src` NOT in the sort
+key** → filtering `src='backfill'` is unsafe (a backfilled rkey later seen live
+collapses to the `live` row → false count-short). MATH FACT: you cannot prove set-
+subset from O(1) digests. Real closures: (a) source-prevention — the loader silent-
+loss fix (`a31b514`) already plugs the only known drop mechanism going forward; (b)
+re-fetch — `--sample` exact-rkey superset, or a re-crawl convergence pass. Candidate
+code tightening: restrict the CH digest to `created_at <= repo fetch time` to strip
+live newcomers — best-effort, NOT proof (back-dated posts / clock skew slip
+through). IMPORTANT distinction surfaced for Alice: "verify can't *prove* zero loss"
+≠ "loss happened" — verify is the checker; the write path (now fixed) decides loss.
+DECISION PENDING (Alice): run `--sample` for a measured loss rate (likely ~0), the
+`created_at` tightening, or both.

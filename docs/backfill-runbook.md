@@ -242,6 +242,91 @@ Settings that were tried and should not be repeated without a new hypothesis:
   discontinuity at the backfill/live boundary, and the final ledger snapshot is
   imported into ClickHouse as `backfill_repos`.
 
+## Blacklisting a host (e.g. Bridgy / atproto.brid.gy)
+
+Why: a host can be permanently uncrawlable even though it answers fast.
+`atproto.brid.gy` (the AT↔Fediverse bridge) returns HTTP 429 in ~0.23s but
+**does not support `getRepo` at all** — the 429 is misleading; those repos can
+never be crawled until Bridgy adds getRepo support. Crawling them just burns
+attempts in a 429/AIMD-cooldown loop. The fix is to add the host to the per-box
+dead-host registry so it is excluded from claim scans and its pending rows are
+parked as deferred-`unreachable` — NOT lost, preserved in the ledger for a
+future backfill.
+
+Mechanism: the dead-host registry is the JSON array in the ledger `meta` table
+under key `dead_hosts`. At crawler startup the scheduler seeds `host-health` +
+the claim-scan exclusion set from `ledger.getDeadHosts()` and bulk-parks each
+dead host's pending rows; the registry also makes enumeration divert that host's
+future rows straight to parked (`upsertParked`). So blacklisting is: merge the
+host into `dead_hosts` (per box — each box's ledger has its own list, ~75–89
+entries, so MERGE, never overwrite) then restart.
+
+Gotchas to respect:
+
+- Each box has a DIFFERENT `dead_hosts` list (each trips its own DNS/legal-dead
+  hosts). Merge per box; never copy one box's list to another.
+- Use the exact canonical `pds_host` string stored in the ledger:
+  `atproto.brid.gy` (https hosts are bare, no scheme; http hosts store
+  `http://host`). Include the legacy `fed.brid.gy` too for the bridge.
+- Stop the service before editing the ledger to avoid any writer race, then
+  start — a plain restart picks it up at startup, no CLI flag needed because the
+  meta is persistent.
+- The merge SQL is idempotent (dedups via `UNION`); run it per box against
+  `/workspace/src/emojistats-bsky/packages/backfill/data/ledger.sqlite`:
+  `UPDATE meta SET value = (SELECT json_group_array(h) FROM (SELECT value AS h FROM json_each((SELECT value FROM meta WHERE key='dead_hosts')) UNION SELECT 'atproto.brid.gy' UNION SELECT 'fed.brid.gy')) WHERE key='dead_hosts';`
+- Verify after with:
+  `SELECT je.value FROM json_each((SELECT value FROM meta WHERE key='dead_hosts')) je WHERE je.value LIKE '%brid.gy%';` — it must list both.
+  Note: a naive `WHERE value LIKE` inside a correlated subquery can resolve
+  `value` to the outer array string and return a wrong `0`; alias json_each
+  (`je.value`) to avoid the scoping trap.
+- Stagger restarts across boxes — synchronized fleet restarts spike the single
+  ClickHouse box to load 16 with insert-timeouts.
+- Verification it worked: at startup the box logs
+  `"host":"atproto.brid.gy","parked":N,"reason":"startup"` (N ≈ that shard's
+  bridge tail, ~15–17k), and the only `host cooling ... atproto.brid.gy ... 429`
+  lines afterward are from the OLD pid (pre-restart). Confirm
+  `bucket=<shardIndex>` brid.gy rows show 0 pending.
+
+PITFALL (very important): the per-box ledger holds the FULL enumeration (all
+~95M repos, every bucket), but a box only claims/parks its OWN
+`bucket = shardIndex`. So
+`SELECT count(*) ... WHERE pds_host='atproto.brid.gy' AND status='pending'`
+returns the cross-shard total (e.g. ~90k) and looks like a park shortfall — it
+is not. ALWAYS filter `AND bucket=<shardIndex>` for per-box truth (e.g. crawl3 =
+bucket 3 showed 0 pending / 16,831 unreachable, correct).
+
+## Reviving a blacklisted or dead host (when it recovers)
+
+Why/when: the inverse of blacklisting — for a host that genuinely recovered, or
+a deliberately-skipped host like Bridgy once it ships `getRepo`. This closes the
+"final-sweep dead-host gap": `--final-sweep` zeroes unreachable budgets but does
+NOT clear the registry, so startup re-seeds the host and re-excludes it forever
+and the rows never get re-crawled.
+
+Mechanism: the `--revive-host <host>` CLI flag (shipped 2026-06-13, commit
+`4c38d0f`). Repeatable. It (a) drops the host from the `dead_hosts` registry
+(`removeDeadHost`) and (b) resets only that host's parked `unreachable` rows to
+claimable (`resetUnreachableForHost` — attempts=0, retry_after=0, shard-scoped,
+`INDEXED BY idx_repos_host_status`). It is applied at startup BEFORE the
+scheduler seeds the dead set, so the verdict is gone before the re-seed.
+Selective by design: genuinely-dead DNS/legal hosts stay parked; only the named
+host is re-armed, never the blanket `resetUnreachableAttempts`.
+
+Gotchas to respect:
+
+- Run it per box/ledger, with the exact canonical `pds_host`.
+- `resetUnreachableForHost` is one unchunked UPDATE — fine at startup (it runs
+  once before the loops), sub-second for a ~100k-row host; a multi-million-row
+  revive would block startup briefly.
+- If enumeration runs CONCURRENTLY (it does NOT on the crawl boxes today — no
+  enumerate service/timer), its ≤60s dead-host cache could re-park rows freshly
+  enumerated in that window. `upsertParked` only clobbers `pending`, never an
+  already-revived `unreachable` row, so the bulk is safe — re-run revive
+  afterward to catch stragglers, or revive while enumeration is idle.
+- Because systemd starts the crawler with fixed args (defined in the pix flake),
+  the flag is for a manual one-off run; but the un-park persists in the ledger,
+  so subsequent normal service starts keep the host live without the flag.
+
 ## Crash recovery semantics
 
 - The ledger is the only checkpoint. Kill any process at any moment — power
