@@ -20,17 +20,24 @@ import {
 
 export class RetryableError extends Error {
   readonly retryAfterMs: number | undefined;
+  readonly rateLimit: RateLimitHint | undefined;
   /** Clearly transient (429/5xx/network/timeout) retries in waves forever; the rest gets MAX_ATTEMPTS. */
   readonly transient: boolean;
 
   constructor(
     message: string,
-    opts: { transient: boolean; retryAfterMs?: number; cause?: unknown },
+    opts: {
+      transient: boolean;
+      retryAfterMs?: number;
+      rateLimit?: RateLimitHint;
+      cause?: unknown;
+    },
   ) {
     super(message, { cause: opts.cause });
     this.name = 'RetryableError';
     this.transient = opts.transient;
     this.retryAfterMs = opts.retryAfterMs;
+    this.rateLimit = opts.rateLimit;
   }
 }
 
@@ -38,11 +45,17 @@ export type TerminalFetchStatus = 'deactivated' | 'takendown' | 'failed';
 
 export class TerminalFetchError extends Error {
   readonly status: TerminalFetchStatus;
+  readonly rateLimit: RateLimitHint | undefined;
 
-  constructor(status: TerminalFetchStatus, message: string) {
+  constructor(
+    status: TerminalFetchStatus,
+    message: string,
+    rateLimit?: RateLimitHint,
+  ) {
     super(message);
     this.name = 'TerminalFetchError';
     this.status = status;
+    this.rateLimit = rateLimit;
   }
 }
 
@@ -121,10 +134,19 @@ export function pdsHostFromEndpoint(endpoint: string): string | undefined {
 
 export interface FetchedCar {
   response: Response;
+  rateLimit: RateLimitHint;
   /** CAR_MAX_BYTES is enforced here; stream errors are always RetryableError or QuarantineError. */
   body: ReadableStream<Uint8Array>;
   /** Bytes pulled through so far; the final value is the ledger's car_bytes. */
   bytesRead(): number;
+}
+
+export interface RateLimitHint {
+  limit?: number;
+  remaining?: number;
+  resetAtMs?: number;
+  windowMs?: number;
+  retryAfterMs?: number;
 }
 
 const TERMINAL_BY_XRPC_ERROR: Record<string, TerminalFetchStatus> = {
@@ -141,6 +163,53 @@ function parseRetryAfter(header: string | null): number | undefined {
   const dateMs = Date.parse(header);
   if (Number.isFinite(dateMs)) return Math.max(0, dateMs - Date.now());
   return undefined;
+}
+
+function parsePositiveNumber(value: string | null): number | undefined {
+  if (value === null || value.trim() === '') return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+function parseReset(value: string | null): number | undefined {
+  if (value === null || value.trim() === '') return undefined;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) {
+    // Bluesky PDSes currently send epoch seconds; RFC-style delta seconds are
+    // also accepted for other servers.
+    return numeric > 1_000_000_000
+      ? numeric * 1000
+      : Date.now() + numeric * 1000;
+  }
+  const dateMs = Date.parse(value);
+  return Number.isFinite(dateMs) ? dateMs : undefined;
+}
+
+function parsePolicyWindow(policy: string | null): number | undefined {
+  if (policy === null) return undefined;
+  const window = /(?:^|[;,]\s*)w=(\d+(?:\.\d+)?)/i.exec(policy)?.[1];
+  if (window === undefined) return undefined;
+  const seconds = Number(window);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : undefined;
+}
+
+export function parseRateLimitHeaders(headers: Headers): RateLimitHint {
+  const retryAfterMs = parseRetryAfter(headers.get('retry-after'));
+  return {
+    limit:
+      parsePositiveNumber(headers.get('ratelimit-limit')) ??
+      parsePositiveNumber(headers.get('x-ratelimit-limit')),
+    remaining:
+      parsePositiveNumber(headers.get('ratelimit-remaining')) ??
+      parsePositiveNumber(headers.get('x-ratelimit-remaining')),
+    resetAtMs:
+      parseReset(headers.get('ratelimit-reset')) ??
+      parseReset(headers.get('x-ratelimit-reset')),
+    windowMs:
+      parsePolicyWindow(headers.get('ratelimit-policy')) ??
+      parsePolicyWindow(headers.get('x-ratelimit-policy')),
+    retryAfterMs,
+  };
 }
 
 function describe(err: unknown): string {
@@ -163,6 +232,7 @@ async function classifyHttpError(
   abort: AbortController,
 ): Promise<Error> {
   const retryAfterMs = parseRetryAfter(response.headers.get('retry-after'));
+  const rateLimit = parseRateLimitHeaders(response.headers);
 
   let xrpcError: string | undefined;
   let detail = '';
@@ -195,14 +265,20 @@ async function classifyHttpError(
 
   if (response.status === 400 && xrpcError !== undefined) {
     const terminal = TERMINAL_BY_XRPC_ERROR[xrpcError];
-    if (terminal !== undefined) return new TerminalFetchError(terminal, label);
+    if (terminal !== undefined)
+      return new TerminalFetchError(terminal, label, rateLimit);
   }
   if (response.status === 429 || response.status >= 500) {
-    return new RetryableError(label, { transient: true, retryAfterMs });
+    return new RetryableError(label, {
+      transient: true,
+      retryAfterMs,
+      rateLimit,
+    });
   }
   return new RetryableError(`${label} ${detail}`.trim(), {
     transient: false,
     retryAfterMs,
+    rateLimit,
   });
 }
 
@@ -311,5 +387,10 @@ export async function fetchRepoCar(
     },
   });
 
-  return { response, body, bytesRead: () => total };
+  return {
+    response,
+    rateLimit: parseRateLimitHeaders(response.headers),
+    body,
+    bytesRead: () => total,
+  };
 }

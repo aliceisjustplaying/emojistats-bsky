@@ -21,6 +21,7 @@ import {
   QuarantineError,
   RetryableError,
   TerminalFetchError,
+  type RateLimitHint,
   type TerminalFetchStatus,
 } from './fetcher.js';
 import { parseRepoCar } from './parser.js';
@@ -35,6 +36,7 @@ export interface RepoJob {
 export interface RepoJobResult {
   rev: string | null;
   carBytes: number;
+  rateLimit: RateLimitHint;
   recordsTotal: number;
   duplicatePostsSkipped: number;
   /** Full-fidelity archive rows; ClickHouse strips them via toClickhouseRow. */
@@ -52,8 +54,14 @@ export type RepoJobError =
       message: string;
       transient: boolean;
       retryAfterMs: number | undefined;
+      rateLimit: RateLimitHint | undefined;
     }
-  | { kind: 'terminal'; message: string; status: TerminalFetchStatus }
+  | {
+      kind: 'terminal';
+      message: string;
+      status: TerminalFetchStatus;
+      rateLimit: RateLimitHint | undefined;
+    }
   | { kind: 'error'; message: string };
 
 export type RepoJobReply =
@@ -64,13 +72,19 @@ function describeError(err: unknown): RepoJobError {
   const message = err instanceof Error ? err.message : String(err);
   if (err instanceof QuarantineError) return { kind: 'quarantine', message };
   if (err instanceof TerminalFetchError)
-    return { kind: 'terminal', message, status: err.status };
+    return {
+      kind: 'terminal',
+      message,
+      status: err.status,
+      rateLimit: err.rateLimit,
+    };
   if (err instanceof RetryableError)
     return {
       kind: 'retryable',
       message,
       transient: err.transient,
       retryAfterMs: err.retryAfterMs,
+      rateLimit: err.rateLimit,
     };
   return { kind: 'error', message };
 }
@@ -96,6 +110,7 @@ async function handle(job: RepoJob): Promise<RepoJobReply> {
       ok: {
         rev: parsed.rev,
         carBytes: fetched.bytesRead(),
+        rateLimit: fetched.rateLimit,
         recordsTotal: parsed.recordsTotal,
         duplicatePostsSkipped: parsed.duplicatePostsSkipped,
         rows,

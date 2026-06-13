@@ -57,6 +57,8 @@ export interface RepoRow {
    * loads without downgrading durable good ledger state on a transient failure.
    */
   preserveExisting?: boolean;
+  /** Scheduler-internal: this repo already consumed a host rate-limit slot. */
+  rateLimitReserved?: boolean;
 }
 
 /** Counts a fetched-and-parsed repo reports into the ledger when marked loaded. */

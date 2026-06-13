@@ -4,6 +4,54 @@ import { describe, it, mock } from 'node:test';
 import { createHostPressure, hostCapFor } from './host-pressure.js';
 
 void describe('host pressure', () => {
+  void it('paces request starts from advertised rate-limit headers', () => {
+    let clock = 1_000_000;
+    const now = mock.method(Date, 'now', () => clock);
+    try {
+      const pressure = createHostPressure();
+      const host = 'jellybaby.us-east.host.bsky.network';
+
+      pressure.observeRateLimit(host, {
+        limit: 3000,
+        remaining: 2999,
+        resetAtMs: clock + 300_000,
+        windowMs: 300_000,
+      });
+
+      assert.equal(pressure.reserve(host), true);
+      assert.equal(pressure.reserve(host), false);
+      assert.equal(pressure.coolingMs(host), 100);
+
+      clock += 100;
+      assert.equal(pressure.reserve(host), true);
+    } finally {
+      now.mock.restore();
+    }
+  });
+
+  void it('waits until reset when advertised remaining reaches zero', () => {
+    let clock = 1_000_000;
+    const now = mock.method(Date, 'now', () => clock);
+    try {
+      const pressure = createHostPressure();
+      const host = 'jellybaby.us-east.host.bsky.network';
+      pressure.observeRateLimit(host, {
+        limit: 3000,
+        remaining: 0,
+        resetAtMs: clock + 5000,
+        windowMs: 300_000,
+      });
+
+      assert.equal(pressure.reserve(host), false);
+      assert.equal(pressure.coolingMs(host), 5000);
+
+      clock += 5000;
+      assert.equal(pressure.reserve(host), true);
+    } finally {
+      now.mock.restore();
+    }
+  });
+
   void it('counts concurrent 429s as one cooldown burst', () => {
     const now = mock.method(Date, 'now', () => 1_000_000);
     try {

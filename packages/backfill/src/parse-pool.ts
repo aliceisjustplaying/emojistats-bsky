@@ -51,11 +51,12 @@ function rehydrate(err: RepoJobError): Error {
     case 'quarantine':
       return new QuarantineError(err.message);
     case 'terminal':
-      return new TerminalFetchError(err.status, err.message);
+      return new TerminalFetchError(err.status, err.message, err.rateLimit);
     case 'retryable':
       return new RetryableError(err.message, {
         transient: err.transient,
         retryAfterMs: err.retryAfterMs,
+        rateLimit: err.rateLimit,
       });
     case 'error':
       return new Error(err.message);

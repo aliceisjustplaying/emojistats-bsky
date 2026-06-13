@@ -1,4 +1,5 @@
 import { PER_HOST_CONCURRENCY, PER_HOST_CONCURRENCY_BSKY } from './config.js';
+import type { RateLimitHint } from './fetcher.js';
 import logger from './logger.js';
 
 const COOLDOWN_BASE_MS = 5_000;
@@ -28,6 +29,13 @@ interface HostState {
   /** Dynamic concurrency cap; undefined until the first 429. */
   cap?: number;
   successStreak: number;
+  rateLimit?: {
+    limit: number;
+    remaining: number;
+    resetAt: number;
+    minIntervalMs: number;
+    nextStartAt: number;
+  };
 }
 
 /**
@@ -67,6 +75,10 @@ export interface HostPressure {
   recordStall(host: string): void;
   /** Called when a host answered a request (any non-429 response). */
   recordSuccess(host: string): void;
+  /** Called whenever a response carries rate-limit headers. */
+  observeRateLimit(host: string, hint: RateLimitHint): void;
+  /** Reserve one request start under the latest advertised rate limit. */
+  reserve(host: string): boolean;
   /** Remaining cooldown for the host; 0 when it is fine to fetch. */
   coolingMs(host: string): number;
   /** True while a host-level cooldown is active. */
@@ -79,6 +91,23 @@ export interface HostPressure {
 
 export function createHostPressure(): HostPressure {
   const state = new Map<string, HostState>();
+
+  const update = (
+    host: string,
+    patch: (prev: HostState) => HostState,
+  ): void => {
+    state.set(
+      host,
+      patch(
+        state.get(host) ?? {
+          strikes: 0,
+          until: 0,
+          lastStrike: 0,
+          successStreak: 0,
+        },
+      ),
+    );
+  };
 
   // Shared AIMD back-off, driven by either a 429 or a stall. `reason` only
   // tags the log line; the mechanics are identical (halve the cap, arm/extend
@@ -93,11 +122,11 @@ export function createHostPressure(): HostPressure {
         COOLDOWN_BASE_MS * 2 ** (prev.strikes - 1),
         COOLDOWN_MAX_MS,
       );
-      state.set(host, {
-        ...prev,
+      update(host, (current) => ({
+        ...current,
         until: Math.max(prev.until, now + cooldown),
         lastStrike: now,
-      });
+      }));
       return;
     }
     const staticCap = hostCapFor(host);
@@ -110,14 +139,15 @@ export function createHostPressure(): HostPressure {
       COOLDOWN_BASE_MS * 2 ** (strikes - 1),
       COOLDOWN_MAX_MS,
     );
-    state.set(host, {
+    update(host, (current) => ({
+      ...current,
       strikes,
       // Never shorten an existing cooldown: the longest window must win.
       until: Math.max(now + cooldown, prev?.until ?? 0),
       lastStrike: now,
       cap,
       successStreak: 0,
-    });
+    }));
     if (strikes === 1 || strikes % 10 === 0) {
       logger.warn(
         { host, strikes, cap, cooldownMs: cooldown, reason },
@@ -152,10 +182,71 @@ export function createHostPressure(): HostPressure {
       state.set(host, { ...prev, cap, successStreak });
     },
 
+    observeRateLimit(host: string, hint: RateLimitHint): void {
+      const limit = hint.limit;
+      if (limit === undefined || limit <= 0) return;
+      const now = Date.now();
+      const resetAt = hint.resetAtMs;
+      const windowMs =
+        hint.windowMs ??
+        (resetAt === undefined ? undefined : Math.max(resetAt - now, 1));
+      if (windowMs === undefined || windowMs <= 0) return;
+      const minIntervalMs = Math.max(1, Math.ceil(windowMs / limit));
+      const remaining = Math.max(0, Math.floor(hint.remaining ?? limit));
+      update(host, (prev) => ({
+        ...prev,
+        rateLimit: {
+          limit,
+          remaining,
+          resetAt: resetAt ?? now + windowMs,
+          minIntervalMs,
+          nextStartAt: Math.max(prev.rateLimit?.nextStartAt ?? 0, now),
+        },
+      }));
+    },
+
+    reserve(host: string): boolean {
+      const prev = state.get(host);
+      if (prev === undefined) return true;
+      const rate = prev.rateLimit;
+      if (rate === undefined) return true;
+      const now = Date.now();
+      if (now >= rate.resetAt) {
+        state.set(host, {
+          ...prev,
+          rateLimit: {
+            ...rate,
+            remaining: rate.limit,
+            resetAt: now + rate.minIntervalMs * rate.limit,
+            nextStartAt: now + rate.minIntervalMs,
+          },
+        });
+        return true;
+      }
+      if (rate.remaining <= 0 || now < rate.nextStartAt) return false;
+      state.set(host, {
+        ...prev,
+        rateLimit: {
+          ...rate,
+          remaining: rate.remaining - 1,
+          nextStartAt: now + rate.minIntervalMs,
+        },
+      });
+      return true;
+    },
+
     coolingMs(host: string): number {
       const cooling = state.get(host);
       if (cooling === undefined) return 0;
-      return Math.max(0, cooling.until - Date.now());
+      const now = Date.now();
+      const rate = cooling.rateLimit;
+      const rateWait =
+        rate === undefined
+          ? 0
+          : rate.remaining <= 0
+            ? rate.resetAt - now
+            : rate.nextStartAt - now;
+      return Math.max(0, cooling.until - now, rateWait);
     },
 
     isCooling(host: string): boolean {

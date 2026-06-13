@@ -145,6 +145,8 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
 
     if (err instanceof TerminalFetchError) {
       // The host answered (404/tombstone/takedown are host SUCCESSES).
+      if (err.rateLimit !== undefined)
+        hostPressure.observeRateLimit(repo.pdsHost, err.rateLimit);
       hostHealth.recordSuccess(repo.pdsHost);
       if (preserveExisting) {
         preserve(err.status);
@@ -217,6 +219,9 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
     const retryAfterHint =
       err instanceof RetryableError ? (err.retryAfterMs ?? 0) : 0;
     const retryAfterMs = Math.max(backoff, retryAfterHint);
+    if (err instanceof RetryableError && err.rateLimit !== undefined) {
+      hostPressure.observeRateLimit(repo.pdsHost, err.rateLimit);
+    }
     // 429 is evidence of OUR pressure, not of the repo being unreachable:
     // it arms the host cooldown and must not burn the attempts budget —
     // during the morel storm, attempts-burning 429s mass-parked repos that

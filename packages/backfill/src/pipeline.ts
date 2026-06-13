@@ -146,6 +146,7 @@ export function createRepoPipeline(
       const fetchTimeUs = Date.now() * 1000;
       const parsed = await parsePool.run(repo.did, repo.pdsHost, fetchTimeUs);
       // The CAR arrived: feed the AIMD cap raise and reset deadness evidence.
+      hostPressure.observeRateLimit(repo.pdsHost, parsed.rateLimit);
       hostPressure.recordSuccess(repo.pdsHost);
       hostHealth.recordSuccess(repo.pdsHost);
 

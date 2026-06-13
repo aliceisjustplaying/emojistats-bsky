@@ -200,6 +200,27 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
         stats.retried += 1;
         return Promise.resolve();
       }
+      if (
+        repo.rateLimitReserved !== true &&
+        !hostPressure.reserve(repo.pdsHost)
+      ) {
+        if (repo.preserveExisting === true) {
+          logger.warn(
+            { did: repo.did, host: repo.pdsHost },
+            'preserved loaded/verified repo waiting for host rate-limit slot',
+          );
+          return new Promise<void>((resolve) => {
+            setTimeout(resolve, hostPressure.coolingMs(repo.pdsHost));
+          }).then(() => globalLimit(() => processRepo(repo)));
+        }
+        ledger.markThrottled(
+          repo.did,
+          `host rate-limit pacing: ${repo.pdsHost}`,
+          hostPressure.coolingMs(repo.pdsHost),
+        );
+        stats.retried += 1;
+        return Promise.resolve();
+      }
       return globalLimit(() => processRepo(repo));
     });
     const tracked: Promise<void> = task
@@ -476,6 +497,12 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
             stats.skipped += 1;
             continue;
           }
+          if (!hostPressure.reserve(repo.pdsHost)) {
+            retained.push(repo);
+            stats.skipped += 1;
+            continue;
+          }
+          repo.rateLimitReserved = true;
           let claimedRow: boolean;
           try {
             claimedRow = ledger.markFetching(repo.did);
