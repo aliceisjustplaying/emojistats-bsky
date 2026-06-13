@@ -947,3 +947,13 @@ All six 4096, fresh, RSS steady (max crawl0 9.9G). emoji healthy (load
 s1 12311, s2 9109, s3 4375, s4 4584, s5 4792 = 39,501/min. Remaining
 25,193,109. ETA ~10.6h → ~12:25 UTC (steady). shard0 closest to drain at
 3.74M, no box near zero yet. shard1 consistently fastest (small-repo mix).
+
+### 02:11 UTC — ETA cycle + crawl4 RSS watch
+
+All six fresh and resolving. Per-shard resolved/min (02:00-02:11): s0 4651,
+s1 12009, s2 11027, s3 3877, s4 4406, s5 5585 = 41,555/min. Remaining
+24,297,840. ETA ~9.7h → ~11:50 UTC (improving). shard1 dipped just under
+3.6M (now smallest with shard0 at 3.64M).
+WATCH: crawl4 RSS 11.4G (up from 9.8G), closest to its 12G heap cap all
+night — still fresh + resolving, no spiral, but flagged for close watch.
+Watchdog bvr8c8nie alerts within 60s on any staleness/restart.
