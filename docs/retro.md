@@ -987,6 +987,103 @@ shard1 the smallest at ~3M). Two non-routine notes:
   *stuck* system from a *slow* one — and the durable wins were the detectors and back-off
   rules that finally learned the difference.
 
+### 2026-06-13 evening (21:14–22:25 UTC) — the takeover, and the 429 tail solved by reading the headers
+
+The handoff's new agent (a Codex session on pix2) didn't drain the tail and call it a
+night — in ~70 minutes it closed most of the open items the handoff listed, shipped eight
+commits, and landed the one fix this whole run kept circling: pacing the mushroom hosts
+*before* they 429 instead of backing off after. Alice steered it turn-by-turn (this was a
+hands-on handoff, not an autonomous one), and three of the eight commits exist only because
+she looked at the actual public page and didn't believe the numbers.
+
+- **The headline: reactive 429 back-off → proactive rate-limit-header pacing
+  (`49fe6d2`, `928c2e6`).** The end-game slowdown wasn't a dead worker — all four shards
+  were fresh and active — it was the tail concentrating onto a handful of bsky "mushroom"
+  PDS hosts (`jellybaby`, `morel`, `shiitake`, `oyster`…) all showing repeated 429 cooldowns
+  with per-host queues pinned at depth 96. The existing back-off was AIMD: slam the host
+  until it 429s, halve the cap, cool, repeat — so it only ever *learns* the limit by
+  tripping it. Alice's call cut through it: "they literally give you headers about the rate
+  limit." A fetch of a live mushroom response confirmed it —
+  `ratelimit-limit: 3000`, `ratelimit-remaining: 2999`, `ratelimit-policy: 3000;w=300` —
+  a budget the host had been advertising on *every* response and the crawler read on *none*
+  of them (it parsed only `Retry-After`, i.e. only after a trip). `49fe6d2` carries the whole
+  header family (`ratelimit-*`, `x-ratelimit-*` aliases, reset-as-epoch or as-delta, policy
+  window) out of the parse worker on success, 429 *and* terminal responses — a 400/RepoNotFound
+  still spends the same bucket — computes a per-host minimum start interval (`window / limit`),
+  and has the scheduler `reserve()` a slot before each request rather than firing freely.
+  The keeper is almost embarrassing in hindsight: the politest, fastest back-off was printed
+  on every response from the start; reactive AIMD is what you build when you assume the server
+  won't tell you its limit, and this one was telling us all along. Evidence: `host-pressure.ts`
+  (`observeRateLimit`/`reserve`), `rate-limit.test.ts`, commits `49fe6d2`/`928c2e6`.
+- **…and the pacing fix immediately needed its own fix (`928c2e6`).** The first deploy of
+  header-pacing over-corrected: `fetching` fell to near-zero on all four shards, because jobs
+  that learned a host's headers *late* were parked via `markThrottled` — pushed back to the
+  ledger as throttled — instead of simply waiting for their next header-derived slot. The fix
+  was to wait *inside* the per-host limiter without holding a global fetch slot or mutating
+  ledger state. Post-fix the fleet recovered to ~27.9k rows/sec with ~1.82M active repos left,
+  and the only in-window 429s left were a non-mushroom host. Same lesson the wedge saga taught
+  in a different costume: a back-pressure mechanism that mutates durable state on every wait
+  turns a transient pace into a recorded setback.
+- **Exact recrawls made state-safe (`66777c5`) — the convergence path couldn't corrupt good
+  rows.** The verify→`--did-file` convergence loop and the planned `v:1` metadata re-crawl both
+  re-fetch repos that are *already* `loaded`/`verified`. The handoff didn't flag that a transient
+  host failure during such a re-fetch would call `markRetry`/`markThrottled` and *downgrade* a
+  good ledger row — turning a verified repo back into pending on a hiccup. `66777c5` threads a
+  `preserveExisting` flag through the retry policy so a failed recrawl preserves the existing
+  loaded/verified state (logged, not silently), and waits out host cooldowns rather than skipping;
+  it also bounded `--did-file` to stream instead of scheduling the whole file at once. This is the
+  prerequisite that makes the zero-loss convergence pass safe to actually run. Evidence:
+  `retry.ts` (`preserveExisting` branch), commit `66777c5`.
+- **The telemetry-client poison closed, and the worker pool hardened (`c81bb26`).** Handoff item
+  §2.4 — the telemetry ClickHouse client that writes `backfill_progress` could keepalive-poison the
+  same way the loader client did (`b825b5c` fixed the loader but not telemetry; that's why a shard's
+  dashboard row could go stale on its own) — is now closed: the connection-error rebuild
+  (`isConnectionError` → swap a fresh client) was ported into `CrawlTelemetry`, with the rebuilt
+  clients owned and closed by the telemetry object so a rebuild can't leak past shutdown. Bundled
+  in the same commit, a *proactive* parse-pool change: a worker reply-timeout used to just free the
+  caller's slot and leave the (possibly half-dead) worker holding hidden jobs; now a timeout treats
+  the worker as poisoned — reject its jobs, terminate, respawn. That one wasn't an observed incident,
+  it was a code-review catch, but it's the same blind spot the watchdog story is about: a component
+  that's stuck-but-not-dead is the dangerous state. Evidence: `telemetry.ts`, `parse-pool.ts`
+  (`failWorker`), commit `c81bb26`.
+- **The dashboard hot-`posts` scan fixed exactly as handed off (`d0d744c`).** The High finding I'd
+  written up in `docs/issues/dashboard-live-stats-scan.md` — `getLiveStats` firing three full-table
+  scans on raw `posts` (billions of rows) at ~2s cadence, competing with ingest for CH memory — was
+  fixed along the recommended route: totals/rates/freshness now read the `posts_hourly` SummingMergeTree
+  (current-hour sums for rates, `max(hour)` for freshness) and never touch raw `posts`; `verify`'s
+  raw-`posts` orphan scan moved behind an opt-in `--orphans`. Satisfying confirmation that a handoff
+  issue-doc written for "an agent to fix" was directly actionable. Evidence: `dashboard/src/server/stats.ts`,
+  commit `d0d744c`.
+- **Three display bugs Alice caught by not trusting the page — the dashboard was lying in the
+  end-game (`7f1572b`, `4104389`, `13b468d`).** The data was sound throughout; the *presentation*
+  had three independent bugs, each found by Alice reading the live site. (1) The public footer
+  labeled emoji *occurrences* as "Emojis" but computed "Ratio" as posts-with-emojis ÷ posts-*without*-emojis
+  — a number (~22.6%) that matched neither visible figure; `7f1572b` makes it total posts / emoji posts /
+  emoji-post share = `postsWithEmojis / processedPosts` (18.41% on 2.29B posts), keeping the language tabs
+  as raw occurrence counts on purpose. (2) The hero "Crawl progress" read **66%** when the run was actually
+  at **98.5%** of enumerated repos — `resolved = total − pending − fetching − unreachable` put ~31M parked
+  `unreachable` repos in the denominator but not the numerator; `4104389` counts parked-unreachable as done
+  for the hero fraction (they're out of active budget) while still listing them separately for the sweep.
+  (3) The fleet badge read "idle" while crawling, because activity/freshness used the *stalest* shard — and
+  the stalest shards were `crawl1`/`crawl2`, whose telemetry is frozen because Alice **deleted those Hetzner
+  boxes** (ledgers backed up for verify/recrawl); `13b468d` uses the *freshest* reporting shard for liveness
+  while still warning on frozen ones. The throughline: in the end-game the dashboard's own accounting became
+  a source of false alarms — a 66% that looked like a stall and an "idle" that looked like death were both
+  artifacts of how parked/deleted shards were counted, not the crawl. The same "is it stuck or just
+  slow / done?" question, now asked of the instrument instead of the system. `4104389` also fixed a real
+  scheduler bug surfaced in the same review: `nextWake()` ignored rate-limit wakeups and a repo could wait
+  on a delay created by *its own* reservation.
+- **Status at session end (~22:25 UTC):** the crawl is still draining — ~1.82M active repos, ~27.9k
+  rows/sec, **98.5%** of the 95.47M enumerated repos resolved; `crawl0/3/4/5` live, `crawl1`/`crawl2` boxes
+  deleted with ledgers preserved on the storagebox. Still *not* run: the post-drain `--final-sweep`, the
+  verify→`--did-file` convergence pass, the `v:1` metadata re-crawl, and the public-site cutover — the
+  same end-game sequence the handoff named, now with its prerequisites (state-safe recrawl, paced hosts,
+  honest dashboard) in place. The process note writes itself: this hour is the cleanest example in the whole
+  run of the division of labor — the agent did the mechanism (header parsing, client rebuild, scheduler
+  reservation) fast and correctly, and the human supplied the three things it kept missing on its own:
+  the *insight* ("read the headers"), the *distrust* (looking at the real page and disbelieving 66% / "idle"),
+  and the *ground truth* the agent couldn't see from the logs (shards 1 and 2 aren't slow, they're gone).
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
