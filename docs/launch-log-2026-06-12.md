@@ -1122,3 +1122,5 @@ crawl2 alert showed age=99999 (watchdog sentinel for 'no crawl-stats line in las
 All six active+fresh; crawl2 18k/sec burning its tail. emoji clean (385 parts, 0 delayed). Per-shard resolved/min (09:58-10:09): s0 4092, s1 5379, s2 4812, s3 4157, s4 3242, s5 3459 = 25,141/min. Remaining 9,024,690. ETA ~6.0h → ~16:10 UTC. shard1 261k, shard2 321k. Holding.
 ### 10:20 UTC — ETA cycle
 All six active+fresh. emoji clean (388 parts, 0 delayed). Per-shard resolved/min (10:09-10:20): s0 3560, s1 4313, s2 4034, s3 4254, s4 3499, s5 4112 = 23,772/min. Remaining 8,778,878. ETA ~6.2h → ~16:30 UTC. shard1 218k, shard2 284k (approaching drained). Holding.
+### 10:31 UTC — ETA cycle
+All six active+fresh. emoji clean (394 parts, 0 delayed). Per-shard resolved/min (10:20-10:31): s0 3143, s1 4062, s2 2863, s3 4182, s4 3210, s5 3562 = 21,022/min. Remaining 8,561,682. ETA ~6.8h → ~17:20 UTC. shard1 179k (closing on drained), shard2 260k. Holding.
