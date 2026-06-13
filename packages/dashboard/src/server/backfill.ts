@@ -92,20 +92,19 @@ const STATUS_ARGMAX_SQL = REPO_STATUSES.map(
 
 /**
  * Statuses that still represent work. Unreachable PARKS for retry waves
- * rather than resolving, so it stays out of "resolved" — the progress
- * fraction and the rate window must agree on this or the dashboard can read
- * 100% while retry waves still run. The ETA is the exception: parked repos
- * are out of budget, so it counts pending + fetching only.
+ * rather than resolving, so it stays out of the throughput rate. The hero
+ * progress is about active crawl budget, so parked unreachable rows count as
+ * done there and pending + fetching are the only remaining statuses.
  */
-const UNRESOLVED_STATUSES: readonly string[] = [
+const UNRESOLVED_STATUSES = new Set<RepoStatus>([
   'pending',
   'fetching',
   'unreachable',
-];
+]);
 
 /** Sum of every genuinely settled status — the "resolved" measure. */
 const RESOLVED_SUM_SQL = REPO_STATUSES.filter(
-  (status) => !UNRESOLVED_STATUSES.includes(status),
+  (status) => !UNRESOLVED_STATUSES.has(status),
 ).join(' + ');
 
 async function fetchOverview(): Promise<BackfillOverview | null> {
@@ -201,12 +200,10 @@ async function fetchOverview(): Promise<BackfillOverview | null> {
     (acc, status) => acc + statusCounts[status],
     0,
   );
-  // Unreachable repos get retry waves, so they must not count as resolved
-  // (UNRESOLVED_STATUSES) — but they are parked out of budget, not queued, so
-  // the ETA covers active crawl work (pending + fetching) only; millions of
-  // bulk-parked dead-host repos would otherwise inflate it.
+  // Parked unreachable repos are out of the active crawl budget; they still
+  // display separately because the final sweep/retry wave may revisit them.
   const remaining = statusCounts.pending + statusCounts.fetching;
-  const resolved = totalEnumerated - remaining - statusCounts.unreachable;
+  const resolved = totalEnumerated - remaining;
   const reposPerMin = num(rate[0]?.repos_per_min);
   const now = Date.now();
   const shardFreshness = snapshot

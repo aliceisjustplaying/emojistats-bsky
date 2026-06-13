@@ -180,7 +180,10 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
 
   const waitForHostPace = async (repo: RepoRow): Promise<void> => {
     for (;;) {
-      const coolMs = hostPressure.coolingMs(repo.pdsHost);
+      const coolMs =
+        repo.rateLimitReserved === true
+          ? hostPressure.backoffMs(repo.pdsHost)
+          : hostPressure.coolingMs(repo.pdsHost);
       if (coolMs > 0) {
         await new Promise((resolve) => {
           setTimeout(resolve, coolMs);

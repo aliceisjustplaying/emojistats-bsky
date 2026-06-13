@@ -81,6 +81,8 @@ export interface HostPressure {
   reserve(host: string): boolean;
   /** Remaining cooldown for the host; 0 when it is fine to fetch. */
   coolingMs(host: string): number;
+  /** Remaining AIMD/stall/429 cooldown only, excluding rate-limit pacing. */
+  backoffMs(host: string): number;
   /** True while a host-level cooldown is active. */
   isCooling(host: string): boolean;
   /** Current AIMD concurrency cap for the host (≤ the static cap). */
@@ -249,6 +251,13 @@ export function createHostPressure(): HostPressure {
       return Math.max(0, cooling.until - now, rateWait);
     },
 
+    backoffMs(host: string): number {
+      const cooling = state.get(host);
+      return cooling === undefined
+        ? 0
+        : Math.max(0, cooling.until - Date.now());
+    },
+
     isCooling(host: string): boolean {
       const cooling = state.get(host);
       return cooling !== undefined && cooling.until > Date.now();
@@ -264,9 +273,16 @@ export function createHostPressure(): HostPressure {
       const now = Date.now();
       let wake: number | undefined;
       for (const cooling of state.values()) {
-        if (cooling.until <= now) continue;
-        wake =
-          wake === undefined ? cooling.until : Math.min(wake, cooling.until);
+        const wakes: number[] = [];
+        if (cooling.until > now) wakes.push(cooling.until);
+        const rate = cooling.rateLimit;
+        if (rate !== undefined) {
+          const rateWake =
+            rate.remaining <= 0 ? rate.resetAt : rate.nextStartAt;
+          if (rateWake > now) wakes.push(rateWake);
+        }
+        for (const next of wakes)
+          wake = wake === undefined ? next : Math.min(wake, next);
       }
       return wake;
     },

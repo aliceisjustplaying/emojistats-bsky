@@ -21,6 +21,8 @@ void describe('host pressure', () => {
       assert.equal(pressure.reserve(host), true);
       assert.equal(pressure.reserve(host), false);
       assert.equal(pressure.coolingMs(host), 100);
+      assert.equal(pressure.backoffMs(host), 0);
+      assert.equal(pressure.nextWake(), clock + 100);
 
       clock += 100;
       assert.equal(pressure.reserve(host), true);
