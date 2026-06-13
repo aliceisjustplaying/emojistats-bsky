@@ -1134,6 +1134,45 @@ agent found by reading the `--final-sweep` code instead of trusting the runbook 
   recrawl/catch-up. As of 23:02 UTC the session went quiet with the end-game armed but not yet fired:
   no `--final-sweep`, verify convergence, `v:1` recrawl or cutover has run.
 
+### 2026-06-13 night (23:02–23:35 UTC) — the sweep and recrawl, deployed cold and waiting for drain
+
+Still draining (active backlog fell from ~914k to ~840k repos across the four live crawlers in
+this window; Alice's read: "done in 1-2-3 hours"), so this was the last of the prep — the
+end-game units are now built, deployed, and sitting *inactive* on the boxes, armed to run the
+moment the backfill finishes. One dashboard commit (`263bc7c`) and a Pix commit carry it.
+
+- **The follow-through on "everything goes through the pix repo."** Last cycle Alice reversed an
+  ad-hoc `systemd-run` launcher; this cycle the agent did it properly — two **manual** NixOS units
+  in the flake (a final-sweep service on every crawl box, a `v:1`-recrawl service only on the four
+  live crawlers with worker indexes 0–3), defined to *not* auto-start, committed to Pix and rolled
+  out with a direct `nixos-rebuild switch` per host. Deploying them only *adds* dormant units; the
+  running crawl service's rendered environment is unchanged, so arming the end-game can't perturb
+  the drain it's waiting on. A duplicate `systemd.services` attribute caught in Nix eval before
+  commit, and the per-host worker TSVs (~50 MB each) copied and checksum-verified ahead of time. This
+  is the clean version of the lesson the run kept relearning: the next phase lives in the flake as a
+  deliberate, inert artifact — not a host-local script that the next rebuild would silently erase.
+- **A deploy gotcha worth its own line: pulling source isn't deploying.** The dashboard host-table/
+  recrawl-status fix (`263bc7c`) didn't take after a source pull + restart — the service runs the
+  built `dist/server/server.js`, so the change only landed after an explicit *build* on the serving
+  box, then a restart. The same build-artifact-vs-source trap that bites every "I pulled, why is it
+  still old" moment; the tell was the restarted service still serving the old table.
+- **Verification scope, settled by reading the notes not vibing it.** Alice asked whether the edge-case
+  bug means re-verifying "the whole shebang" or only part — the agent's answer (after checking the
+  verification notes): a *full verification pass* is needed, but *not* a full re-fetch of everything.
+  That's the shape the convergence tooling was built for — verify everything, re-fetch only the LOOSE
+  tail it can't account for.
+- **Pre-drain housekeeping: where the ledgers live, and what the disk is actually holding.** Mapped
+  for the verify pass: live ledgers on the four crawlers, the *retired* shard1/2 ledgers preserved on
+  the serving box (the only copy now that those boxes are deleted), and the `v:1` worker files staged.
+  The agent deliberately stopped running heavy full-`sqlite` scans over the 34 GB ledgers during the
+  active crawl (not worth the I/O contention) and used the ClickHouse progress table as the live
+  source instead — sqlite reads deferred to post-drain. A disk check put numbers on the teardown
+  hindsight: ClickHouse is ~57 GB (under the earlier ~75 GB guess), and the ~68 GB hogging
+  `packages/backfill` on the serving box is the retired shard1/2 ledgers — kept untouched until the
+  verify pass has consumed them, then reclaimable. As of 23:35 UTC nothing in the end-game sequence
+  has *run*: final-sweep, verify convergence, `v:1` recrawl and cutover are all staged and cold,
+  waiting on the drain.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
