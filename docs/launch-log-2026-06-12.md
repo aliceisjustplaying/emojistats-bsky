@@ -1110,3 +1110,5 @@ Alice rightly pushed back on retiring at 500k. Checked shard1 ledger: of 491k pe
 All six active+fresh, bulk healthy. emoji clean (413 parts, 0 delayed). Per-shard resolved/min (09:02-09:14): s0 3713, s1 3759, s2 5015, s3 3835, s4 3487, s5 3701 = 23,510/min. Remaining 10,345,030. ETA ~7.3h → ~16:30 UTC. shard1 446k, shard2 556k (real bsky-host repos, draining, NOT retiring). Holding.
 ### 09:25 UTC — ETA cycle
 All six active+fresh, bulk healthy. emoji clean (403 parts, 0 delayed). Per-shard resolved/min (09:14-09:25): s0 3881, s1 6574, s2 1351, s3 4616, s4 3673, s5 3587 = 23,682/min. Remaining 10,111,944. ETA ~7.1h → ~16:30 UTC. shard1 396k, shard2 547k (real repos draining). Holding.
+### 09:36 UTC — ETA cycle; under 10M remaining
+All six active+fresh, all resolving. emoji clean (399 parts, 0 delayed). Per-shard resolved/min (09:25-09:36): s0 3787, s1 2068, s2 6803, s3 5128, s4 3766, s5 3969 = 25,521/min. Remaining 9,843,117 (under 10M). ETA ~6.4h → ~16:00 UTC. shard1 384k, shard2 474k (real repos draining, NOT retiring). Holding.
