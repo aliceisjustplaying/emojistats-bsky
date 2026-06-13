@@ -72,4 +72,23 @@ void describe('host pressure', () => {
       now.mock.restore();
     }
   });
+
+  void it('recordStall backs a host off with the same AIMD as a 429', () => {
+    const now = mock.method(Date, 'now', () => 1_000_000);
+    try {
+      const pressure = createHostPressure();
+      const host = 'atproto.brid.gy';
+      const staticCap = hostCapFor(host);
+      assert.equal(pressure.effectiveCap(host), staticCap);
+
+      pressure.recordStall(host); // one stall burst → half the cap + cooldown
+      assert.equal(
+        pressure.effectiveCap(host),
+        Math.max(1, Math.floor(staticCap / 2)),
+      );
+      assert.equal(pressure.isCooling(host), true);
+    } finally {
+      now.mock.restore();
+    }
+  });
 });

@@ -1,3 +1,4 @@
+import { isStallMessage } from './fetcher.js';
 import logger from './logger.js';
 
 /**
@@ -11,6 +12,19 @@ const TRIP_CONSECUTIVE = 30;
 const TRIP_MIN_SPAN_MS = 30_000;
 
 /**
+ * Stall-specific trip thresholds (lower count, longer span than DNS/legal). A
+ * host that goes silent — accepts the socket then never delivers (e.g. the
+ * rate-limited atproto.brid.gy bridge that owns a whole drained shard's tail) —
+ * is not "dead" but is unworkable now: every fetch eats the full stall budget
+ * for nothing. Parking it (rows → unreachable, the deferred final-sweep list,
+ * NOT lost) frees the box instead of burning dedi-hours trickling one host.
+ * Conservative on purpose: any success / HTTP response resets the streak, so a
+ * host making real progress can never trip; only sustained pure silence does.
+ */
+const TRIP_CONSECUTIVE_STALL = 6;
+const TRIP_MIN_SPAN_STALL_MS = 120_000;
+
+/**
  * Host-level deadness detection. The claim scan is host-blind: a PDS whose
  * domain no longer resolves (pds.trump.com: 1.9M pending rows per shard,
  * ENOTFOUND) or that legal-blocks everything (plc.surge.sh: http 451) feeds
@@ -22,7 +36,7 @@ const TRIP_MIN_SPAN_MS = 30_000;
  * down ≠ data gone) and excludes the host from claim scans for the rest of
  * the run.
  */
-export type DeadHostKind = 'dns' | 'legal';
+export type DeadHostKind = 'dns' | 'legal' | 'stall';
 
 export function classifyDeadness(message: string): DeadHostKind | null {
   // ENOTFOUND is DNS NXDOMAIN — a domain that stopped existing. EAI_AGAIN
@@ -31,6 +45,10 @@ export function classifyDeadness(message: string): DeadHostKind | null {
   // 451: the host exists and refuses everything for legal reasons. Per-repo
   // retries cannot change the answer.
   if (/http 451\b/.test(message)) return 'legal';
+  // Sustained stalls (half-open/silent socket) — parked under the higher
+  // stall thresholds so a briefly-slow host recovers but a dead-silent one
+  // (rate-limited bridge tail) stops eating the box.
+  if (isStallMessage(message)) return 'stall';
   return null;
 }
 
@@ -77,14 +95,18 @@ export function createHostHealth(): HostHealth {
       }
       const now = Date.now();
       if (prev?.dead) return;
+      // A kind change starts a fresh streak: stall and dns/legal have different
+      // trip thresholds, so a few ENOTFOUNDs must not let a single later stall
+      // (or vice-versa) inherit the count and trip under the wrong threshold.
       const next: HostHealthState =
-        prev === undefined
+        prev === undefined || prev.kind !== kind
           ? { consecutive: 1, firstAt: now, kind, dead: false }
           : { ...prev, consecutive: prev.consecutive + 1, kind };
-      if (
-        next.consecutive >= TRIP_CONSECUTIVE &&
-        now - next.firstAt >= TRIP_MIN_SPAN_MS
-      ) {
+      const tripCount =
+        kind === 'stall' ? TRIP_CONSECUTIVE_STALL : TRIP_CONSECUTIVE;
+      const tripSpan =
+        kind === 'stall' ? TRIP_MIN_SPAN_STALL_MS : TRIP_MIN_SPAN_MS;
+      if (next.consecutive >= tripCount && now - next.firstAt >= tripSpan) {
         next.dead = true;
         newlyTripped.push(host);
         logger.warn(

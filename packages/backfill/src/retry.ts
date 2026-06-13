@@ -11,6 +11,7 @@ import {
 } from './config.js';
 import { CH_RKEY_DIGEST_EXPR, normalizeDigestHex } from './digest.js';
 import {
+  isStallMessage,
   pdsHostFromEndpoint,
   QuarantineError,
   RetryableError,
@@ -145,6 +146,9 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
       return;
     }
     if (err instanceof QuarantineError) {
+      // Hitting CAR_MAX_BYTES means the host delivered a >1GiB body — loud
+      // proof of life that must clear any stall/deadness streak.
+      hostHealth.recordSuccess(repo.pdsHost);
       ledger.markTerminal(repo.did, 'quarantined', message);
       stats.terminal += 1;
       telemetry.recordEvent({
@@ -195,6 +199,29 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
       // Rate limiting is proof of life — never deadness evidence.
       hostHealth.recordSuccess(repo.pdsHost);
       hostPressure.record429(repo.pdsHost);
+      ledger.markThrottled(
+        repo.did,
+        message,
+        Math.max(RETRY_BASE_MS, retryAfterHint),
+      );
+      stats.retried += 1;
+      telemetry.recordEvent({
+        did: repo.did,
+        pdsHost: repo.pdsHost,
+        event: 'retry',
+        error: message,
+      });
+      return;
+    }
+    if (isStallMessage(message)) {
+      // A half-open/silent host (see fetcher progress timeout). Soft: cool it
+      // so the box stops burning slots on it. Hard: count it toward the
+      // stall-deadness park so a host that ONLY stalls (a rate-limited bridge
+      // owning a drained shard's tail) gets parked and the box moves on.
+      // Like 429 this is host pressure, not the repo's fault, so markThrottled
+      // backs the repo off WITHOUT burning its attempts budget.
+      hostPressure.recordStall(repo.pdsHost);
+      hostHealth.recordFailure(repo.pdsHost, message);
       ledger.markThrottled(
         repo.did,
         message,

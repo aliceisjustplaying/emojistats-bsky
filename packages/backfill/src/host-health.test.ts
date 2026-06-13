@@ -72,6 +72,70 @@ void describe('host health tripping', () => {
     assert.equal(health.isDead('slow.example'), false);
   });
 
+  void it('classifies a progress-timeout stall as a stall', () => {
+    assert.equal(
+      classifyDeadness(
+        'getRepo did@brid.gy: stalled: no progress for 60000ms during body',
+      ),
+      'stall',
+    );
+    assert.equal(
+      classifyDeadness(
+        'getRepo did@brid.gy: stalled: no progress for 60000ms during connect/headers',
+      ),
+      'stall',
+    );
+  });
+
+  void it('parks a host on sustained stalls (6 over 120s), span-guarded', (t) => {
+    const health = createHostHealth();
+    let now = 1_000_000;
+    t.mock.method(Date, 'now', () => now);
+    const stall =
+      'getRepo did@brid.gy: stalled: no progress for 60000ms during body';
+
+    // 6 stalls but zero elapsed span: meets the count, not the span — no trip.
+    for (let i = 0; i < 6; i += 1) health.recordFailure('brid.gy', stall);
+    assert.equal(health.isDead('brid.gy'), false);
+
+    // Cross the 120s span: now it parks.
+    now += 121_000;
+    health.recordFailure('brid.gy', stall);
+    assert.equal(health.isDead('brid.gy'), true);
+    assert.deepEqual(health.takeNewlyTripped(), ['brid.gy']);
+  });
+
+  void it('a success resets a stall streak before it can park', (t) => {
+    const health = createHostHealth();
+    let now = 1_000_000;
+    t.mock.method(Date, 'now', () => now);
+    const stall = 'stalled: no progress for 60000ms during connect/headers';
+
+    for (let i = 0; i < 6; i += 1)
+      health.recordFailure('slowish.example', stall);
+    health.recordSuccess('slowish.example'); // proof of life clears the streak
+    now += 121_000;
+    health.recordFailure('slowish.example', stall);
+    assert.equal(health.isDead('slowish.example'), false);
+  });
+
+  void it('a kind change restarts the streak (dns and stall do not combine)', (t) => {
+    const health = createHostHealth();
+    let now = 1_000_000;
+    t.mock.method(Date, 'now', () => now);
+    // 5 DNS failures spanning >120s, then one stall: the stall opens a fresh
+    // streak, so this is NOT 6 consecutive stalls and must not park under the
+    // lower stall threshold.
+    for (let i = 0; i < 5; i += 1)
+      health.recordFailure('mixed.example', 'ENOTFOUND mixed.example');
+    now += 121_000;
+    health.recordFailure(
+      'mixed.example',
+      'stalled: no progress for 60000ms during body',
+    );
+    assert.equal(health.isDead('mixed.example'), false);
+  });
+
   void it('an HTTP response resets a DNS/451 streak; pure network errors do not', (t) => {
     const health = createHostHealth();
     let now = 1_000_000;

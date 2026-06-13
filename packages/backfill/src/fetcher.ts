@@ -54,6 +54,18 @@ export class QuarantineError extends Error {
 }
 
 /**
+ * Marker embedded in every stall rejection so the retry policy and host-health
+ * can recognise a half-open/silent-socket failure (distinct from a 429, a real
+ * HTTP error, or a plain timeout) and drive stall-specific cooling/parking.
+ */
+export const STALL_REASON = 'stalled: no progress';
+
+/** True when a failure message came from a withProgressTimeout stall. */
+export function isStallMessage(message: string): boolean {
+  return message.includes(STALL_REASON);
+}
+
+/**
  * Settles `promise`, OR rejects after `ms` of no settlement — whichever first.
  * The reject is driven by our OWN timer, so it fires even when the abort never
  * reaches a half-open socket and the wrapped read()/fetch() hangs forever; the
@@ -73,7 +85,7 @@ export function withProgressTimeout<T>(
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => {
       onTimeout();
-      reject(new Error(`stalled: no progress for ${ms}ms during ${phase}`));
+      reject(new Error(`${STALL_REASON} for ${ms}ms during ${phase}`));
     }, ms);
     timer.unref();
   });

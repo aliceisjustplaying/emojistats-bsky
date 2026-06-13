@@ -57,6 +57,14 @@ interface HostState {
 export interface HostPressure {
   /** Called by the retry policy when a fetch came back 429. */
   record429(host: string): void;
+  /**
+   * Called when a fetch STALLED (half-open/silent socket, see fetcher's
+   * progress timeout). Applies the same AIMD back-off as a 429: a silent host
+   * is over-pressured or failing, so cap it down and cool it so the box stops
+   * burning slots on it. Unlike a 429 this is NOT proof of life — the caller
+   * also feeds host-health so sustained stalls can park the host.
+   */
+  recordStall(host: string): void;
   /** Called when a host answered a request (any non-429 response). */
   recordSuccess(host: string): void;
   /** Remaining cooldown for the host; 0 when it is fine to fetch. */
@@ -72,48 +80,59 @@ export interface HostPressure {
 export function createHostPressure(): HostPressure {
   const state = new Map<string, HostState>();
 
-  return {
-    record429(host: string): void {
-      const now = Date.now();
-      const prev = state.get(host);
-      if (prev !== undefined && now < prev.until) {
-        // Concurrent 429s from one burst all land here; the burst already
-        // halved the cap, so only extend the window — never shorten it.
-        const cooldown = Math.min(
-          COOLDOWN_BASE_MS * 2 ** (prev.strikes - 1),
-          COOLDOWN_MAX_MS,
-        );
-        state.set(host, {
-          ...prev,
-          until: Math.max(prev.until, now + cooldown),
-          lastStrike: now,
-        });
-        return;
-      }
-      const staticCap = hostCapFor(host);
-      const strikes =
-        prev !== undefined && now - prev.lastStrike < STRIKE_DECAY_MS
-          ? prev.strikes + 1
-          : 1;
-      const cap = Math.max(1, Math.floor((prev?.cap ?? staticCap) / 2));
+  // Shared AIMD back-off, driven by either a 429 or a stall. `reason` only
+  // tags the log line; the mechanics are identical (halve the cap, arm/extend
+  // the cooldown).
+  const penalize = (host: string, reason: '429' | 'stall'): void => {
+    const now = Date.now();
+    const prev = state.get(host);
+    if (prev !== undefined && now < prev.until) {
+      // Concurrent strikes from one burst all land here; the burst already
+      // halved the cap, so only extend the window — never shorten it.
       const cooldown = Math.min(
-        COOLDOWN_BASE_MS * 2 ** (strikes - 1),
+        COOLDOWN_BASE_MS * 2 ** (prev.strikes - 1),
         COOLDOWN_MAX_MS,
       );
       state.set(host, {
-        strikes,
-        // Never shorten an existing cooldown: the longest window must win.
-        until: Math.max(now + cooldown, prev?.until ?? 0),
+        ...prev,
+        until: Math.max(prev.until, now + cooldown),
         lastStrike: now,
-        cap,
-        successStreak: 0,
       });
-      if (strikes === 1 || strikes % 10 === 0) {
-        logger.warn(
-          { host, strikes, cap, cooldownMs: cooldown },
-          'host cooling',
-        );
-      }
+      return;
+    }
+    const staticCap = hostCapFor(host);
+    const strikes =
+      prev !== undefined && now - prev.lastStrike < STRIKE_DECAY_MS
+        ? prev.strikes + 1
+        : 1;
+    const cap = Math.max(1, Math.floor((prev?.cap ?? staticCap) / 2));
+    const cooldown = Math.min(
+      COOLDOWN_BASE_MS * 2 ** (strikes - 1),
+      COOLDOWN_MAX_MS,
+    );
+    state.set(host, {
+      strikes,
+      // Never shorten an existing cooldown: the longest window must win.
+      until: Math.max(now + cooldown, prev?.until ?? 0),
+      lastStrike: now,
+      cap,
+      successStreak: 0,
+    });
+    if (strikes === 1 || strikes % 10 === 0) {
+      logger.warn(
+        { host, strikes, cap, cooldownMs: cooldown, reason },
+        'host cooling',
+      );
+    }
+  };
+
+  return {
+    record429(host: string): void {
+      penalize(host, '429');
+    },
+
+    recordStall(host: string): void {
+      penalize(host, 'stall');
     },
 
     recordSuccess(host: string): void {
