@@ -472,6 +472,30 @@ top of it:
   armed; live ingest archiving extras since 23:32; 6144 canary verdict and the
   post-sweep honest ETA still pending.*
 
+### 2026-06-13 small hours (00:00–01:00 UTC)
+
+- **The concurrency ladder tops out, with a mechanism this time: 6144 REJECTED.**
+  The fleet fully restarted post-sweep by 00:10, and the canary verdict came in at
+  00:40: crawl1 OOM-crashed (SIGABRT, V8 heap) and entered a GC death spiral —
+  16.2 GB RSS against a 12 GB heap cap, ~278% CPU all in collection, event loop
+  starved, telemetry silent for 7+ minutes while the unit read "active". The two
+  ambiguous resolved/min measurement rounds (shard1 reading *lowest*) had been this
+  memory pressure all along, not repo mix. Both canary boxes reverted to 4096. The
+  ladder's full record now has a distinct mechanism per rung: 5120 broke ClickHouse
+  upload bodies, 6144 broke the V8 heap — 4096 isn't a superstition, it's the
+  measured envelope of two separate resources.
+- **Alice's phone beat the monitoring — again, and this time it got
+  institutionalized.** At 00:39, heading back to bed: "crawl1 isnt reporting for 5
+  minutes and counting now. this is the exact thing that needs monitoring please"
+  *(typos normalized)*. That's the third operator-eyes-beat-telemetry catch of the
+  project, and it produced the structural answer: a persistent fleet watchdog
+  keyed on **stats-line age** (>120s alerts), not unit state — because this
+  crawler's signature failure mode is never "down", it's *alive and silent* (the
+  zombie claim-loop, the hung Jetstream socket, now the GC spiral). Her standing
+  order escalated the night mode to a 10-minute all-server cadence; the pix2
+  session also flipped to a larger-context model at 00:55 to survive the longer
+  guard duty — long autonomous ops sessions are themselves a resource to budget.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
