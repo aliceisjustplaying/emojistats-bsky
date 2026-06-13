@@ -60,6 +60,16 @@ interface Mismatch {
   status: string;
   ledgerPostsTotal: number;
   clickhousePosts: number;
+  // 'count-short': CH holds fewer rows than the ledger recorded — unambiguous
+  // loss. 'digest-mismatch': counts are equal but the rkey SETS differ, which
+  // means a dropped backfill row was numerically masked by an offsetting
+  // live-path arrival (or a since-crawl delete + arrival). XOR digests can't
+  // say which, and the contract is to never let live traffic paper over a lost
+  // backfill row — so this fails the run for --sample / re-crawl adjudication
+  // instead of promoting to 'verified'.
+  reason: 'count-short' | 'digest-mismatch';
+  ledgerDigest?: string;
+  clickhouseDigest?: string;
 }
 
 interface ReconcileResult {
@@ -163,32 +173,43 @@ async function reconcile(
       // count alone can't say that (one lost CAR post + one live-only arrival
       // still balances; the digest does not).
       exact += 1;
+    } else if (
+      ledgerDigest !== null &&
+      stats !== undefined &&
+      expected > 0 &&
+      actual === expected
+    ) {
+      // Counts balance exactly but the rkey sets differ (we're here, not in the
+      // EXACT branch, so the digests are unequal). A dropped backfill row that
+      // happened to be offset by a live-path arrival looks EXACTLY like this —
+      // and so does a since-crawl delete paired with an arrival. XOR digests
+      // can't separate the two, and we refuse to let live traffic mask a lost
+      // backfill row, so this FAILS the run rather than promoting. The DID is
+      // surfaced for `--sample` (exact rkey-set superset check) or re-crawl.
+      mismatches.push({
+        did: repo.did,
+        status: repo.status,
+        ledgerPostsTotal: expected,
+        clickhousePosts: actual,
+        reason: 'digest-mismatch',
+        ledgerDigest,
+        clickhouseDigest: stats.digest,
+      });
+      continue;
     } else if (actual >= expected) {
       // LOOSE: the CAR is a lower bound — posts created after the fetch
       // legitimately push the CH count above posts_total (live path), which
-      // also perturbs the digest. Only CH < ledger is loss.
+      // also perturbs the digest. CH count > ledger can't be set-checked from a
+      // 64-bit XOR digest alone, so it stays a lower-bound pass; only CH <
+      // ledger (handled below) or the balanced-but-divergent case (above) fail.
       loose += 1;
-      if (ledgerDigest !== null && actual === expected) {
-        // Counts balance but the sets differ: either an offsetting lost-post /
-        // live-arrival pair (the exact failure mode the digest exists to
-        // catch) or live deletes. Promoted per the lower-bound contract, but
-        // loudly — eyes on these.
-        logger.warn(
-          {
-            did: repo.did,
-            posts: actual,
-            ledgerDigest,
-            clickhouseDigest: stats?.digest,
-          },
-          'counts equal but rkey digests differ: set changed since the CAR fetch',
-        );
-      }
     } else {
       mismatches.push({
         did: repo.did,
         status: repo.status,
         ledgerPostsTotal: expected,
         clickhousePosts: actual,
+        reason: 'count-short',
       });
       continue;
     }
@@ -235,7 +256,10 @@ async function reconcile(
   for (const mismatch of mismatches) {
     logger.error(
       mismatch,
-      'count mismatch: ClickHouse count() < ledger posts_total',
+      mismatch.reason === 'count-short'
+        ? 'count mismatch: ClickHouse count() < ledger posts_total (lost rows)'
+        : 'digest mismatch: counts equal but rkey sets differ (possible lost ' +
+            'backfill row masked by a live arrival) — run --sample on this DID',
     );
   }
   return { exact, loose, mismatches };

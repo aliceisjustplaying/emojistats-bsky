@@ -12,15 +12,6 @@ const MAX_INSERT_ATTEMPTS = 3;
 const INSERT_BACKOFF_BASE_MS = 1_000;
 
 /**
- * How many flushed generations keep their outcome around for late finish()
- * lookups. A repo touches a generation, then looks it up at its very next
- * addRow/finish — minutes at most. 128 generations × LOADER_FLUSH_MS is hours
- * of slack; a lookup past that bound means the flush settled long ago and a
- * failure would already have parked every involved repo via other paths.
- */
-const GEN_RETENTION = 128;
-
-/**
  * ClickHouse server error codes where retrying the identical insert cannot
  * succeed (schema/auth/data-shape problems). Everything else — socket resets,
  * timeouts, TOO_MANY_SIMULTANEOUS_QUERIES, memory pressure — is treated as
@@ -68,7 +59,10 @@ interface Waiter {
  * only after finish() resolves" contract is unchanged, it just resolves for
  * many repos at once. A flush failure rejects every repo with rows in that
  * batch — batch-mates of a poison row park as retryable and their re-fetch
- * collapses into ReplacingMergeTree like any other at-least-once replay.
+ * collapses into ReplacingMergeTree like any other at-least-once replay. A
+ * generation's outcome is evicted from #runByGen only when its flush SUCCEEDS;
+ * failed flushes are retained so a late finish() can never mistake an evicted
+ * entry for success and mark a repo `loaded` despite dropped rows.
  *
  * The insert_deduplication_token is a digest of the batch's (did, rev) pairs
  * plus row count: the in-process retry loop resends the identical payload
@@ -142,8 +136,14 @@ export class ClickHouseRepoLoader implements RepoLoader {
             );
             this.#armTimer();
           } else {
-            // Generation already swapped out; awaiting a missing entry means
-            // it settled successfully more than GEN_RETENTION flushes ago.
+            // Generation already swapped out. Entries are evicted ONLY when
+            // their flush succeeds (see #scheduleFlush), and a failed flush is
+            // retained forever — so a missing entry provably settled
+            // successfully and is safe to treat as success, while any failure
+            // is still present here and rejects this finish(). This is the fix
+            // for the old time-windowed eviction, which could drop a
+            // not-yet-settled generation under insert backpressure and let a
+            // late finish() see a missing entry as success despite lost rows.
             const run = this.#runByGen.get(gen);
             if (run !== undefined) pending.push(run);
           }
@@ -179,12 +179,18 @@ export class ClickHouseRepoLoader implements RepoLoader {
     this.#bufferTags = [];
     this.#waiters = [];
     this.#gen += 1;
-    this.#runByGen.delete(gen - GEN_RETENTION);
 
     const run = this.#flushChain.then(async () => {
       try {
         await this.#insertBatch(rows, tags);
         for (const w of waiters) w.resolve();
+        // Evict ONLY on success: a later finish() that finds no entry for this
+        // gen can now safely conclude it succeeded. Failed generations are
+        // deliberately left in the map (rejecting any late finish()), so the
+        // map's steady-state size is the in-flight flush backlog plus the
+        // count of failed flushes — the latter is rare and bounded by a run's
+        // total insert failures.
+        this.#runByGen.delete(gen);
         return undefined;
       } catch (err) {
         const wrapped = err instanceof Error ? err : new Error(String(err));
