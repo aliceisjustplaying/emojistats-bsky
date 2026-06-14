@@ -1551,6 +1551,51 @@ own ledgerless verify from the preserved copies.)
   whole project, *did we silently lose data*, now has a measured answer: eight repos, all visible, all
   recoverable.
 
+### 2026-06-14 late afternoon (16:10–16:51 UTC) — "the verification round was for all of them": a four-of-six miss the dashboard hid, and a near-meltdown of the page
+
+This window is the candid one. The clean four-shard verdict from the last entry was, it turned out,
+only four of the **six** shards that were supposed to be verified — and the reason it read as complete
+is that the instrument said so.
+
+- **Operator miss: verify ran the live half of the fleet and called it done.** The agent treated
+  "the live shards" (0/3/4/5) as the verification set after the shard1/2 boxes were deleted, and the
+  dashboard's "verified shards 4/4" made that look like the whole fleet. Alice caught it flat —
+  *"why did we not verify the other two?? the verification round was for all of them............"* — and
+  she was right: the handover and this very document specified the pass as **active shard0/3/4/5 + the
+  retired shard1/2 copies on the serving box**, the copies preserved for exactly this. The cause was a
+  too-convenient mental substitution ("runnable hosts" for "shards to verify") backed by a label that
+  confirmed it. The fix to the label came first — "verified shards" → "reporting shards," caption
+  "latest reporting shard runs" (`2a03c1e`) — so 4/4 stops reading as 6/6; then the real fix: locate the
+  ~36 GB retired ledgers on the serving box and run their verify from the preserved copies. (A first
+  attempt failed instantly on auth — it used the crawler's secret source, not the serving box's — a
+  small reminder that the retired-ledger path is a *different* environment than the crawl hosts.)
+  Restarted correctly, shard1 and shard2 verifiers are now staging (~2.34M repos each), and the page
+  honestly reads **4 / 6 reporting shards** — the state it should have shown all along. shard1/2 results
+  are still pending; the six-shard verdict isn't in yet.
+- **Then the cure nearly killed the patient: starting the retired-ledger verify almost melted the
+  dashboard.** Bringing shard1/2 back into play meant the overview's *crawl* rollup suddenly saw both the
+  old frozen shard1/2 crawler telemetry *and* the new retired-ledger snapshots, and double-counted —
+  enumerated/status totals went wrong, and Alice (after two aborted turns) said *"okay. stop. this is
+  getting out of hand."* Root cause, and it's the same root as every run-scoping bug this end-game:
+  `fetchOverview()` takes the **latest row per shard across all `run_id`s**, which was fine when only one
+  kind of run existed — and is actively dangerous now that backfill, `dev`, over-cap, verification, and
+  recrawl telemetry all coexist. The specific poison was a single `dev/shard0` row from the targeted
+  fail-round recrawl carrying `pending = 56,584,730`, picked as "newest shard0" and corrupting the whole
+  crawl card. The fix pins the crawl overview to the **canonical backfill run IDs only**
+  (`whale-2026`, `whale-2026-overcap`, `whale-2026-overcap-long`), excluding dev/verification/recrawl
+  snapshots (`4dea6f5`) — then a 500 from a ClickHouse `argMax(run_id) AS run_id` alias colliding with
+  the inner `WHERE`, fixed by renaming the alias (`06d1de1`). The keeper, now unavoidable: **the dashboard
+  was built assuming a single run, and the end-game is many concurrent run types.** Every "the page is
+  wrong" of the last two days is one instance of that unstated assumption breaking.
+- **Meanwhile the fail-round recrawl is running, with the heap knob it needed.** The 8 mismatches (and the
+  over-cap repos) are being re-fetched independently on the crawl hosts; `468528a` makes the *parser
+  worker* heap configurable so the parent and worker caps can be sized per box (shard3's box has less RAM,
+  so a smaller cap; shard0/4 get 24 GiB parent + worker) — large repos need the headroom. Still ahead and
+  unchanged: the shard1/2 verdict, the `--did-file` convergence on the LOOSE band, the `v:1` recrawl, the
+  Bridgy revive, and cutover. The honest reframe of this hour: the *data* answer is still excellent, but
+  "verified" briefly meant "verified the part that was easy to reach," and it took the human reading the
+  page — again — to turn 4/4 back into 4/6.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
