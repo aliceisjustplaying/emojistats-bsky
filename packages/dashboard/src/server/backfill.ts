@@ -456,7 +456,10 @@ export interface BackfillRecrawlStatus {
 
 export interface BackfillVerifyStatus {
   generatedAt: string;
+  /** Newest run represented in the per-shard rollup. */
   runId: string | null;
+  /** All run IDs represented by the latest meaningful row per shard. */
+  runIds: string[];
   active: boolean;
   shards: number;
   freshnessSeconds: number | null;
@@ -566,35 +569,7 @@ export const getBackfillVerifyStatus = createServerFn().handler(
       return {
         generatedAt: new Date().toISOString(),
         runId: null,
-        active: false,
-        shards: 0,
-        freshnessSeconds: null,
-        phase: 'ready',
-        reposTotal: 0,
-        reposChecked: 0,
-        exact: 0,
-        loose: 0,
-        mismatches: 0,
-        looseEmitted: 0,
-        sampleChecked: 0,
-        sampleFailures: 0,
-        doneShards: 0,
-        failedShards: 0,
-        error: null,
-      };
-    }
-
-    const runRows = await chQuery<{ run_id: string }>(`
-      SELECT run_id
-      FROM backfill_verify_progress
-      ORDER BY ts DESC
-      LIMIT 1
-    `);
-    const runId = runRows[0]?.run_id;
-    if (runId === undefined) {
-      return {
-        generatedAt: new Date().toISOString(),
-        runId: null,
+        runIds: [],
         active: false,
         shards: 0,
         freshnessSeconds: null,
@@ -615,6 +590,7 @@ export const getBackfillVerifyStatus = createServerFn().handler(
 
     const rows = await chQuery<{
       shard: string;
+      run_id: string;
       latest_ts: string;
       phase: string;
       repos_total: string;
@@ -627,10 +603,10 @@ export const getBackfillVerifyStatus = createServerFn().handler(
       sample_failures: string;
       done: string;
       error: string;
-    }>(
-      `
+    }>(`
       SELECT
         shard,
+        argMax(run_id, progress_order) AS run_id,
         max(ts) AS latest_ts,
         argMax(phase, progress_order) AS phase,
         argMax(repos_total, progress_order) AS repos_total,
@@ -645,16 +621,43 @@ export const getBackfillVerifyStatus = createServerFn().handler(
         argMax(error, progress_order) AS error
       FROM
       (
-        SELECT *, (ts, done, error != '') AS progress_order
+        SELECT *, (ts, done, error != '', repos_checked) AS progress_order
         FROM backfill_verify_progress
-        WHERE run_id = {run:String}
+        WHERE startsWith(shard, 'shard')
+          AND repos_total > 0
+          AND (
+            (done > 0 AND repos_checked > 0)
+            OR ts >= now() - INTERVAL 10 MINUTE
+          )
       )
       GROUP BY shard
-    `,
-      { run: runId },
-    );
-
+    `);
+    if (rows.length === 0) {
+      return {
+        generatedAt: new Date().toISOString(),
+        runId: null,
+        runIds: [],
+        active: false,
+        shards: 0,
+        freshnessSeconds: null,
+        phase: 'ready',
+        reposTotal: 0,
+        reposChecked: 0,
+        exact: 0,
+        loose: 0,
+        mismatches: 0,
+        looseEmitted: 0,
+        sampleChecked: 0,
+        sampleFailures: 0,
+        doneShards: 0,
+        failedShards: 0,
+        error: null,
+      };
+    }
     let newestTs = 0;
+    let newestRunTs = 0;
+    let runId: string | null = null;
+    const runIds = new Set<string>();
     let reposTotal = 0;
     let reposChecked = 0;
     let exact = 0;
@@ -668,7 +671,13 @@ export const getBackfillVerifyStatus = createServerFn().handler(
     const phases = new Set<string>();
     const errors: string[] = [];
     for (const row of rows) {
-      newestTs = Math.max(newestTs, chTsToDate(row.latest_ts).getTime());
+      const rowTs = chTsToDate(row.latest_ts).getTime();
+      newestTs = Math.max(newestTs, rowTs);
+      if (rowTs >= newestRunTs) {
+        newestRunTs = rowTs;
+        runId = row.run_id;
+      }
+      runIds.add(row.run_id);
       reposTotal += num(row.repos_total);
       reposChecked += num(row.repos_checked);
       exact += num(row.exact);
@@ -693,6 +702,7 @@ export const getBackfillVerifyStatus = createServerFn().handler(
     return {
       generatedAt: new Date().toISOString(),
       runId,
+      runIds: [...runIds].sort(),
       active,
       shards: rows.length,
       freshnessSeconds,

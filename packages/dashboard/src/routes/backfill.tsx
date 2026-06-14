@@ -910,8 +910,14 @@ function RecrawlStatus({
 function VerificationStatus({ status }: { status: BackfillVerifyStatus }) {
   const prepared = status.runId === null;
   const failed = status.failedShards > 0;
+  const hasMismatches = status.mismatches > 0;
+  const needsAttention = failed || hasMismatches;
   const pct =
     status.reposTotal > 0 ? (status.reposChecked / status.reposTotal) * 100 : 0;
+  const runLabel =
+    status.runIds.length > 1
+      ? `${integer.format(status.runIds.length)} shard runs`
+      : status.runId;
   return (
     <Card>
       <CardHeader className="pb-3">
@@ -921,14 +927,12 @@ function VerificationStatus({ status }: { status: BackfillVerifyStatus }) {
             <CardDescription>
               {prepared
                 ? 'ready; waiting for manual kickoff'
-                : failed && !status.active
-                  ? `last attempt: ${status.runId} · ${status.phase}`
-                  : `${status.runId} · ${status.phase}`}
+                : `${runLabel} · ${status.phase}`}
             </CardDescription>
           </div>
           <Badge
             variant={
-              status.failedShards > 0
+              needsAttention
                 ? 'destructive'
                 : status.active
                   ? 'outline'
@@ -940,10 +944,12 @@ function VerificationStatus({ status }: { status: BackfillVerifyStatus }) {
               : failed
                 ? status.active
                   ? 'failing'
-                  : 'last failed'
-                : status.active
-                  ? 'running'
-                  : 'seen'}
+                  : 'failed'
+                : hasMismatches
+                  ? 'mismatch'
+                  : status.active
+                    ? 'running'
+                    : 'seen'}
           </Badge>
         </div>
       </CardHeader>
@@ -958,7 +964,7 @@ function VerificationStatus({ status }: { status: BackfillVerifyStatus }) {
           <p className="text-right text-xs text-muted-foreground tabular-nums">
             {prepared
               ? 'not started'
-              : `${integer.format(status.reposChecked)} / ${integer.format(status.reposTotal)} repos in this run · ${pct.toFixed(1)}%`}
+              : `${integer.format(status.reposChecked)} / ${integer.format(status.reposTotal)} repos across latest shard runs · ${pct.toFixed(1)}%`}
           </p>
         </div>
         <div className="grid grid-cols-3 gap-3 text-sm">
@@ -977,13 +983,14 @@ function VerificationStatus({ status }: { status: BackfillVerifyStatus }) {
             value={integer.format(status.sampleChecked)}
           />
           <RecrawlMetric
-            label="run shards"
+            label="verified shards"
             value={`${integer.format(status.doneShards)} / ${integer.format(status.shards)}`}
           />
         </div>
-        {failed && !status.active ? (
+        {needsAttention && !status.active ? (
           <p className="text-xs text-muted-foreground">
-            full verification is not running; this is the last failed canary
+            mismatched repos remain loaded for recrawl/debug; verified shards
+            are counted above
           </p>
         ) : null}
         {status.runId !== null ? (
