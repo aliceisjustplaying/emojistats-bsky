@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { nextClaimWakeDelay, shouldDropRetainedBacklog } from './scheduler.js';
+import {
+  nextClaimWakeDelay,
+  shouldDropRetainedBacklog,
+  shouldExcludeHostFromClaimScan,
+} from './scheduler.js';
 
 void describe('scheduler retained backlog policy', () => {
   void it('drops a huge retained tail when only a tiny batch was scheduled', () => {
@@ -28,5 +32,17 @@ void describe('scheduler claim wake delay', () => {
 
   void it('clamps distant wakes to the scheduler ceiling', () => {
     assert.equal(nextClaimWakeDelay(20_000, 1_000), 5_000);
+  });
+});
+
+void describe('scheduler claim scan host exclusion', () => {
+  void it('excludes true backoff but not short rate-limit pacing', () => {
+    assert.equal(shouldExcludeHostFromClaimScan(0, 16, 5_000, false), true);
+    assert.equal(shouldExcludeHostFromClaimScan(0, 16, 0, false), false);
+  });
+
+  void it('excludes saturated and dead hosts', () => {
+    assert.equal(shouldExcludeHostFromClaimScan(16, 16, 0, false), true);
+    assert.equal(shouldExcludeHostFromClaimScan(0, 16, 0, true), true);
   });
 });

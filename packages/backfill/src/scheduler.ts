@@ -144,6 +144,15 @@ export function nextClaimWakeDelay(
     : Math.min(Math.max(wake - now, 250), 5_000);
 }
 
+export function shouldExcludeHostFromClaimScan(
+  queued: number,
+  effectiveCap: number,
+  backoffMs: number,
+  isDead: boolean,
+): boolean {
+  return isDead || queued >= effectiveCap || backoffMs > 0;
+}
+
 const yieldToTimers = async (): Promise<void> => {
   await new Promise<void>((resolve) => {
     setImmediate(resolve);
@@ -218,10 +227,13 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
   };
   const unavailableHosts = (): string[] => [
     ...new Set([
-      ...[...hostLimits.keys()].filter(
-        (host) =>
-          hostQueued(host) >= hostPressure.effectiveCap(host) ||
-          hostPressure.coolingMs(host) > 0,
+      ...[...hostLimits.keys()].filter((host) =>
+        shouldExcludeHostFromClaimScan(
+          hostQueued(host),
+          hostPressure.effectiveCap(host),
+          hostPressure.backoffMs(host),
+          false,
+        ),
       ),
       // Dead hosts are excluded at the SQL level too: their millions of
       // pending rows would otherwise dominate every scan window while the
@@ -530,11 +542,14 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
             stats.skipped += 1;
             continue;
           }
-          // Cooling hosts are skipped without claiming: the rows stay
+          // Backed-off hosts are skipped without claiming: the rows stay
           // pending and re-offer once the cooldown lapses, and the in-flight
           // pool only ever holds repos that can actually fetch right now.
+          // Short header-derived pacing is handled by reserve() below; treating
+          // that as a SQL scan exclusion starves the tail when only a few
+          // mushroom hosts remain and each has a small next-start delay.
           if (
-            hostPressure.coolingMs(repo.pdsHost) > 0 ||
+            hostPressure.backoffMs(repo.pdsHost) > 0 ||
             hostQueued(repo.pdsHost) >= hostPressure.effectiveCap(repo.pdsHost)
           ) {
             retained.push(repo);
