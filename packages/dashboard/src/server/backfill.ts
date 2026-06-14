@@ -27,6 +27,14 @@ const TERMINAL_EVENTS = ['loaded', 'empty', ...ISSUE_EVENTS] as const;
 const V1_RECRAWL_TARGET_REPOS = 3_208_370;
 const V1_RECRAWL_TARGET_POSTS = 478_676_984;
 const V1_RECRAWL_RUN_PREFIX = 'v1-recrawl';
+const BACKFILL_OVERVIEW_RUNS = [
+  'whale-2026',
+  'whale-2026-overcap',
+  'whale-2026-overcap-long',
+] as const;
+const BACKFILL_OVERVIEW_RUNS_SQL = BACKFILL_OVERVIEW_RUNS.map(
+  (run) => `'${run}'`,
+).join(', ');
 
 /**
  * Window for the rolling repos-per-minute estimate. Must span multiple shard
@@ -125,6 +133,7 @@ async function fetchOverview(): Promise<BackfillOverview | null> {
         ${LOGICAL_SHARD_SQL} AS logical_shard,
         argMax(run_id, ts) AS run_id
       FROM backfill_progress
+      WHERE run_id IN (${BACKFILL_OVERVIEW_RUNS_SQL})
       GROUP BY logical_shard
     )
   `);
@@ -145,6 +154,7 @@ async function fetchOverview(): Promise<BackfillOverview | null> {
       (
         SELECT *, ${LOGICAL_SHARD_SQL} AS logical_shard
         FROM backfill_progress
+        WHERE run_id IN (${BACKFILL_OVERVIEW_RUNS_SQL})
       )
       GROUP BY logical_shard
     `,
@@ -189,6 +199,7 @@ async function fetchOverview(): Promise<BackfillOverview | null> {
           SELECT *, ${LOGICAL_SHARD_SQL} AS logical_shard
           FROM backfill_progress
           WHERE ts >= now() - INTERVAL ${RATE_WINDOW_MINUTES} MINUTE
+            AND run_id IN (${BACKFILL_OVERVIEW_RUNS_SQL})
         )
         GROUP BY logical_shard
       )
