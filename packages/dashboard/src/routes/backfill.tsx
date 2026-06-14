@@ -132,6 +132,10 @@ const compact = new Intl.NumberFormat('en-US', {
   notation: 'compact',
   maximumFractionDigits: 1,
 });
+const compactMobile = new Intl.NumberFormat('en-US', {
+  notation: 'compact',
+  maximumFractionDigits: 0,
+});
 
 const MONTH_NAMES = [
   'January',
@@ -770,6 +774,13 @@ function HostsTable({
     avgPostsPerRepo: number;
   }>;
 }) {
+  const CompactHostValue = ({ value }: { value: number }) => (
+    <>
+      <span className="sm:hidden">{compactMobile.format(value)}</span>
+      <span className="hidden sm:inline">{compact.format(value)}</span>
+    </>
+  );
+
   return (
     <Card>
       <CardHeader>
@@ -801,13 +812,13 @@ function HostsTable({
                     </p>
                   </td>
                   <td className="py-1.5 text-right font-medium">
-                    {compact.format(row.total)}
+                    <CompactHostValue value={row.total} />
                   </td>
                   <td className="py-1.5 text-right">
-                    {compact.format(row.loaded)}
+                    <CompactHostValue value={row.loaded} />
                   </td>
                   <td className="py-1.5 text-right text-muted-foreground">
-                    {compact.format(row.empty)}
+                    <CompactHostValue value={row.empty} />
                   </td>
                   <td
                     className={`py-1.5 text-right ${
@@ -816,7 +827,7 @@ function HostsTable({
                         : 'text-muted-foreground'
                     }`}
                   >
-                    {compact.format(row.issues)}
+                    <CompactHostValue value={row.issues} />
                   </td>
                 </tr>
               ))}
