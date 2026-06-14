@@ -1173,6 +1173,33 @@ moment the backfill finishes. One dashboard commit (`263bc7c`) and a Pix commit 
   has *run*: final-sweep, verify convergence, `v:1` recrawl and cutover are all staged and cold,
   waiting on the drain.
 
+### 2026-06-13/14 the drain tail (23:36–00:03 UTC) — and the O(n) claim-scan villain comes back for the last mile
+
+Activation finished cleanly (all four hosts `nixos-rebuild switch`ed, current crawl stayed up, the
+final-sweep and `v:1`-recrawl units installed *inactive* and each pointed at its own worker
+TSV/ledger/archive dir), and the agent settled into a 5-minute drain watch. The tail is the slow
+part, exactly as feared:
+
+- **The drain, sampled honestly:** 23:36 ~826k pending / ~9,760 repos/min → 23:42 ~798k / 9,394 →
+  23:47 ~770k / 8,482 → 23:52 ~749k / 8,064 → 23:57 ~730k / 7,490 → 00:02 ~713k / 6,914. A clean,
+  honest taper — throughput sliding as the easy repos run out and the residue concentrates on
+  cooling/shallow host queues; the live-host ETA drifted *up* from ~85 to ~103 minutes across the
+  half hour as the rate fell, which is the correct direction for a tail and the opposite of the
+  optimistic flat-rate projection. Retired shard1/2 stale rows are excluded from the count.
+- **shard0 is the drag — and the reason is the run's oldest villain.** With lots of pending but
+  almost no fetch slots in use, shard0 looked stuck; it wasn't. The logs showed `skipped` climbing
+  *into the billions* with `topHosts` queue depth mostly 1–5 — the claim loop scanning enormous
+  numbers of ineligible rows (parked behind cooling/dead hosts) to surface the few currently-claimable
+  ones, so fetch slots bounce low not from deadness but from a claim path that's gone O(n) over a
+  pending set that's now mostly un-claimable. This is the *same* family as the listClaimable cost
+  and the bulk-park scans from earlier in the run — the claim scan is cheap while most rows are
+  eligible and quadratic-feeling once the tail inverts that ratio. The agent's first move was the
+  right one: check for an existing scan-depth/limit env knob before touching code, since the tail is
+  the worst time to ship a risky change. (Open as of 00:03 UTC — the session went quiet mid-diagnosis;
+  no fix committed, drain continuing toward an estimated ~01:40 UTC finish. The keeper, pending the
+  resolution: an end-game is where every "fine while n is small / fine while the ratio holds" cost
+  you let slide comes due at once.)
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
