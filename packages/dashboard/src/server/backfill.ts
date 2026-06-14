@@ -534,7 +534,7 @@ export interface BackfillVerifyStatus {
   loose: number;
   /** Current post-recrawl rows still left in ledger status loaded. */
   recheckLoadedOpen: number;
-  /** Latest fail-recrawl run ids represented in recheckLoadedOpen. */
+  /** Canonical crawl run ids represented in recheckLoadedOpen. */
   recheckRunIds: string[];
   recheckShards: number;
   mismatches: number;
@@ -660,6 +660,7 @@ export const getBackfillVerifyStatus = createServerFn().handler(
       };
     }
 
+    const mainScope = await fetchMainBackfillRunScope();
     const [rows, recheckRows] = await Promise.all([
       chQuery<{
         shard: string;
@@ -709,15 +710,35 @@ export const getBackfillVerifyStatus = createServerFn().handler(
         selected_run_id: string;
         latest_ts: string;
         loaded: string;
-      }>(`
+      }>(
+        mainScope === null
+          ? 'SELECT toString(NULL) AS selected_run_id, toDateTime(0) AS latest_ts, toString(0) AS loaded LIMIT 0'
+          : `
+        WITH recheck_shards AS
+        (
+          SELECT DISTINCT ${LOGICAL_SHARD_SQL} AS logical_shard
+          FROM backfill_progress
+          WHERE startsWith(run_id, 'fail-')
+        )
         SELECT
-          argMax(run_id, ts) AS selected_run_id,
-          max(ts) AS latest_ts,
-          argMax(loaded, ts) AS loaded
-        FROM backfill_progress
-        WHERE startsWith(run_id, 'fail-')
-        GROUP BY shard
-      `),
+          canonical.selected_run_id,
+          canonical.latest_ts,
+          canonical.loaded
+        FROM
+        (
+          SELECT
+            ${LOGICAL_SHARD_SQL} AS logical_shard,
+            argMax(run_id, ts) AS selected_run_id,
+            max(ts) AS latest_ts,
+            argMax(loaded, ts) AS loaded
+          FROM backfill_progress
+          WHERE ${mainScope.progressWhereSql}
+          GROUP BY logical_shard
+        ) AS canonical
+        INNER JOIN recheck_shards USING (logical_shard)
+        ORDER BY canonical.logical_shard
+      `,
+      ),
     ]);
     if (rows.length === 0) {
       return {
