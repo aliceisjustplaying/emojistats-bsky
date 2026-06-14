@@ -79,10 +79,22 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(1)} ${units[unit]}`;
 }
 
-function formatHour(chUtcDateTime: string): string {
-  // ClickHouse returns "YYYY-MM-DD HH:MM:SS" in UTC; render local hour.
+function formatChartHour(
+  chUtcDateTime: string,
+  prevChUtcDateTime?: string,
+): string {
   const date = new Date(`${chUtcDateTime.replace(' ', 'T')}Z`);
-  return `${date.getHours().toString().padStart(2, '0')}h`;
+  const prev =
+    prevChUtcDateTime === undefined
+      ? undefined
+      : new Date(`${prevChUtcDateTime.replace(' ', 'T')}Z`);
+  const hour = `${date.getHours().toString().padStart(2, '0')}h`;
+  if (prev !== undefined && date.toDateString() === prev.toDateString())
+    return hour;
+  return `${date.toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+  })} ${hour}`;
 }
 
 function OpsDashboard() {
@@ -331,7 +343,10 @@ function HourlyChart({
 }: {
   hourly: Array<{ hour: string; posts: number; postsWithEmojis: number }>;
 }) {
-  const data = hourly.map((row) => ({ ...row, label: formatHour(row.hour) }));
+  const data = hourly.map((row, index) => ({
+    ...row,
+    label: formatChartHour(row.hour, hourly[index - 1]?.hour),
+  }));
   return (
     <Card>
       <CardHeader>
@@ -411,7 +426,13 @@ function BackfillPanel({ status }: { status: BackfillStatus | null }) {
             <div className="flex flex-wrap gap-1.5">
               {BACKFILL_STATUS_ORDER.map((key) => (
                 <Badge key={key} variant="secondary" className="tabular-nums">
-                  {key} {integer.format(status.statusCounts[key])}
+                  {key}{' '}
+                  {integer.format(
+                    key === 'loaded'
+                      ? status.statusCounts.loaded +
+                          status.statusCounts.verified
+                      : status.statusCounts[key],
+                  )}
                 </Badge>
               ))}
             </div>

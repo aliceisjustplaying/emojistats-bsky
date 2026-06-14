@@ -66,22 +66,19 @@ interface PartsRow {
 export const getLiveStats = createServerFn().handler(
   async (): Promise<LiveStats> => {
     const [rates, freshness, totals, topEmojis, languages] = await Promise.all([
-      // Aggregate-table estimate: avoids production-cadence raw posts scans.
-      // posts_hourly is event-hour based, so this is an operational trend, not
-      // an exact ingest-rate counter.
+      // Ingest-time aggregate: keeps the public dashboard off raw posts scans.
+      // Source-filtered to the Jetstream/live path so recrawls cannot mask a
+      // stalled live worker.
       chQuery<RatesRow>(`
-        WITH
-          toStartOfHour(now()) AS current_hour,
-          greatest(dateDiff('second', current_hour, now()), 1) AS elapsed_s
         SELECT
-          toUInt64(round(sumIf(posts, hour = current_hour) * 60 / elapsed_s)) AS posts_1m,
-          toUInt64(round(sumIf(posts, hour = current_hour) * 900 / elapsed_s)) AS posts_15m
-        FROM posts_hourly
-        WHERE hour = current_hour
+          sumIf(posts, second >= now() - INTERVAL 1 MINUTE) AS posts_1m,
+          sumIf(posts, second >= now() - INTERVAL 15 MINUTE) AS posts_15m
+        FROM live_ingest_second
+        WHERE second >= now() - INTERVAL 15 MINUTE
       `),
       chQuery<FreshnessRow>(`
-        SELECT dateDiff('second', max(hour), now()) AS freshness_s
-        FROM posts_hourly
+        SELECT greatest(dateDiff('second', max(second), now()), 0) AS freshness_s
+        FROM live_ingest_second
       `),
       chQuery<TotalsRow>(`
         SELECT
@@ -140,12 +137,28 @@ export const getStorageStats = createServerFn().handler(
   async (): Promise<StorageStats> => {
     const [hourly, parts] = await Promise.all([
       chQuery<HourlyRow>(`
+        WITH toStartOfHour(now()) AS end_hour
         SELECT
           hour,
-          sum(posts) AS posts,
-          sum(posts_with_emojis) AS posts_with_emojis
-        FROM posts_hourly
-        WHERE hour >= toStartOfHour(now() - INTERVAL 24 HOUR)
+          toUInt64(coalesce(sum(posts), 0)) AS posts,
+          toUInt64(coalesce(sum(posts_with_emojis), 0)) AS posts_with_emojis
+        FROM
+        (
+          SELECT end_hour - number * 3600 AS hour
+          FROM numbers(24)
+        ) AS hours
+        LEFT JOIN
+        (
+          SELECT
+            hour,
+            sum(posts) AS posts,
+            sum(posts_with_emojis) AS posts_with_emojis
+          FROM posts_hourly
+          WHERE
+            hour >= end_hour - INTERVAL 23 HOUR
+            AND hour <= end_hour
+          GROUP BY hour
+        ) AS aggregates USING hour
         GROUP BY hour
         ORDER BY hour
       `),

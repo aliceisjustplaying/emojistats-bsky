@@ -70,6 +70,14 @@ CREATE TABLE IF NOT EXISTS posts_hourly (
 PARTITION BY toYear(hour)
 ORDER BY hour;
 
+CREATE TABLE IF NOT EXISTS live_ingest_second (
+  second DateTime('UTC') CODEC(Delta(4), ZSTD(1)),
+  posts  UInt64
+) ENGINE = SummingMergeTree(posts)
+PARTITION BY toYYYYMMDD(second)
+ORDER BY second
+TTL second + INTERVAL 7 DAY DELETE;
+
 CREATE TABLE IF NOT EXISTS emoji_total (
   emoji       LowCardinality(String),
   occurrences UInt64,

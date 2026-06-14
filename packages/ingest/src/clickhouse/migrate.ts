@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 
@@ -15,6 +16,19 @@ import {
 import { createClickHouseClient } from './client.js';
 
 const SCHEMA_PATH = fileURLToPath(new URL('schema.sql', import.meta.url));
+
+const LIVE_INGEST_SECOND_MV = {
+  table: 'live_ingest_second',
+  mvName: 'mv_live_ingest_second',
+  createSql: `
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_live_ingest_second TO live_ingest_second AS
+SELECT
+  toDateTime(toUnixTimestamp(ingested_at), 'UTC') AS second,
+  toUInt64(count()) AS posts
+FROM posts
+WHERE src = 'live'
+GROUP BY second`,
+};
 
 /** First table/view identifier, for log lines. */
 function statementName(statement: string): string {
@@ -95,6 +109,48 @@ async function ensureMv(
   );
 }
 
+function liveIngestSecondMvComment(): string {
+  const hash = createHash('sha256')
+    .update(LIVE_INGEST_SECOND_MV.createSql.trim())
+    .digest('hex')
+    .slice(0, 16);
+  return `spec:${hash}`;
+}
+
+async function ensureLiveIngestSecondMv(
+  client: ClickHouseClient,
+): Promise<void> {
+  const expected = liveIngestSecondMvComment();
+  const live = await liveMvComment(client, LIVE_INGEST_SECOND_MV.mvName);
+  if (live === expected) {
+    logger.info(`${LIVE_INGEST_SECOND_MV.mvName} current (${expected})`);
+    return;
+  }
+  if (live !== undefined) {
+    await client.command({
+      query: `DROP VIEW IF EXISTS ${LIVE_INGEST_SECOND_MV.mvName}`,
+    });
+  }
+  await client.command({ query: LIVE_INGEST_SECOND_MV.createSql });
+  await client.command({
+    query: `ALTER TABLE ${LIVE_INGEST_SECOND_MV.mvName} MODIFY COMMENT '${expected}'`,
+  });
+  logger.info(`Applied ${LIVE_INGEST_SECOND_MV.mvName} (${expected})`);
+  if (live !== undefined) {
+    logger.warn(
+      {
+        mv: LIVE_INGEST_SECOND_MV.mvName,
+        table: LIVE_INGEST_SECOND_MV.table,
+        was: live || '(none)',
+        now: expected,
+      },
+      `${LIVE_INGEST_SECOND_MV.mvName} drifted and was recreated. ` +
+        `${LIVE_INGEST_SECOND_MV.table} is recent operational telemetry; ` +
+        'it will repopulate from new live posts.',
+    );
+  }
+}
+
 async function migrate(): Promise<void> {
   // Tables first (schema.sql), then the materialized views from aggregates.ts —
   // the single source the rebuild CLI shares. Tables are append-only IF NOT
@@ -122,8 +178,18 @@ async function migrate(): Promise<void> {
         return;
       }
     }
+    try {
+      await ensureLiveIngestSecondMv(client);
+    } catch (err) {
+      logger.error(
+        { err },
+        `Migration failed on view ${LIVE_INGEST_SECOND_MV.mvName}`,
+      );
+      process.exitCode = 1;
+      return;
+    }
     logger.info(
-      `Migration complete: ${statements.length} statements, ${AGGREGATES.length} views.`,
+      `Migration complete: ${statements.length} statements, ${AGGREGATES.length + 1} views.`,
     );
   } finally {
     await client.close();
