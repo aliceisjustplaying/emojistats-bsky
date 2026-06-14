@@ -33,6 +33,7 @@ import {
   getBackfillIssues,
   getBackfillOverview,
   getBackfillRecrawlStatus,
+  getBackfillStatusReasons,
   getBackfillTimeline,
   getBackfillVerifyStatus,
 } from '#/server/backfill';
@@ -40,6 +41,7 @@ import type {
   BackfillOverview,
   BackfillRecrawlStatus,
   BackfillRepoStatus,
+  BackfillStatusReasons,
   BackfillVerifyStatus,
 } from '#/server/backfill';
 
@@ -91,6 +93,12 @@ const funQueryOptions = queryOptions({
   refetchInterval: 60_000,
 });
 
+const statusReasonsQueryOptions = queryOptions({
+  queryKey: ['backfill-status-reasons'],
+  queryFn: () => getBackfillStatusReasons(),
+  refetchInterval: 60_000,
+});
+
 export const Route = createFileRoute('/backfill')({
   head: () => ({
     meta: [{ title: 'emojistats · backfill' }],
@@ -105,6 +113,7 @@ export const Route = createFileRoute('/backfill')({
       context.queryClient.ensureQueryData(verifyQueryOptions),
       context.queryClient.ensureQueryData(issuesQueryOptions),
       context.queryClient.ensureQueryData(funQueryOptions),
+      context.queryClient.ensureQueryData(statusReasonsQueryOptions),
     ]);
   },
   errorComponent: ({ error }) => (
@@ -201,6 +210,7 @@ function BackfillPage() {
   const { data: verify } = useSuspenseQuery(verifyQueryOptions);
   const { data: issues } = useSuspenseQuery(issuesQueryOptions);
   const { data: fun } = useSuspenseQuery(funQueryOptions);
+  const { data: statusReasons } = useSuspenseQuery(statusReasonsQueryOptions);
 
   return (
     <main className="mx-auto max-w-6xl space-y-4 p-4 pb-10">
@@ -250,6 +260,7 @@ function BackfillPage() {
       />
       <ThroughputTimeline points={timeline?.points ?? []} />
       <StatusBreakdown overview={overview} />
+      <StatusReasonBreakdown breakdown={statusReasons} />
 
       {/* items-start: the issues feed is far taller than the hosts table */}
       <div className="grid items-start gap-4 lg:grid-cols-2">
@@ -667,6 +678,78 @@ function StatusBreakdown({ overview }: { overview: BackfillOverview | null }) {
                 </div>
               );
             })}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+const REASON_TITLES: Record<
+  BackfillStatusReasons['groups'][number]['status'],
+  string
+> = {
+  unreachable: 'unreachable',
+  quarantined: 'quarantined',
+  failed: 'failed',
+};
+
+function StatusReasonBreakdown({
+  breakdown,
+}: {
+  breakdown: BackfillStatusReasons | null;
+}) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-sm">Repo issue reasons</CardTitle>
+        <CardDescription>
+          latest 6-shard ledger rollup · grouped from SQLite error text
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {breakdown === null ? (
+          <p className="text-sm text-muted-foreground">
+            no reason rollup has been published yet
+          </p>
+        ) : (
+          <div className="grid gap-4 lg:grid-cols-3">
+            {breakdown.groups.map((group) => (
+              <div key={group.status} className="space-y-2">
+                <div>
+                  <p className="text-sm font-medium">
+                    {REASON_TITLES[group.status]}
+                  </p>
+                  <p className="font-mono text-lg font-semibold tabular-nums">
+                    {integer.format(group.total)}
+                  </p>
+                </div>
+                <div className="space-y-1.5">
+                  {group.reasons.map((row) => {
+                    const pct =
+                      group.total > 0 ? (row.count / group.total) * 100 : 0;
+                    return (
+                      <div key={row.reason} className="space-y-0.5">
+                        <div className="flex items-start justify-between gap-3 text-xs">
+                          <span className="text-muted-foreground">
+                            {row.reason}
+                          </span>
+                          <span className="font-mono tabular-nums">
+                            {integer.format(row.count)}
+                          </span>
+                        </div>
+                        <div className="h-1.5 overflow-hidden rounded-full bg-secondary">
+                          <div
+                            className="h-full rounded-full bg-primary"
+                            style={{ width: `${Math.max(1, pct)}%` }}
+                          />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
           </div>
         )}
       </CardContent>

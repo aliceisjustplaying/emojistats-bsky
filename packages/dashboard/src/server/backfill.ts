@@ -474,6 +474,86 @@ export interface BackfillVerifyStatus {
   error: string | null;
 }
 
+export interface BackfillStatusReasonGroup {
+  status: 'unreachable' | 'quarantined' | 'failed';
+  total: number;
+  reasons: Array<{ reason: string; count: number }>;
+}
+
+export interface BackfillStatusReasons {
+  generatedAt: string;
+  snapshotId: string;
+  groups: Array<BackfillStatusReasonGroup>;
+}
+
+export const getBackfillStatusReasons = createServerFn().handler(
+  async (): Promise<BackfillStatusReasons | null> => {
+    const exists = await chQuery<{ n: string }>(`
+      SELECT count() AS n
+      FROM system.tables
+      WHERE database = currentDatabase()
+        AND name = 'backfill_status_reason_counts'
+    `);
+    if (num(exists[0]?.n) === 0) return null;
+
+    const snapshots = await chQuery<{ snapshot_id: string }>(`
+      SELECT snapshot_id
+      FROM backfill_status_reason_counts
+      GROUP BY snapshot_id
+      HAVING uniqExact(shard) >= 6
+      ORDER BY max(ts) DESC
+      LIMIT 1
+    `);
+    const snapshotId = snapshots[0]?.snapshot_id;
+    if (snapshotId === undefined) return null;
+
+    const rows = await chQuery<{
+      status: 'unreachable' | 'quarantined' | 'failed';
+      reason: string;
+      count: string;
+    }>(
+      `
+      SELECT status, reason, sum(count) AS count
+      FROM
+      (
+        SELECT
+          shard,
+          status,
+          reason,
+          argMax(count, ts) AS count
+        FROM backfill_status_reason_counts
+        WHERE snapshot_id = {snapshot:String}
+        GROUP BY shard, status, reason
+      )
+      GROUP BY status, reason
+      ORDER BY status, count DESC
+    `,
+      { snapshot: snapshotId },
+    );
+
+    const byStatus = new Map<
+      BackfillStatusReasonGroup['status'],
+      BackfillStatusReasonGroup
+    >();
+    for (const status of ['unreachable', 'quarantined', 'failed'] as const) {
+      byStatus.set(status, { status, total: 0, reasons: [] });
+    }
+    for (const row of rows) {
+      const group = byStatus.get(row.status);
+      if (group === undefined) continue;
+      const count = num(row.count);
+      group.total += count;
+      group.reasons.push({ reason: row.reason, count });
+    }
+
+    return {
+      generatedAt: new Date().toISOString(),
+      snapshotId,
+      groups: [...byStatus.values()],
+    };
+  },
+);
+
 export const getBackfillVerifyStatus = createServerFn().handler(
   async (): Promise<BackfillVerifyStatus> => {
     const exists = await chQuery<{ n: string }>(`

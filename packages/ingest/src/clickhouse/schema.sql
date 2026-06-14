@@ -153,3 +153,15 @@ CREATE TABLE IF NOT EXISTS backfill_verify_progress (
 PARTITION BY toYYYYMM(ts)
 ORDER BY (run_id, shard, ts)
 TTL ts + INTERVAL 6 MONTH DELETE;
+
+CREATE TABLE IF NOT EXISTS backfill_status_reason_counts (
+  ts          DateTime('UTC') CODEC(Delta(4), ZSTD(1)),
+  snapshot_id LowCardinality(String),
+  shard       LowCardinality(String),
+  status      LowCardinality(String),
+  reason      LowCardinality(String),
+  count       UInt64
+) ENGINE = ReplacingMergeTree(ts)
+PARTITION BY toYYYYMM(ts)
+ORDER BY (snapshot_id, shard, status, reason)
+TTL ts + INTERVAL 6 MONTH DELETE;
