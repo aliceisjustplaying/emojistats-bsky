@@ -1200,6 +1200,86 @@ part, exactly as feared:
   resolution: an end-game is where every "fine while n is small / fine while the ratio holds" cost
   you let slide comes due at once.)
 
+### 2026-06-14 the overnight tail-fight (00:03–08:52 UTC) — the last 1% took nine hours, and then the backfill drained to zero
+
+This is the climax of the white whale: the enumeration is *done*, every active shard hit **zero
+pending at ~08:51 UTC**. But the last ~700k repos — call it the final 1% — took nine hours and four
+scheduler commits to clear, and the reason is the most instructive bug of the whole run: the
+rate-pacing we built to survive the 429 storm was being *misread* by the claim loop as host
+unavailability, so the scheduler starved itself exactly when the work got scarce. A fix in one
+subsystem had planted a latent bug in another, and it only detonated in the tail.
+
+- **The shard0 skip-scan, resolved (`c5d15cd`, 00:35Z) — necessary, not sufficient.** The billion-row
+  skip-scans were a real defect: when a claim pass scheduled a tiny batch but *retained* 150k+
+  busy/cooling rows, the next wake re-walked that retained array instead of forcing a fresh scan with
+  current host exclusions. `c5d15cd` drops the retained backlog (`shouldDropRetainedBacklog`) when a
+  pass schedules few but parks many, forcing a time-floored fresh scan. It cut wasted event-loop work
+  but did *not* restore drain rate — throughput kept falling (2,130→887/min by 00:52), because the
+  bottleneck had already moved downstream to pacing.
+- **The claim loop was blocking on the wrong event (`c8a3f57`, 00:55Z).** Second defect: after a
+  rate-limited host reserved a request, the loop did `await Promise.race(active)` — it waited for a
+  *fetch to complete* before re-entering. With only a handful of slow downloads in flight, it kept
+  missing the rate-limit windows of hosts that would happily allow 10 starts/sec. The fix wakes the
+  loop at the next rate-limit start time even while long fetches run. It produced a dramatic burst
+  (in-flight 28→939 in one wake) but not sustained throughput — the queues were genuinely shallow and
+  the skip scans still high.
+- **The discipline that mattered most at 2am: the agent refused to improvise the real fix.** It
+  correctly diagnosed the remaining need — "a host-focused, rate-limited crawl mode that honors
+  rate-limit reservations while bypassing generic claim scans" — and just as correctly declined to
+  build it live overnight: "I'm not going to improvise an exact-mode sidecar tonight." So through the
+  small hours the crawl ground at ~400–800/min (a real tail ETA of ~14–15h), and the only big drops
+  came from `listrepos-diff` *classification* — bulk-marking PLC-only spam DIDs (jellybaby, morel,
+  stropharia, ~850k rows at a time) as resolved without fetching CARs, a tail accelerator that deletes
+  work rather than doing it. Honoring Alice's standing overnight order ("if you have nothing to do,
+  sleep 15 minutes then check… if the backfill is complete, start the final sweep"), it never touched
+  the risky path and never started the sweep on an incomplete drain.
+- **Alice woke up and authorized the surgery (07:36Z) — and that's what ended it.** Her message —
+  "we made progress but the backfill is somehow still not done… this last 1% will take forever, there
+  must be a way to finish this" — is the load-bearing course-correction. With a human awake to own the
+  risk, the two deferred fixes shipped within thirteen minutes:
+  - **`75e4d21` (07:37Z) keep rate-paced hosts claimable.** The core bug, named at last: a host under
+    short *header-pacing* (e.g. a 250ms inter-request floor) was being excluded from the SQL claim scan
+    as if it were *down*. On shard4, down to ~3 live hosts, that meant the scanner kept concluding
+    "nothing claimable," ran starved micro-bursts, and idled while a perfectly healthy host sat one
+    pace-tick away. The fix splits the two questions cleanly: the claim-scan exclusion set uses only
+    *true* backoff/dead/full hosts, while per-request pacing is applied later, right before the fetch.
+    A regression test pins the exact case. shard4: ~72 → ~128/min on the first sample.
+  - **`adc3d5a` (07:49Z) pace requests inside host queues — the decisive one.** The remaining throttle
+    was claim-time *reservation* holding fleet-wide fetch slots while a paced row waited. Moving the
+    header-pacing wait *inside* each per-host queue (before the global slot) let paced rows wait
+    politely without occupying capacity the rest of the fleet could use. Result at 07:54: shard4
+    ~1,549/min, fleet ~7,732/min — roughly a 10× recovery from the overnight grind.
+- **Then it fell off a cliff, the good way.** Post-fix the tail collapsed on schedule: 08:05 ~146k →
+  08:21 ~75k → 08:40 ~18k → 08:47 ~4k → **08:51 zero pending on all four shards** (crawl0 drained by
+  08:31, crawl3 by 08:34, shard4/shard5 the last gate). A brief 08:14 slowdown to ~4,500/min was
+  correctly read as *normal* tail capacity collapse — crawl0 down to one remaining host, others to
+  two or three, bounded by per-host budgets — not a regression. As of the last line (08:52Z) the agent
+  is "waiting one more minute for shard4's last in-flight rows" before stopping the crawl services and
+  starting the final sweep.
+- **Three keepers from the night.** (1) *The cross-subsystem latent bug:* the rate-pacing built to fix
+  the 429 storm was semantically conflated with host-deadness in the claim scan — "this host needs a
+  250ms pause" and "this host is unreachable" took the same exclusion path, invisible until the host
+  pool shrank to where the difference was the whole game. The cure was making the distinction explicit
+  (claimable vs. should-wait are different questions). (2) *Defer risky fixes to when a human owns the
+  risk:* the agent grinding at a 14h ETA rather than improvising scheduler surgery at 2am was the right
+  call, and Alice waking to authorize it was the right unblock — the ETA went from ~14h to ~75min once
+  the fix shipped. (3) *Tail accelerators that delete work beat tail accelerators that do work faster:*
+  `listrepos-diff` classification cleared more of the backlog overnight than crawling did.
+- **A near-miss worth recording: broad-pattern `pkill` kept catching its own SSH wrapper.** At least
+  three times a kill-by-pattern (`healthcheck`, a sqlite probe, the watch loop) matched the agent's own
+  `ssh … pkill …` command or its parent, nearly killing the monitor instead of the target. Each time it
+  was caught and verified before harm. The lesson is old and keeps being true: a `pkill -f <substring>`
+  on a shared box is a foot-gun because your own tooling contains the substring; match on the unit or
+  the full argv, not a fragment. And one reporting confusion Alice caught at 08:42 — the dashboard
+  "repo breakdown" shows ~44k remaining because it sums the *frozen deleted* shard1/2 telemetry (~30k)
+  on top of the live ~14.8k Bridgy/parked tail, while the active-drain query counts only live shards;
+  not a bug, but a number that lies if you don't know which buckets it mixes.
+
+The backfill is, after all of it, **drained** — the thing the November-2025 attempt never reached and
+the thing this whole document was written around. What's *not* done: the final sweep (about to fire),
+the verify→`--did-file` convergence pass, the `v:1` metadata recrawl, the Bridgy/`--revive-host` tail,
+and the public-site cutover. The white whale is alongside; it isn't on the deck yet.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
