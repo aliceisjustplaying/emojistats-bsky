@@ -151,6 +151,10 @@ function chDateTime(ms: number): string {
   return new Date(ms).toISOString().slice(0, 19).replace('T', ' ');
 }
 
+function chString(value: string): string {
+  return `'${value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+}
+
 class VerifyTelemetry {
   #lastInsertMs = 0;
   #lastProgress: VerifyProgress | undefined;
@@ -272,13 +276,14 @@ async function chStatsForDids(
 ): Promise<Map<string, ChDidStats>> {
   const stats = new Map<string, ChDidStats>();
   for (let i = 0; i < dids.length; i += RECONCILE_CHUNK) {
+    const chunk = dids.slice(i, i + RECONCILE_CHUNK);
     const result = await ch.query({
       query: `
         SELECT did, toUInt64(count()) AS posts,
                hex(${CH_RKEY_DIGEST_EXPR}) AS digest
-        FROM posts FINAL WHERE did IN ({dids:Array(String)}) GROUP BY did
+        FROM posts FINAL WHERE did IN (${chunk.map(chString).join(',')})
+        GROUP BY did
       `,
-      query_params: { dids: dids.slice(i, i + RECONCILE_CHUNK) },
       format: 'JSONEachRow',
     });
     const rows = await result.json<{
