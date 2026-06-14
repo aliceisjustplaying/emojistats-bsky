@@ -1467,6 +1467,51 @@ is deployed fleet-wide.
   recrawl of the deleted shard1/2, baking the verify-timer fix into the flake, and the data cutover.
   But this is the first cycle in two days where the thing blocking all of it stopped being blocked.
 
+### 2026-06-14 mid-afternoon (15:13–15:46 UTC) — the verdict lands: the zero-loss number, and it's clean
+
+The number this whole document has been pointing at finally exists. With the scalable verifier
+deployed, the fleet-wide pass actually ran — sequentially, one shard at a time — and the first two
+shards came back overwhelmingly **exact**:
+
+- **shard0:** `2,231,041 exact · 102,271 loose · 3 mismatches` — promoted 2,199,790 loaded repos to
+  `verified`, left the 3 mismatches `loaded` for recrawl.
+- **shard3:** `2,233,389 exact · 100,670 loose · 2 failures` — promoted 1,825,495 more to `verified`.
+
+That is ~4.46M repos checked with **five genuine hard mismatches between them** — real count-short
+rows, kept `loaded` for re-fetch, not waved through. The ~100k-per-shard `loose` band is the expected
+shape, not loss: it's repos where ClickHouse holds *more* than the ledger receipt because the live
+Jetstream firehose kept writing after the backfill snapshot — ambiguous by construction (the O(1)
+digest can't distinguish a benign live arrival from a masked drop), which is exactly why the
+convergence pass re-fetches them rather than trusting the count. After two days of "verify can't even
+run," the first real verdict is: near-total exact match, a handful of genuine discrepancies, and a
+known-ambiguous tail to converge — about as clean as this could land.
+
+- **Running the verifier at scale surfaced the verifier's *own* workflow bugs — three, all fixed
+  live (`3ec3edd`, `ff7cb17`).** (1) The promotion gate was too coarse: 3 bad repos blocked promoting
+  the other ~2.33M — fixed to promote the good loaded repos and leave *only* the mismatches unverified,
+  collecting the **full** mismatch DID set (not just the sample logged to stdout — a subtle edge the
+  agent caught in self-review). (2) After classification the run hung burning CPU on a full SQLite
+  terminal report before writing telemetry — made opt-in (`--terminal-report`). (3) A verifier-specific
+  ClickHouse timeout + 8 GiB spill threshold so the scan doesn't inherit crawler defaults. The pattern
+  holds: you only find the operational bugs in the thing that runs for minutes over billions of rows by
+  *running* it — the canary proved the math, the real shard proved the workflow.
+- **The bottleneck moved, instructively, from the verification to the bookkeeping.** The ClickHouse
+  classification is fast — ~73s to scan ~2.31B rows at ~4–5 GiB, spill-free — but promoting ~2.2M rows
+  in the per-shard SQLite ledger (updating status and maintaining several status indexes) became the
+  long leg, ~4 minutes end-to-end per shard. So verify runs **sequentially** by necessity: each shard's
+  CH scan is the shared bottleneck on the single serving box (five-wide would fight for CPU/IO and push
+  toward the ~15 GiB memory ceiling), and the SQLite promotion is local per host. A reminder that at
+  this scale the "expensive" step isn't always the one you designed for — here the digest math got cheap
+  and the status-update bookkeeping got dear.
+- **And the dashboard learned to show the *fleet*, not the last run.** Alice again read the page and
+  flagged it (*"i want the backfill status page to show the combined results of all verifications not
+  just the latest one"*; *"this is what i see… seems weird"*) — the "run shards 0 / 1" label was
+  per-`run_id` and read as wrong while shard3 sat in `promoting` with `done=0`. The fix aggregates the
+  latest meaningful row *per shard* across runs (excluding zero-progress failed canaries) into a
+  fleet-wide "verified shards" rollup — the same instrument-scoping lesson, now applied to verification
+  coverage. Still ahead: shards 4 and 5, the `--did-file` convergence on the LOOSE+mismatch tail, the
+  `v:1` recrawl, the Bridgy revive, and cutover — but the verdict is no longer hypothetical.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
