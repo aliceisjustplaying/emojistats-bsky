@@ -163,6 +163,7 @@ const VERIFY_MAX_MEMORY_USAGE_BYTES = positiveIntEnv(
   8 * 1024 ** 3,
 );
 const VERIFY_QUERY_SETTINGS: ClickHouseSettings = {
+  send_progress_in_http_headers: 0,
   max_bytes_before_external_group_by: String(VERIFY_EXTERNAL_GROUP_BY_BYTES),
   max_bytes_before_external_sort: String(VERIFY_EXTERNAL_SORT_BYTES),
   max_threads: VERIFY_MAX_THREADS,
