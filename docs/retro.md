@@ -1783,6 +1783,62 @@ ability to measure itself against the first.
   and 8 hard mismatches remain exactly as open as before — just now with better tooling for when they
   do get closed.
 
+### 2026-06-14 ~20:30 UTC — what the agent memories knew that the transcripts didn't
+
+The retro has been mined from session transcripts and git commits. But the agents on pix2 also
+maintain their own persistent memories — Claude's project-level memory files and the Codex agent's
+`~/.codex/memories/` — and those contain decisions, incidents and findings that never surfaced in
+the transcript text because the agents internalized them silently. Mining those memories revealed
+several retro-worthy gaps.
+
+**The night ops protocol.** When Alice sleeps and asks the ops agent to guard the fleet, the
+standing orders are: stay in a `/loop`, never stop on errors; if idle, sleep ~10 min and re-check.
+Code changes are allowed for new bottlenecks but must be conservative, and reviewed via the Codex
+CLI (GPT 5.5, xhigh reasoning) with at most 3 review/fix rounds before deploy. This protocol —
+conservative-change plus external-model review as a gate on autonomous deploys — is a significant
+process decision about how multi-agent collaboration works when the human is asleep. The retro
+mentioned "the watcher needs watching" (the 03:10 malformed command incident) but never documented
+the protocol itself. In hindsight, the fact that the overnight guard loop *worked* — the drain
+completed, the fleet stayed healthy, no bad deploys — is partly because the protocol constrained the
+agent's autonomy to a narrow, reviewed band of action.
+
+**Open correctness findings from the adversarial reviews.** The June 13 adversarial code review
+(`docs/adversarial-code-review-2026-06-13.md`) and the June 14 thermo-nuclear review both found
+High-severity issues that are still open. Two matter for run 2 planning because they affect whether
+the write path can silently lose data:
+
+- **GEN_RETENTION eviction** (`packages/backfill/src/loader.ts`): a repo spanning more than 128
+  flush generations can have earlier failed generations evicted from `#runByGen`. When `finish()`
+  checks whether all generations succeeded, missing generations are treated as success — so the
+  ledger marks the repo `loaded` despite failed ClickHouse inserts. This is a durability violation:
+  the write path tells the ledger it succeeded when it didn't. The post-hoc verification pass is
+  what catches the mismatch (the digest won't match), which is exactly why the verification pass
+  exists and can't be dropped until this is fixed. For run 2, fixing this at the source — retaining
+  generation outcomes until all handles that touched them have finished — would remove one of the
+  structural reasons verification is necessary rather than optional.
+- **Parse workers materialize whole repos in memory** (`packages/backfill/src/parse-worker.ts`):
+  the worker collects every parsed post into a single `rows: ArchiveRow[]` array and posts the full
+  array back to the main thread via structured cloning. With `CAR_MAX_BYTES` now at 64 GiB (raised
+  from 1 GiB after the silent-cap data-loss discovery), multiple concurrent workers completing
+  around the same time can cause memory spikes or OOMs through double-materialization. This is the
+  specific mechanism behind the whale-repo memory pressure the retro has discussed; the fix is to
+  stream row batches from worker to main instead of buffering the whole repo.
+
+A third finding is lower severity but cheap to fix: the **live insert deduplication token**
+(`packages/ingest/src/writer.ts`) is based only on `rows.length` plus the first and last
+`(did, rkey)` pair. Two distinct batches with the same boundary tuples and length within
+ClickHouse's dedup window would collide, silently dropping one. The token could hash all row keys
+or the serialized payload instead.
+
+**The stop-state discipline convergence.** The Codex agent's own memories independently arrived at
+the same principle the retro calls "hold the line": *finish the named subgoal, document the stable
+operating point or failed canaries, and do not over-claim broader completion.* The retro derived
+this from watching the agent's behavior in transcripts; the agent derived it from Alice's
+corrections. That both sides converged on the same rule — from different evidence, stored in
+different systems — suggests it's load-bearing. The rule works because it keeps the agent honest
+about what's done and what isn't, which is the same property that makes the retro itself useful:
+you can't plan the second run from a narrative that overstates what the first one achieved.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
