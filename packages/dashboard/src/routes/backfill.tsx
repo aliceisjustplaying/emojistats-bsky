@@ -81,6 +81,7 @@ const looseRecrawlQueryOptions = queryOptions({
   queryKey: ['backfill-loose-recrawl'],
   queryFn: () => getBackfillLooseRecrawlStatus(),
   refetchInterval: 10_000,
+  refetchIntervalInBackground: true,
 });
 
 const verifyQueryOptions = queryOptions({
