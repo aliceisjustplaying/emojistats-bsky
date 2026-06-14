@@ -1548,6 +1548,94 @@ Each of these earned its place in this run; origin in parentheses.
   keep operational truth in the repo where any session on any host can find it; and
   let the human's short skeptical questions interrupt anything.
 
+## If I did this again — the second-time playbook
+
+The honest thesis of the whole run: **the data was never the hard part.** Roughly a day
+and a half of *healthy* throughput moved ~2.6B posts; the calendar cost was several days,
+and the overwhelming majority of the hard hours went to two things — telling a *stuck*
+system from a *slow* one, and discovering, reactively, the caps and detectors we should
+have built up front. A second run isn't faster because the crawler is faster. It's faster
+because you stop fighting your own instrumentation. Below, ranked by the time it would
+actually save. (The verify/cutover items are still provisional — those phases were unfinished
+when this was written.)
+
+**The five that would save the most time, in order:**
+
+1. **Build the progress-gated watchdog first.** This is the spine of the entire run — the
+   liveness detector went alert-only → auto-restart → CPU-gated → log-freshness →
+   progress-gated, and *nearly every crawler incident was a referendum on which signal tells
+   the truth*. A 0-CPU hang, an exit-1 crash, and a chatty-but-wedged box look identical from
+   the outside; CPU and log-freshness both lie (the wedge kept logging stats while `loaded`
+   sat frozen). Define liveness as **work advancing** (`loaded`/`resolved` climbing) from day
+   one and most of the firefight never happens.
+
+2. **Parse rate-limit headers and pace proactively — from line one.** The single biggest tail
+   bottleneck (and the thing that ate a whole overnight) was reactive AIMD back-off: slam a
+   host until it 429s, halve, cool, repeat — so you only ever *learn* the limit by tripping it.
+   The mushroom hosts advertise `ratelimit-limit/remaining/reset` on **every** response; the
+   crawler read it on none. Read the headers, space to the advertised budget, and from the
+   start keep **"is this host claimable" separate from "should this request wait"** — conflating
+   pacing with host-deadness in the claim scan is exactly what starved the scheduler in the tail.
+
+3. **No silent caps. Ever.** The worst bug of the run — every repo over a 1 GiB CAR cap was
+   *wholly dropped*, posts and all, for the entire backfill, filed under a "quarantined" status
+   nobody was reading — was a cap doing its job silently. Every limit that can reject data (CAR
+   size, fetch timeout, attempt budget, claim-scan depth) must be **loud, generous by default,
+   and paired with something that re-examines what it rejected.** And raising one cap reveals the
+   next (the 1 GiB cap hid a 300 s fetch-timeout cap behind it) — so audit for the *pattern*, not
+   the instance. A rejection status that no process reads again is data loss with a friendly label.
+
+4. **Design verification into the write path, and make it scale, before you need it.** Verify
+   was still failing to run at the very end (ClickHouse parameter-length limits on inline DID
+   lists), and even when it runs, an O(1) `(count, XOR-digest)` receipt *cannot prove set-subset*
+   once a live firehose keeps growing the table. Decide what "verified" means on day one; write
+   the per-repo receipts at load time; build the convergence loop (re-fetch only the LOOSE tail)
+   and the *scaling* verify (a temp DID table joined per shard, never DID lists shipped as query
+   params) before the end-game, not during it.
+
+5. **Classify the spam / PLC-only tail early and delete that work.** A large share of the
+   "failed/unresolved" millions is not lost data — it's `listRepos` returning DIDs that PLC knows
+   about but the host doesn't actually serve, plus bulk spam DIDs. `listrepos-diff` classification
+   cleared *more* backlog in a night than crawling did. The tail is **politeness-bound, not
+   capacity-bound**, so the lever is deleting work, not adding boxes — measure `GROUP BY pds_host`
+   on the remaining pending before you provision anything.
+
+**Build-in-from-day-one checklist** (the cheap insurance):
+
+- progress-gated watchdog + per-shard freshness, not CPU/log-liveness
+- header-driven host pacing, with the claimable-vs-should-wait split
+- a dead-host registry **with its inverse** (`--revive-host`) shipped together — blacklisting
+  without an un-blacklist means "park" silently becomes "abandon"
+- generous, loud caps + a re-examination pass over anything rejected
+- write-time verify receipts + a verify that scales; and put `src`/source **in** the
+  `ReplacingMergeTree` sort key (or split backfill and live into separate tables) so
+  verification can actually isolate backfilled rows — the `(did, rkey)`-with-`src`-outside
+  sort key is precisely what made the digest unable to prove zero-loss
+- everything load-bearing in the nix flake / IaC; no ad-hoc host scripts or `/run`-only drop-ins
+  that the next rebuild silently erases
+- the dashboard scoped to **project lifetime, not the latest `run_id`**, and its numbers
+  data-backed (aggregate tables), never hardcoded and never raw-`posts` scans at live cadence
+- quote an ETA only from **sustained measured throughput on healthy software**, and report
+  posts/min next to repos/min so "stopped wasting" and "got faster" stay distinguishable
+
+**Keep doing (these earned their place):**
+
+- the adversarial **second-agent review rounds** — they caught real pre-launch defects that would
+  have been 3am outages (the seq-reuse parquet overwrite, a dead ExecStart)
+- the core architecture — sharded crawlers → ClickHouse + per-repo SQLite ledger + zstd-parquet
+  archive — largely held under 2.6B posts; the changes above are refinements, not a redesign
+- naming bottlenecks out loud, the ETA honesty table, atomic commits, the runbook of
+  settings-not-to-repeat
+- the human's short skeptical questions as the highest-leverage tool in the kit — *"how were you
+  off by almost an order of magnitude?"*, *"are we not also missing posts?"*, *"they literally
+  give you headers"* each turned a stuck path
+
+**What would still be slow (the irreducible floor):** you cannot crawl faster than the hosts
+permit, dead hosts and PLC/host disagreement never become posts, and multi-GB repos take real
+time even with the caps raised. So the honest second-time estimate is that the *data* moves in
+roughly a day or two of wall-clock — the savings aren't in the crawl, they're in the days you'd
+no longer lose to instrumentation you built right the first time.
+
 ## Open: to revisit when the crawl completes
 
 - Final wall-clock duration and total cost vs the original napkin (1–1.5 days;
