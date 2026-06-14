@@ -109,9 +109,9 @@ export async function reconcileRecentLoads(
 
 export interface RetryPolicy {
   /** Classifies a pipeline failure: terminal, quarantined, failed or retry wave. */
-  handleRepoError(repo: RepoRow, err: unknown): void;
+  handleRepoError(repo: RepoRow, err: unknown): Promise<'done' | 'retry-now'>;
   /** Re-resolves the DID's current PDS before a retry; 'tombstoned' is terminal. */
-  refreshHost(repo: RepoRow): Promise<'ok' | 'tombstoned'>;
+  refreshHost(repo: RepoRow): Promise<'ok' | 'tombstoned' | 'host-updated'>;
 }
 
 export interface RetryPolicyDeps {
@@ -125,7 +125,10 @@ export interface RetryPolicyDeps {
 export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
   const { ledger, telemetry, stats, hostPressure, hostHealth } = deps;
 
-  function handleRepoError(repo: RepoRow, err: unknown): void {
+  async function handleRepoError(
+    repo: RepoRow,
+    err: unknown,
+  ): Promise<'done' | 'retry-now'> {
     const message = err instanceof Error ? err.message : String(err);
     const preserveExisting = repo.preserveExisting === true;
 
@@ -149,8 +152,22 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
         hostPressure.observeRateLimit(repo.pdsHost, err.rateLimit);
       hostHealth.recordSuccess(repo.pdsHost);
       if (preserveExisting) {
+        if (err.status === 'failed' && message.includes('RepoNotFound')) {
+          const refreshed = await refreshHost(repo);
+          if (refreshed === 'host-updated') {
+            stats.retried += 1;
+            telemetry.recordEvent({
+              did: repo.did,
+              pdsHost: repo.pdsHost,
+              event: 'retry',
+              error:
+                'preserved recrawl saw RepoNotFound on stale host; retrying current PLC host',
+            });
+            return 'retry-now';
+          }
+        }
         preserve(err.status);
-        return;
+        return 'done';
       }
       ledger.markTerminal(repo.did, err.status, message);
       stats.terminal += 1;
@@ -164,7 +181,7 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
         { did: repo.did, status: err.status, err: message },
         'repo terminal',
       );
-      return;
+      return 'done';
     }
     if (err instanceof QuarantineError) {
       // Hitting CAR_MAX_BYTES means the host delivered a body above the
@@ -173,7 +190,7 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
       hostHealth.recordSuccess(repo.pdsHost);
       if (preserveExisting) {
         preserve('quarantined');
-        return;
+        return 'done';
       }
       ledger.markTerminal(repo.did, 'quarantined', message);
       stats.terminal += 1;
@@ -184,7 +201,7 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
         error: message,
       });
       logger.warn({ did: repo.did, err: message }, 'repo quarantined');
-      return;
+      return 'done';
     }
 
     // Everything else retries. Clearly-transient failures (429/5xx/network/timeout,
@@ -199,7 +216,7 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
     if (!transient && attempts >= MAX_ATTEMPTS) {
       if (preserveExisting) {
         preserve('failed');
-        return;
+        return 'done';
       }
       ledger.markTerminal(repo.did, 'failed', message);
       stats.terminal += 1;
@@ -213,7 +230,7 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
         { did: repo.did, attempts, err: message },
         'repo failed: max attempts on a non-transient error',
       );
-      return;
+      return 'done';
     }
 
     const backoff = Math.min(RETRY_BASE_MS * 2 ** repo.attempts, RETRY_MAX_MS);
@@ -234,7 +251,7 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
       hostPressure.record429(repo.pdsHost);
       if (preserveExisting) {
         preserve('retry');
-        return;
+        return 'done';
       }
       ledger.markThrottled(
         repo.did,
@@ -248,7 +265,7 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
         event: 'retry',
         error: message,
       });
-      return;
+      return 'done';
     }
     if (isStallMessage(message)) {
       // A half-open/silent host (see fetcher progress timeout). Soft: cool it
@@ -261,7 +278,7 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
       hostHealth.recordFailure(repo.pdsHost, message);
       if (preserveExisting) {
         preserve('retry');
-        return;
+        return 'done';
       }
       ledger.markThrottled(
         repo.did,
@@ -275,12 +292,12 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
         event: 'retry',
         error: message,
       });
-      return;
+      return 'done';
     }
     hostHealth.recordFailure(repo.pdsHost, message);
     if (preserveExisting) {
       preserve('retry');
-      return;
+      return 'done';
     }
     ledger.markRetry(repo.did, message, retryAfterMs);
     stats.retried += 1;
@@ -294,6 +311,7 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
       { did: repo.did, attempts, retryAfterMs, err: message },
       'repo retry scheduled',
     );
+    return 'done';
   }
 
   // Stale-host self-healing: the ledger's PDS pointer reflects whichever PLC ops
@@ -302,7 +320,9 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
   // the DID's current document and follows it; tombstones discovered here are
   // terminal. Resolution is best-effort: on PLC hiccups the old host is kept and
   // the fetch below classifies the real failure.
-  async function refreshHost(repo: RepoRow): Promise<'ok' | 'tombstoned'> {
+  async function refreshHost(
+    repo: RepoRow,
+  ): Promise<'ok' | 'tombstoned' | 'host-updated'> {
     try {
       const res = await fetch(
         `${PLC_DIRECTORY_URL}/${encodeURIComponent(repo.did)}`,
@@ -332,6 +352,7 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
         );
         ledger.updateHost(repo.did, host);
         repo.pdsHost = host;
+        return 'host-updated';
       }
     } catch {
       // best-effort; the fetch below classifies the real failure

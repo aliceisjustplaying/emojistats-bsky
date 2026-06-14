@@ -16,6 +16,7 @@ import {
   REPO_FETCH_TIMEOUT_MS,
 } from './config.js';
 import {
+  isStallMessage,
   QuarantineError,
   RetryableError,
   TerminalFetchError,
@@ -77,6 +78,10 @@ function rehydrate(err: RepoJobError): Error {
       return exhaustive;
     }
   }
+}
+
+export function shouldRetireWorkerAfterError(err: RepoJobError): boolean {
+  return err.kind === 'retryable' && isStallMessage(err.message);
 }
 
 export interface ParsePool {
@@ -163,8 +168,14 @@ export function createParsePool(): ParsePool {
       }
       pending!.delete(reply.seq);
       clearTimeout(job.timer);
-      if ('ok' in reply) job.resolve(reply.ok);
-      else job.reject(rehydrate(reply.err));
+      if ('ok' in reply) {
+        job.resolve(reply.ok);
+      } else {
+        job.reject(rehydrate(reply.err));
+        if (shouldRetireWorkerAfterError(reply.err)) {
+          failWorker(worker, `stall failure: ${reply.err.message}`, true);
+        }
+      }
     });
     worker.on('error', (err) => {
       failWorker(worker, err.message);

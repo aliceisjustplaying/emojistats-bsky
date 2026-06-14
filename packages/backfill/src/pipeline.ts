@@ -283,7 +283,9 @@ export function createRepoPipeline(
       // can still partially land if archive/loader I/O fails mid-loop; those
       // park as retryable and the re-fetch collapses into ReplacingMergeTree
       // + the dedup tokens like any other at-least-once replay.
-      retry.handleRepoError(repo, err);
+      if ((await retry.handleRepoError(repo, err)) === 'retry-now') {
+        await processRepo(repo);
+      }
     }
   };
 }

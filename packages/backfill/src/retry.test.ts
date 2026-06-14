@@ -28,7 +28,7 @@ const repo = (preserveExisting: boolean): RepoRow => ({
 });
 
 void describe('retry policy preserved recrawls', () => {
-  void it('does not downgrade loaded/verified rows on recrawl failures', () => {
+  void it('does not downgrade loaded/verified rows on recrawl failures', async () => {
     const ledgerCalls: string[] = [];
     const policy = createRetryPolicy({
       ledger: {
@@ -50,19 +50,76 @@ void describe('retry policy preserved recrawls', () => {
       } as never,
     });
 
-    policy.handleRepoError(
+    await policy.handleRepoError(
       repo(true),
       new RetryableError('socket hang up', { transient: true }),
     );
-    policy.handleRepoError(
+    await policy.handleRepoError(
       repo(true),
       new TerminalFetchError('deactivated', 'deactivated'),
     );
-    policy.handleRepoError(
+    await policy.handleRepoError(
       repo(true),
       new RetryableError('http 429', { transient: true }),
     );
 
     assert.deepEqual(ledgerCalls, []);
+  });
+
+  void it('retries preserved RepoNotFound recrawls against a migrated host', async () => {
+    const originalFetch = globalThis.fetch;
+    const ledgerCalls: string[] = [];
+    const testRepo = repo(true);
+    testRepo.pdsHost = 'old.example';
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({
+          service: [
+            {
+              type: 'AtprotoPersonalDataServer',
+              serviceEndpoint: 'https://new.example',
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    try {
+      const policy = createRetryPolicy({
+        ledger: {
+          updateHost: (did: string, host: string) => {
+            ledgerCalls.push(`update:${did}:${host}`);
+          },
+          markRetry: () => ledgerCalls.push('retry'),
+          markThrottled: () => ledgerCalls.push('throttled'),
+          markTerminal: () => ledgerCalls.push('terminal'),
+        } as unknown as Ledger,
+        telemetry: {
+          recordEvent: () => undefined,
+        } as unknown as CrawlTelemetry,
+        stats: { retried: 0 } as CrawlStats,
+        hostPressure: {
+          record429: () => undefined,
+          recordStall: () => undefined,
+        } as never,
+        hostHealth: {
+          recordSuccess: () => undefined,
+          recordFailure: () => undefined,
+        } as never,
+      });
+
+      const result = await policy.handleRepoError(
+        testRepo,
+        new TerminalFetchError(
+          'failed',
+          'getRepo did:plc:test@old.example: http 400 RepoNotFound',
+        ),
+      );
+
+      assert.equal(result, 'retry-now');
+      assert.equal(testRepo.pdsHost, 'new.example');
+      assert.deepEqual(ledgerCalls, ['update:did:plc:test:new.example']);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
