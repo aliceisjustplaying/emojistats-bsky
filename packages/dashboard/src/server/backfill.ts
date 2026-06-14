@@ -96,6 +96,9 @@ const STATUS_ARGMAX_SQL = REPO_STATUSES.map(
   (status) => `argMax(${status}, ts) AS ${status}`,
 ).join(',\n        ');
 
+const LOGICAL_SHARD_SQL =
+  "replaceRegexpOne(shard, '^(overcap-long-|overcap-)shard', 'shard')";
+
 /**
  * Statuses that still represent work. Unreachable PARKS for retry waves
  * rather than resolving, so it stays out of the throughput rate. The hero
@@ -115,7 +118,15 @@ const RESOLVED_SUM_SQL = REPO_STATUSES.filter(
 
 async function fetchOverview(): Promise<BackfillOverview | null> {
   const runRows = await chQuery<{ run_id: string }>(`
-    SELECT run_id FROM backfill_progress ORDER BY ts DESC LIMIT 1
+    SELECT arrayStringConcat(arraySort(groupUniqArray(run_id)), ', ') AS run_id
+    FROM
+    (
+      SELECT
+        ${LOGICAL_SHARD_SQL} AS logical_shard,
+        argMax(run_id, ts) AS run_id
+      FROM backfill_progress
+      GROUP BY logical_shard
+    )
   `);
   const runId = runRows[0]?.run_id;
   if (runId === undefined) return null;
@@ -124,17 +135,19 @@ async function fetchOverview(): Promise<BackfillOverview | null> {
     chQuery<SnapshotRow>(
       `
       SELECT
-        shard,
+        logical_shard AS shard,
         -- aliased away from plain "ts": the alias would shadow the column
         -- inside the argMax calls (ILLEGAL_AGGREGATION)
         max(ts) AS latest_ts,
         ${STATUS_ARGMAX_SQL},
         argMax(in_flight, ts) AS in_flight
-      FROM backfill_progress
-      WHERE run_id = {run:String}
-      GROUP BY shard
+      FROM
+      (
+        SELECT *, ${LOGICAL_SHARD_SQL} AS logical_shard
+        FROM backfill_progress
+      )
+      GROUP BY logical_shard
     `,
-      { run: runId },
     ),
     // Posts/bytes/row-rate come from the append-only events table, NOT the
     // crawler's in-process gauges: those reset to zero on every service
@@ -171,13 +184,15 @@ async function fetchOverview(): Promise<BackfillOverview | null> {
         SELECT
           (argMax(${RESOLVED_SUM_SQL}, ts) - argMin(${RESOLVED_SUM_SQL}, ts))
           / greatest(dateDiff('second', min(ts), max(ts)) / 60, 1) AS rpm
-        FROM backfill_progress
-        WHERE run_id = {run:String}
-          AND ts >= now() - INTERVAL ${RATE_WINDOW_MINUTES} MINUTE
-        GROUP BY shard
+        FROM
+        (
+          SELECT *, ${LOGICAL_SHARD_SQL} AS logical_shard
+          FROM backfill_progress
+          WHERE ts >= now() - INTERVAL ${RATE_WINDOW_MINUTES} MINUTE
+        )
+        GROUP BY logical_shard
       )
     `,
-      { run: runId },
     ),
     chQuery<{ did: string; error: string }>(`
       SELECT did, error
