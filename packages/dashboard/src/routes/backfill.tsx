@@ -964,7 +964,7 @@ function VerificationStatus({ status }: { status: BackfillVerifyStatus }) {
           <p className="text-right text-xs text-muted-foreground tabular-nums">
             {prepared
               ? 'not started'
-              : `${integer.format(status.reposChecked)} / ${integer.format(status.reposTotal)} repos across latest shard runs · ${pct.toFixed(1)}%`}
+              : `${integer.format(status.reposChecked)} / ${integer.format(status.reposTotal)} repos across latest reporting shard runs · ${pct.toFixed(1)}%`}
           </p>
         </div>
         <div className="grid grid-cols-3 gap-3 text-sm">
@@ -983,13 +983,13 @@ function VerificationStatus({ status }: { status: BackfillVerifyStatus }) {
             value={integer.format(status.sampleChecked)}
           />
           <RecrawlMetric
-            label="verified shards"
+            label="reporting shards"
             value={`${integer.format(status.doneShards)} / ${integer.format(status.shards)}`}
           />
         </div>
         {needsAttention && !status.active ? (
           <p className="text-xs text-muted-foreground">
-            mismatched repos remain loaded for recrawl/debug; verified shards
+            mismatched repos remain loaded for recrawl/debug; reporting shards
             are counted above
           </p>
         ) : null}
