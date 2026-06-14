@@ -1652,6 +1652,37 @@ So: six shards measured, one false pass caught and corrected, 8 mismatches re-fe
 still ahead — and per the standing correction, none of this gets called clean or done until the
 re-fetches reconcile and the loose band converges.
 
+### 2026-06-14 evening (18:00–18:38 UTC) — the convergence pass is memory-bound, and the false-pass guard catches an OOM
+
+Getting from the digest verdict to the loose-convergence round turned out to be the expensive part —
+not the math, the memory. To emit the loose DID set for re-fetch, the verifier re-runs the shard-wide
+reconciliation (`INSERT … SELECT` over `posts FINAL`), and at full parallelism that scan **OOMed
+ClickHouse** at the 12 GiB cap after ~684s. The fix throttles it (`ec6c2d5`): a `max_threads` cap, and
+when that still wasn't enough, a strict single-lane profile — **1 ClickHouse thread, 128 MiB spill
+thresholds, a 4 GiB query cap**. That holds memory at ~1.5–2.5 GiB and survives, but a single-thread
+full-`FINAL` scan is **~20 minutes per shard** versus the ~73s the happy-path classification took. The
+honest shape of verify cost, now clear: the digest classification is cheap; it's re-running the FINAL
+scan *under memory pressure* — which the loose convergence forces — where the real time lives.
+
+- **The guard added an hour ago for shard2's false pass just defended against a completely different
+  failure.** When the reconciliation OOMed, ClickHouse killed the query and the `INSERT … SELECT` wrote
+  **zero result rows** — which is *byte-for-byte identical* to a genuine empty classification. The
+  `ce7f310` "refuse promotion on zero/partial classification" guard caught it and refused to promote,
+  exactly as it would for a real empty result. So a guard built for one failure mode (a verifier that
+  classifies nothing yet promotes anyway) turned out to also block a second the design never
+  anticipated (an OOM that masquerades as an empty pass). That's defense-in-depth earned rather than
+  planned — and it's the reason an OOM mid-convergence is a *slow retry* now instead of another
+  ~2M-repo false "verified." The keeper: when "succeeded with nothing" and "failed loudly" produce the
+  same observable (zero rows), a guard on the *invariant* ("you may not promote what you did not
+  classify") covers failure modes you haven't thought of yet.
+- **Status, held to the line:** the loose convergence has **not** produced numbers — the agent is still
+  getting the throttled reconciliation to run survivably (strict single-lane shard0 in progress, ~20
+  min), and only then does the loose DID list get emitted and re-fetched. The 8 hard mismatches are
+  still mid-recrawl from the previous round, not confirmed reconciled. So nothing has converged and
+  nothing is closed: six shards are digest-measured, the convergence machinery is fighting memory, and
+  the 631k loose + 8 fail remain exactly as open as they were — just now with a verifier that won't lie
+  about it even when ClickHouse falls over mid-scan.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
