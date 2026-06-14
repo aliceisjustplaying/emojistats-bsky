@@ -622,9 +622,8 @@ function StatusBreakdown({ overview }: { overview: BackfillOverview | null }) {
       <CardHeader>
         <CardTitle className="text-sm">Repo status breakdown</CardTitle>
         <CardDescription>
-          every enumerated repo walks the ledger to a terminal status;
-          loaded&nbsp;→&nbsp;verified happens in a separate periodic digest
-          pass, so verified lags loaded by design
+          loaded is every fetched repo with post rows; verified is the subset
+          whose post rows have passed the digest check
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -635,7 +634,11 @@ function StatusBreakdown({ overview }: { overview: BackfillOverview | null }) {
         ) : (
           <div className="grid grid-cols-3 gap-x-4 gap-y-5 sm:grid-cols-4 lg:grid-cols-6">
             {STATUS_ORDER.map(({ key, tone }) => {
-              const count = overview.statusCounts[key];
+              const count =
+                key === 'loaded'
+                  ? overview.statusCounts.loaded +
+                    overview.statusCounts.verified
+                  : overview.statusCounts[key];
               return (
                 <div key={key} className="space-y-0.5">
                   <p className="text-xs text-muted-foreground">{key}</p>
