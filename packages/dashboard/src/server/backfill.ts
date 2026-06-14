@@ -592,19 +592,23 @@ export const getBackfillVerifyStatus = createServerFn().handler(
       SELECT
         shard,
         max(ts) AS latest_ts,
-        argMax(phase, ts) AS phase,
-        argMax(repos_total, ts) AS repos_total,
-        argMax(repos_checked, ts) AS repos_checked,
-        argMax(exact, ts) AS exact,
-        argMax(loose, ts) AS loose,
-        argMax(mismatches, ts) AS mismatches,
-        argMax(loose_emitted, ts) AS loose_emitted,
-        argMax(sample_checked, ts) AS sample_checked,
-        argMax(sample_failures, ts) AS sample_failures,
-        argMax(done, ts) AS done,
-        argMax(error, ts) AS error
-      FROM backfill_verify_progress
-      WHERE run_id = {run:String}
+        argMax(phase, progress_order) AS phase,
+        argMax(repos_total, progress_order) AS repos_total,
+        argMax(repos_checked, progress_order) AS repos_checked,
+        argMax(exact, progress_order) AS exact,
+        argMax(loose, progress_order) AS loose,
+        argMax(mismatches, progress_order) AS mismatches,
+        argMax(loose_emitted, progress_order) AS loose_emitted,
+        argMax(sample_checked, progress_order) AS sample_checked,
+        argMax(sample_failures, progress_order) AS sample_failures,
+        argMax(done, progress_order) AS done,
+        argMax(error, progress_order) AS error
+      FROM
+      (
+        SELECT *, (ts, done, error != '') AS progress_order
+        FROM backfill_verify_progress
+        WHERE run_id = {run:String}
+      )
       GROUP BY shard
     `,
       { run: runId },
