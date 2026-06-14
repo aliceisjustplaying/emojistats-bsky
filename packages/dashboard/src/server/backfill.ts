@@ -126,12 +126,12 @@ const RESOLVED_SUM_SQL = REPO_STATUSES.filter(
 
 async function fetchOverview(): Promise<BackfillOverview | null> {
   const runRows = await chQuery<{ run_id: string }>(`
-    SELECT arrayStringConcat(arraySort(groupUniqArray(run_id)), ', ') AS run_id
+    SELECT arrayStringConcat(arraySort(groupUniqArray(selected_run_id)), ', ') AS run_id
     FROM
     (
       SELECT
         ${LOGICAL_SHARD_SQL} AS logical_shard,
-        argMax(run_id, ts) AS run_id
+        argMax(run_id, ts) AS selected_run_id
       FROM backfill_progress
       WHERE run_id IN (${BACKFILL_OVERVIEW_RUNS_SQL})
       GROUP BY logical_shard
