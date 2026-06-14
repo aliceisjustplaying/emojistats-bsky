@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as BackfillRouteImport } from './routes/backfill'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as AssetsSplatRouteImport } from './routes/assets.$'
 
 const BackfillRoute = BackfillRouteImport.update({
   id: '/backfill',
@@ -22,31 +23,40 @@ const IndexRoute = IndexRouteImport.update({
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AssetsSplatRoute = AssetsSplatRouteImport.update({
+  id: '/assets/$',
+  path: '/assets/$',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/backfill': typeof BackfillRoute
+  '/assets/$': typeof AssetsSplatRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/backfill': typeof BackfillRoute
+  '/assets/$': typeof AssetsSplatRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/backfill': typeof BackfillRoute
+  '/assets/$': typeof AssetsSplatRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/backfill'
+  fullPaths: '/' | '/backfill' | '/assets/$'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/backfill'
-  id: '__root__' | '/' | '/backfill'
+  to: '/' | '/backfill' | '/assets/$'
+  id: '__root__' | '/' | '/backfill' | '/assets/$'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   BackfillRoute: typeof BackfillRoute
+  AssetsSplatRoute: typeof AssetsSplatRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -65,12 +75,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/assets/$': {
+      id: '/assets/$'
+      path: '/assets/$'
+      fullPath: '/assets/$'
+      preLoaderRoute: typeof AssetsSplatRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   BackfillRoute: BackfillRoute,
+  AssetsSplatRoute: AssetsSplatRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
