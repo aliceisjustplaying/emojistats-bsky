@@ -147,19 +147,26 @@ const VERIFY_INSERT_BATCH_ROWS = positiveIntEnv(
 );
 const VERIFY_EXTERNAL_GROUP_BY_BYTES = positiveIntEnv(
   'VERIFY_EXTERNAL_GROUP_BY_BYTES',
-  8 * 1024 ** 3,
+  512 * 1024 ** 2,
 );
 const VERIFY_EXTERNAL_SORT_BYTES = positiveIntEnv(
   'VERIFY_EXTERNAL_SORT_BYTES',
-  8 * 1024 ** 3,
+  512 * 1024 ** 2,
 );
 const VERIFY_CLICKHOUSE_REQUEST_TIMEOUT_MS = positiveIntEnv(
   'VERIFY_CLICKHOUSE_REQUEST_TIMEOUT_MS',
   60 * 60_000,
 );
+const VERIFY_MAX_THREADS = positiveIntEnv('VERIFY_MAX_THREADS', 2);
+const VERIFY_MAX_MEMORY_USAGE_BYTES = positiveIntEnv(
+  'VERIFY_MAX_MEMORY_USAGE_BYTES',
+  8 * 1024 ** 3,
+);
 const VERIFY_QUERY_SETTINGS: ClickHouseSettings = {
   max_bytes_before_external_group_by: String(VERIFY_EXTERNAL_GROUP_BY_BYTES),
   max_bytes_before_external_sort: String(VERIFY_EXTERNAL_SORT_BYTES),
+  max_threads: VERIFY_MAX_THREADS,
+  max_memory_usage: String(VERIFY_MAX_MEMORY_USAGE_BYTES),
 };
 const VERIFY_EXPECTED_TABLE = 'backfill_verify_expected';
 const VERIFY_RESULT_TABLE = 'backfill_verify_result';
