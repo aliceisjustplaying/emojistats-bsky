@@ -479,6 +479,187 @@ export interface BackfillRecrawlStatus {
   etaHours: number | null;
 }
 
+export interface BackfillVerifyStatus {
+  generatedAt: string;
+  runId: string | null;
+  active: boolean;
+  shards: number;
+  freshnessSeconds: number | null;
+  phase: string;
+  reposTotal: number;
+  reposChecked: number;
+  exact: number;
+  loose: number;
+  mismatches: number;
+  looseEmitted: number;
+  sampleChecked: number;
+  sampleFailures: number;
+  doneShards: number;
+  failedShards: number;
+  error: string | null;
+}
+
+export const getBackfillVerifyStatus = createServerFn().handler(
+  async (): Promise<BackfillVerifyStatus> => {
+    const exists = await chQuery<{ n: string }>(`
+      SELECT count() AS n
+      FROM system.tables
+      WHERE database = currentDatabase()
+        AND name = 'backfill_verify_progress'
+    `);
+    if (num(exists[0]?.n) === 0) {
+      return {
+        generatedAt: new Date().toISOString(),
+        runId: null,
+        active: false,
+        shards: 0,
+        freshnessSeconds: null,
+        phase: 'ready',
+        reposTotal: 0,
+        reposChecked: 0,
+        exact: 0,
+        loose: 0,
+        mismatches: 0,
+        looseEmitted: 0,
+        sampleChecked: 0,
+        sampleFailures: 0,
+        doneShards: 0,
+        failedShards: 0,
+        error: null,
+      };
+    }
+
+    const runRows = await chQuery<{ run_id: string }>(`
+      SELECT run_id
+      FROM backfill_verify_progress
+      ORDER BY ts DESC
+      LIMIT 1
+    `);
+    const runId = runRows[0]?.run_id;
+    if (runId === undefined) {
+      return {
+        generatedAt: new Date().toISOString(),
+        runId: null,
+        active: false,
+        shards: 0,
+        freshnessSeconds: null,
+        phase: 'ready',
+        reposTotal: 0,
+        reposChecked: 0,
+        exact: 0,
+        loose: 0,
+        mismatches: 0,
+        looseEmitted: 0,
+        sampleChecked: 0,
+        sampleFailures: 0,
+        doneShards: 0,
+        failedShards: 0,
+        error: null,
+      };
+    }
+
+    const rows = await chQuery<{
+      shard: string;
+      latest_ts: string;
+      phase: string;
+      repos_total: string;
+      repos_checked: string;
+      exact: string;
+      loose: string;
+      mismatches: string;
+      loose_emitted: string;
+      sample_checked: string;
+      sample_failures: string;
+      done: string;
+      error: string;
+    }>(
+      `
+      SELECT
+        shard,
+        max(ts) AS latest_ts,
+        argMax(phase, ts) AS phase,
+        argMax(repos_total, ts) AS repos_total,
+        argMax(repos_checked, ts) AS repos_checked,
+        argMax(exact, ts) AS exact,
+        argMax(loose, ts) AS loose,
+        argMax(mismatches, ts) AS mismatches,
+        argMax(loose_emitted, ts) AS loose_emitted,
+        argMax(sample_checked, ts) AS sample_checked,
+        argMax(sample_failures, ts) AS sample_failures,
+        argMax(done, ts) AS done,
+        argMax(error, ts) AS error
+      FROM backfill_verify_progress
+      WHERE run_id = {run:String}
+      GROUP BY shard
+    `,
+      { run: runId },
+    );
+
+    let newestTs = 0;
+    let reposTotal = 0;
+    let reposChecked = 0;
+    let exact = 0;
+    let loose = 0;
+    let mismatches = 0;
+    let looseEmitted = 0;
+    let sampleChecked = 0;
+    let sampleFailures = 0;
+    let doneShards = 0;
+    let failedShards = 0;
+    const phases = new Set<string>();
+    const errors: string[] = [];
+    for (const row of rows) {
+      newestTs = Math.max(newestTs, chTsToDate(row.latest_ts).getTime());
+      reposTotal += num(row.repos_total);
+      reposChecked += num(row.repos_checked);
+      exact += num(row.exact);
+      loose += num(row.loose);
+      mismatches += num(row.mismatches);
+      looseEmitted += num(row.loose_emitted);
+      sampleChecked += num(row.sample_checked);
+      sampleFailures += num(row.sample_failures);
+      if (num(row.done) > 0) doneShards += 1;
+      if (row.phase === 'failed' || row.error !== '') failedShards += 1;
+      phases.add(row.phase);
+      if (row.error !== '') errors.push(`${row.shard}: ${row.error}`);
+    }
+    const freshnessSeconds =
+      newestTs > 0
+        ? Math.max(0, Math.round((Date.now() - newestTs) / 1000))
+        : null;
+    const active =
+      freshnessSeconds !== null &&
+      freshnessSeconds < IDLE_AFTER_SECONDS &&
+      doneShards < rows.length;
+    return {
+      generatedAt: new Date().toISOString(),
+      runId,
+      active,
+      shards: rows.length,
+      freshnessSeconds,
+      phase:
+        phases.size === 1
+          ? [...phases][0]
+          : active
+            ? 'mixed'
+            : doneShards === rows.length
+              ? 'finished'
+              : 'idle',
+      reposTotal,
+      reposChecked,
+      exact,
+      loose,
+      mismatches,
+      looseEmitted,
+      sampleChecked,
+      sampleFailures,
+      doneShards,
+      failedShards,
+      error: errors[0] ?? null,
+    };
+  },
+);
+
 export const getBackfillRecrawlStatus = createServerFn().handler(
   async (): Promise<BackfillRecrawlStatus> => {
     const runRows = await chQuery<{ run_id: string }>(

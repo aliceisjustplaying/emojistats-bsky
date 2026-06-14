@@ -132,3 +132,24 @@ CREATE TABLE IF NOT EXISTS backfill_repo_events (
 PARTITION BY toYYYYMM(ts)
 ORDER BY ts
 TTL ts + INTERVAL 6 MONTH DELETE;
+
+CREATE TABLE IF NOT EXISTS backfill_verify_progress (
+  ts              DateTime('UTC') CODEC(Delta(4), ZSTD(1)),
+  run_id          LowCardinality(String),
+  shard           LowCardinality(String),
+  ledger_path     String CODEC(ZSTD(1)),
+  phase           LowCardinality(String),
+  repos_total     UInt64,
+  repos_checked   UInt64,
+  exact           UInt64,
+  loose           UInt64,
+  mismatches      UInt64,
+  loose_emitted   UInt64,
+  sample_checked  UInt64,
+  sample_failures UInt64,
+  done            UInt8,
+  error           String CODEC(ZSTD(3))
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(ts)
+ORDER BY (run_id, shard, ts)
+TTL ts + INTERVAL 6 MONTH DELETE;

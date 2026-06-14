@@ -46,6 +46,7 @@
  * Ledger.markVerified.
  */
 import { existsSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { parseArgs } from 'node:util';
 
 import type { ClickHouseClient } from '@clickhouse/client';
@@ -114,6 +115,138 @@ interface ChDidStats {
 
 const RECONCILE_CHUNK = 1000;
 
+const VERIFY_RUN_ID =
+  process.env.VERIFY_RUN_ID ??
+  `verify-${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}`;
+const VERIFY_SHARD =
+  process.env.VERIFY_SHARD ??
+  process.env.CRAWL_SHARD_INDEX ??
+  path.basename(LEDGER_DB_PATH, '.sqlite');
+
+interface VerifyProgress {
+  phase: string;
+  reposTotal: number;
+  reposChecked: number;
+  exact: number;
+  loose: number;
+  mismatches: number;
+  looseEmitted: number;
+  sampleChecked: number;
+  sampleFailures: number;
+  done: boolean;
+  error?: string;
+}
+
+/** 'YYYY-MM-DD HH:MM:SS' UTC, the JSONEachRow-friendly DateTime form. */
+function chDateTime(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 19).replace('T', ' ');
+}
+
+class VerifyTelemetry {
+  #lastInsertMs = 0;
+  #lastProgress: VerifyProgress | undefined;
+  readonly #ch: ClickHouseClient;
+  readonly #runId: string;
+  readonly #shard: string;
+  readonly #ledgerPath: string;
+
+  constructor(
+    ch: ClickHouseClient,
+    runId: string,
+    shard: string,
+    ledgerPath: string,
+  ) {
+    this.#ch = ch;
+    this.#runId = runId;
+    this.#shard = shard;
+    this.#ledgerPath = ledgerPath;
+  }
+
+  async ensureTable(): Promise<void> {
+    await this.#ch.command({
+      query: `
+        CREATE TABLE IF NOT EXISTS backfill_verify_progress (
+          ts              DateTime('UTC') CODEC(Delta(4), ZSTD(1)),
+          run_id          LowCardinality(String),
+          shard           LowCardinality(String),
+          ledger_path     String CODEC(ZSTD(1)),
+          phase           LowCardinality(String),
+          repos_total     UInt64,
+          repos_checked   UInt64,
+          exact           UInt64,
+          loose           UInt64,
+          mismatches      UInt64,
+          loose_emitted   UInt64,
+          sample_checked  UInt64,
+          sample_failures UInt64,
+          done            UInt8,
+          error           String CODEC(ZSTD(3))
+        ) ENGINE = MergeTree
+        PARTITION BY toYYYYMM(ts)
+        ORDER BY (run_id, shard, ts)
+        TTL ts + INTERVAL 6 MONTH DELETE
+      `,
+    });
+  }
+
+  async record(progress: VerifyProgress, force = false): Promise<void> {
+    this.#lastProgress = progress;
+    const now = Date.now();
+    if (!force && now - this.#lastInsertMs < 5_000) return;
+    this.#lastInsertMs = now;
+    await this.#ch.insert({
+      table: 'backfill_verify_progress',
+      values: [
+        {
+          ts: chDateTime(now),
+          run_id: this.#runId,
+          shard: this.#shard,
+          ledger_path: this.#ledgerPath,
+          phase: progress.phase,
+          repos_total: progress.reposTotal,
+          repos_checked: progress.reposChecked,
+          exact: progress.exact,
+          loose: progress.loose,
+          mismatches: progress.mismatches,
+          loose_emitted: progress.looseEmitted,
+          sample_checked: progress.sampleChecked,
+          sample_failures: progress.sampleFailures,
+          done: progress.done ? 1 : 0,
+          error: progress.error ?? '',
+        },
+      ],
+      format: 'JSONEachRow',
+    });
+  }
+
+  async finish(progress: VerifyProgress): Promise<void> {
+    await this.record({ ...progress, done: true }, true);
+  }
+
+  async fail(err: unknown): Promise<void> {
+    await this.record(
+      {
+        ...(this.#lastProgress ?? {
+          phase: 'failed',
+          reposTotal: 0,
+          reposChecked: 0,
+          exact: 0,
+          loose: 0,
+          mismatches: 0,
+          looseEmitted: 0,
+          sampleChecked: 0,
+          sampleFailures: 0,
+          done: false,
+        }),
+        phase: 'failed',
+        done: true,
+        error: err instanceof Error ? err.message : String(err),
+      },
+      true,
+    );
+  }
+}
+
 // Src-agnostic on purpose: a post created during the crawl arrives via BOTH the
 // live path and the repo CAR; whichever inserts later wins the ReplacingMergeTree
 // merge and keeps its src label. Filtering on src='backfill' undercounts active
@@ -126,6 +259,7 @@ const RECONCILE_CHUNK = 1000;
 async function chStatsForDids(
   ch: ClickHouseClient,
   dids: string[],
+  onProgress?: (reposChecked: number) => Promise<void>,
 ): Promise<Map<string, ChDidStats>> {
   const stats = new Map<string, ChDidStats>();
   for (let i = 0; i < dids.length; i += RECONCILE_CHUNK) {
@@ -149,6 +283,7 @@ async function chStatsForDids(
         digest: normalizeDigestHex(row.digest),
       });
     }
+    await onProgress?.(Math.min(i + RECONCILE_CHUNK, dids.length));
   }
   return stats;
 }
@@ -165,6 +300,7 @@ async function chBackfillDids(ch: ClickHouseClient): Promise<Set<string>> {
 async function reconcile(
   db: Database.Database,
   ch: ClickHouseClient,
+  telemetry: VerifyTelemetry,
   backfillDids?: Set<string>,
 ): Promise<ReconcileResult> {
   const repos = db
@@ -174,9 +310,38 @@ async function reconcile(
     )
     .all() as LedgerRepo[];
 
+  await telemetry.record(
+    {
+      phase: 'querying-clickhouse',
+      reposTotal: repos.length,
+      reposChecked: 0,
+      exact: 0,
+      loose: 0,
+      mismatches: 0,
+      looseEmitted: 0,
+      sampleChecked: 0,
+      sampleFailures: 0,
+      done: false,
+    },
+    true,
+  );
+
   const chStats = await chStatsForDids(
     ch,
     repos.map((repo) => repo.did),
+    (reposChecked) =>
+      telemetry.record({
+        phase: 'querying-clickhouse',
+        reposTotal: repos.length,
+        reposChecked,
+        exact: 0,
+        loose: 0,
+        mismatches: 0,
+        looseEmitted: 0,
+        sampleChecked: 0,
+        sampleFailures: 0,
+        done: false,
+      }),
   );
 
   const mismatches: Mismatch[] = [];
@@ -185,6 +350,22 @@ async function reconcile(
   let exact = 0;
   let loose = 0;
   let alreadyVerified = 0;
+
+  await telemetry.record(
+    {
+      phase: 'classifying',
+      reposTotal: repos.length,
+      reposChecked: repos.length,
+      exact,
+      loose,
+      mismatches: mismatches.length,
+      looseEmitted: 0,
+      sampleChecked: 0,
+      sampleFailures: 0,
+      done: false,
+    },
+    true,
+  );
 
   for (const repo of repos) {
     const expected = repo.posts_total ?? 0;
@@ -249,6 +430,22 @@ async function reconcile(
     if (repo.status === 'loaded') passedLoadedDids.push(repo.did);
     else alreadyVerified += 1;
   }
+
+  await telemetry.record(
+    {
+      phase: 'promoting',
+      reposTotal: repos.length,
+      reposChecked: repos.length,
+      exact,
+      loose,
+      mismatches: mismatches.length,
+      looseEmitted: 0,
+      sampleChecked: 0,
+      sampleFailures: 0,
+      done: false,
+    },
+    true,
+  );
 
   const markVerified = db.prepare(
     "UPDATE repos SET status = 'verified' WHERE did = ? AND status = 'loaded'",
@@ -390,6 +587,8 @@ async function sampleVerifyRepos(
   ch: ClickHouseClient,
   repos: LedgerRepo[],
   pool: string,
+  telemetry: VerifyTelemetry,
+  base: VerifyProgress,
 ): Promise<number> {
   const refetch = refetchPostRows;
   logger.info(
@@ -398,7 +597,8 @@ async function sampleVerifyRepos(
   );
 
   let failures = 0;
-  for (const repo of repos) {
+  for (let i = 0; i < repos.length; i += 1) {
+    const repo = repos[i];
     try {
       const rows = await refetch(repo.did, repo.pds_host);
       const fetchedRkeys = new Set(rows.map((row) => row.rkey));
@@ -465,6 +665,13 @@ async function sampleVerifyRepos(
         'sample re-fetch failed',
       );
     }
+    await telemetry.record({
+      ...base,
+      phase: `sampling-${pool}`,
+      sampleChecked: i + 1,
+      sampleFailures: failures,
+      done: false,
+    });
   }
   return failures;
 }
@@ -549,9 +756,29 @@ async function main(): Promise<void> {
   const db = new Database(LEDGER_DB_PATH);
   db.pragma('busy_timeout = 5000');
   const ch = createClickHouseClient();
+  const telemetry = new VerifyTelemetry(
+    ch,
+    VERIFY_RUN_ID,
+    VERIFY_SHARD,
+    LEDGER_DB_PATH,
+  );
+  let latestProgress: VerifyProgress = {
+    phase: 'starting',
+    reposTotal: 0,
+    reposChecked: 0,
+    exact: 0,
+    loose: 0,
+    mismatches: 0,
+    looseEmitted: 0,
+    sampleChecked: 0,
+    sampleFailures: 0,
+    done: false,
+  };
 
   try {
     await pingClickHouse(ch);
+    await telemetry.ensureTable();
+    await telemetry.record(latestProgress, true);
 
     let exact = 0;
     let loose = 0;
@@ -564,8 +791,21 @@ async function main(): Promise<void> {
       ({ exact, loose, looseRepos, mismatches } = await reconcile(
         db,
         ch,
+        telemetry,
         backfillDids,
       ));
+      latestProgress = {
+        phase: 'reconciled',
+        reposTotal: exact + loose + mismatches.length,
+        reposChecked: exact + loose + mismatches.length,
+        exact,
+        loose,
+        mismatches: mismatches.length,
+        looseEmitted: 0,
+        sampleChecked: 0,
+        sampleFailures: 0,
+        done: false,
+      };
       terminalStateReport(db);
 
       if (emitLoose !== undefined) {
@@ -577,6 +817,12 @@ async function main(): Promise<void> {
           { path: emitLoose, dids: looseRepos.length },
           'wrote LOOSE DID list — re-fetch at scale with: crawl --did-file <path>, then re-run verify',
         );
+        latestProgress = {
+          ...latestProgress,
+          phase: 'loose-emitted',
+          looseEmitted: looseRepos.length,
+        };
+        await telemetry.record(latestProgress, true);
       }
     }
 
@@ -586,6 +832,8 @@ async function main(): Promise<void> {
         ch,
         selectRandomRepos(db, sampleSize),
         'random',
+        telemetry,
+        latestProgress,
       );
     if (sampleLooseSize !== null) {
       if (looseRepos.length === 0)
@@ -598,14 +846,22 @@ async function main(): Promise<void> {
           ch,
           pickSample(looseRepos, sampleLooseSize),
           'loose',
+          telemetry,
+          latestProgress,
         );
     }
+    latestProgress = {
+      ...latestProgress,
+      phase: 'finished',
+      sampleFailures,
+    };
 
     if (mismatches.length > 0 || sampleFailures > 0) {
       logger.error(
         { exact, loose, failed: mismatches.length, sampleFailures },
         'verification FAILED',
       );
+      await telemetry.finish(latestProgress);
       process.exitCode = 1;
     } else if (noReconcile) {
       // Reconciliation was skipped — do NOT claim ledger/CH agreement.
@@ -613,12 +869,17 @@ async function main(): Promise<void> {
         { sampleFailures: 0 },
         'sample check passed: every re-fetched repo is a subset of ClickHouse — NOTE --no-reconcile skipped the full ledger↔CH pass, so this is an early indicator, not a verify',
       );
+      await telemetry.finish(latestProgress);
     } else {
       logger.info(
         { exact, loose, failed: 0 },
         'verification passed: reconciliation found no CH<ledger or balanced-divergent losses (LOOSE is a lower bound — use --sample-loose for the directed re-fetch check)',
       );
+      await telemetry.finish(latestProgress);
     }
+  } catch (err) {
+    await telemetry.fail(err).catch(() => undefined);
+    throw err;
   } finally {
     db.close();
     await ch.close();
