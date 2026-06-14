@@ -1846,6 +1846,68 @@ different systems — suggests it's load-bearing. The rule works because it keep
 about what's done and what isn't, which is the same property that makes the retro itself useful:
 you can't plan the second run from a narrative that overstates what the first one achieved.
 
+### 2026-06-14 night (19:44–22:23 UTC) — the eight hard mismatches close, loose convergence begins, and the dashboard lies three more times
+
+Three things converged in a long evening session (rollout-2026-06-14T19-31-25, 3548 lines).
+
+**All eight hard digest mismatches are resolved.** An earlier fail-recrawl had silently cleared 4 of
+the 8 to exact — but nobody knew, because the dashboard was using stale fail-run telemetry instead of
+canonical ledger snapshots (showing `loaded open 8` when the ledgers said 4). Alice asked the
+right question: *"are you super duper sure that the other 4 was recrawled and done correctly?"*
+The agent checked and confirmed the first 4 from ledger evidence: verified exact, promoted, zero
+mismatches. Then kicked off targeted recrawls for the remaining 4 DIDs — one 5M-post repo on
+shard0 (mottlegill), one 4M-post and one 152k-post on shard3 (stropharia), one 55k-post on shard4
+(magic). Each recrawled, loaded, loaded-only verified exact, promoted. **Loaded-open is now 0
+across all shards.** The hard-mismatch thread that opened at 15:13 UTC is closed.
+
+**The dashboard lied three more times** in the same session, for a running total of eight:
+
+- `loaded open` sourced from stale `fail-rerun-fixed-20260614` telemetry snapshots, not the
+  canonical crawl snapshots — showing 8 when the ledgers said 4 (`6b23981`)
+- After the shard3/4 loaded-only promotions, the dashboard didn't learn about them because it reads
+  ClickHouse telemetry, not live SQLite ledgers — still showing 4 when the truth was 1
+  (`39ba5e6`)
+- `digest diff 8` kept rendering as active failure debt after the hard mismatches were all
+  resolved — the label needed a state transition from "active" to "historic" (`b166586`)
+
+The pattern is now unmistakable and worth naming: **the dashboard's truth expires faster than the
+dashboard updates.** Every fix in this session was the same shape: a metric that was correct when
+written, displayed as current, but stale against the ledger's real state. The gap is structural — the
+dashboard reads ClickHouse telemetry, but the ground truth lives in SQLite ledgers that only the
+verifier promotes. Until a verifier run writes new telemetry, the dashboard shows the last thing it
+was told, and the last thing it was told is now wrong.
+
+**The thermo-nuclear code review drove real fixes.** Four commits from iterating on review rounds,
+each reviewed by Claude before push:
+
+- `1306327`: verification run accounting — promotion becomes an explicit passed-DID allowlist,
+  telemetry carries `run_id`/`shard`, event schema migrated with `ADD COLUMN IF NOT EXISTS`,
+  parse workers stream row batches with ack instead of buffering full repos
+- `7a7960c`: run guardrails — explicit promotion staging objects, `BACKFILL_RUN_ID` guard (missing
+  or `dev` → fail before touching ClickHouse), shard count documented in runbook, recrawl file
+  backpressure
+- `f246182`: recrawl host migration — preserved exact recrawls now PLC-refresh on `RepoNotFound`
+  and retry with the corrected host; stalled workers get retired instead of leaking
+- `97db9e2`: crawl guardrails from Claude's review — worker watchdog stays alive during
+  backpressured streaming, telemetry schema preflight fails the crawl if event columns are missing
+
+**Loose convergence has actually started.** After the hard mismatches closed, the agent began
+emitting loose DID files. Shard0 completed: **112,118 loose DIDs**, 0 hard mismatches — the
+reconciliation ran through 2.22B rows, 125 GiB, in ~10 minutes under the throttled single-lane
+profile. Shard1 (retired ledger on the serving box) was still staging when the session was last
+read. This is the first time the loose convergence has produced an actual number since the OOM
+and header-overflow failures blocked it.
+
+- **Process note:** Alice had to correct the agent's sequencing twice. The agent tried to kick off a
+  "final canonical verify" when the next step was the loose round. *"please pay attention and follow
+  the order time is money mistakes are very costly."* The order is hard → loose → final sweep →
+  cutover. The agent conflated "verify the repairs" with "verify the whole fleet," and nearly ran
+  the wrong expensive operation.
+- **Status, held to the line:** the 8 hard mismatches are closed and verified exact. Loose
+  convergence is running — shard0 emitted 112k DIDs, remaining shards in progress. The 631k loose
+  band is about to shrink for the first time. Nothing has converged *to closure* yet, but the
+  machinery is finally producing numbers instead of fighting infrastructure.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
