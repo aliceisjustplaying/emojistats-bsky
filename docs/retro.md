@@ -1400,6 +1400,42 @@ commit, it's an accounting of what the ~30M+ non-`loaded` repos actually are.
   rollup table + script + pane are mid-build; verify, the `v:1` recrawl, the Bridgy revive, and cutover
   are all still ahead, exactly where the 13:07 halt left them.
 
+### 2026-06-14 mid-afternoon (14:07–14:37 UTC) — the reason pane lands, the app turns 1.0.0, and the dashboard lies a fourth way
+
+The status-reason pane shipped (`fca8ff1`: a `backfill_status_reason_counts` rollup + a
+`status-reasons` ledger-scan script + the dashboard card), closing the data-backed breakdown
+the previous entry left mid-build. The frontend was bumped to **1.0.0** (`8e0ebed`, deployed
+and verified live) — a release marker, not the data cutover, which still gates on a verify that
+hasn't run. And then Alice opened a page she'd *"barely looked at"* and it produced three more
+correctness bugs — the same instrument-lies-confidently family, now its fourth distinct costume.
+
+- **The public backfill page was wrong three ways at once, all from windowing/column mistakes.**
+  Alice caught the tells herself: *"posts/s 1m and posts/s 15m is suspiciously the same number
+  and the last 24 hours part shows more than 24."* Reproduced and root-caused (`caef707`): the two
+  rate cards were hour-average math that algebraically *cancels to the same value*; the "last 24h"
+  chart had **no upper time bound**, so future-dated post `created_at` timestamps leaked in and
+  plotted well past 24 hours; freshness was computed off `created_at` buckets while the label said
+  `ingested_at` (hence a *negative* freshness); and the root-page badges still showed `loaded`
+  *excluding* `verified`, inconsistent with the detail page's "every fetched repo with post rows."
+  Fixes: a live-only rate from raw `ingested_at` (live is ~45–50 posts/s; the backfill source has no
+  recent rows), a bounded 24h window with day labels, and unified `loaded` semantics — backed by a
+  new live-rate aggregate seeded historically so the page is correct immediately, not after a
+  15-minute warmup.
+- **The keeper, said plainly because it keeps recurring:** across this end-game the dashboard has now
+  been wrong about progress (run_id-scoped hero dropping a shard), about liveness ("idle" off the
+  stalest deleted shard), about its own history (run-scoped charts), and now about rates and time
+  windows (averages that cancel, an unbounded window admitting future timestamps, the wrong
+  timestamp column). Every one was the *instrument*, not the system. The transferable rule is
+  getting sharp: a live dashboard needs **bounded windows, the right timestamp column named
+  honestly, and one definition of each metric shared across every view** — without those it doesn't
+  just lose precision, it states false things confidently, and in an end-game that reads as a crisis
+  that isn't there. (A genuine data quirk fell out of it too: the network contains **future-dated
+  post timestamps** — clients and bridges stamping `created_at` ahead of now — which any unbounded
+  "recent" window will admit.)
+- **Status unchanged where it matters:** verify still has not run, no `v:1` recrawl, no Bridgy
+  `--revive-host` recrawl, no data cutover. What shipped this window is the public face — an honest,
+  1.0.0-tagged dashboard — not the verified completion behind it.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
