@@ -1908,6 +1908,44 @@ and header-overflow failures blocked it.
   band is about to shrink for the first time. Nothing has converged *to closure* yet, but the
   machinery is finally producing numbers instead of fighting infrastructure.
 
+### 2026-06-14 late night (22:23–23:37 UTC) — ClickHouse OOMs the loose recrawl, and DID-file restarts replay everything
+
+The loose convergence that finally started producing numbers hit the same wall — ClickHouse
+`MEMORY_LIMIT_EXCEEDED` — but from a different angle. This time it wasn't a FINAL scan; it was
+**four concurrent insert streams from the loose recrawlers** while materialized views tried to
+aggregate them. `jemalloc.allocated` climbed above the 12 GiB server cap, and even status queries
+started failing. The fix was operational: restart ClickHouse to clear allocator pressure, then
+resume the loose recrawl at gentler settings — `GLOBAL_CONCURRENCY=128` (down from the default),
+`PER_HOST=8`, `LOADER_BATCH_ROWS=500`. That held memory at ~3-4 GiB and the recrawl resumed at
+~505 repos/min.
+
+The dashboard lied again — the ninth time, by now so expected it barely rates a mention. The
+loose recrawl progress card used the ledger's `loaded` count as progress, but for preserved
+loaded/verified repos being re-fetched, that field stays flat while the crawler is actively
+working. Fixed (`5bb8fce`) to use event-backed progress: `68,502 / 684,873` processed after the
+fix deployed. The total loose DID count across all shards is **684,873** (up from the earlier
+631k because the per-shard emission included repos the fleet-level rollup had deduplicated).
+
+**The restart duplication bug.** Alice's question surfaced the real problem: exact `--did-file`
+recrawl starts from line 1 on every restart. With loaded/verified rows intentionally reprocessable
+(`preserveExisting`), every restart replays DIDs that already completed — burning rate-limit
+budget on work already done. The first 70,908 DIDs had been processed, but every restart was
+starting from DID #1 again. The agent first applied an ops workaround (extract processed DIDs
+from ClickHouse, write remaining-DID files with `comm`), then Alice called it out and the agent
+began a proper code fix: run-scoped `.done.<BACKFILL_RUN_ID>` checkpoint files that the scheduler
+skips on restart. That fix is in progress but not yet pushed.
+
+This is the same pattern as `listrepos-diff` clearing more backlog than crawling — when the
+process can't remember what it's done, it wastes time rediscovering it. And it's another entry
+for the run 2 preflight: any DID-targeted operation (`--did-file`, `--emit-loose`, exact recrawl)
+must checkpoint progress durably per run, or restarts multiply the wall-clock by the restart
+count. The ~27h ETA the dashboard was showing was partly real (the throttled concurrency) and
+partly phantom (replayed DIDs inflating the denominator without advancing the numerator).
+
+- **Status, held to the line:** loose recrawl is running at throttled settings across all 4
+  shards. 70,908 of 684,873 loose DIDs processed (~10%). ClickHouse is stable at the lower
+  insertion rate. The checkpoint fix is local, not yet pushed. Nothing has converged to closure.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
