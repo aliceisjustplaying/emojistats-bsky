@@ -97,13 +97,14 @@ interface Waiter {
  * failed flushes are retained so a late finish() can never mistake an evicted
  * entry for success and mark a repo `loaded` despite dropped rows.
  *
- * The insert_deduplication_token is a digest of the batch's (did, rev) pairs
- * plus row count: the in-process retry loop resends the identical payload
- * under the identical token, so transient mid-insert failures cannot
- * double-load (within non_replicated_deduplication_window). Across crashes,
- * batch composition differs, tokens differ, and the re-inserted rows collapse
- * structurally via ReplacingMergeTree(did, rkey) — loads stay idempotent
- * either way.
+ * The insert_deduplication_token is a digest of the batch's actual row keys:
+ * the in-process retry loop resends the identical payload under the identical
+ * token, so transient mid-insert failures cannot double-load (within
+ * non_replicated_deduplication_window). Consecutive same-size batches from one
+ * whale repo must still have different tokens, so repo tags/row count alone are
+ * not enough. Across crashes, batch composition differs, tokens differ, and the
+ * re-inserted rows collapse structurally via ReplacingMergeTree(did, rkey) —
+ * loads stay idempotent either way.
  */
 export class ClickHouseRepoLoader implements RepoLoader {
   #client: ClickHouseClient;
@@ -286,10 +287,14 @@ export class ClickHouseRepoLoader implements RepoLoader {
   }
 
   async #insertBatch(rows: PostRow[], tags: string[]): Promise<void> {
-    const token = `batch:${createHash('sha1')
-      .update(tags.join('\n'))
-      .update(`:${rows.length}`)
-      .digest('hex')}`;
+    const digest = createHash('sha1');
+    for (const row of rows) {
+      digest.update(row.did);
+      digest.update('\0');
+      digest.update(row.rkey);
+      digest.update('\0');
+    }
+    const token = `batch:${digest.digest('hex')}`;
     for (let attempt = 1; ; attempt += 1) {
       try {
         await this.#client.insert({

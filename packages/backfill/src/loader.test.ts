@@ -48,6 +48,33 @@ void describe('ClickHouseRepoLoader durability', () => {
     assert.equal(inserted, 1);
   });
 
+  void it('uses distinct dedup tokens for consecutive same-size batches from one repo', async () => {
+    const tokens: string[] = [];
+    const client = {
+      insert: async (options: {
+        clickhouse_settings?: { insert_deduplication_token?: string };
+      }) => {
+        tokens.push(
+          options.clickhouse_settings?.insert_deduplication_token ?? '',
+        );
+      },
+    } as unknown as ClickHouseClient;
+
+    const loader = new ClickHouseRepoLoader(client, {
+      batchRows: 2,
+      flushMs: 1_000_000,
+    });
+    const repo = loader.openRepo('did:A', 'rev');
+    await repo.addRow(row('did:A', 'a1'));
+    await repo.addRow(row('did:A', 'a2'));
+    await repo.addRow(row('did:A', 'a3'));
+    await repo.addRow(row('did:A', 'a4'));
+    await repo.finish();
+
+    assert.equal(tokens.length, 2);
+    assert.notEqual(tokens[0], tokens[1]);
+  });
+
   void it('rejects finish() when the live-buffer flush fails', async () => {
     const client = {
       insert: async () => {
