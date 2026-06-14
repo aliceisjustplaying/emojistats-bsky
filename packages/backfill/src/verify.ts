@@ -113,7 +113,16 @@ interface ChDidStats {
   digest: string;
 }
 
-const RECONCILE_CHUNK = 1000;
+function positiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0)
+    throw new Error(`${name} must be a positive integer, got ${raw}`);
+  return parsed;
+}
+
+const RECONCILE_CHUNK = positiveIntEnv('VERIFY_RECONCILE_CHUNK', 10_000);
 
 const VERIFY_RUN_ID =
   process.env.VERIFY_RUN_ID ??
