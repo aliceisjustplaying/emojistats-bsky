@@ -1512,6 +1512,45 @@ known-ambiguous tail to converge — about as clean as this could land.
   coverage. Still ahead: shards 4 and 5, the `--did-file` convergence on the LOOSE+mismatch tail, the
   `v:1` recrawl, the Bridgy revive, and cutover — but the verdict is no longer hypothetical.
 
+### 2026-06-14 late afternoon (15:46–16:10 UTC) — all four live shards verified: eight discrepancies in nine million repos
+
+The sequential pass finished the rest of the live fleet, and the full verdict is in:
+
+| shard  | exact     | loose   | mismatches |
+|--------|-----------|---------|------------|
+| shard0 | 2,231,041 | 102,271 | 3 |
+| shard3 | 2,233,389 | 100,670 | 2 |
+| shard4 | 2,231,379 | 101,984 | 2 |
+| shard5 | 2,232,947 | 101,196 | 1 |
+| **total** | **8,928,756** | **406,121** | **8** |
+
+**Eight** genuine count-short repos across **9,334,885** verified on the live fleet — a real-discrepancy
+rate under one in a million. The ~406k `loose` (≈4.3%) is the known live-overlay band, not loss: ClickHouse
+holds more than the backfill receipt because Jetstream kept writing, and the O(1) digest can't tell a benign
+live arrival from a masked drop, so those go to the convergence pass rather than being trusted either way.
+After everything — the wedges, the silent 1 GiB cap, the two days verify couldn't even run — the data itself
+came back essentially intact. (This is the four *live* shards 0/3/4/5; the deleted shard1/2 still need their
+own ledgerless verify from the preserved copies.)
+
+- **The instrument needed one more honesty pass to report this correctly.** A stale shard5 row from an
+  aborted *pre-rewrite* attempt (`done=1` but `repos_checked=0`) was polluting the rollup, so `done=1`
+  alone wasn't a safe "completed" filter — the fix counts only rows *completed with checked repos, or
+  fresh in-progress* (`a7400ed`, after a rebase/amend dance). And the badge that read **"last failed"**
+  for a shard verified-with-mismatches got reworded to **"mismatch"** — "failed" is the wrong word for
+  "8 of 9.3M didn't reconcile." Small, but exactly the genre of this end-game: the numbers were right
+  and the *labels* were lying, one more time.
+- **Throughput held its shape:** each shard ~2.33M repos, ClickHouse classification ~70–75s spill-free at
+  ~4.7 GiB, then the SQLite promotion as the long disk-bound leg — ~4 min end-to-end, run strictly
+  sequentially on the single serving box. No new data-loss or cap surprises this round; the verifier that
+  was rewritten and adversarially reviewed an hour ago ran four shards clean.
+- **The next question is now the real one, and Alice asked it plainly:** *"so what do we do with 1. loose
+  2. fail"* — `fail` first (the 8 hard mismatches: re-fetch and reconcile, or confirm they're upstream
+  deletions), `loose` second (the convergence `--did-file` pass that re-crawls the ambiguous band until it
+  collapses to the genuinely-live tail). That work, plus the deleted shard1/2 verify, the `v:1` recrawl,
+  the Bridgy revive, and cutover, is what stands between here and done — but the load-bearing fear of this
+  whole project, *did we silently lose data*, now has a measured answer: eight repos, all visible, all
+  recoverable.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
