@@ -528,6 +528,9 @@ export interface BackfillLooseRecrawlStatus {
   shards: number;
   activeShards: number;
   freshnessSeconds: number | null;
+  processedEvents: number;
+  loadedEvents: number;
+  issueEvents: number;
   loaded: number;
   inFlight: number;
   reposPerMin: number;
@@ -1060,6 +1063,9 @@ export const getBackfillLooseRecrawlStatus = createServerFn().handler(
         shards: 0,
         activeShards: 0,
         freshnessSeconds: null,
+        processedEvents: 0,
+        loadedEvents: 0,
+        issueEvents: 0,
         loaded: 0,
         inFlight: 0,
         reposPerMin: 0,
@@ -1068,7 +1074,7 @@ export const getBackfillLooseRecrawlStatus = createServerFn().handler(
       };
     }
 
-    const [snapshot, rate] = await Promise.all([
+    const [snapshot, eventTotals, eventRate] = await Promise.all([
       chQuery<{
         shard: string;
         latest_ts: string;
@@ -1090,19 +1096,29 @@ export const getBackfillLooseRecrawlStatus = createServerFn().handler(
       `,
         { run: runId },
       ),
+      chQuery<{
+        processed: string;
+        loaded: string;
+        issues: string;
+      }>(
+        `
+        SELECT
+          uniqExactIf(did, event IN (${TERMINAL_EVENTS.map((e) => `'${e}'`).join(', ')})) AS processed,
+          uniqExactIf(did, event = 'loaded') AS loaded,
+          uniqExactIf(did, event IN (${ISSUE_EVENTS.map((e) => `'${e}'`).join(', ')})) AS issues
+        FROM backfill_repo_events
+        WHERE run_id = {run:String}
+      `,
+        { run: runId },
+      ),
       chQuery<{ repos_per_min: string }>(
         `
-        SELECT sum(rpm) AS repos_per_min
-        FROM
-        (
-          SELECT
-            (argMax(loaded, ts) - argMin(loaded, ts))
-            / greatest(dateDiff('second', min(ts), max(ts)) / 60, 1) AS rpm
-          FROM backfill_progress
-          WHERE run_id = {run:String}
-            AND ts >= now() - INTERVAL ${RATE_WINDOW_MINUTES} MINUTE
-          GROUP BY shard
-        )
+        SELECT
+          uniqExactIf(did, event IN (${TERMINAL_EVENTS.map((e) => `'${e}'`).join(', ')}))
+          / greatest(dateDiff('second', min(ts), max(ts)) / 60, 1) AS repos_per_min
+        FROM backfill_repo_events
+        WHERE run_id = {run:String}
+          AND ts >= now() - INTERVAL ${RATE_WINDOW_MINUTES} MINUTE
       `,
         { run: runId },
       ),
@@ -1133,8 +1149,11 @@ export const getBackfillLooseRecrawlStatus = createServerFn().handler(
       freshnessSeconds !== null &&
       freshnessSeconds < IDLE_AFTER_SECONDS &&
       (activeShards > 0 || inFlight > 0);
-    const remainingRepos = Math.max(0, targetRepos - loaded);
-    const reposPerMin = num(rate[0]?.repos_per_min);
+    const processedEvents = num(eventTotals[0]?.processed);
+    const loadedEvents = num(eventTotals[0]?.loaded);
+    const issueEvents = num(eventTotals[0]?.issues);
+    const remainingRepos = Math.max(0, targetRepos - processedEvents);
+    const reposPerMin = num(eventRate[0]?.repos_per_min);
     return {
       generatedAt: new Date().toISOString(),
       targetRepos,
@@ -1143,6 +1162,9 @@ export const getBackfillLooseRecrawlStatus = createServerFn().handler(
       shards: snapshot.length,
       activeShards,
       freshnessSeconds,
+      processedEvents,
+      loadedEvents,
+      issueEvents,
       loaded,
       inFlight,
       reposPerMin,

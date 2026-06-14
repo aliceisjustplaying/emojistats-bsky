@@ -929,7 +929,9 @@ function LooseRecrawlStatus({
 }) {
   const prepared = status.runId === null;
   const pct =
-    status.targetRepos > 0 ? (status.loaded / status.targetRepos) * 100 : 0;
+    status.targetRepos > 0
+      ? (status.processedEvents / status.targetRepos) * 100
+      : 0;
   return (
     <Card>
       <CardHeader className="pb-3">
@@ -958,7 +960,7 @@ function LooseRecrawlStatus({
           <p className="text-right text-xs text-muted-foreground tabular-nums">
             {prepared
               ? 'not started'
-              : `${integer.format(status.loaded)} / ${integer.format(status.targetRepos)} loaded from loose files · ${pct.toFixed(1)}%`}
+              : `${integer.format(status.processedEvents)} / ${integer.format(status.targetRepos)} repo events recorded · ${pct.toFixed(1)}%`}
           </p>
         </div>
         <div className="grid grid-cols-2 gap-3 text-sm">
@@ -969,6 +971,18 @@ function LooseRecrawlStatus({
           <RecrawlMetric
             label="in flight"
             value={integer.format(status.inFlight)}
+          />
+          <RecrawlMetric
+            label="event loaded"
+            value={integer.format(status.loadedEvents)}
+          />
+          <RecrawlMetric
+            label="event issues"
+            value={integer.format(status.issueEvents)}
+          />
+          <RecrawlMetric
+            label="ledger loaded"
+            value={integer.format(status.loaded)}
           />
           <RecrawlMetric
             label="repos/min"
