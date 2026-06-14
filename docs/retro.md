@@ -1807,15 +1807,15 @@ agent's autonomy to a narrow, reviewed band of action.
 High-severity issues that are still open. Two matter for run 2 planning because they affect whether
 the write path can silently lose data:
 
-- **GEN_RETENTION eviction** (`packages/backfill/src/loader.ts`): a repo spanning more than 128
-  flush generations can have earlier failed generations evicted from `#runByGen`. When `finish()`
-  checks whether all generations succeeded, missing generations are treated as success — so the
-  ledger marks the repo `loaded` despite failed ClickHouse inserts. This is a durability violation:
-  the write path tells the ledger it succeeded when it didn't. The post-hoc verification pass is
-  what catches the mismatch (the digest won't match), which is exactly why the verification pass
-  exists and can't be dropped until this is fixed. For run 2, fixing this at the source — retaining
-  generation outcomes until all handles that touched them have finished — would remove one of the
-  structural reasons verification is necessary rather than optional.
+- **GEN_RETENTION eviction** (`packages/backfill/src/loader.ts`): the adversarial review found that
+  a repo spanning more than 128 flush generations could have earlier failed generations evicted from
+  `#runByGen`, with `finish()` treating a missing entry as success — a durability violation where
+  the write path tells the ledger it succeeded despite dropped rows. **This was fixed the same day**
+  (`a31b514`, 2026-06-13): failed flushes are now retained forever in the map, and entries are only
+  evicted on success. A missing entry now provably means the flush succeeded. The retro watcher
+  initially reported this as still open (the adversarial review doc was never updated); the code
+  tells a different story. [Corrected: the bug was found and fixed on the same day; it is not an
+  open issue for run 2.]
 - **Parse workers materialize whole repos in memory** (`packages/backfill/src/parse-worker.ts`):
   the worker collects every parsed post into a single `rows: ArchiveRow[]` array and posts the full
   array back to the main thread via structured cloning. With `CAR_MAX_BYTES` now at 64 GiB (raised
