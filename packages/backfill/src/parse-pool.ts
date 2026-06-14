@@ -8,7 +8,11 @@
 import os from 'node:os';
 import { Worker } from 'node:worker_threads';
 
-import { PARSE_WORKERS, REPO_FETCH_TIMEOUT_MS } from './config.js';
+import {
+  PARSE_WORKER_MAX_OLD_SPACE_MB,
+  PARSE_WORKERS,
+  REPO_FETCH_TIMEOUT_MS,
+} from './config.js';
 import {
   QuarantineError,
   RetryableError,
@@ -116,6 +120,10 @@ export function createParsePool(): ParsePool {
     // .ts entry fails to resolve inside the thread.
     const worker = new Worker(new URL('./parse-worker.ts', import.meta.url), {
       execArgv: ['--import', 'tsx'],
+      resourceLimits:
+        PARSE_WORKER_MAX_OLD_SPACE_MB > 0
+          ? { maxOldGenerationSizeMb: PARSE_WORKER_MAX_OLD_SPACE_MB }
+          : undefined,
     });
     pendingByWorker.set(worker, new Map());
     worker.on('message', (reply: RepoJobReply) => {
@@ -135,7 +143,16 @@ export function createParsePool(): ParsePool {
   };
 
   for (let i = 0; i < size; i += 1) workers.push(spawn());
-  logger.info({ workers: size }, 'repo worker pool up');
+  logger.info(
+    {
+      workers: size,
+      workerMaxOldSpaceMb:
+        PARSE_WORKER_MAX_OLD_SPACE_MB > 0
+          ? PARSE_WORKER_MAX_OLD_SPACE_MB
+          : undefined,
+    },
+    'repo worker pool up',
+  );
 
   return {
     run(did, pdsHost, fetchTimeUs) {

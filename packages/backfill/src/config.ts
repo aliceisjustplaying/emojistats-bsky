@@ -77,6 +77,10 @@ export const CAR_MAX_BYTES = num('CAR_MAX_BYTES', 64 * 1024 * 1024 * 1024);
 // Parse worker threads (0 = auto: availableParallelism - 2, min 1). CAR
 // parsing is pure CPU; on the main thread it starves every socket and timer.
 export const PARSE_WORKERS = num('PARSE_WORKERS', 0);
+export const PARSE_WORKER_MAX_OLD_SPACE_MB = num(
+  'PARSE_WORKER_MAX_OLD_SPACE_MB',
+  0,
+);
 
 export const RETRY_BASE_MS = num('RETRY_BASE_MS', 60_000);
 export const RETRY_MAX_MS = num('RETRY_MAX_MS', 3_600_000);
