@@ -323,10 +323,17 @@ export class SqliteLedger implements Ledger {
       WHERE repos.status = 'pending'
     `);
 
-    // COALESCE keeps the last recorded error when markTerminal is called without one
+    // COALESCE keeps the last recorded error when marking failures without one
     // (e.g. 'failed' after exhausting retries — the markRetry error is the diagnosis).
+    // Successful terminal states must clear stale errors from prior attempts.
     this.stmtMarkTerminal = this.db.prepare(`
-      UPDATE repos SET status = ?, error = COALESCE(?, error), retry_after = NULL
+      UPDATE repos SET
+        status = ?,
+        error = CASE
+          WHEN ? IN ('empty', 'deactivated', 'takendown', 'tombstoned') THEN NULL
+          ELSE COALESCE(?, error)
+        END,
+        retry_after = NULL
       WHERE did = ?
     `);
 
@@ -647,7 +654,7 @@ export class SqliteLedger implements Ledger {
     >,
     error?: string,
   ): void {
-    this.stmtMarkTerminal.run(status, error ?? null, did);
+    this.stmtMarkTerminal.run(status, status, error ?? null, did);
   }
 
   markVerified(did: string): void {

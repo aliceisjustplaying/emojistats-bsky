@@ -70,7 +70,10 @@ export const REPO_FETCH_TIMEOUT_MS = num('REPO_FETCH_TIMEOUT_MS', 300_000);
 // well under the 180s wedge-watchdog threshold so stalls self-heal without a
 // restart. REPO_FETCH_TIMEOUT_MS remains the absolute wall-clock cap.
 export const REPO_FETCH_STALL_MS = num('REPO_FETCH_STALL_MS', 60_000);
-export const CAR_MAX_BYTES = num('CAR_MAX_BYTES', 1_073_741_824);
+// Safety valve only. Real Bluesky repos can exceed 1 GiB, so the default must
+// stay well above observed production CARs. Set CAR_MAX_BYTES lower only for
+// targeted tests or emergency memory containment.
+export const CAR_MAX_BYTES = num('CAR_MAX_BYTES', 64 * 1024 * 1024 * 1024);
 // Parse worker threads (0 = auto: availableParallelism - 2, min 1). CAR
 // parsing is pure CPU; on the main thread it starves every socket and timer.
 export const PARSE_WORKERS = num('PARSE_WORKERS', 0);

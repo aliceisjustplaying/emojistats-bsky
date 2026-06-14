@@ -7,7 +7,8 @@ import type { PostRow } from 'ingest/types';
  *   empty       — repo exists but has zero app.bsky.feed.post records
  *   tombstoned  — PLC tombstone (account deleted at identity layer)
  *   deactivated / takendown — PDS refused with the corresponding error
- *   quarantined — CAR/CBOR was malformed or exceeded caps; never crash the worker
+ *   quarantined — CAR/CBOR was malformed or exceeded a configured safety valve;
+ *                 never crash the worker
  *   failed      — exhausted MAX_ATTEMPTS on errors that aren't clearly transient
  * Retryable parking state:
  *   unreachable — PDS down/timeout; retried in waves while attempts <

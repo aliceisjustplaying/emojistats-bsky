@@ -15,7 +15,7 @@ import {
  *   429 / 5xx                       RetryableError(transient) honoring Retry-After
  *   network / DNS / timeout         RetryableError(transient)
  *   other 4xx or unrecognized 400   RetryableError(non-transient) → 'failed' after MAX_ATTEMPTS
- *   body over CAR_MAX_BYTES         QuarantineError, request aborted
+ *   body over CAR_MAX_BYTES         QuarantineError, request aborted (safety valve)
  */
 
 export class RetryableError extends Error {
@@ -135,7 +135,7 @@ export function pdsHostFromEndpoint(endpoint: string): string | undefined {
 export interface FetchedCar {
   response: Response;
   rateLimit: RateLimitHint;
-  /** CAR_MAX_BYTES is enforced here; stream errors are always RetryableError or QuarantineError. */
+  /** CAR_MAX_BYTES is a high safety valve; stream errors are always RetryableError or QuarantineError. */
   body: ReadableStream<Uint8Array>;
   /** Bytes pulled through so far; the final value is the ledger's car_bytes. */
   bytesRead(): number;
@@ -364,7 +364,7 @@ export async function fetchRepoCar(
         return;
       }
       total += result.value.byteLength;
-      if (total > CAR_MAX_BYTES) {
+      if (CAR_MAX_BYTES > 0 && total > CAR_MAX_BYTES) {
         abort.abort();
         throw new QuarantineError(
           `getRepo ${did}@${host}: car exceeded CAR_MAX_BYTES (${CAR_MAX_BYTES}) at ${total}+ bytes`,

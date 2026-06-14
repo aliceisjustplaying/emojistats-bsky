@@ -167,8 +167,9 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
       return;
     }
     if (err instanceof QuarantineError) {
-      // Hitting CAR_MAX_BYTES means the host delivered a >1GiB body — loud
-      // proof of life that must clear any stall/deadness streak.
+      // Hitting CAR_MAX_BYTES means the host delivered a body above the
+      // configured safety valve — loud proof of life that must clear any
+      // stall/deadness streak.
       hostHealth.recordSuccess(repo.pdsHost);
       if (preserveExisting) {
         preserve('quarantined');
