@@ -5,6 +5,7 @@ import {
   nextClaimWakeDelay,
   shouldDropRetainedBacklog,
   shouldExcludeHostFromClaimScan,
+  shouldWaitForUnreachableRetry,
 } from './scheduler.js';
 
 void describe('scheduler retained backlog policy', () => {
@@ -44,5 +45,24 @@ void describe('scheduler claim scan host exclusion', () => {
   void it('excludes saturated and dead hosts', () => {
     assert.equal(shouldExcludeHostFromClaimScan(16, 16, 0, false), true);
     assert.equal(shouldExcludeHostFromClaimScan(0, 16, 0, true), true);
+  });
+});
+
+void describe('scheduler unreachable idle policy', () => {
+  void it('waits only for non-dead unreachable rows with retry budget left', () => {
+    const isDead = (host: string): boolean => host === 'dead.example';
+
+    assert.equal(
+      shouldWaitForUnreachableRetry(4, 'alive.example', isDead),
+      true,
+    );
+    assert.equal(
+      shouldWaitForUnreachableRetry(4, 'dead.example', isDead),
+      false,
+    );
+    assert.equal(
+      shouldWaitForUnreachableRetry(5, 'alive.example', isDead),
+      false,
+    );
   });
 });

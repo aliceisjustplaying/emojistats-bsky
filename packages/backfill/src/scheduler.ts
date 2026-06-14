@@ -153,6 +153,14 @@ export function shouldExcludeHostFromClaimScan(
   return isDead || queued >= effectiveCap || backoffMs > 0;
 }
 
+export function shouldWaitForUnreachableRetry(
+  attempts: number,
+  pdsHost: string,
+  isDeadHost: (host: string) => boolean,
+): boolean {
+  return attempts < MAX_ATTEMPTS && !isDeadHost(pdsHost);
+}
+
 const yieldToTimers = async (): Promise<void> => {
   await new Promise<void>((resolve) => {
     setImmediate(resolve);
@@ -392,11 +400,16 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
   const idleWait = (): number | null => {
     const counts = ledger.statusCounts();
     if ((counts.pending ?? 0) > 0 || (counts.fetching ?? 0) > 0) return 1_000;
-    if ((counts.unreachable ?? 0) === 0) return null;
     let withinBudget = false;
     let nextDueMs = Number.POSITIVE_INFINITY;
     for (const row of ledger.iterateByStatus('unreachable')) {
-      if (row.attempts < MAX_ATTEMPTS) withinBudget = true;
+      if (
+        !shouldWaitForUnreachableRetry(row.attempts, row.pdsHost, (host) =>
+          hostHealth.isDead(host),
+        )
+      )
+        continue;
+      withinBudget = true;
       nextDueMs = Math.min(nextDueMs, row.retryAfter ?? 0);
     }
     if (!withinBudget) return null;
