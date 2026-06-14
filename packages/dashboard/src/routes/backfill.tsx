@@ -915,8 +915,7 @@ function VerificationStatus({ status }: { status: BackfillVerifyStatus }) {
   const prepared = status.runId === null;
   const failed = status.failedShards > 0;
   const hasOpenRecheck = status.recheckLoadedOpen > 0;
-  const hasMismatches = status.mismatches > 0 && !hasOpenRecheck;
-  const needsAttention = failed || hasOpenRecheck || hasMismatches;
+  const needsAttention = failed || hasOpenRecheck;
   const classified = status.exact + status.loose + status.mismatches;
   const pct =
     status.reposTotal > 0 ? (classified / status.reposTotal) * 100 : 0;
@@ -953,11 +952,9 @@ function VerificationStatus({ status }: { status: BackfillVerifyStatus }) {
                   : 'failed'
                 : hasOpenRecheck
                   ? 'loaded check'
-                  : hasMismatches
-                    ? 'mismatch'
-                    : status.active
-                      ? 'running'
-                      : 'seen'}
+                  : status.active
+                    ? 'running'
+                    : 'seen'}
           </Badge>
         </div>
       </CardHeader>
@@ -983,7 +980,7 @@ function VerificationStatus({ status }: { status: BackfillVerifyStatus }) {
             value={integer.format(status.recheckLoadedOpen)}
           />
           <RecrawlMetric
-            label="digest diff"
+            label="historic diff"
             value={integer.format(status.mismatches)}
           />
           <RecrawlMetric
@@ -999,7 +996,7 @@ function VerificationStatus({ status }: { status: BackfillVerifyStatus }) {
           <p className="text-xs text-muted-foreground">
             {hasOpenRecheck
               ? `${integer.format(status.recheckLoadedOpen)} post-recrawl repos remain loaded pending loaded-only verification`
-              : 'mismatched repos remain loaded for recrawl/debug'}
+              : 'verification needs operator attention'}
           </p>
         ) : null}
         {status.recheckRunIds.length > 0 ? (
