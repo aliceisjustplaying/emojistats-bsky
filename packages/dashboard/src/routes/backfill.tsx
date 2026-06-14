@@ -971,10 +971,14 @@ function LooseRecrawlStatus({
             value={integer.format(status.inFlight)}
           />
           <RecrawlMetric
+            label="repos/min"
+            value={integer.format(Math.round(status.reposPerMin))}
+          />
+          <RecrawlMetric label="eta" value={formatEta(status.etaHours)} />
+          <RecrawlMetric
             label="rows/sec"
             value={integer.format(Math.round(status.rowsPerSec))}
           />
-          <RecrawlMetric label="eta" value={formatEta(status.etaHours)} />
         </div>
         {status.runId !== null ? (
           <p className="text-xs text-muted-foreground tabular-nums">

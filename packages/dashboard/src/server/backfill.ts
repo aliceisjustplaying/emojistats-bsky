@@ -530,6 +530,7 @@ export interface BackfillLooseRecrawlStatus {
   freshnessSeconds: number | null;
   loaded: number;
   inFlight: number;
+  reposPerMin: number;
   rowsPerSec: number;
   etaHours: number | null;
 }
@@ -1061,32 +1062,51 @@ export const getBackfillLooseRecrawlStatus = createServerFn().handler(
         freshnessSeconds: null,
         loaded: 0,
         inFlight: 0,
+        reposPerMin: 0,
         rowsPerSec: 0,
         etaHours: null,
       };
     }
 
-    const snapshot = await chQuery<{
-      shard: string;
-      latest_ts: string;
-      loaded: string;
-      in_flight: string;
-      rows_per_sec: string;
-    }>(
-      `
-      SELECT
-        shard,
-        max(ts) AS latest_ts,
-        argMax(loaded, ts) AS loaded,
-        argMax(in_flight, ts) AS in_flight,
-        argMax(rows_per_sec, ts) AS rows_per_sec
-      FROM backfill_progress
-      WHERE run_id = {run:String}
-      GROUP BY shard
-      ORDER BY shard
-    `,
-      { run: runId },
-    );
+    const [snapshot, rate] = await Promise.all([
+      chQuery<{
+        shard: string;
+        latest_ts: string;
+        loaded: string;
+        in_flight: string;
+        rows_per_sec: string;
+      }>(
+        `
+        SELECT
+          shard,
+          max(ts) AS latest_ts,
+          argMax(loaded, ts) AS loaded,
+          argMax(in_flight, ts) AS in_flight,
+          argMax(rows_per_sec, ts) AS rows_per_sec
+        FROM backfill_progress
+        WHERE run_id = {run:String}
+        GROUP BY shard
+        ORDER BY shard
+      `,
+        { run: runId },
+      ),
+      chQuery<{ repos_per_min: string }>(
+        `
+        SELECT sum(rpm) AS repos_per_min
+        FROM
+        (
+          SELECT
+            (argMax(loaded, ts) - argMin(loaded, ts))
+            / greatest(dateDiff('second', min(ts), max(ts)) / 60, 1) AS rpm
+          FROM backfill_progress
+          WHERE run_id = {run:String}
+            AND ts >= now() - INTERVAL ${RATE_WINDOW_MINUTES} MINUTE
+          GROUP BY shard
+        )
+      `,
+        { run: runId },
+      ),
+    ]);
 
     let newestTs = 0;
     let activeShards = 0;
@@ -1114,6 +1134,7 @@ export const getBackfillLooseRecrawlStatus = createServerFn().handler(
       freshnessSeconds < IDLE_AFTER_SECONDS &&
       (activeShards > 0 || inFlight > 0);
     const remainingRepos = Math.max(0, targetRepos - loaded);
+    const reposPerMin = num(rate[0]?.repos_per_min);
     return {
       generatedAt: new Date().toISOString(),
       targetRepos,
@@ -1124,10 +1145,11 @@ export const getBackfillLooseRecrawlStatus = createServerFn().handler(
       freshnessSeconds,
       loaded,
       inFlight,
+      reposPerMin,
       rowsPerSec,
       etaHours:
-        rowsPerSec > 0 && targetRepos > 0
-          ? remainingRepos / rowsPerSec / 3600
+        reposPerMin > 0 && targetRepos > 0
+          ? remainingRepos / reposPerMin / 60
           : null,
     };
   },
