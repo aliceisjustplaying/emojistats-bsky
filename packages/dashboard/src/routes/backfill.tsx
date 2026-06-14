@@ -647,7 +647,9 @@ function StatusBreakdown({ overview }: { overview: BackfillOverview | null }) {
         <CardTitle className="text-sm">Repo status breakdown</CardTitle>
         <CardDescription>
           loaded is every fetched repo with post rows; verified is the subset
-          whose post rows have passed the digest check
+          whose post rows have passed the digest check. residual
+          pending/fetching here is retained canonical telemetry residue from
+          retired/stale shard snapshots, not active backfill work.
         </CardDescription>
       </CardHeader>
       <CardContent>

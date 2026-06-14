@@ -830,6 +830,11 @@ async function reconcile(
 
   await materializeClassification(ch);
   const counts = await queryClassificationCounts(ch);
+  if (counts.checked !== reposTotal) {
+    throw new Error(
+      `verification classified ${counts.checked} of ${reposTotal} staged repos; refusing to promote ledger rows`,
+    );
+  }
 
   await telemetry.record(
     {
