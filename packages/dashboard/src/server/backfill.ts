@@ -296,95 +296,55 @@ export interface BackfillTimeline {
 
 export const getBackfillTimeline = createServerFn().handler(
   async (): Promise<BackfillTimeline | null> => {
-    // Two steps, not a scalar subquery: ClickHouse throws on scalar subqueries
-    // over an empty table, and "no telemetry yet" must render, not 500.
-    const latest = await chQuery<{ run_id: string }>(`
-      SELECT run_id FROM backfill_progress ORDER BY ts DESC LIMIT 1
-    `);
-    if (latest[0] === undefined) return null;
-    const runRows = await chQuery<{
-      run_id: string;
+    const bounds = await chQuery<{
       min_ts: string;
       max_ts: string;
-    }>(
-      `
-      SELECT run_id, min(ts) AS min_ts, max(ts) AS max_ts
-      FROM backfill_progress
-      WHERE run_id = {run:String}
-      GROUP BY run_id
-    `,
-      { run: latest[0].run_id },
-    );
-    const run = runRows[0];
-    if (run === undefined) return null;
+      events: string;
+    }>(`
+      SELECT min(ts) AS min_ts, max(ts) AS max_ts, count() AS events
+      FROM backfill_repo_events
+    `);
+    const bound = bounds[0];
+    if (bound === undefined || num(bound.events) === 0) return null;
 
     const spanSeconds = Math.max(
       0,
-      (chTsToDate(run.max_ts).getTime() - chTsToDate(run.min_ts).getTime()) /
+      (chTsToDate(bound.max_ts).getTime() -
+        chTsToDate(bound.min_ts).getTime()) /
         1000,
     );
-    const stepSeconds = Math.max(10, Math.ceil(spanSeconds / TIMELINE_POINTS));
+    const stepSeconds = Math.max(60, Math.ceil(spanSeconds / TIMELINE_POINTS));
 
-    // Cumulative counters per shard → bucket per shard (max within bucket),
-    // sum across shards, then deltas between consecutive buckets in JS.
-    // Rates are normalized by the latest sample ts per bucket, not the bucket
-    // start: buckets hold a varying number of telemetry samples whenever the
-    // step isn't a multiple of the report interval, and dividing by the bucket
-    // width would alias that into a sawtooth.
+    // Project-lifetime history comes from append-only repo events. Progress
+    // telemetry is per-run and can be superseded by recovery runs, which made
+    // the chart show only the tail of the project.
     const buckets = await chQuery<{
       bucket: string;
-      latest_ts: string;
       posts_loaded: string;
       bytes_downloaded: string;
-      rows_per_sec: number;
     }>(
       `
       SELECT
-        bucket,
-        max(shard_latest_ts) AS latest_ts,
-        sum(p) AS posts_loaded,
-        sum(b) AS bytes_downloaded,
-        sum(r) AS rows_per_sec
-      FROM (
-        SELECT
-          toStartOfInterval(ts, toIntervalSecond({step:UInt32})) AS bucket,
-          shard,
-          max(ts) AS shard_latest_ts,
-          max(posts_loaded) AS p,
-          max(bytes_downloaded) AS b,
-          avg(rows_per_sec) AS r
-        FROM backfill_progress
-        WHERE run_id = {run:String}
-        GROUP BY bucket, shard
-      )
+        toStartOfInterval(ts, toIntervalSecond({step:UInt32})) AS bucket,
+        sumIf(posts, event = 'loaded') AS posts_loaded,
+        sum(car_bytes) AS bytes_downloaded
+      FROM backfill_repo_events
       GROUP BY bucket
       ORDER BY bucket
     `,
-      { run: run.run_id, step: String(stepSeconds) },
+      { step: String(stepSeconds) },
     );
 
-    const points: Array<BackfillTimelinePoint> = [];
-    for (let i = 1; i < buckets.length; i += 1) {
-      const prev = buckets[i - 1];
-      const curr = buckets[i];
-      const minutes =
-        (chTsToDate(curr.latest_ts).getTime() -
-          chTsToDate(prev.latest_ts).getTime()) /
-        60_000;
-      if (minutes <= 0) continue;
-      points.push({
-        ts: curr.bucket,
-        postsPerMin: Math.max(
-          0,
-          (num(curr.posts_loaded) - num(prev.posts_loaded)) / minutes,
-        ),
-        bytesPerMin: Math.max(
-          0,
-          (num(curr.bytes_downloaded) - num(prev.bytes_downloaded)) / minutes,
-        ),
-        rowsPerSec: num(curr.rows_per_sec),
-      });
-    }
+    const minutes = stepSeconds / 60;
+    const points = buckets.map((bucket) => {
+      const postsLoaded = num(bucket.posts_loaded);
+      return {
+        ts: bucket.bucket,
+        postsPerMin: postsLoaded / minutes,
+        bytesPerMin: num(bucket.bytes_downloaded) / minutes,
+        rowsPerSec: postsLoaded / stepSeconds,
+      };
+    });
     return { stepSeconds, points };
   },
 );

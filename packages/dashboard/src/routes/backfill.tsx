@@ -163,6 +163,11 @@ function formatClock(chUtcDateTime: string): string {
     .padStart(2, '0')}`;
 }
 
+function formatTimelineLabel(chUtcDateTime: string): string {
+  const date = chTsToDate(chUtcDateTime);
+  return `${date.getMonth() + 1}/${date.getDate()} ${formatClock(chUtcDateTime)}`;
+}
+
 function formatDuration(seconds: number): string {
   if (seconds < 60) return `${Math.round(seconds)}s`;
   if (seconds < 3_600) return `${Math.round(seconds / 60)}m`;
@@ -476,7 +481,7 @@ function HistoryHistogram({
 
 const throughputChartConfig = {
   postsPerMin: { label: 'posts/min', color: 'var(--chart-2)' },
-  rowsPerSec: { label: 'rows/s', color: 'var(--chart-1)' },
+  rowsPerSec: { label: 'posts/s', color: 'var(--chart-1)' },
 } satisfies ChartConfig;
 
 const downloadChartConfig = {
@@ -508,7 +513,7 @@ function ThroughputTimeline({
   }
 
   const data = points.map((p) => ({
-    label: formatClock(p.ts),
+    label: formatTimelineLabel(p.ts),
     postsPerMin: Math.round(p.postsPerMin),
     rowsPerSec: Math.round(p.rowsPerSec),
     mibPerMin: Number((p.bytesPerMin / 1024 / 1024).toFixed(1)),
@@ -520,7 +525,7 @@ function ThroughputTimeline({
         <CardHeader>
           <CardTitle className="text-sm">Posts throughput</CardTitle>
           <CardDescription>
-            posts loaded per minute · insert rows/s (local time)
+            project lifetime · posts loaded per minute and per second
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -567,7 +572,7 @@ function ThroughputTimeline({
         <CardHeader>
           <CardTitle className="text-sm">Download rate</CardTitle>
           <CardDescription>
-            repo archive data fetched per minute (local time)
+            project lifetime · repo archive data fetched per minute
           </CardDescription>
         </CardHeader>
         <CardContent>
