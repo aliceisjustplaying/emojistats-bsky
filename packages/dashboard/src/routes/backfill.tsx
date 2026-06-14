@@ -912,8 +912,9 @@ function RecrawlStatus({
 function VerificationStatus({ status }: { status: BackfillVerifyStatus }) {
   const prepared = status.runId === null;
   const failed = status.failedShards > 0;
-  const hasMismatches = status.mismatches > 0;
-  const needsAttention = failed || hasMismatches;
+  const hasOpenRecheck = status.recheckLoadedOpen > 0;
+  const hasMismatches = status.mismatches > 0 && !hasOpenRecheck;
+  const needsAttention = failed || hasOpenRecheck || hasMismatches;
   const classified = status.exact + status.loose + status.mismatches;
   const pct =
     status.reposTotal > 0 ? (classified / status.reposTotal) * 100 : 0;
@@ -948,11 +949,13 @@ function VerificationStatus({ status }: { status: BackfillVerifyStatus }) {
                 ? status.active
                   ? 'failing'
                   : 'failed'
-                : hasMismatches
-                  ? 'mismatch'
-                  : status.active
-                    ? 'running'
-                    : 'seen'}
+                : hasOpenRecheck
+                  ? 'loaded check'
+                  : hasMismatches
+                    ? 'mismatch'
+                    : status.active
+                      ? 'running'
+                      : 'seen'}
           </Badge>
         </div>
       </CardHeader>
@@ -974,16 +977,16 @@ function VerificationStatus({ status }: { status: BackfillVerifyStatus }) {
           <RecrawlMetric label="exact" value={integer.format(status.exact)} />
           <RecrawlMetric label="loose" value={integer.format(status.loose)} />
           <RecrawlMetric
-            label="fail"
+            label="loaded open"
+            value={integer.format(status.recheckLoadedOpen)}
+          />
+          <RecrawlMetric
+            label="digest diff"
             value={integer.format(status.mismatches)}
           />
           <RecrawlMetric
             label="loose file"
             value={integer.format(status.looseEmitted)}
-          />
-          <RecrawlMetric
-            label="sampled"
-            value={integer.format(status.sampleChecked)}
           />
           <RecrawlMetric
             label="reporting shards"
@@ -992,8 +995,14 @@ function VerificationStatus({ status }: { status: BackfillVerifyStatus }) {
         </div>
         {needsAttention && !status.active ? (
           <p className="text-xs text-muted-foreground">
-            mismatched repos remain loaded for recrawl/debug; reporting shards
-            are counted above
+            {hasOpenRecheck
+              ? `${integer.format(status.recheckLoadedOpen)} post-recrawl repos remain loaded pending loaded-only verification`
+              : 'mismatched repos remain loaded for recrawl/debug'}
+          </p>
+        ) : null}
+        {status.recheckRunIds.length > 0 ? (
+          <p className="text-xs text-muted-foreground tabular-nums">
+            recheck: {status.recheckRunIds.join(', ')}
           </p>
         ) : null}
         {status.runId !== null ? (

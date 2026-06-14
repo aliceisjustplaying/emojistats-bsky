@@ -479,6 +479,11 @@ export interface BackfillVerifyStatus {
   reposChecked: number;
   exact: number;
   loose: number;
+  /** Current post-recrawl rows still left in ledger status loaded. */
+  recheckLoadedOpen: number;
+  /** Latest fail-recrawl run ids represented in recheckLoadedOpen. */
+  recheckRunIds: string[];
+  recheckShards: number;
   mismatches: number;
   looseEmitted: number;
   sampleChecked: number;
@@ -589,6 +594,9 @@ export const getBackfillVerifyStatus = createServerFn().handler(
         reposChecked: 0,
         exact: 0,
         loose: 0,
+        recheckLoadedOpen: 0,
+        recheckRunIds: [],
+        recheckShards: 0,
         mismatches: 0,
         looseEmitted: 0,
         sampleChecked: 0,
@@ -599,22 +607,23 @@ export const getBackfillVerifyStatus = createServerFn().handler(
       };
     }
 
-    const rows = await chQuery<{
-      shard: string;
-      run_id: string;
-      latest_ts: string;
-      phase: string;
-      repos_total: string;
-      repos_checked: string;
-      exact: string;
-      loose: string;
-      mismatches: string;
-      loose_emitted: string;
-      sample_checked: string;
-      sample_failures: string;
-      done: string;
-      error: string;
-    }>(`
+    const [rows, recheckRows] = await Promise.all([
+      chQuery<{
+        shard: string;
+        run_id: string;
+        latest_ts: string;
+        phase: string;
+        repos_total: string;
+        repos_checked: string;
+        exact: string;
+        loose: string;
+        mismatches: string;
+        loose_emitted: string;
+        sample_checked: string;
+        sample_failures: string;
+        done: string;
+        error: string;
+      }>(`
       SELECT
         shard,
         argMax(run_id, progress_order) AS run_id,
@@ -634,7 +643,7 @@ export const getBackfillVerifyStatus = createServerFn().handler(
       (
         SELECT *, (ts, done, error != '', repos_checked) AS progress_order
         FROM backfill_verify_progress
-        WHERE startsWith(shard, 'shard')
+        WHERE match(shard, '^shard[0-9]+$')
           AND repos_total > 0
           AND (
             (done > 0 AND repos_checked > 0)
@@ -642,7 +651,21 @@ export const getBackfillVerifyStatus = createServerFn().handler(
           )
       )
       GROUP BY shard
-    `);
+    `),
+      chQuery<{
+        run_id: string;
+        latest_ts: string;
+        loaded: string;
+      }>(`
+        SELECT
+          argMax(run_id, ts) AS run_id,
+          max(ts) AS latest_ts,
+          argMax(loaded, ts) AS loaded
+        FROM backfill_progress
+        WHERE startsWith(run_id, 'fail-')
+        GROUP BY shard
+      `),
+    ]);
     if (rows.length === 0) {
       return {
         generatedAt: new Date().toISOString(),
@@ -656,6 +679,9 @@ export const getBackfillVerifyStatus = createServerFn().handler(
         reposChecked: 0,
         exact: 0,
         loose: 0,
+        recheckLoadedOpen: 0,
+        recheckRunIds: [],
+        recheckShards: 0,
         mismatches: 0,
         looseEmitted: 0,
         sampleChecked: 0,
@@ -673,6 +699,8 @@ export const getBackfillVerifyStatus = createServerFn().handler(
     let reposChecked = 0;
     let exact = 0;
     let loose = 0;
+    let recheckLoadedOpen = 0;
+    const recheckRunIds = new Set<string>();
     let mismatches = 0;
     let looseEmitted = 0;
     let sampleChecked = 0;
@@ -702,6 +730,10 @@ export const getBackfillVerifyStatus = createServerFn().handler(
       phases.add(row.phase);
       if (row.error !== '') errors.push(`${row.shard}: ${row.error}`);
     }
+    for (const row of recheckRows) {
+      recheckLoadedOpen += num(row.loaded);
+      recheckRunIds.add(row.run_id);
+    }
     const freshnessSeconds =
       newestTs > 0
         ? Math.max(0, Math.round((Date.now() - newestTs) / 1000))
@@ -729,6 +761,9 @@ export const getBackfillVerifyStatus = createServerFn().handler(
       reposChecked,
       exact,
       loose,
+      recheckLoadedOpen,
+      recheckRunIds: [...recheckRunIds].sort(),
+      recheckShards: recheckRows.length,
       mismatches,
       looseEmitted,
       sampleChecked,
