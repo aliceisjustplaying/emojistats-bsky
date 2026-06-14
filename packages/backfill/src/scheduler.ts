@@ -268,9 +268,9 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
 
   // Per-host limiter outermost so a slow host's queue never pins global slots;
   // the global limiter inside is what actually caps simultaneous downloads.
-  // A host that started cooling after this repo was claimed gets requeued
-  // immediately — never slept on: sleeping here held the whole in-flight pool
-  // hostage to the deepest host's cooldown (observed fetching: 2 of 3,072).
+  // Pacing happens inside the host limiter, before the global slot is taken:
+  // queued work for one host cannot pin fleet-wide download capacity, and the
+  // scheduler can keep a small ready queue for rate-limited tail hosts.
   const trackRepo = (repo: RepoRow): void => {
     const task = hostLimitFor(repo.pdsHost)(() => {
       return waitForHostPace(repo);
@@ -545,9 +545,9 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
           // Backed-off hosts are skipped without claiming: the rows stay
           // pending and re-offer once the cooldown lapses, and the in-flight
           // pool only ever holds repos that can actually fetch right now.
-          // Short header-derived pacing is handled by reserve() below; treating
-          // that as a SQL scan exclusion starves the tail when only a few
-          // mushroom hosts remain and each has a small next-start delay.
+          // Short header-derived pacing is handled inside the per-host limiter;
+          // claiming a bounded host queue lets the crawler stay close to the
+          // advertised request rate without burning global slots.
           if (
             hostPressure.backoffMs(repo.pdsHost) > 0 ||
             hostQueued(repo.pdsHost) >= hostPressure.effectiveCap(repo.pdsHost)
@@ -556,12 +556,6 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
             stats.skipped += 1;
             continue;
           }
-          if (!hostPressure.reserve(repo.pdsHost)) {
-            retained.push(repo);
-            stats.skipped += 1;
-            continue;
-          }
-          repo.rateLimitReserved = true;
           let claimedRow: boolean;
           try {
             claimedRow = ledger.markFetching(repo.did);
