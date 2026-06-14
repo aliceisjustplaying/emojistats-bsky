@@ -661,7 +661,7 @@ export const getBackfillVerifyStatus = createServerFn().handler(
     }
 
     const mainScope = await fetchMainBackfillRunScope();
-    const [rows, recheckRows] = await Promise.all([
+    const [rows, recheckRows, recheckClearRows] = await Promise.all([
       chQuery<{
         shard: string;
         run_id: string;
@@ -707,6 +707,7 @@ export const getBackfillVerifyStatus = createServerFn().handler(
       GROUP BY shard
     `),
       chQuery<{
+        logical_shard: string;
         selected_run_id: string;
         latest_ts: string;
         loaded: string;
@@ -721,6 +722,7 @@ export const getBackfillVerifyStatus = createServerFn().handler(
           WHERE startsWith(run_id, 'fail-')
         )
         SELECT
+          canonical.logical_shard,
           canonical.selected_run_id,
           canonical.latest_ts,
           canonical.loaded
@@ -739,6 +741,30 @@ export const getBackfillVerifyStatus = createServerFn().handler(
         ORDER BY canonical.logical_shard
       `,
       ),
+      chQuery<{
+        logical_shard: string;
+        cleared: string;
+      }>(`
+        SELECT logical_shard, exact AS cleared
+        FROM
+        (
+          SELECT
+            replaceRegexpOne(shard, '^fail-shard', 'shard') AS logical_shard,
+            argMax(exact, progress_order) AS exact,
+            argMax(mismatches, progress_order) AS mismatches,
+            argMax(done, progress_order) AS done,
+            argMax(error, progress_order) AS error
+          FROM
+          (
+            SELECT *, (ts, done, error != '', repos_checked) AS progress_order
+            FROM backfill_verify_progress
+            WHERE match(shard, '^fail-shard[0-9]+$')
+              AND repos_total > 0
+          )
+          GROUP BY logical_shard
+        )
+        WHERE done > 0 AND mismatches = 0 AND error = ''
+      `),
     ]);
     if (rows.length === 0) {
       return {
@@ -804,8 +830,14 @@ export const getBackfillVerifyStatus = createServerFn().handler(
       phases.add(row.phase);
       if (row.error !== '') errors.push(`${row.shard}: ${row.error}`);
     }
+    const recheckClearedByShard = new Map(
+      recheckClearRows.map((row) => [row.logical_shard, num(row.cleared)]),
+    );
     for (const row of recheckRows) {
-      recheckLoadedOpen += num(row.loaded);
+      recheckLoadedOpen += Math.max(
+        0,
+        num(row.loaded) - (recheckClearedByShard.get(row.logical_shard) ?? 0),
+      );
       recheckRunIds.add(row.selected_run_id);
     }
     const freshnessSeconds =
