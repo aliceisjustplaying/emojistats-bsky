@@ -272,13 +272,17 @@ function CrawlBadge({ overview }: { overview: BackfillOverview | null }) {
   ) : (
     <Badge variant="secondary" className="tabular-nums">
       <span className="size-1.5 rounded-full bg-muted-foreground" />
-      idle · last update {formatDuration(overview.freshnessSeconds)} ago
+      idle · newest snapshot {formatDuration(
+        overview.latestFreshnessSeconds,
+      )}{' '}
+      ago
     </Badge>
   );
 }
 
-// A shard past amber has missed several telemetry intervals (~10s); past red
-// its breakdown counts are frozen at its last report.
+// These are logical ledger snapshot ages. Recovery runs can refresh an old
+// shard after the original crawler host is gone, so this must not be phrased
+// as crawler-host liveness.
 const SHARD_AMBER_SECONDS = 60;
 const SHARD_RED_SECONDS = 300;
 
@@ -305,15 +309,15 @@ function ShardFreshnessStrip({
                   : 'text-muted-foreground'
             }`}
           >
-            {s.shard} · {formatDuration(s.ageSeconds)}
+            {s.shard} snapshot · {formatDuration(s.ageSeconds)}
           </span>
         ))}
       </div>
       {frozen.length > 0 ? (
         <p className="text-right text-xs text-red-600/90">
           {frozen.length === 1
-            ? `${frozen[0].shard} has stopped reporting — its counts in the breakdown below are frozen at its last report`
-            : `${frozen.length} shards have stopped reporting — their counts in the breakdown below are frozen at their last reports`}
+            ? `${frozen[0].shard} snapshot is stale — counts below use its latest telemetry row`
+            : `${frozen.length} shard snapshots are stale — counts below use each shard's latest telemetry row`}
         </p>
       ) : null}
     </div>
