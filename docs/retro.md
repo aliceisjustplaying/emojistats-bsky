@@ -1436,6 +1436,37 @@ correctness bugs — the same instrument-lies-confidently family, now its fourth
   `--revive-host` recrawl, no data cutover. What shipped this window is the public face — an honest,
   1.0.0-tagged dashboard — not the verified completion behind it.
 
+### 2026-06-14 mid-afternoon (14:37–15:13 UTC) — the verify blocker breaks: a set-based verifier, reviewed by the other agent before it runs
+
+After two days of verify being the wall the end-game couldn't get past — three canary attempts
+killed by ClickHouse parameter and query-size limits on inlined DID lists — the verifier got the
+rewrite it needed (`96ba6b1`, ~600 lines of `verify.ts` replaced). The shape is the one the
+13:07 halt had already identified: instead of shipping DID lists *to* ClickHouse as `IN (...)`
+strings, **stage the ledger's per-repo expectations into a ClickHouse table and classify the whole
+shard with one joined aggregation**, materialized once so the follow-up counts and LOOSE emission
+are cheap rather than re-running the expensive `posts FINAL` pass. The old chunked path survives
+only for small sample/orphan lookups. A live end-to-end canary — a one-row temp ledger run through
+the actual script on the serving box — passed clean: the repo promoted to `verified` with
+`exact=1, loose=0, failed=0`. The machinery that produces the zero-loss number finally exists and
+is deployed fleet-wide.
+
+- **The keeper that the meta-retro just predicted, demonstrated in real time: the adversarial review
+  is load-bearing — *especially on the checker itself*.** Alice's move was the right one: before
+  trusting the new verifier, she had Codex ask Claude (Opus 4.8, xhigh effort) to review the diff.
+  Claude found **three real issues** — a digest-padding bug, an over-broad promotion scope, and a
+  query path that could still trigger full-table `FINAL` scans — all fixed before a single shard was
+  verified. This matters more than an ordinary review: a *verifier* is the instrument that will
+  certify the whole backfill as complete, so a bug in it doesn't corrupt data, it manufactures false
+  confidence — the most expensive kind. Catching the checker's bugs *before* it runs is the
+  difference between "verified" meaning something and "verified" being a second silent cap. The
+  second-agent pattern earned its place in the playbook again, on the highest-stakes code in the run.
+- **Honest status: the verifier is ready, the verdict is not.** Everything so far is canaries —
+  one staged row, `exact=1`. The fleet-wide pass over ~95M repos, the real per-shard
+  EXACT/LOOSE/FAIL counts, the `--did-file` convergence on whatever comes back LOOSE — none of that
+  has run yet. Still also ahead: the `v:1` metadata recrawl, the ledgerless `--revive-host` Bridgy
+  recrawl of the deleted shard1/2, baking the verify-timer fix into the flake, and the data cutover.
+  But this is the first cycle in two days where the thing blocking all of it stopped being blocked.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
