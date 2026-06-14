@@ -1363,6 +1363,43 @@ Eight commits, one genuine data-loss recovery, and zero progress toward cutover.
   of bug — a silent cap, found by accident, on the largest and most data-rich repos in the network —
   that the rest of the run had taught us to expect and still didn't see coming.
 
+### 2026-06-14 early afternoon (13:29–14:07 UTC) — making the dashboard tell the whole truth, and naming what the "unresolved" millions actually are
+
+Verify still hasn't run — this window went to the question that has to be answered *before* verify
+means anything: do the numbers on the page even mean what they say? Alice drove it
+(*"the big one: are all these numbers correct? if yes, explain them"*), and the useful output isn't a
+commit, it's an accounting of what the ~30M+ non-`loaded` repos actually are.
+
+- **The dashboard was still showing only the tail.** The history charts were scoped to the latest
+  `run_id` — which after the over-cap recovery run meant they displayed a sliver, not the project. The
+  agent moved the timeline off `backfill_progress` (per-run) and onto `backfill_repo_events` (the
+  append-only project history), so the chart now spans the real lifetime, `2026-06-12 00:09` →
+  `2026-06-14 11:30`, with day-stamped x-labels (`b0768b2`); a verify-progress card got tie-broken
+  timestamps and a "failed canary" label (`9a7120f`, `0c5f577`). Same recurring end-game lesson in a
+  third costume: an instrument scoped to "the current run" lies about a multi-run project.
+- **What the un-loaded buckets actually are — the number that reframes "98.5%".** Checking the status
+  counts against the authoritative SQLite ledgers (active shard0/3/4/5 + the retired shard1/2 copies on
+  the serving box, shard-filtered by `bucket % 6`) and grouping the error text into reason classes gave
+  the first real anatomy of the ~30M `unreachable` + the `failed` and `quarantined` rows: `unreachable`
+  is overwhelmingly **host-dead parking** (a PDS that stopped answering, not a dropped repo);
+  `quarantined` is **almost entirely malformed-CAR decode errors** (16.9k, the structural-corruption
+  tail from the data-loss entry above); and `failed` is overwhelmingly **listRepos returning DIDs that
+  PLC knows about but the host does not actually serve** — i.e. the PLC directory and the PDS disagree
+  about which repos exist. The reframing matters for the eventual honesty of the headline: a large part
+  of "not captured" is not *lost data*, it's the network telling the truth about itself — dead hosts and
+  directory/host disagreements that no amount of re-crawling can turn into posts. (Oldest post in the
+  store cross-checked three ways — `posts_hourly` min-hour, raw `posts FINAL`, and part metadata — all
+  agree: `2022-11-16`, the network's early days.)
+- **The reason breakdown is being built data-backed, not hardcoded.** Alice's rule held — *"the numbers
+  not hardcoded in the html but the data coming from wherever it should"* — so rather than bake the
+  categorized counts into the page, the agent is adding a `backfill_status_reason_counts` ClickHouse
+  rollup fed by a `backfill status-reasons` script that scans the ledgers, with a dashboard card reading
+  the latest complete six-shard rollup. The authoritative source for *why* a repo didn't load is the
+  per-repo ledger reason text, not the event stream (which only carries emitted terminal events, not the
+  bulk parking states) — a distinction the agent flagged rather than papering over. As of 14:07 UTC the
+  rollup table + script + pane are mid-build; verify, the `v:1` recrawl, the Bridgy revive, and cutover
+  are all still ahead, exactly where the 13:07 halt left them.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
