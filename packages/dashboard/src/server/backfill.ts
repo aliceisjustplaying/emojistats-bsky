@@ -528,9 +528,14 @@ export interface BackfillLooseRecrawlStatus {
   shards: number;
   activeShards: number;
   freshnessSeconds: number | null;
+  /** Unique DIDs with a terminal recrawl event. */
   processedEvents: number;
+  /** Unique DIDs with a loaded recrawl event. */
   loadedEvents: number;
+  /** Unique DIDs with a terminal issue event. */
   issueEvents: number;
+  /** Raw event rows, including retries and duplicate rows from restarts. */
+  eventRows: number;
   loaded: number;
   inFlight: number;
   reposPerMin: number;
@@ -1066,6 +1071,7 @@ export const getBackfillLooseRecrawlStatus = createServerFn().handler(
         processedEvents: 0,
         loadedEvents: 0,
         issueEvents: 0,
+        eventRows: 0,
         loaded: 0,
         inFlight: 0,
         reposPerMin: 0,
@@ -1100,12 +1106,14 @@ export const getBackfillLooseRecrawlStatus = createServerFn().handler(
         processed: string;
         loaded: string;
         issues: string;
+        event_rows: string;
       }>(
         `
         SELECT
           uniqExactIf(did, event IN (${TERMINAL_EVENTS.map((e) => `'${e}'`).join(', ')})) AS processed,
           uniqExactIf(did, event = 'loaded') AS loaded,
-          uniqExactIf(did, event IN (${ISSUE_EVENTS.map((e) => `'${e}'`).join(', ')})) AS issues
+          uniqExactIf(did, event IN (${ISSUE_EVENTS.map((e) => `'${e}'`).join(', ')})) AS issues,
+          count() AS event_rows
         FROM backfill_repo_events
         WHERE run_id = {run:String}
       `,
@@ -1152,6 +1160,7 @@ export const getBackfillLooseRecrawlStatus = createServerFn().handler(
     const processedEvents = num(eventTotals[0]?.processed);
     const loadedEvents = num(eventTotals[0]?.loaded);
     const issueEvents = num(eventTotals[0]?.issues);
+    const eventRows = num(eventTotals[0]?.event_rows);
     const remainingRepos = Math.max(0, targetRepos - processedEvents);
     const reposPerMin = num(eventRate[0]?.repos_per_min);
     return {
@@ -1165,6 +1174,7 @@ export const getBackfillLooseRecrawlStatus = createServerFn().handler(
       processedEvents,
       loadedEvents,
       issueEvents,
+      eventRows,
       loaded,
       inFlight,
       reposPerMin,

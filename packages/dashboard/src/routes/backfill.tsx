@@ -960,7 +960,7 @@ function LooseRecrawlStatus({
           <p className="text-right text-xs text-muted-foreground tabular-nums">
             {prepared
               ? 'not started'
-              : `${integer.format(status.processedEvents)} / ${integer.format(status.targetRepos)} repo events recorded · ${pct.toFixed(1)}%`}
+              : `${integer.format(status.processedEvents)} / ${integer.format(status.targetRepos)} repos completed · ${pct.toFixed(1)}%`}
           </p>
         </div>
         <div className="grid grid-cols-2 gap-3 text-sm">
@@ -973,16 +973,16 @@ function LooseRecrawlStatus({
             value={integer.format(status.inFlight)}
           />
           <RecrawlMetric
-            label="event loaded"
+            label="loaded repos"
             value={integer.format(status.loadedEvents)}
           />
           <RecrawlMetric
-            label="event issues"
+            label="issue repos"
             value={integer.format(status.issueEvents)}
           />
           <RecrawlMetric
-            label="ledger loaded"
-            value={integer.format(status.loaded)}
+            label="event rows"
+            value={integer.format(status.eventRows)}
           />
           <RecrawlMetric
             label="repos/min"
@@ -990,7 +990,7 @@ function LooseRecrawlStatus({
           />
           <RecrawlMetric label="eta" value={formatEta(status.etaHours)} />
           <RecrawlMetric
-            label="rows/sec"
+            label="post rows/sec"
             value={integer.format(Math.round(status.rowsPerSec))}
           />
         </div>
