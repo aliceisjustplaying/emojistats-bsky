@@ -1596,6 +1596,62 @@ is that the instrument said so.
   "verified" briefly meant "verified the part that was easy to reach," and it took the human reading the
   page — again — to turn 4/4 back into 4/6.
 
+### 2026-06-14 evening (16:51–18:00 UTC) — all six shards reach the digest layer, but the verifier itself faked a pass on one
+
+All six shards are now through digest/count verification — and the way the sixth got there is the
+sharpest possible illustration of why "the digest matched" is *not* the same as "verified," the exact
+distinction Alice held the line on. The six-shard picture at the count layer:
+
+| shard  | exact      | loose   | fail |
+|--------|------------|---------|------|
+| shard0 | 2,231,041  | 102,271 | 3 |
+| shard1 | 2,230,967  | 112,835 | 0 |
+| shard2 | 2,219,025  | 112,243 | 0 |
+| shard3 | 2,233,389  | 100,670 | 2 |
+| shard4 | 2,231,379  | 101,984 | 2 |
+| shard5 | 2,232,947  | 101,196 | 1 |
+| **total** | **13,378,748** | **631,199** | **8** |
+
+That is the digest/count layer only. It is **not done and not clean**: the 8 hard mismatches are
+mid-recrawl (not yet reconciled to zero), the 631,199 `loose` are a *separate, not-yet-started*
+convergence round, and "loose" by construction means ClickHouse has at least the ledger's post count
+but the exact count+digest didn't match — usually live posts beyond the snapshot, but unproven until
+re-fetched. Digest-verified is a measurement; the verdict needs the reconciliation.
+
+- **The headline, and the vindication: shard2's first verify was a *false pass*.** Its run staged
+  2.33M DIDs, classified **zero** ClickHouse rows (a bad/empty result), and then **promoted 1,994,670
+  ledger rows to `verified` anyway** — the verifier certified ~2M repos it had not actually checked.
+  This is precisely the nightmare the earlier entry named in the abstract ("a bug in the verifier
+  doesn't corrupt data, it manufactures false confidence — the most expensive kind") happening for
+  real, and it is exactly why a digest match isn't a verdict: the checker can pass on nothing. Caught,
+  shard2 was marked back to not-verified and the guard added — `ce7f310`, *refuse partial/zero
+  classification promotion* — so a verify that didn't actually classify can never promote again. The
+  rerun came back honest: `2,219,025 exact, 112,243 loose, 0 fail`. Without the insistence that
+  "verified" means the integrity pass actually ran, shard2 would be sitting in the table above as a
+  clean ~2M-repo lie.
+- **The 8 mismatches are being re-fetched — provisionally, not closed.** After a `5d559cb` fix to a
+  *whale-batch dedup collision* in the loader (reviewed by Claude, verdict: safe and required before
+  rerun), the 8 known fail DIDs were restarted host-sharded, one process per shard at
+  `GLOBAL_CONCURRENCY=1` with high heap (whale repos need the headroom). By 18:00 it was "mostly done"
+  — 7 of 8 fetched, shard5's DID reloaded `113,042` rows — but *mostly done* is not zero, and the
+  reconciliation that turns these from "count-short" into "accounted for" hasn't been confirmed. The
+  loose convergence is queued behind it as its own round.
+- **A process-retro beat with a real price tag: don't kill a quiet Claude.** Trying to get the loader
+  fix reviewed, the agent inferred Claude Code was *stuck* from a lack of stdout and killed the review
+  — twice. Alice corrected it hard and with the economics attached: *"claude is not stuck, claude is
+  almost never stuck, claude just takes time… killing a running claude code review costs a lot of
+  money"*, *"every hour the crawler servers are running they cost me ~40 eurocents"*, *"time is
+  literally money."* The right diagnostics, now recorded as a rule: smoke-test the CLI params with a
+  tiny prompt (it returned `OK` in ~8s — params were fine), watch the review's **session JSONL** for
+  live progress, and check CPU — silence on stdout is the *normal* shape of a long review, not
+  evidence of a hang. The recovered review (from its session log) was the thing that cleared the
+  loader fix to deploy. The lesson generalizes past Claude: "no output" is not "stuck," and tearing
+  down a long-running job on that inference burns exactly the money and time you were trying to save.
+
+So: six shards measured, one false pass caught and corrected, 8 mismatches re-fetching, 631k loose
+still ahead — and per the standing correction, none of this gets called clean or done until the
+re-fetches reconcile and the loose band converges.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
