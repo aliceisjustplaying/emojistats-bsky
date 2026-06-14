@@ -8,6 +8,10 @@ import {
   shouldWaitForUnreachableRetry,
 } from './scheduler.js';
 
+function isDeadHost(host: string): boolean {
+  return host === 'dead.example';
+}
+
 void describe('scheduler retained backlog policy', () => {
   void it('drops a huge retained tail when only a tiny batch was scheduled', () => {
     assert.equal(shouldDropRetainedBacklog(12, 150_000, 8_192), true);
@@ -50,18 +54,16 @@ void describe('scheduler claim scan host exclusion', () => {
 
 void describe('scheduler unreachable idle policy', () => {
   void it('waits only for non-dead unreachable rows with retry budget left', () => {
-    const isDead = (host: string): boolean => host === 'dead.example';
-
     assert.equal(
-      shouldWaitForUnreachableRetry(4, 'alive.example', isDead),
+      shouldWaitForUnreachableRetry(4, 'alive.example', isDeadHost),
       true,
     );
     assert.equal(
-      shouldWaitForUnreachableRetry(4, 'dead.example', isDead),
+      shouldWaitForUnreachableRetry(4, 'dead.example', isDeadHost),
       false,
     );
     assert.equal(
-      shouldWaitForUnreachableRetry(5, 'alive.example', isDead),
+      shouldWaitForUnreachableRetry(5, 'alive.example', isDeadHost),
       false,
     );
   });

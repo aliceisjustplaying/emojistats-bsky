@@ -8,6 +8,8 @@
 import os from 'node:os';
 import { Worker } from 'node:worker_threads';
 
+import type { ArchiveRow } from 'archive/types';
+
 import {
   PARSE_WORKER_MAX_OLD_SPACE_MB,
   PARSE_WORKERS,
@@ -25,9 +27,15 @@ import type {
   RepoJobResult,
 } from './parse-worker.js';
 
+export interface RepoRowBatch {
+  rev: string | null;
+  rows: ArchiveRow[];
+}
+
 interface PendingJob {
   resolve: (result: RepoJobResult) => void;
   reject: (err: Error) => void;
+  onRows: (batch: RepoRowBatch) => Promise<void> | void;
   timer: NodeJS.Timeout;
 }
 
@@ -76,6 +84,7 @@ export interface ParsePool {
     did: string,
     pdsHost: string,
     fetchTimeUs: number,
+    onRows?: (batch: RepoRowBatch) => Promise<void> | void,
   ): Promise<RepoJobResult>;
   close(): Promise<void>;
 }
@@ -130,12 +139,36 @@ export function createParsePool(): ParsePool {
       const pending = pendingByWorker.get(worker);
       const job = pending?.get(reply.seq);
       if (job === undefined) return;
+      if ('rows' in reply) {
+        void (async () => {
+          try {
+            await job.onRows({ rev: reply.rev, rows: reply.rows });
+            worker.postMessage({
+              seq: reply.seq,
+              batch: reply.batch,
+              ack: true,
+            });
+          } catch (err) {
+            pending!.delete(reply.seq);
+            clearTimeout(job.timer);
+            job.reject(err instanceof Error ? err : new Error(String(err)));
+            failWorker(
+              worker,
+              `row batch failed: ${err instanceof Error ? err.message : String(err)}`,
+              true,
+            );
+          }
+        })();
+        return;
+      }
       pending!.delete(reply.seq);
       clearTimeout(job.timer);
       if ('ok' in reply) job.resolve(reply.ok);
       else job.reject(rehydrate(reply.err));
     });
-    worker.on('error', (err) => failWorker(worker, err.message));
+    worker.on('error', (err) => {
+      failWorker(worker, err.message);
+    });
     worker.on('exit', (code) => {
       if (code !== 0) failWorker(worker, `exit code ${code}`);
     });
@@ -155,7 +188,7 @@ export function createParsePool(): ParsePool {
   );
 
   return {
-    run(did, pdsHost, fetchTimeUs) {
+    run(did, pdsHost, fetchTimeUs, onRows = () => undefined) {
       return new Promise<RepoJobResult>((resolve, reject) => {
         rr = (rr + 1) % workers.length;
         const worker = workers[rr];
@@ -176,6 +209,7 @@ export function createParsePool(): ParsePool {
           reject: (err) => {
             reject(err);
           },
+          onRows,
           timer,
         });
         worker.postMessage({ seq: jobSeq, did, pdsHost, fetchTimeUs });

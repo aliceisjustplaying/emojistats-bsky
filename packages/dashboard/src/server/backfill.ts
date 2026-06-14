@@ -27,14 +27,18 @@ const TERMINAL_EVENTS = ['loaded', 'empty', ...ISSUE_EVENTS] as const;
 const V1_RECRAWL_TARGET_REPOS = 3_208_370;
 const V1_RECRAWL_TARGET_POSTS = 478_676_984;
 const V1_RECRAWL_RUN_PREFIX = 'v1-recrawl';
-const BACKFILL_OVERVIEW_RUNS = [
+const LEGACY_BACKFILL_EVENT_RUNS = [
   'whale-2026',
   'whale-2026-overcap',
   'whale-2026-overcap-long',
 ] as const;
-const BACKFILL_OVERVIEW_RUNS_SQL = BACKFILL_OVERVIEW_RUNS.map(
-  (run) => `'${run}'`,
-).join(', ');
+const MAIN_BACKFILL_RUN_FILTER_SQL = `
+  run_id != 'dev'
+  AND NOT startsWith(run_id, 'fail-')
+  AND NOT startsWith(run_id, 'hard-close-')
+  AND NOT startsWith(run_id, 'verify-')
+  AND NOT startsWith(run_id, '${V1_RECRAWL_RUN_PREFIX}')
+`;
 
 /**
  * Window for the rolling repos-per-minute estimate. Must span multiple shard
@@ -107,6 +111,55 @@ const STATUS_ARGMAX_SQL = REPO_STATUSES.map(
 const LOGICAL_SHARD_SQL =
   "replaceRegexpOne(shard, '^(overcap-long-|overcap-)shard', 'shard')";
 
+function sqlString(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+function sqlStringList(values: readonly string[]): string {
+  return values.map(sqlString).join(', ');
+}
+
+interface MainBackfillRunScope {
+  runId: string;
+  runIds: string[];
+  progressWhereSql: string;
+  eventWhereSql: string;
+}
+
+async function fetchMainBackfillRunScope(): Promise<MainBackfillRunScope | null> {
+  const rows = await chQuery<{ selected_run_id: string }>(`
+    SELECT selected_run_id
+    FROM
+    (
+      SELECT
+        ${LOGICAL_SHARD_SQL} AS logical_shard,
+        argMax(run_id, ts) AS selected_run_id
+      FROM backfill_progress
+      WHERE ${MAIN_BACKFILL_RUN_FILTER_SQL}
+      GROUP BY logical_shard
+    )
+    ORDER BY selected_run_id
+  `);
+  const runIds = [
+    ...new Set(rows.map((row) => row.selected_run_id).filter(Boolean)),
+  ].toSorted();
+  if (runIds.length === 0) return null;
+  const runIdsSql = sqlStringList(runIds);
+  const progressWhereSql = `run_id IN (${runIdsSql})`;
+  const hasLegacyEvents = LEGACY_BACKFILL_EVENT_RUNS.some((run) =>
+    runIds.includes(run),
+  );
+  const eventWhereSql = hasLegacyEvents
+    ? `(run_id IN (${runIdsSql}) OR run_id = '')`
+    : `run_id IN (${runIdsSql})`;
+  return {
+    runId: runIds.join(', '),
+    runIds,
+    progressWhereSql,
+    eventWhereSql,
+  };
+}
+
 /**
  * Statuses that still represent work. Unreachable PARKS for retry waves
  * rather than resolving, so it stays out of the throughput rate. The hero
@@ -125,20 +178,9 @@ const RESOLVED_SUM_SQL = REPO_STATUSES.filter(
 ).join(' + ');
 
 async function fetchOverview(): Promise<BackfillOverview | null> {
-  const runRows = await chQuery<{ run_id: string }>(`
-    SELECT arrayStringConcat(arraySort(groupUniqArray(selected_run_id)), ', ') AS run_id
-    FROM
-    (
-      SELECT
-        ${LOGICAL_SHARD_SQL} AS logical_shard,
-        argMax(run_id, ts) AS selected_run_id
-      FROM backfill_progress
-      WHERE run_id IN (${BACKFILL_OVERVIEW_RUNS_SQL})
-      GROUP BY logical_shard
-    )
-  `);
-  const runId = runRows[0]?.run_id;
-  if (runId === undefined) return null;
+  const scope = await fetchMainBackfillRunScope();
+  if (scope === null) return null;
+  const { eventWhereSql, progressWhereSql, runId } = scope;
 
   const [snapshot, totals, rate, lastErrorRows] = await Promise.all([
     chQuery<SnapshotRow>(
@@ -154,7 +196,7 @@ async function fetchOverview(): Promise<BackfillOverview | null> {
       (
         SELECT *, ${LOGICAL_SHARD_SQL} AS logical_shard
         FROM backfill_progress
-        WHERE run_id IN (${BACKFILL_OVERVIEW_RUNS_SQL})
+        WHERE ${progressWhereSql}
       )
       GROUP BY logical_shard
     `,
@@ -180,6 +222,7 @@ async function fetchOverview(): Promise<BackfillOverview | null> {
           event = 'loaded' AND ts >= now() - INTERVAL ${RATE_WINDOW_MINUTES} MINUTE
         ) AS recent_posts
       FROM backfill_repo_events
+      WHERE ${eventWhereSql}
     `),
     // Per-shard rate = delta / the shard's ACTUAL covered minutes, not the
     // nominal window. Progress snapshots are replace-and-retry under load,
@@ -199,7 +242,7 @@ async function fetchOverview(): Promise<BackfillOverview | null> {
           SELECT *, ${LOGICAL_SHARD_SQL} AS logical_shard
           FROM backfill_progress
           WHERE ts >= now() - INTERVAL ${RATE_WINDOW_MINUTES} MINUTE
-            AND run_id IN (${BACKFILL_OVERVIEW_RUNS_SQL})
+            AND ${progressWhereSql}
         )
         GROUP BY logical_shard
       )
@@ -209,6 +252,7 @@ async function fetchOverview(): Promise<BackfillOverview | null> {
       SELECT did, error
       FROM backfill_repo_events
       WHERE event IN ('failed', 'quarantined') AND error != ''
+        AND ${eventWhereSql}
       ORDER BY ts DESC
       LIMIT 1
     `),
@@ -307,6 +351,9 @@ export interface BackfillTimeline {
 
 export const getBackfillTimeline = createServerFn().handler(
   async (): Promise<BackfillTimeline | null> => {
+    const scope = await fetchMainBackfillRunScope();
+    if (scope === null) return null;
+    const { eventWhereSql } = scope;
     const bounds = await chQuery<{
       min_ts: string;
       max_ts: string;
@@ -314,6 +361,7 @@ export const getBackfillTimeline = createServerFn().handler(
     }>(`
       SELECT min(ts) AS min_ts, max(ts) AS max_ts, count() AS events
       FROM backfill_repo_events
+      WHERE ${eventWhereSql}
     `);
     const bound = bounds[0];
     if (bound === undefined || num(bound.events) === 0) return null;
@@ -340,6 +388,7 @@ export const getBackfillTimeline = createServerFn().handler(
         sumIf(posts, event = 'loaded') AS posts_loaded,
         sum(car_bytes) AS bytes_downloaded
       FROM backfill_repo_events
+      WHERE ${eventWhereSql}
       GROUP BY bucket
       ORDER BY bucket
     `,
@@ -417,6 +466,9 @@ export interface BackfillHost {
 
 export const getBackfillHosts = createServerFn().handler(
   async (): Promise<Array<BackfillHost>> => {
+    const scope = await fetchMainBackfillRunScope();
+    if (scope === null) return [];
+    const { eventWhereSql } = scope;
     const rows = await chQuery<{
       host: string;
       total: string;
@@ -435,6 +487,7 @@ export const getBackfillHosts = createServerFn().handler(
         sum(car_bytes) AS bytes,
         avgIf(posts, event = 'loaded') AS avg_posts
       FROM backfill_repo_events
+      WHERE ${eventWhereSql}
       GROUP BY pds_host
       ORDER BY total DESC, loaded DESC
       LIMIT 12
@@ -745,7 +798,7 @@ export const getBackfillVerifyStatus = createServerFn().handler(
     return {
       generatedAt: new Date().toISOString(),
       runId,
-      runIds: [...runIds].sort(),
+      runIds: [...runIds].toSorted(),
       active,
       shards: rows.length,
       freshnessSeconds,
@@ -762,7 +815,7 @@ export const getBackfillVerifyStatus = createServerFn().handler(
       exact,
       loose,
       recheckLoadedOpen,
-      recheckRunIds: [...recheckRunIds].sort(),
+      recheckRunIds: [...recheckRunIds].toSorted(),
       recheckShards: recheckRows.length,
       mismatches,
       looseEmitted,
@@ -890,6 +943,8 @@ export interface BackfillIssues {
 
 export const getBackfillIssues = createServerFn().handler(
   async (): Promise<BackfillIssues> => {
+    const scope = await fetchMainBackfillRunScope();
+    const eventWhereSql = scope?.eventWhereSql ?? '0';
     const rows = await chQuery<BackfillIssue>(`
       SELECT
         ts,
@@ -899,6 +954,7 @@ export const getBackfillIssues = createServerFn().handler(
         substring(error, 1, 160) AS error
       FROM backfill_repo_events
       WHERE event IN (${ISSUE_EVENTS.map((e) => `'${e}'`).join(', ')})
+        AND ${eventWhereSql}
       ORDER BY ts DESC
       LIMIT 20
     `);

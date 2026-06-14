@@ -68,7 +68,7 @@ async function remainingWork(): Promise<{
     query_params: { run, shards },
     format: 'JSONEachRow',
   });
-  const rows = (await result.json()) as DrainRow[];
+  const rows = await result.json<DrainRow>();
   const row = rows[0];
   if (row === undefined || Number(row.shards) !== shards.length) {
     throw new Error(
@@ -94,7 +94,9 @@ try {
     } else {
       stable = 0;
     }
-    await new Promise((resolve) => setTimeout(resolve, pollSeconds * 1000));
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, pollSeconds * 1000);
+    });
   }
 } finally {
   await client.close();

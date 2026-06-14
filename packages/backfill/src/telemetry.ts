@@ -36,6 +36,8 @@ export interface RepoEvent {
 
 interface RepoEventRow {
   ts: string;
+  run_id: string;
+  shard: string;
   did: string;
   pds_host: string;
   event: string;
@@ -134,6 +136,8 @@ export class CrawlTelemetry {
   recordEvent(event: RepoEvent): void {
     this.#events.push({
       ts: chDateTime(Date.now()),
+      run_id: this.#runId,
+      shard: this.#shard,
       did: event.did,
       pds_host: event.pdsHost,
       event: event.event,

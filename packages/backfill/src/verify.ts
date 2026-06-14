@@ -6,10 +6,8 @@
  *       ledger expectations into ClickHouse, then runs one set-based join
  *       against deduped (did, rkey) rows. EXACT = digests match and counts are equal; LOOSE
  *       = CH count >= ledger (today's lower-bound semantics); CH count < ledger
- *       is loss and fails the run. Both tiers promote to 'verified' — tiering
- *       is report-level only, never a new status. LOOSE rows are not promoted
- *       during --emit-loose / --sample-loose runs until an exhaustive loose
- *       sample has passed.
+ *       is loss and fails the run. EXACT rows promote to 'verified'; LOOSE rows
+ *       promote only after an explicit exhaustive --sample-loose all pass.
  *   (b) Terminal-state report: counts per status plus the explicit
  *       unreachable/quarantined/failed DID lists (capped at 50 each).
  *   (c) --sample N: re-fetch N random loaded/verified repos end to end and
@@ -72,6 +70,11 @@ import { fetchRepoCar } from './fetcher.js';
 import logger from './logger.js';
 import { parseRepoCar } from './parser.js';
 import type { RepoStatus } from './types.js';
+import {
+  promoteLoadedReposByDid,
+  promotionResultListSql,
+} from './verify-promotion.js';
+import { VerifyTelemetry, type VerifyProgress } from './verify-telemetry.js';
 
 const DID_LIST_CAP = 50;
 // Compile-checked subset of THE status registry (types.ts REPO_STATUSES).
@@ -183,28 +186,20 @@ const VERIFY_QUERY_SETTINGS: ClickHouseSettings = {
 const VERIFY_EXPECTED_TABLE = 'backfill_verify_expected';
 const VERIFY_RESULT_TABLE = 'backfill_verify_result';
 
+function canonicalShardFromIndex(value: string): string {
+  return /^\d+$/.test(value) ? `shard${value}` : value;
+}
+
 const VERIFY_RUN_ID_EXPLICIT = process.env.VERIFY_RUN_ID !== undefined;
 const VERIFY_RUN_ID = VERIFY_RUN_ID_EXPLICIT
   ? process.env.VERIFY_RUN_ID!
   : `verify-${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}`;
 const VERIFY_SHARD =
   process.env.VERIFY_SHARD ??
-  process.env.CRAWL_SHARD_INDEX ??
+  (process.env.CRAWL_SHARD_INDEX === undefined
+    ? undefined
+    : canonicalShardFromIndex(process.env.CRAWL_SHARD_INDEX)) ??
   path.basename(LEDGER_DB_PATH, '.sqlite');
-
-interface VerifyProgress {
-  phase: string;
-  reposTotal: number;
-  reposChecked: number;
-  exact: number;
-  loose: number;
-  mismatches: number;
-  looseEmitted: number;
-  sampleChecked: number;
-  sampleFailures: number;
-  done: boolean;
-  error?: string;
-}
 
 /** 'YYYY-MM-DD HH:MM:SS' UTC, the JSONEachRow-friendly DateTime form. */
 function chDateTime(ms: number): string {
@@ -213,111 +208,6 @@ function chDateTime(ms: number): string {
 
 function verifyQueryParams() {
   return { run_id: VERIFY_RUN_ID, shard: VERIFY_SHARD };
-}
-
-class VerifyTelemetry {
-  #lastInsertMs = 0;
-  #lastProgress: VerifyProgress | undefined;
-  readonly #ch: ClickHouseClient;
-  readonly #runId: string;
-  readonly #shard: string;
-  readonly #ledgerPath: string;
-
-  constructor(
-    ch: ClickHouseClient,
-    runId: string,
-    shard: string,
-    ledgerPath: string,
-  ) {
-    this.#ch = ch;
-    this.#runId = runId;
-    this.#shard = shard;
-    this.#ledgerPath = ledgerPath;
-  }
-
-  async ensureTable(): Promise<void> {
-    await this.#ch.command({
-      query: `
-        CREATE TABLE IF NOT EXISTS backfill_verify_progress (
-          ts              DateTime('UTC') CODEC(Delta(4), ZSTD(1)),
-          run_id          LowCardinality(String),
-          shard           LowCardinality(String),
-          ledger_path     String CODEC(ZSTD(1)),
-          phase           LowCardinality(String),
-          repos_total     UInt64,
-          repos_checked   UInt64,
-          exact           UInt64,
-          loose           UInt64,
-          mismatches      UInt64,
-          loose_emitted   UInt64,
-          sample_checked  UInt64,
-          sample_failures UInt64,
-          done            UInt8,
-          error           String CODEC(ZSTD(3))
-        ) ENGINE = MergeTree
-        PARTITION BY toYYYYMM(ts)
-        ORDER BY (run_id, shard, ts)
-        TTL ts + INTERVAL 6 MONTH DELETE
-      `,
-    });
-  }
-
-  async record(progress: VerifyProgress, force = false): Promise<void> {
-    this.#lastProgress = progress;
-    const now = Date.now();
-    if (!force && now - this.#lastInsertMs < 5_000) return;
-    this.#lastInsertMs = now;
-    await this.#ch.insert({
-      table: 'backfill_verify_progress',
-      values: [
-        {
-          ts: chDateTime(now),
-          run_id: this.#runId,
-          shard: this.#shard,
-          ledger_path: this.#ledgerPath,
-          phase: progress.phase,
-          repos_total: progress.reposTotal,
-          repos_checked: progress.reposChecked,
-          exact: progress.exact,
-          loose: progress.loose,
-          mismatches: progress.mismatches,
-          loose_emitted: progress.looseEmitted,
-          sample_checked: progress.sampleChecked,
-          sample_failures: progress.sampleFailures,
-          done: progress.done ? 1 : 0,
-          error: progress.error ?? '',
-        },
-      ],
-      format: 'JSONEachRow',
-    });
-  }
-
-  async finish(progress: VerifyProgress): Promise<void> {
-    await this.record({ ...progress, done: true }, true);
-  }
-
-  async fail(err: unknown): Promise<void> {
-    await this.record(
-      {
-        ...(this.#lastProgress ?? {
-          phase: 'failed',
-          reposTotal: 0,
-          reposChecked: 0,
-          exact: 0,
-          loose: 0,
-          mismatches: 0,
-          looseEmitted: 0,
-          sampleChecked: 0,
-          sampleFailures: 0,
-          done: false,
-        }),
-        phase: 'failed',
-        done: true,
-        error: err instanceof Error ? err.message : String(err),
-      },
-      true,
-    );
-  }
 }
 
 async function ensureExpectedTable(ch: ClickHouseClient): Promise<void> {
@@ -728,7 +618,7 @@ async function collectPromotableLoadedDids(
         run_id = {run_id:String}
         AND shard = {shard:String}
         AND status = 'loaded'
-        AND result IN ${includeLoose ? "('exact', 'loose')" : "('exact')"}
+        AND result IN ${promotionResultListSql(includeLoose)}
       ORDER BY did
     `,
     query_params: verifyQueryParams(),
@@ -736,30 +626,6 @@ async function collectPromotableLoadedDids(
   });
   const rows = await result.json<{ did: string }>();
   return rows.map((row) => row.did);
-}
-
-function promoteLoadedRepos(db: Database.Database, dids: string[]): number {
-  db.exec(`
-    DROP TABLE IF EXISTS verify_promotable;
-    CREATE TEMP TABLE verify_promotable (
-      did TEXT PRIMARY KEY
-    ) WITHOUT ROWID
-  `);
-  const insertPromotable = db.prepare(
-    'INSERT INTO verify_promotable (did) VALUES (?)',
-  );
-  const stagePromotable = db.transaction((promotableDids: string[]) => {
-    for (const did of promotableDids) insertPromotable.run(did);
-  });
-  stagePromotable(dids);
-  return db
-    .prepare(
-      `UPDATE repos SET status = 'verified'
-       WHERE status = 'loaded'
-         AND did IN (SELECT did FROM verify_staged_loaded)
-         AND did IN (SELECT did FROM verify_promotable)`,
-    )
-    .run().changes;
 }
 
 async function emitLooseDids(
@@ -948,7 +814,7 @@ async function reconcile(
     ch,
     options.promoteLoose,
   );
-  const promoted = promoteLoadedRepos(db, promotableDids);
+  const promoted = promoteLoadedReposByDid(db, promotableDids);
 
   const orphans = options.includeOrphans
     ? await orphanExamples(ch)
@@ -1316,7 +1182,7 @@ async function main(): Promise<void> {
           collectLooseRepos: sampleLooseSize !== null,
           includeOrphans: values.orphans ?? false,
           loadedOnly,
-          promoteLoose: sampleLooseSize === null && emitLoose === undefined,
+          promoteLoose: false,
         }));
       latestProgress = {
         phase: 'reconciled',
@@ -1385,7 +1251,7 @@ async function main(): Promise<void> {
         },
         true,
       );
-      const promoted = promoteLoadedRepos(
+      const promoted = promoteLoadedReposByDid(
         db,
         await collectPromotableLoadedDids(ch, true),
       );
@@ -1402,6 +1268,11 @@ async function main(): Promise<void> {
       logger.info(
         { loose },
         'LOOSE repos were emitted for recrawl and left unpromoted until a follow-up verify clears them',
+      );
+    } else if (!noReconcile && loose > 0) {
+      logger.warn(
+        { loose },
+        "LOOSE repos were not promoted; only '--sample-loose all' with zero sample failures promotes them",
       );
     }
     latestProgress = {

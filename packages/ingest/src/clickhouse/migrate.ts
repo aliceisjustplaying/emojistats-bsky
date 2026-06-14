@@ -151,6 +151,20 @@ async function ensureLiveIngestSecondMv(
   }
 }
 
+async function ensureBackfillRepoEventsRunScope(
+  client: ClickHouseClient,
+): Promise<void> {
+  await client.command({
+    query:
+      'ALTER TABLE backfill_repo_events ADD COLUMN IF NOT EXISTS run_id LowCardinality(String) AFTER ts',
+  });
+  await client.command({
+    query:
+      'ALTER TABLE backfill_repo_events ADD COLUMN IF NOT EXISTS shard LowCardinality(String) AFTER run_id',
+  });
+  logger.info('Applied backfill_repo_events run_id/shard columns');
+}
+
 async function migrate(): Promise<void> {
   // Tables first (schema.sql), then the materialized views from aggregates.ts —
   // the single source the rebuild CLI shares. Tables are append-only IF NOT
@@ -168,6 +182,16 @@ async function migrate(): Promise<void> {
         return;
       }
       logger.info(`Applied ${statementName(statement)}`);
+    }
+    try {
+      await ensureBackfillRepoEventsRunScope(client);
+    } catch (err) {
+      logger.error(
+        { err },
+        'Migration failed on backfill_repo_events run_id/shard columns',
+      );
+      process.exitCode = 1;
+      return;
     }
     for (const spec of AGGREGATES) {
       try {

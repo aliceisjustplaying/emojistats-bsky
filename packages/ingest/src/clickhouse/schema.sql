@@ -129,6 +129,8 @@ TTL ts + INTERVAL 6 MONTH DELETE;
 
 CREATE TABLE IF NOT EXISTS backfill_repo_events (
   ts        DateTime('UTC') CODEC(Delta(4), ZSTD(1)),
+  run_id    LowCardinality(String),
+  shard     LowCardinality(String),
   did       String CODEC(ZSTD(1)),
   pds_host  LowCardinality(String),
   event     LowCardinality(String),
@@ -138,7 +140,7 @@ CREATE TABLE IF NOT EXISTS backfill_repo_events (
   error     String CODEC(ZSTD(3))
 ) ENGINE = MergeTree
 PARTITION BY toYYYYMM(ts)
-ORDER BY ts
+ORDER BY (run_id, shard, ts)
 TTL ts + INTERVAL 6 MONTH DELETE;
 
 CREATE TABLE IF NOT EXISTS backfill_verify_progress (

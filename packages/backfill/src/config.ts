@@ -81,6 +81,7 @@ export const PARSE_WORKER_MAX_OLD_SPACE_MB = num(
   'PARSE_WORKER_MAX_OLD_SPACE_MB',
   0,
 );
+export const PARSE_ROW_BATCH_ROWS = num('PARSE_ROW_BATCH_ROWS', 10_000);
 
 export const RETRY_BASE_MS = num('RETRY_BASE_MS', 60_000);
 export const RETRY_MAX_MS = num('RETRY_MAX_MS', 3_600_000);

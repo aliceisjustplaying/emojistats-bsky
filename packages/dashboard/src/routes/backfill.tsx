@@ -137,6 +137,15 @@ const compactMobile = new Intl.NumberFormat('en-US', {
   maximumFractionDigits: 0,
 });
 
+function CompactHostValue({ value }: { value: number }) {
+  return (
+    <>
+      <span className="sm:hidden">{compactMobile.format(value)}</span>
+      <span className="hidden sm:inline">{compact.format(value)}</span>
+    </>
+  );
+}
+
 const MONTH_NAMES = [
   'January',
   'February',
@@ -776,13 +785,6 @@ function HostsTable({
     avgPostsPerRepo: number;
   }>;
 }) {
-  const CompactHostValue = ({ value }: { value: number }) => (
-    <>
-      <span className="sm:hidden">{compactMobile.format(value)}</span>
-      <span className="hidden sm:inline">{compact.format(value)}</span>
-    </>
-  );
-
   return (
     <Card>
       <CardHeader>

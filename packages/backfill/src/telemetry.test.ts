@@ -89,6 +89,7 @@ void describe('crawl telemetry', () => {
   void it('uses separate clients and chunks event inserts', async () => {
     const progressTables: string[] = [];
     const eventBatchSizes: number[] = [];
+    const eventRows: Array<{ run_id: string; shard: string }> = [];
     const progressClient = {
       query: async () => ({
         json: async () => [],
@@ -101,6 +102,9 @@ void describe('crawl telemetry', () => {
       insert: async (params: { table: string; values: unknown[] }) => {
         assert.equal(params.table, 'backfill_repo_events');
         eventBatchSizes.push(params.values.length);
+        eventRows.push(
+          ...(params.values as Array<{ run_id: string; shard: string }>),
+        );
       },
     } as unknown as ClickHouseClient;
     const telemetry = new CrawlTelemetry(
@@ -124,6 +128,10 @@ void describe('crawl telemetry', () => {
     await telemetry.stop();
 
     assert.deepEqual(eventBatchSizes, [1000, 1]);
+    assert.equal(eventRows[0]?.run_id, 'test');
+    assert.equal(eventRows[0]?.shard, 'shard0');
+    assert.ok(eventRows.every((row) => row.run_id === 'test'));
+    assert.ok(eventRows.every((row) => row.shard === 'shard0'));
     assert.ok(progressTables.every((table) => table === 'backfill_progress'));
   });
 

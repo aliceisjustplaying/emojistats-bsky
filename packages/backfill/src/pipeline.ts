@@ -12,7 +12,13 @@ import type { ParsePool } from './parse-pool.js';
 import type { RetryPolicy } from './retry.js';
 import type { CrawlControl, CrawlStats } from './run-state.js';
 import type { CrawlTelemetry } from './telemetry.js';
-import type { Ledger, RepoCounts, RepoLoader, RepoRow } from './types.js';
+import type {
+  Ledger,
+  RepoCounts,
+  RepoLoad,
+  RepoLoader,
+  RepoRow,
+} from './types.js';
 
 export interface RepoPipelineDeps {
   ledger: Ledger;
@@ -138,41 +144,59 @@ export function createRepoPipeline(
         });
         return;
       }
-      // Fetch AND parse happen inside a repo worker: concurrent whale-stream
-      // buffering churned this thread's heap as badly as the parsing did, so
-      // both live off-thread now. A failure inside the worker (fetch or
-      // quarantine) means NO rows have been written anywhere — materializing
-      // rows before any append removed the old partial-coverage caveat.
+      // Fetch AND parse happen inside a repo worker; row batches come back with
+      // backpressure so whale repos never materialize a second full row array
+      // on this thread.
       const fetchTimeUs = Date.now() * 1000;
-      const parsed = await parsePool.run(repo.did, repo.pdsHost, fetchTimeUs);
+      const streamed = {
+        postsTotal: 0,
+        load: null as RepoLoad | null,
+      };
+      const parsed = await parsePool.run(
+        repo.did,
+        repo.pdsHost,
+        fetchTimeUs,
+        async ({ rev, rows }) => {
+          if (rows.length === 0) return;
+          let batchLoad = streamed.load;
+          if (batchLoad === null) {
+            batchLoad = loader.openRepo(repo.did, rev);
+            streamed.load = batchLoad;
+          }
+          streamed.postsTotal += rows.length;
+          for (const row of rows) {
+            // Full rows (text always included) go to the parquet archive first
+            // — it is the only durable home of non-emoji post text.
+            if (archiveSink !== null) {
+              try {
+                await archiveSink.append(row);
+              } catch (err) {
+                throw archiveAppendFailed(repo.did, err);
+              }
+            }
+
+            // Cost-revised storage (plan 0001): ClickHouse keeps text for emoji
+            // posts only; rows without emojis ship with text stripped. The pick
+            // in toClickhouseRow also drops the archive-only metadata columns.
+            try {
+              await batchLoad.addRow(toClickhouseRow(row, policy));
+            } catch (err) {
+              throw loaderChunkFailed(err);
+            }
+          }
+        },
+      );
+      const postsTotal = streamed.postsTotal;
+      if (postsTotal !== parsed.postsTotal) {
+        throw new RetryableError(
+          `worker streamed ${postsTotal} rows but reported ${parsed.postsTotal}`,
+          { transient: true },
+        );
+      }
       // The CAR arrived: feed the AIMD cap raise and reset deadness evidence.
       hostPressure.observeRateLimit(repo.pdsHost, parsed.rateLimit);
       hostPressure.recordSuccess(repo.pdsHost);
       hostHealth.recordSuccess(repo.pdsHost);
-
-      const postsTotal = parsed.rows.length;
-      const load =
-        postsTotal > 0 ? loader.openRepo(repo.did, parsed.rev) : null;
-      for (const row of parsed.rows) {
-        // Full rows (text always included) go to the parquet archive first — it
-        // is the only durable home of non-emoji post text.
-        if (archiveSink !== null) {
-          try {
-            await archiveSink.append(row);
-          } catch (err) {
-            throw archiveAppendFailed(repo.did, err);
-          }
-        }
-
-        // Cost-revised storage (plan 0001): ClickHouse keeps text for emoji
-        // posts only; rows without emojis ship with text stripped. The pick in
-        // toClickhouseRow also drops the archive-only metadata columns.
-        try {
-          await load!.addRow(toClickhouseRow(row, policy));
-        } catch (err) {
-          throw loaderChunkFailed(err);
-        }
-      }
 
       const repoCounts: RepoCounts = {
         rev: parsed.rev,
@@ -192,7 +216,7 @@ export function createRepoPipeline(
       }
 
       try {
-        if (load !== null) await load.finish();
+        if (streamed.load !== null) await streamed.load.finish();
         consecutiveLoaderFailures = 0;
       } catch (err) {
         throw loaderChunkFailed(err);
