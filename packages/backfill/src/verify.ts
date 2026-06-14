@@ -405,21 +405,11 @@ async function stageExpectedRepos(
       did TEXT PRIMARY KEY
     ) WITHOUT ROWID
   `);
-  const insertStagedLoaded = db.prepare(
-    'INSERT INTO verify_staged_loaded (did) VALUES (?)',
-  );
-  let stagedLoadedBatch: string[] = [];
-  const flushStagedLoaded = db.transaction((dids: string[]) => {
-    for (const did of dids) insertStagedLoaded.run(did);
-  });
+  const stagedLoadedDids: string[] = [];
   let staged = 0;
   let batch: VerifyExpectedInsertRow[] = [];
   const flush = async () => {
     if (batch.length === 0) return;
-    if (stagedLoadedBatch.length > 0) {
-      flushStagedLoaded(stagedLoadedBatch);
-      stagedLoadedBatch = [];
-    }
     await ch.insert({
       table: VERIFY_EXPECTED_TABLE,
       values: batch,
@@ -455,10 +445,19 @@ async function stageExpectedRepos(
       pds_host: repo.pds_host,
       rev: repo.rev,
     });
-    if (repo.status === 'loaded') stagedLoadedBatch.push(repo.did);
+    if (repo.status === 'loaded') stagedLoadedDids.push(repo.did);
     if (batch.length >= VERIFY_INSERT_BATCH_ROWS) await flush();
   }
   await flush();
+
+  const insertStagedLoaded = db.prepare(
+    'INSERT INTO verify_staged_loaded (did) VALUES (?)',
+  );
+  const flushStagedLoaded = db.transaction((dids: string[]) => {
+    for (const did of dids) insertStagedLoaded.run(did);
+  });
+  flushStagedLoaded(stagedLoadedDids);
+
   await telemetry.record(
     {
       phase: 'staging-ledger',
