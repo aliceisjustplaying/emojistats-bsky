@@ -4,10 +4,12 @@
  *   (a) Per-repo reconciliation, tiered: ledger posts_total + rkey_digest vs
  *       ClickHouse count() + groupBitXor rkey digest. The verifier stages the
  *       ledger expectations into ClickHouse, then runs one set-based join
- *       against posts FINAL. EXACT = digests match and counts are equal; LOOSE
+ *       against deduped (did, rkey) rows. EXACT = digests match and counts are equal; LOOSE
  *       = CH count >= ledger (today's lower-bound semantics); CH count < ledger
  *       is loss and fails the run. Both tiers promote to 'verified' — tiering
- *       is report-level only, never a new status.
+ *       is report-level only, never a new status. LOOSE rows are not promoted
+ *       during --emit-loose / --sample-loose runs until an exhaustive loose
+ *       sample has passed.
  *   (b) Terminal-state report: counts per status plus the explicit
  *       unreachable/quarantined/failed DID lists (capped at 50 each).
  *   (c) --sample N: re-fetch N random loaded/verified repos end to end and
@@ -42,6 +44,11 @@
  *       whole-fleet orphan audit, stage every shard with the same run id first.
  *
  * Exit codes: 0 clean, 1 mismatches found, 2 could not run.
+ *
+ * `--loaded-only` restricts reconciliation to rows still in ledger status
+ * loaded, for non-canonical post-recrawl checks. Use a non-canonical
+ * VERIFY_SHARD label such as fail-shard0 so dashboard full-shard totals are not
+ * replaced by a partial run.
  *
  * The ledger is accessed directly over its frozen schema (src/ledger.sql) so
  * this CLI stays runnable independently of the crawler's ledger.ts module;
@@ -130,6 +137,8 @@ interface ReconcileOptions {
   emitLoosePath?: string;
   collectLooseRepos: boolean;
   includeOrphans: boolean;
+  loadedOnly: boolean;
+  promoteLoose: boolean;
 }
 
 function positiveIntEnv(name: string, fallback: number): number {
@@ -164,17 +173,20 @@ const VERIFY_MAX_MEMORY_USAGE_BYTES = positiveIntEnv(
 );
 const VERIFY_QUERY_SETTINGS: ClickHouseSettings = {
   send_progress_in_http_headers: 0,
+  wait_end_of_query: 1,
   max_bytes_before_external_group_by: String(VERIFY_EXTERNAL_GROUP_BY_BYTES),
   max_bytes_before_external_sort: String(VERIFY_EXTERNAL_SORT_BYTES),
   max_threads: VERIFY_MAX_THREADS,
   max_memory_usage: String(VERIFY_MAX_MEMORY_USAGE_BYTES),
+  optimize_aggregation_in_order: 1,
 };
 const VERIFY_EXPECTED_TABLE = 'backfill_verify_expected';
 const VERIFY_RESULT_TABLE = 'backfill_verify_result';
 
-const VERIFY_RUN_ID =
-  process.env.VERIFY_RUN_ID ??
-  `verify-${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}`;
+const VERIFY_RUN_ID_EXPLICIT = process.env.VERIFY_RUN_ID !== undefined;
+const VERIFY_RUN_ID = VERIFY_RUN_ID_EXPLICIT
+  ? process.env.VERIFY_RUN_ID!
+  : `verify-${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}`;
 const VERIFY_SHARD =
   process.env.VERIFY_SHARD ??
   process.env.CRAWL_SHARD_INDEX ??
@@ -379,16 +391,20 @@ async function stageExpectedRepos(
   db: Database.Database,
   ch: ClickHouseClient,
   telemetry: VerifyTelemetry,
+  loadedOnly: boolean,
 ): Promise<number> {
   await ensureExpectedTable(ch);
   await resetExpectedRows(ch);
+  const statusWhere = loadedOnly
+    ? "status = 'loaded'"
+    : "status IN ('loaded', 'verified')";
 
   const total = (
     db
-      .prepare(
-        "SELECT COUNT(*) AS n FROM repos WHERE status IN ('loaded', 'verified')",
-      )
-      .get() as { n: number }
+      .prepare(`SELECT COUNT(*) AS n FROM repos WHERE ${statusWhere}`)
+      .get() as {
+      n: number;
+    }
   ).n;
 
   await telemetry.record(
@@ -409,7 +425,7 @@ async function stageExpectedRepos(
 
   const stmt = db.prepare(
     `SELECT did, status, posts_total, pds_host, rev, rkey_digest
-     FROM repos WHERE status IN ('loaded', 'verified')`,
+     FROM repos WHERE ${statusWhere}`,
   );
   db.exec(`
     DROP TABLE IF EXISTS verify_staged_loaded;
@@ -501,8 +517,13 @@ function classifiedSql(selectSql: string): string {
           did,
           toUInt64(count()) AS actual_posts,
           leftPad(lower(hex(${CH_RKEY_DIGEST_EXPR})), 16, '0') AS actual_digest
-        FROM posts FINAL
-        WHERE did IN (SELECT did FROM expected)
+        FROM
+        (
+          SELECT did, rkey
+          FROM posts
+          WHERE did IN (SELECT did FROM expected)
+          GROUP BY did, rkey
+        )
         GROUP BY did
       ),
       classified AS (
@@ -656,24 +677,6 @@ async function queryMismatchExamples(
   }));
 }
 
-async function collectMismatchDids(ch: ClickHouseClient): Promise<string[]> {
-  const result = await ch.query({
-    query: `
-      SELECT did
-      FROM ${VERIFY_RESULT_TABLE}
-      WHERE
-        run_id = {run_id:String}
-        AND shard = {shard:String}
-        AND result IN ('count-short', 'digest-mismatch')
-      ORDER BY did
-    `,
-    query_params: verifyQueryParams(),
-    format: 'JSONEachRow',
-  });
-  const rows = await result.json<{ did: string }>();
-  return rows.map((row) => row.did);
-}
-
 async function collectLooseRepos(ch: ClickHouseClient): Promise<LedgerRepo[]> {
   const result = await ch.query({
     query: `
@@ -711,6 +714,52 @@ async function collectLooseRepos(ch: ClickHouseClient): Promise<LedgerRepo[]> {
     rev: row.rev,
     rkey_digest: row.rkey_digest,
   }));
+}
+
+async function collectPromotableLoadedDids(
+  ch: ClickHouseClient,
+  includeLoose: boolean,
+): Promise<string[]> {
+  const result = await ch.query({
+    query: `
+      SELECT did
+      FROM ${VERIFY_RESULT_TABLE}
+      WHERE
+        run_id = {run_id:String}
+        AND shard = {shard:String}
+        AND status = 'loaded'
+        AND result IN ${includeLoose ? "('exact', 'loose')" : "('exact')"}
+      ORDER BY did
+    `,
+    query_params: verifyQueryParams(),
+    format: 'JSONEachRow',
+  });
+  const rows = await result.json<{ did: string }>();
+  return rows.map((row) => row.did);
+}
+
+function promoteLoadedRepos(db: Database.Database, dids: string[]): number {
+  db.exec(`
+    DROP TABLE IF EXISTS verify_promotable;
+    CREATE TEMP TABLE verify_promotable (
+      did TEXT PRIMARY KEY
+    ) WITHOUT ROWID
+  `);
+  const insertPromotable = db.prepare(
+    'INSERT INTO verify_promotable (did) VALUES (?)',
+  );
+  const stagePromotable = db.transaction((promotableDids: string[]) => {
+    for (const did of promotableDids) insertPromotable.run(did);
+  });
+  stagePromotable(dids);
+  return db
+    .prepare(
+      `UPDATE repos SET status = 'verified'
+       WHERE status = 'loaded'
+         AND did IN (SELECT did FROM verify_staged_loaded)
+         AND did IN (SELECT did FROM verify_promotable)`,
+    )
+    .run().changes;
 }
 
 async function emitLooseDids(
@@ -782,19 +831,24 @@ async function orphanExamples(ch: ClickHouseClient): Promise<{
         WHERE run_id = {run_id:String}
       )
       SELECT did, toUInt64(count()) AS posts
-      FROM posts FINAL
-      INNER JOIN
+      FROM
       (
-        SELECT did
-        FROM
+        SELECT did, rkey
+        FROM posts
+        INNER JOIN
         (
-          SELECT DISTINCT did
-          FROM posts
-          WHERE src = 'backfill'
-        ) AS backfilled
-        LEFT ANTI JOIN expected USING did
-        LIMIT ${DID_LIST_CAP}
-      ) AS orphan_dids USING did
+          SELECT did
+          FROM
+          (
+            SELECT DISTINCT did
+            FROM posts
+            WHERE src = 'backfill'
+          ) AS backfilled
+          LEFT ANTI JOIN expected USING did
+          LIMIT ${DID_LIST_CAP}
+        ) AS orphan_dids USING did
+        GROUP BY did, rkey
+      )
       GROUP BY did
       ORDER BY did
     `,
@@ -818,7 +872,12 @@ async function reconcile(
   telemetry: VerifyTelemetry,
   options: ReconcileOptions,
 ): Promise<ReconcileResult> {
-  const reposTotal = await stageExpectedRepos(db, ch, telemetry);
+  const reposTotal = await stageExpectedRepos(
+    db,
+    ch,
+    telemetry,
+    options.loadedOnly,
+  );
 
   await telemetry.record(
     {
@@ -840,7 +899,7 @@ async function reconcile(
   const counts = await queryClassificationCounts(ch);
   if (counts.checked !== reposTotal) {
     throw new Error(
-      `verification classified ${counts.checked} of ${reposTotal} staged repos; refusing to promote ledger rows`,
+      `verification classified ${counts.checked} of ${reposTotal} staged repos; refusing to promote ledger rows. This usually means the ClickHouse INSERT ... SELECT failed mid-query; inspect system.query_log for the underlying error.`,
     );
   }
 
@@ -861,8 +920,6 @@ async function reconcile(
   );
 
   const mismatches = await queryMismatchExamples(ch);
-  const mismatchDids =
-    counts.mismatchCount === 0 ? [] : await collectMismatchDids(ch);
   const looseRepos = options.collectLooseRepos
     ? await collectLooseRepos(ch)
     : [];
@@ -887,27 +944,11 @@ async function reconcile(
     true,
   );
 
-  db.exec(`
-    DROP TABLE IF EXISTS verify_mismatched;
-    CREATE TEMP TABLE verify_mismatched (
-      did TEXT PRIMARY KEY
-    ) WITHOUT ROWID
-  `);
-  const insertMismatch = db.prepare(
-    'INSERT INTO verify_mismatched (did) VALUES (?)',
+  const promotableDids = await collectPromotableLoadedDids(
+    ch,
+    options.promoteLoose,
   );
-  const stageMismatches = db.transaction((dids: string[]) => {
-    for (const did of dids) insertMismatch.run(did);
-  });
-  stageMismatches(mismatchDids);
-  const promoted = db
-    .prepare(
-      `UPDATE repos SET status = 'verified'
-       WHERE status = 'loaded'
-         AND did IN (SELECT did FROM verify_staged_loaded)
-         AND did NOT IN (SELECT did FROM verify_mismatched)`,
-    )
-    .run().changes;
+  const promoted = promoteLoadedRepos(db, promotableDids);
 
   const orphans = options.includeOrphans
     ? await orphanExamples(ch)
@@ -1053,8 +1094,15 @@ async function sampleVerifyRepos(
 
       const result = await ch.query({
         // Src-agnostic, same reasoning as reconciliation: live can win the merge.
-        query: 'SELECT rkey FROM posts FINAL WHERE did = {did:String}',
+        query: `
+          SELECT rkey
+          FROM posts
+          WHERE did = {did:String}
+          GROUP BY rkey
+          ORDER BY rkey
+        `,
         query_params: { did: repo.did },
+        clickhouse_settings: VERIFY_QUERY_SETTINGS,
         format: 'JSONEachRow',
       });
       const chRkeys = new Set(
@@ -1138,14 +1186,16 @@ async function main(): Promise<void> {
       'emit-loose': { type: 'string' },
       orphans: { type: 'boolean', default: false },
       // Skip the full ledger↔CH reconciliation (a) — for a fast, CH-light random
-      // --sample run while the crawl is still loading (reconcile fires ~1 query
-      // per 1000 loaded DIDs with FINAL, heavy on a busy ClickHouse). Incompatible
+      // --sample run while the crawl is still loading (reconcile still scans
+      // ClickHouse for every staged DID). Incompatible
       // with --sample-loose / --emit-loose, which are derived FROM reconciliation.
       'no-reconcile': { type: 'boolean', default: false },
       'terminal-report': { type: 'boolean', default: false },
+      'loaded-only': { type: 'boolean', default: false },
     },
   });
   const noReconcile = values['no-reconcile'] ?? false;
+  const loadedOnly = values['loaded-only'] ?? false;
   const sampleSize = values.sample === undefined ? null : Number(values.sample);
   if (
     sampleSize !== null &&
@@ -1191,6 +1241,28 @@ async function main(): Promise<void> {
     logger.error({}, '--no-reconcile needs --sample N (nothing else to do)');
     process.exitCode = 2;
     return;
+  }
+  if (loadedOnly && !/^fail-shard\d+$/.test(VERIFY_SHARD)) {
+    logger.error(
+      { shard: VERIFY_SHARD },
+      "--loaded-only is a partial run; set VERIFY_SHARD to a non-canonical label matching 'fail-shardN' so the dashboard does not replace the full-shard verification total",
+    );
+    process.exitCode = 2;
+    return;
+  }
+  if (loadedOnly && (values.orphans ?? false)) {
+    logger.error(
+      {},
+      '--loaded-only cannot be combined with --orphans because a partial expected set would report the rest of the backfill as orphaned',
+    );
+    process.exitCode = 2;
+    return;
+  }
+  if (!VERIFY_RUN_ID_EXPLICIT) {
+    logger.warn(
+      { runId: VERIFY_RUN_ID },
+      'VERIFY_RUN_ID was not set; generated a per-process run id, which is unsafe for multi-shard/orphan audits',
+    );
   }
 
   if (!existsSync(LEDGER_DB_PATH)) {
@@ -1243,6 +1315,8 @@ async function main(): Promise<void> {
           emitLoosePath: emitLoose,
           collectLooseRepos: sampleLooseSize !== null,
           includeOrphans: values.orphans ?? false,
+          loadedOnly,
+          promoteLoose: sampleLooseSize === null && emitLoose === undefined,
         }));
       latestProgress = {
         phase: 'reconciled',
@@ -1295,6 +1369,40 @@ async function main(): Promise<void> {
           telemetry,
           latestProgress,
         );
+    }
+    if (
+      !noReconcile &&
+      sampleLooseSize === Number.POSITIVE_INFINITY &&
+      mismatchCount === 0 &&
+      sampleFailures === 0
+    ) {
+      await telemetry.record(
+        {
+          ...latestProgress,
+          phase: 'promoting-loose',
+          sampleFailures,
+          done: false,
+        },
+        true,
+      );
+      const promoted = promoteLoadedRepos(
+        db,
+        await collectPromotableLoadedDids(ch, true),
+      );
+      logger.info(
+        { promotedToVerified: promoted },
+        'exhaustive loose sample passed; promoted remaining loaded repos that classified exact or loose',
+      );
+    } else if (!noReconcile && sampleLooseSize !== null && loose > 0) {
+      logger.warn(
+        { loose, sampleLoose: values['sample-loose'] },
+        "LOOSE repos were not promoted during reconciliation; only '--sample-loose all' with zero sample failures promotes them",
+      );
+    } else if (!noReconcile && emitLoose !== undefined && loose > 0) {
+      logger.info(
+        { loose },
+        'LOOSE repos were emitted for recrawl and left unpromoted until a follow-up verify clears them',
+      );
     }
     latestProgress = {
       ...latestProgress,
