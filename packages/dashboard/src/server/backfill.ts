@@ -653,12 +653,12 @@ export const getBackfillVerifyStatus = createServerFn().handler(
       GROUP BY shard
     `),
       chQuery<{
-        run_id: string;
+        selected_run_id: string;
         latest_ts: string;
         loaded: string;
       }>(`
         SELECT
-          argMax(run_id, ts) AS run_id,
+          argMax(run_id, ts) AS selected_run_id,
           max(ts) AS latest_ts,
           argMax(loaded, ts) AS loaded
         FROM backfill_progress
@@ -732,7 +732,7 @@ export const getBackfillVerifyStatus = createServerFn().handler(
     }
     for (const row of recheckRows) {
       recheckLoadedOpen += num(row.loaded);
-      recheckRunIds.add(row.run_id);
+      recheckRunIds.add(row.selected_run_id);
     }
     const freshnessSeconds =
       newestTs > 0
