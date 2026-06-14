@@ -1280,6 +1280,89 @@ the thing this whole document was written around. What's *not* done: the final s
 the verify→`--did-file` convergence pass, the `v:1` metadata recrawl, the Bridgy/`--revive-host` tail,
 and the public-site cutover. The white whale is alongside; it isn't on the deck yet.
 
+### 2026-06-14 the morning after the drain (08:52–13:29 UTC) — the final sweep ran clean, and then we found out we'd been losing the biggest repos all along
+
+The end-game finally fired — and the first thing it surfaced was the worst bug of the entire run:
+for the whole backfill we had been *silently dropping every repo bigger than 1 GiB*. Not corrupting
+it, not partially loading it — dropping the entire repo, all its posts, and filing it under a status
+that looked like a deliberate safety decision. The final sweep ran cleanly; the verify pass never
+produced a number; and Alice halted the whole thing at 13:07 to stop and rebuild her mental model.
+Eight commits, one genuine data-loss recovery, and zero progress toward cutover.
+
+- **The final sweep ran and exited cleanly — after the dead-host/idle bug bit a third time.** At
+  08:53 the sweep fired on all four live crawlers (drain confirmed: zero pending/fetching/in-flight),
+  rearmed the retry rows, and drained to a hard tail. But it wouldn't *exit*: dead-host rows with
+  `attempts < 5` were counted by the idle-wait check even though the claim scan excludes them — so the
+  sweep saw "work remaining" forever. This is the **same dead-host-vs-idle interaction** that
+  `411ea08` and the cooling-on-stall saga were supposed to have closed; it had one more edge. The fix
+  (`5154411`, "ignore dead hosts when waiting idle", with a regression test) plus live ledger parking
+  of the stragglers — ~26.8k loopback rows, a host 83 hours out on a `retry-after`, ~2,236
+  rate-limit-bound `atp.referendumapp.com` rows — was hot-deployed *without restarting the running
+  sweep*, and all four units deactivated cleanly by 09:30. The throughline holds: the single hardest
+  thing in this system remained telling "parked and never coming back" from "busy and will retry," and
+  the sweep's termination contract was the last place that distinction hadn't been nailed.
+- **The data loss: 16 repos over 1 GiB, every post missing, for the entire run.** While narrating the
+  sweep tail the agent mentioned a straggler near the `CAR_MAX_BYTES` cap. Alice, just awake, caught it
+  cold: *"are you telling me the whole backfill we ignored car files over 1gb"* → *"please tell me we
+  are not also missing posts."* We were. A repo whose CAR exceeds 1 GiB threw `QuarantineError`, landed
+  as `status='quarantined'`, and because the pipeline parses the *whole* CAR before it writes anything
+  to ClickHouse or the archive, an over-cap repo was **wholly** missing — not truncated, gone. Sixteen
+  of them across all six shards (including three each on the *deleted* shard1/2). The status was
+  "visible, not silent" in the ledger — but nobody was reading that row, so visible-in-principle was
+  invisible-in-practice. The lesson is the sharpest in the document: **a cap you set for safety is a
+  data-loss boundary unless something actively re-examines what it rejected.** "Quarantined" sounded
+  like a decision; it was a hole.
+- **Recovery, and the second cap hiding behind the first.** Raising `CAR_MAX_BYTES` to 8 GiB recovered
+  some and immediately exposed the *next* limit — the 300 s absolute fetch timeout, which killed
+  multi-GB downloads at 0.85–4.43 GB. Only with a 30-minute fetch timeout *and* a 32–34 GiB cap did
+  they come back. The deleted shard1/2 ledgers were pulled from the storagebox (~73 GB), queried,
+  recrawled with `LEDGER_DB_PATH` aimed at the copies, checkpointed and shipped back. Final tally:
+  16 → 12 loaded, 2 empty, 2 still unrecoverable (genuinely malformed CARs) — **23,227,732 posts
+  recovered from 23.65 GiB** of CAR data, including a single 4.06-million-post repo. `f309ce2` raises
+  the default cap to 64 GiB (`0` disables it) and clears the stale timeout `error` text when a repo
+  later resolves `empty`. The recursive shape is its own keeper: *raising one cap reveals the next* —
+  the fetch timeout had been a no-op safety margin until the size cap moved and made it load-bearing.
+- **Alice's standing instinct, vindicated again: audit for the pattern, not just the instance.** She
+  ordered (*"after all this is done"*) a sweep for other baked-in limits and a full quarantine
+  breakdown. The quarantine audit came back **16,948 rows, now entirely malformed/structural CAR
+  errors** (decode-remainder, varint EOF, missing MST node…) with *zero* `CAR_MAX_BYTES` left — i.e.
+  the only size-based loss is closed. The limits audit found the parser scan-buffer cap is fail-loud
+  only (it disables a passive optimization, never drops posts) — no other silent data caps. This is
+  the "fix the cause, not the symptom" rule paying off: the instance was 16 repos; the pattern-hunt
+  proved there wasn't a second class of silent loss hiding behind a different constant.
+- **Verify was attempted three times and never produced a number — the headline that didn't happen.**
+  The zero-loss number this whole document keeps pointing at *still does not exist*. Three canary runs
+  failed in a row: too slow at 1k-DID ClickHouse chunks; then the CH HTTP parameter-length limit at
+  10k; then `max_query_size` with the DID list inlined into SQL. Each produced a real fix —
+  `131d9e8` (a `backfill_verify_progress` table + dashboard card so a multi-hour verify is observable),
+  `bb16852` (configurable chunk size), `82f6bec` (move the DID list into the POST *body* instead of
+  HTTP params) — but no shard completed. At 13:07 Alice called it: *"lets stop i am too confused about
+  things and we need to stop and clarify."* The honest status the agent gave: *"no useful verification
+  result has been produced yet."* The right next step (a temp ClickHouse DID table joined per shard
+  instead of shipping DID lists at all) is identified but unbuilt. So: drained, mostly de-lossed, and
+  still entirely *unverified*.
+- **The dashboard was lying about the finish line, in Alice's actual source of truth.** She pinned it:
+  *"my source of truth is [the public dashboard]… it can only be one of these"* (the page is wrong or
+  your numbers are). It was the page: the overview was scoped to the latest `run_id` — which was now
+  the *over-cap recovery run* that only touched five shards — so shard5 silently dropped out of the
+  hero totals. `820b3a2` aggregates the freshest snapshot *per logical shard* (six), `942f99d` redefines
+  the hero so `loaded` includes `verified` (Alice's model: *"loaded is every repo we fetched that had
+  post rows, verified is how much of that we verified, and at the very end loaded will equal verified"*),
+  and `ee9e600` clarifies per-shard freshness. Browser-verified at 13:29, the corrected public numbers:
+  **95,440,579 of 95,470,241 repos resolved across 6 shards, 30,361,263 parked unreachable,
+  2,593,792,562 posts, 7.8 TiB**. The recurring end-game lesson, restated: when the instrument and the
+  system disagree, the instrument's accounting (which `run_id`, which buckets, which shard speaks) is
+  as likely to be the bug as the system — and in a hand-off-heavy end-game it usually is.
+- **Status at 13:29 UTC — paused at Alice's request, mid-end-game, NOT done.** What's now true: the
+  final sweep completed cleanly; the 1 GiB data-loss hole was found and 12/16 repos (~23.2M posts)
+  recovered; the dashboard tells the truth again at ~2.59B posts / 7.8 TiB / 95.44M of 95.47M resolved.
+  What's still ahead, all of it: a verify pass that actually *runs* (the scaling rework is unbuilt), the
+  `v:1` metadata recrawl, the ledgerless `--revive-host` Bridgy recrawl of shard1/2, baking the
+  verify-timer fix into the pix flake, and the public-site cutover. The drain was the milestone; this
+  morning was the reminder that "drained" and "complete and verified" are separated by exactly the kind
+  of bug — a silent cap, found by accident, on the largest and most data-rich repos in the network —
+  that the rest of the run had taught us to expect and still didn't see coming.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
