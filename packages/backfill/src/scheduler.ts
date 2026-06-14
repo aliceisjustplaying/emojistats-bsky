@@ -1,6 +1,11 @@
 /** Claim/scheduling loop: concurrency limits, the claimable scan and --did mode. */
 
-import { createReadStream } from 'node:fs';
+import {
+  appendFileSync,
+  createReadStream,
+  existsSync,
+  readFileSync,
+} from 'node:fs';
 import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
 
@@ -118,6 +123,32 @@ const CLAIM_LOOP_YIELD_AFTER_MS = 50;
 const CLAIM_SCAN_RETRY_MS = 2_000;
 const CLAIM_RETAINED_DROP_MIN = CLAIM_SCAN_MIN >> 1;
 const CLAIM_RETAINED_DROP_RATIO = CLAIM_SCAN_MULTIPLIER * 4;
+
+function checkpointRunId(): string {
+  return (process.env.BACKFILL_RUN_ID ?? 'dev').replaceAll(
+    /[^A-Za-z0-9_.-]/g,
+    '_',
+  );
+}
+
+export function exactDonePathForInput(inputPath: string): string {
+  return `${inputPath}.done.${checkpointRunId()}`;
+}
+
+function readExactDone(path: string | undefined): Set<string> {
+  if (path === undefined || !existsSync(path)) return new Set();
+  return new Set(
+    readFileSync(path, 'utf8')
+      .split(/\r?\n/)
+      .map((did) => did.trim())
+      .filter((did) => did.length > 0),
+  );
+}
+
+function appendExactDone(path: string | undefined, did: string): void {
+  if (path === undefined) return;
+  appendFileSync(path, `${did}\n`, 'utf8');
+}
 /** Rows per dead-host parking UPDATE; the pause adapts to chunk duration. */
 const DEAD_HOST_PARK_CHUNK = 10_000;
 /** Re-park dead hosts this often: catches enumeration trickle + restart leftovers. */
@@ -279,11 +310,14 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
   // Pacing happens inside the host limiter, before the global slot is taken:
   // queued work for one host cannot pin fleet-wide download capacity, and the
   // scheduler can keep a small ready queue for rate-limited tail hosts.
-  const trackRepo = (repo: RepoRow): void => {
+  const trackRepo = (repo: RepoRow, onDone?: () => void): void => {
     const task = hostLimitFor(repo.pdsHost)(() => {
       return waitForHostPace(repo);
     });
     const tracked: Promise<void> = task
+      .then(() => {
+        onDone?.();
+      })
       .catch((err: unknown) => {
         logger.error(
           {
@@ -423,9 +457,28 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
       flags.didHostFile !== undefined
     ) {
       const maxOutstanding = GLOBAL_CONCURRENCY * 2;
+      const exactDonePath =
+        process.env.EXACT_DID_DONE_FILE ??
+        (flags.didFile !== undefined
+          ? exactDonePathForInput(flags.didFile)
+          : flags.didHostFile !== undefined
+            ? exactDonePathForInput(flags.didHostFile)
+            : undefined);
+      const exactDone = readExactDone(exactDonePath);
+      if (exactDonePath !== undefined)
+        logger.info(
+          { path: exactDonePath, done: exactDone.size },
+          'loaded exact DID resume checkpoint',
+        );
+      let exactInputCount = 0;
       let exactCount = 0;
       for await (const exact of exactRepos(flags)) {
         const { did, pdsHost } = exact;
+        exactInputCount += 1;
+        if (exactDone.has(did)) {
+          stats.skipped += 1;
+          continue;
+        }
         if (control.stopClaiming || stats.claimed >= flags.limit) break;
         while (active.size >= maxOutstanding) await Promise.race(active);
         if (pdsHost !== undefined) ledger.upsertPending(did, pdsHost);
@@ -453,13 +506,21 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
         }
         stats.claimed += 1;
         exactCount += 1;
-        trackRepo(repo);
+        trackRepo(repo, () => {
+          appendExactDone(exactDonePath, did);
+          exactDone.add(did);
+        });
       }
-      if (exactCount === 0) {
+      if (exactInputCount === 0) {
         throw new Error(
           `exact recrawl input contained no DIDs; refusing to fall through to a full claimable crawl`,
         );
       }
+      if (exactCount === 0)
+        logger.info(
+          { skipped: exactDone.size },
+          'all exact recrawl DIDs were already checkpointed',
+        );
     } else {
       // Repos stuck in 'fetching' from a killed run are otherwise unclaimable;
       // requeue them through markRetry(0) so they re-fetch immediately.

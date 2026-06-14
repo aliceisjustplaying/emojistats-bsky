@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import {
+  exactDonePathForInput,
   nextClaimWakeDelay,
   shouldDropRetainedBacklog,
   shouldExcludeHostFromClaimScan,
@@ -23,6 +24,25 @@ void describe('scheduler retained backlog policy', () => {
 
   void it('keeps small retained tails', () => {
     assert.equal(shouldDropRetainedBacklog(12, 20_000, 8_192), false);
+  });
+});
+
+void describe('scheduler exact DID checkpoint path', () => {
+  void it('scopes exact DID checkpoints by sanitized run id', () => {
+    const oldRunId = process.env.BACKFILL_RUN_ID;
+    process.env.BACKFILL_RUN_ID = 'loose/round:1';
+    try {
+      assert.equal(
+        exactDonePathForInput('data/loose.dids'),
+        'data/loose.dids.done.loose_round_1',
+      );
+    } finally {
+      if (oldRunId === undefined) {
+        delete process.env.BACKFILL_RUN_ID;
+      } else {
+        process.env.BACKFILL_RUN_ID = oldRunId;
+      }
+    }
   });
 });
 
