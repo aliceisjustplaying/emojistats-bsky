@@ -31,6 +31,7 @@ import {
   getBackfillHistogram,
   getBackfillHosts,
   getBackfillIssues,
+  getBackfillLooseRecrawlStatus,
   getBackfillOverview,
   getBackfillRecrawlStatus,
   getBackfillStatusReasons,
@@ -39,6 +40,7 @@ import {
 } from '#/server/backfill';
 import type {
   BackfillOverview,
+  BackfillLooseRecrawlStatus,
   BackfillRecrawlStatus,
   BackfillRepoStatus,
   BackfillStatusReasons,
@@ -73,6 +75,12 @@ const recrawlQueryOptions = queryOptions({
   queryKey: ['backfill-recrawl'],
   queryFn: () => getBackfillRecrawlStatus(),
   refetchInterval: 15_000,
+});
+
+const looseRecrawlQueryOptions = queryOptions({
+  queryKey: ['backfill-loose-recrawl'],
+  queryFn: () => getBackfillLooseRecrawlStatus(),
+  refetchInterval: 10_000,
 });
 
 const verifyQueryOptions = queryOptions({
@@ -110,6 +118,7 @@ export const Route = createFileRoute('/backfill')({
       context.queryClient.ensureQueryData(histogramQueryOptions),
       context.queryClient.ensureQueryData(hostsQueryOptions),
       context.queryClient.ensureQueryData(recrawlQueryOptions),
+      context.queryClient.ensureQueryData(looseRecrawlQueryOptions),
       context.queryClient.ensureQueryData(verifyQueryOptions),
       context.queryClient.ensureQueryData(issuesQueryOptions),
       context.queryClient.ensureQueryData(funQueryOptions),
@@ -220,6 +229,7 @@ function BackfillPage() {
   const { data: histogram } = useSuspenseQuery(histogramQueryOptions);
   const { data: hosts } = useSuspenseQuery(hostsQueryOptions);
   const { data: recrawl } = useSuspenseQuery(recrawlQueryOptions);
+  const { data: looseRecrawl } = useSuspenseQuery(looseRecrawlQueryOptions);
   const { data: verify } = useSuspenseQuery(verifyQueryOptions);
   const { data: issues } = useSuspenseQuery(issuesQueryOptions);
   const { data: fun } = useSuspenseQuery(funQueryOptions);
@@ -253,8 +263,9 @@ function BackfillPage() {
       </header>
 
       <Hero overview={overview} />
-      <div className="grid gap-4 lg:grid-cols-2">
+      <div className="grid gap-4 lg:grid-cols-3">
         <VerificationStatus status={verify} />
+        <LooseRecrawlStatus status={looseRecrawl} />
         <RecrawlStatus status={recrawl} overview={overview} />
       </div>
 
@@ -906,6 +917,72 @@ function RecrawlStatus({
               : `updated ${formatDuration(status.freshnessSeconds)} ago`}
           </p>
         )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function LooseRecrawlStatus({
+  status,
+}: {
+  status: BackfillLooseRecrawlStatus;
+}) {
+  const prepared = status.runId === null;
+  const pct =
+    status.targetRepos > 0 ? (status.loaded / status.targetRepos) * 100 : 0;
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <CardTitle className="text-sm">loose recrawl</CardTitle>
+            <CardDescription>
+              {prepared
+                ? 'waiting for loose DID files'
+                : `${status.runId} · ${status.active ? 'active' : 'idle'}`}
+            </CardDescription>
+          </div>
+          <Badge variant={status.active ? 'outline' : 'secondary'}>
+            {prepared ? 'ready' : status.active ? 'running' : 'seen'}
+          </Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="space-y-1.5">
+          <div className="h-2.5 w-full overflow-hidden rounded-full bg-secondary">
+            <div
+              className="h-full rounded-full bg-primary transition-[width] duration-700"
+              style={{ width: `${Math.min(100, pct)}%` }}
+            />
+          </div>
+          <p className="text-right text-xs text-muted-foreground tabular-nums">
+            {prepared
+              ? 'not started'
+              : `${integer.format(status.loaded)} / ${integer.format(status.targetRepos)} loaded from loose files · ${pct.toFixed(1)}%`}
+          </p>
+        </div>
+        <div className="grid grid-cols-2 gap-3 text-sm">
+          <RecrawlMetric
+            label="active shards"
+            value={`${integer.format(status.activeShards)} / ${integer.format(status.shards)}`}
+          />
+          <RecrawlMetric
+            label="in flight"
+            value={integer.format(status.inFlight)}
+          />
+          <RecrawlMetric
+            label="rows/sec"
+            value={integer.format(Math.round(status.rowsPerSec))}
+          />
+          <RecrawlMetric label="eta" value={formatEta(status.etaHours)} />
+        </div>
+        {status.runId !== null ? (
+          <p className="text-xs text-muted-foreground tabular-nums">
+            {status.freshnessSeconds === null
+              ? 'no telemetry age'
+              : `updated ${formatDuration(status.freshnessSeconds)} ago`}
+          </p>
+        ) : null}
       </CardContent>
     </Card>
   );

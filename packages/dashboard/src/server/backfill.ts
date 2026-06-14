@@ -27,6 +27,8 @@ const TERMINAL_EVENTS = ['loaded', 'empty', ...ISSUE_EVENTS] as const;
 const V1_RECRAWL_TARGET_REPOS = 3_208_370;
 const V1_RECRAWL_TARGET_POSTS = 478_676_984;
 const V1_RECRAWL_RUN_PREFIX = 'v1-recrawl';
+const LOOSE_RECRAWL_RUN_PREFIX = 'fail-loose-recrawl-';
+const LOOSE_VERIFY_RUN_PREFIX = 'loose-round-';
 const LEGACY_BACKFILL_EVENT_RUNS = [
   'whale-2026',
   'whale-2026-overcap',
@@ -518,6 +520,20 @@ export interface BackfillRecrawlStatus {
   etaHours: number | null;
 }
 
+export interface BackfillLooseRecrawlStatus {
+  generatedAt: string;
+  targetRepos: number;
+  runId: string | null;
+  active: boolean;
+  shards: number;
+  activeShards: number;
+  freshnessSeconds: number | null;
+  loaded: number;
+  inFlight: number;
+  rowsPerSec: number;
+  etaHours: number | null;
+}
+
 export interface BackfillVerifyStatus {
   generatedAt: string;
   /** Newest run represented in the per-shard rollup. */
@@ -977,6 +993,142 @@ export const getBackfillRecrawlStatus = createServerFn().handler(
       remainingRepos: Math.max(0, totalEnumerated - processed),
       reposPerMin,
       etaHours: reposPerMin > 0 ? remaining / reposPerMin / 60 : null,
+    };
+  },
+);
+
+export const getBackfillLooseRecrawlStatus = createServerFn().handler(
+  async (): Promise<BackfillLooseRecrawlStatus> => {
+    const [runRows, looseRunRows] = await Promise.all([
+      chQuery<{ run_id: string }>(
+        `
+        SELECT run_id
+        FROM backfill_progress
+        WHERE startsWith(run_id, {prefix:String})
+        ORDER BY ts DESC
+        LIMIT 1
+      `,
+        { prefix: LOOSE_RECRAWL_RUN_PREFIX },
+      ),
+      chQuery<{ run_id: string }>(
+        `
+        SELECT run_id
+        FROM backfill_verify_progress
+        WHERE startsWith(run_id, {prefix:String})
+        ORDER BY ts DESC
+        LIMIT 1
+      `,
+        { prefix: LOOSE_VERIFY_RUN_PREFIX },
+      ),
+    ]);
+    const runId = runRows[0]?.run_id;
+    const looseRunId = looseRunRows[0]?.run_id;
+
+    const targetRows =
+      looseRunId === undefined
+        ? []
+        : await chQuery<{ target_repos: string }>(
+            `
+            SELECT sum(loose_emitted) AS target_repos
+            FROM
+            (
+              SELECT
+                shard,
+                argMax(loose_emitted, progress_order) AS loose_emitted
+              FROM
+              (
+                SELECT *, (ts, done, error != '', repos_checked) AS progress_order
+                FROM backfill_verify_progress
+                WHERE run_id = {run:String}
+                  AND match(shard, '^shard[0-9]+$')
+                  AND repos_total > 0
+              )
+              GROUP BY shard
+            )
+          `,
+            { run: looseRunId },
+          );
+    const targetRepos = num(targetRows[0]?.target_repos);
+
+    if (runId === undefined) {
+      return {
+        generatedAt: new Date().toISOString(),
+        targetRepos,
+        runId: null,
+        active: false,
+        shards: 0,
+        activeShards: 0,
+        freshnessSeconds: null,
+        loaded: 0,
+        inFlight: 0,
+        rowsPerSec: 0,
+        etaHours: null,
+      };
+    }
+
+    const snapshot = await chQuery<{
+      shard: string;
+      latest_ts: string;
+      loaded: string;
+      in_flight: string;
+      rows_per_sec: string;
+    }>(
+      `
+      SELECT
+        shard,
+        max(ts) AS latest_ts,
+        argMax(loaded, ts) AS loaded,
+        argMax(in_flight, ts) AS in_flight,
+        argMax(rows_per_sec, ts) AS rows_per_sec
+      FROM backfill_progress
+      WHERE run_id = {run:String}
+      GROUP BY shard
+      ORDER BY shard
+    `,
+      { run: runId },
+    );
+
+    let newestTs = 0;
+    let activeShards = 0;
+    let loaded = 0;
+    let inFlight = 0;
+    let rowsPerSec = 0;
+    for (const row of snapshot) {
+      const rowTs = chTsToDate(row.latest_ts).getTime();
+      newestTs = Math.max(newestTs, rowTs);
+      if (
+        Math.max(0, Math.round((Date.now() - rowTs) / 1000)) <
+        IDLE_AFTER_SECONDS
+      )
+        activeShards += 1;
+      loaded += num(row.loaded);
+      inFlight += num(row.in_flight);
+      rowsPerSec += num(row.rows_per_sec);
+    }
+    const freshnessSeconds =
+      newestTs > 0
+        ? Math.max(0, Math.round((Date.now() - newestTs) / 1000))
+        : null;
+    const active =
+      freshnessSeconds !== null &&
+      freshnessSeconds < IDLE_AFTER_SECONDS &&
+      (activeShards > 0 || inFlight > 0);
+    const remainingRepos = Math.max(0, targetRepos - loaded);
+    return {
+      generatedAt: new Date().toISOString(),
+      targetRepos,
+      runId,
+      active,
+      shards: snapshot.length,
+      activeShards,
+      freshnessSeconds,
+      loaded,
+      inFlight,
+      rowsPerSec,
+      etaHours:
+        rowsPerSec > 0 && targetRepos > 0
+          ? remainingRepos / rowsPerSec / 3600
+          : null,
     };
   },
 );
