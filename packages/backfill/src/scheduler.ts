@@ -116,10 +116,24 @@ const CLAIM_LOOP_YIELD_CHECK_EVERY = 1_000;
 const CLAIM_LOOP_YIELD_AFTER_MS = 50;
 /** Hard floor between ledger scans — each one is synchronous main-thread work. */
 const CLAIM_SCAN_RETRY_MS = 2_000;
+const CLAIM_RETAINED_DROP_MIN = CLAIM_SCAN_MIN >> 1;
+const CLAIM_RETAINED_DROP_RATIO = CLAIM_SCAN_MULTIPLIER * 4;
 /** Rows per dead-host parking UPDATE; the pause adapts to chunk duration. */
 const DEAD_HOST_PARK_CHUNK = 10_000;
 /** Re-park dead hosts this often: catches enumeration trickle + restart leftovers. */
 const DEAD_HOST_SWEEP_MS = 300_000;
+
+export function shouldDropRetainedBacklog(
+  scheduled: number,
+  retained: number,
+  capacity: number,
+): boolean {
+  return (
+    retained >= CLAIM_RETAINED_DROP_MIN &&
+    scheduled < Math.min(CLAIM_REFILL_MIN, capacity) &&
+    retained > Math.max(1, scheduled) * CLAIM_RETAINED_DROP_RATIO
+  );
+}
 
 const yieldToTimers = async (): Promise<void> => {
   await new Promise<void>((resolve) => {
@@ -561,13 +575,31 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
           },
           'claim pass',
         );
-        claimBacklog = retained.concat(claimBacklog.slice(read));
+        const nextBacklog = retained.concat(claimBacklog.slice(read));
         // A backlog that is ONLY busy/cooling rows is dropped: the next
         // (time-floored) scan re-derives it with fresh host exclusions
         // instead of this loop re-walking the same parked rows on every
         // completion wake-up.
-        if (scheduled === 0 && retained.length === claimBacklog.length)
+        if (
+          (scheduled === 0 && retained.length === nextBacklog.length) ||
+          shouldDropRetainedBacklog(
+            scheduled,
+            nextBacklog.length,
+            claimCapacity,
+          )
+        ) {
+          logger.debug(
+            {
+              scheduled,
+              retained: nextBacklog.length,
+              capacity: claimCapacity,
+            },
+            'dropping retained claim backlog for fresh scan',
+          );
           claimBacklog = [];
+        } else {
+          claimBacklog = nextBacklog;
+        }
         if (scheduled < claimCapacity) {
           const wake = hostPressure.nextWake();
           if (active.size > 0) {
