@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { shouldDropRetainedBacklog } from './scheduler.js';
+import { nextClaimWakeDelay, shouldDropRetainedBacklog } from './scheduler.js';
 
 void describe('scheduler retained backlog policy', () => {
   void it('drops a huge retained tail when only a tiny batch was scheduled', () => {
@@ -14,5 +14,19 @@ void describe('scheduler retained backlog policy', () => {
 
   void it('keeps small retained tails', () => {
     assert.equal(shouldDropRetainedBacklog(12, 20_000, 8_192), false);
+  });
+});
+
+void describe('scheduler claim wake delay', () => {
+  void it('uses the idle delay when no host wake is known', () => {
+    assert.equal(nextClaimWakeDelay(undefined, 1_000), 1_000);
+  });
+
+  void it('clamps near wakes to the scheduler floor', () => {
+    assert.equal(nextClaimWakeDelay(1_010, 1_000), 250);
+  });
+
+  void it('clamps distant wakes to the scheduler ceiling', () => {
+    assert.equal(nextClaimWakeDelay(20_000, 1_000), 5_000);
   });
 });

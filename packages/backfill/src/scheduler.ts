@@ -135,6 +135,15 @@ export function shouldDropRetainedBacklog(
   );
 }
 
+export function nextClaimWakeDelay(
+  wake: number | undefined,
+  now: number = Date.now(),
+): number {
+  return wake === undefined
+    ? 1_000
+    : Math.min(Math.max(wake - now, 250), 5_000);
+}
+
 const yieldToTimers = async (): Promise<void> => {
   await new Promise<void>((resolve) => {
     setImmediate(resolve);
@@ -603,14 +612,17 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
         if (scheduled < claimCapacity) {
           const wake = hostPressure.nextWake();
           if (active.size > 0) {
-            await Promise.race(active);
+            if (wake === undefined) {
+              await Promise.race(active);
+            } else {
+              await Promise.race([
+                Promise.race(active),
+                sleep(nextClaimWakeDelay(wake)),
+              ]);
+            }
             continue;
           }
-          await sleep(
-            wake === undefined
-              ? 1_000
-              : Math.min(Math.max(wake - Date.now(), 250), 5_000),
-          );
+          await sleep(nextClaimWakeDelay(wake));
         }
       }
     }
