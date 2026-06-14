@@ -912,8 +912,9 @@ function VerificationStatus({ status }: { status: BackfillVerifyStatus }) {
   const failed = status.failedShards > 0;
   const hasMismatches = status.mismatches > 0;
   const needsAttention = failed || hasMismatches;
+  const classified = status.exact + status.loose + status.mismatches;
   const pct =
-    status.reposTotal > 0 ? (status.reposChecked / status.reposTotal) * 100 : 0;
+    status.reposTotal > 0 ? (classified / status.reposTotal) * 100 : 0;
   const runLabel =
     status.runIds.length > 1
       ? `${integer.format(status.runIds.length)} shard runs`
@@ -964,7 +965,7 @@ function VerificationStatus({ status }: { status: BackfillVerifyStatus }) {
           <p className="text-right text-xs text-muted-foreground tabular-nums">
             {prepared
               ? 'not started'
-              : `${integer.format(status.reposChecked)} / ${integer.format(status.reposTotal)} repos across latest reporting shard runs · ${pct.toFixed(1)}%`}
+              : `${integer.format(classified)} / ${integer.format(status.reposTotal)} repos classified across latest reporting shard runs · ${pct.toFixed(1)}%`}
           </p>
         </div>
         <div className="grid grid-cols-3 gap-3 text-sm">
