@@ -1683,6 +1683,55 @@ scan *under memory pressure* — which the loose convergence forces — where th
   the 631k loose + 8 fail remain exactly as open as they were — just now with a verifier that won't lie
   about it even when ClickHouse falls over mid-scan.
 
+### 2026-06-14 evening (18:38–19:10 UTC) — header overflow, a halted verifier and a full safety refactor
+
+The throttled shard0 reconciliation survived the OOM cap but hit a third failure mode: after ~674s
+and 87 GiB read, ClickHouse's HTTP progress headers overflowed and the client reset the connection —
+`Parse Error: Header overflow`, no result rows written (pix2 session rollout-2026-06-13T21-12-24,
+~line 14400). That makes three distinct ways the loose-convergence pass has failed to produce a
+number: the original OOM, the zero-classification false pass, and now a protocol-level overflow from
+long-running HTTP queries. Each one surfaced a different assumption about how ClickHouse communicates
+failure.
+
+Alice halted all production verifier runs: *"Have Claude review this script… I do not want to lose
+more money on this."* A Claude code-review agent on pix2 audited `verify.ts` and returned **do not
+start another production verifier run yet** — the first time a review agent has hard-blocked an ops
+action in this project. The agent then implemented a substantial safety refactor:
+
+- **`wait_end_of_query`** on all verifier ClickHouse commands — surfaces errors as query errors
+  instead of the zero-row "succeeded with nothing" artifact that fooled promotion before
+- **Removed `FINAL`** from reconciliation and orphan-example queries — `FINAL` forces an in-memory
+  merge of the full `ReplacingMergeTree`, which is precisely what pushed the 12 GiB cap
+- **`--loaded-only` mode** with a hard guard: can only run under a non-canonical shard label (e.g.
+  `fail-shard0`), so cheap recrawl-verification cannot accidentally overwrite the dashboard's
+  full-shard totals
+- **Narrowed promotion policy:** exact-match loaded repos promote immediately; loose loaded repos
+  promote *only* after an exhaustive sample passes — a failed loose sample no longer leaves the
+  ledger marked verified
+- **Missing `VERIFY_RUN_ID` warning:** default per-process run IDs are unsafe for fleet
+  coordination; the verifier now logs it
+
+Typecheck and 51 tests pass. The diff was sent to a second Claude review round; that review was still
+running when the session ended (~19:08 UTC). **No commits have been pushed** — the entire refactor is
+local on pix2, gated behind the second review.
+
+- **Status, held to the line:** loose convergence still has not produced numbers. The 631k loose and
+  8 hard mismatches remain exactly as open as the previous entry. The refactored verifier is closer
+  to something that can survive its own queries, but it has not run yet.
+
+### 2026-06-14 ~19:08 UTC — a second backfill run
+
+Alice started a fresh Codex session (rollout-2026-06-14T19-08-16) with a "thermo-nuclear code
+quality review" of the entire repo, especially the backfill path. The stated reason: *"now that I've
+learned a lot from the first backfill I intend to run it the second time and see how much it
+improves."* The retro's "If I did this again" section — the progress-gated watchdog, header-driven
+pacing, no-silent-caps, write-time verify — is about to be tested against a real re-run.
+
+The review agent (102 lines in at time of writing) is flagging structural risk in `verify.ts`
+(1,439 lines), duplicated invariants in comments instead of types, and dashboard label
+normalization. The first backfill is not done (verify still open, cutover still ahead), but the
+planning for a second run is now concurrent with closing out the first.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
