@@ -111,11 +111,15 @@ All times UTC (the launch log uses local time, two hours ahead).
   dead weight at VPS scale, microcosm's Hubble is weeks away and pre-launch. Plan
   0001: custom lean crawler, ClickHouse as the single store, raw `posts` as the only
   truth.
-- **~17:00–21:00** — build. Contracts pinned, then parallel agents build ingest,
-  archive sink, crawler, dashboard, rebuild job. Live slice verified against the
-  firehose with kill-and-restart tests. Cost pushback drives the storage split (full
-  text → zstd parquet on a Storage Box; ClickHouse keeps text for emoji posts only).
-  Dry run: 2,990 of the network's oldest repos, 100% reconciled.
+- **~17:00–21:00** — build. First, toolchain groundwork: oxlint + oxfmt adopted
+  repo-wide, Node 24 pinned, TypeScript 7 preview (tsgo) chosen for typechecking
+  (`b4f642d`, `323db86`, `2ae6601`) — a bet on an unreleased compiler for a production
+  system, traded for significantly faster typechecks across the monorepo. Then contracts
+  pinned, and parallel agents build ingest, archive sink, crawler, dashboard, rebuild
+  job. Live slice verified against the firehose with kill-and-restart tests. Cost
+  pushback drives the storage split (full text → zstd parquet on a Storage Box;
+  ClickHouse keeps text for emoji posts only). Dry run: 2,990 of the network's oldest
+  repos, 100% reconciled.
 - **~21:00–23:00** — the review gauntlet. Five Codex review sessions (three
   "thermo-nuclear" quality, two correctness) interleaved with Claude's fix waves, plus
   Claude's own round numbering to five. Roughly 30 distinct findings, near-all real.
@@ -143,10 +147,13 @@ All times UTC (the launch log uses local time, two hours ahead).
   slots (#10), the telemetry tick (#11), the park-vs-enumeration race (#12). AIMD
   per-host pressure replaces static caps; a dead-host registry parks the ~40% of PLC
   that is junk; the microcosm field trip yields `listrepos-diff` (classify spam DIDs
-  with zero getRepo calls). Deploys move from rsync to git-hash-verified. The midday
-  stable checkpoint (13:40, before the evening fix wave) read ~10.1k repos/min / ETA
-  ~3.82 days at ~€0.54/h burn; by 17:15, mid-ramp after the wave, ~35k repos/min and
-  ~26h.
+  with zero getRepo calls). Deploys move from rsync to git-hash-verified. The Jetstream
+  45s silence watchdog (`2fd3233`) lands in the same batch — the half-open socket
+  failure that killed the ingest twice on day 1 gets a structural guard rather than
+  another manual restart. Every outstanding lint error goes to zero (`053970b`, 38 → 0)
+  as a quality gate before the overnight autonomous run. The midday stable checkpoint
+  (13:40, before the evening fix wave) read ~10.1k repos/min / ETA ~3.82 days at
+  ~€0.54/h burn; by 17:15, mid-ramp after the wave, ~35k repos/min and ~26h.
 - **Open:** crawl completion, final sweep, verify pass, cutover, box teardown.
 
 ## What went well (and why it went well)
