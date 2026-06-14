@@ -16,6 +16,7 @@ import {
   CRAWL_SHARDS,
   LEDGER_DB_PATH,
   TEXT_IN_CLICKHOUSE,
+  assertBackfillRunIdConfigured,
 } from './config.js';
 import { createHostHealth } from './host-health.js';
 import { createHostPressure } from './host-pressure.js';
@@ -39,6 +40,7 @@ import { createScheduler, parseFlags } from './scheduler.js';
 import type { Ledger, RepoLoader } from './types.js';
 
 async function main(): Promise<void> {
+  assertBackfillRunIdConfigured();
   const flags = parseFlags();
   // Resolved exactly once, fail-fast; every behavior read goes through the
   // policy object (archive/policy), never the raw config values.

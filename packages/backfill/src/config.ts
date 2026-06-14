@@ -135,6 +135,14 @@ export const TELEMETRY_EVENT_BATCH_ROWS = num(
   1_000,
 );
 export const BACKFILL_RUN_ID = process.env.BACKFILL_RUN_ID ?? 'dev';
+export function assertBackfillRunIdConfigured(): void {
+  if (process.env.BACKFILL_RUN_ID !== undefined && BACKFILL_RUN_ID !== '') {
+    return;
+  }
+  throw new Error(
+    'BACKFILL_RUN_ID is required for crawl telemetry; set a run-specific id before running `bun run crawl`',
+  );
+}
 export const CRAWL_SHARDS = num('CRAWL_SHARDS', 1);
 export const CRAWL_SHARD_INDEX = num('CRAWL_SHARD_INDEX', 0);
 export const SHARD_LABEL =

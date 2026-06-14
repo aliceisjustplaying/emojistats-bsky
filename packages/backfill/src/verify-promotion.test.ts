@@ -4,8 +4,11 @@ import { describe, it } from 'node:test';
 import Database from 'better-sqlite3';
 
 import {
+  createLoadedPromotionStage,
+  type LoadedPromotionStage,
   promoteLoadedReposByDid,
   promotionResultListSql,
+  stageLoadedReposForPromotion,
 } from './verify-promotion.js';
 
 void describe('verifier promotion policy', () => {
@@ -21,21 +24,20 @@ void describe('verifier promotion policy', () => {
         did TEXT PRIMARY KEY,
         status TEXT NOT NULL
       );
-      CREATE TEMP TABLE verify_staged_loaded (
-        did TEXT PRIMARY KEY
-      ) WITHOUT ROWID;
       INSERT INTO repos (did, status) VALUES
         ('did:plc:exact', 'loaded'),
         ('did:plc:mismatch', 'loaded'),
         ('did:plc:unstaged', 'loaded'),
         ('did:plc:already', 'verified');
-      INSERT INTO verify_staged_loaded (did) VALUES
-        ('did:plc:exact'),
-        ('did:plc:mismatch'),
-        ('did:plc:already');
     `);
+    const stage = createLoadedPromotionStage(db);
+    stageLoadedReposForPromotion(db, stage, [
+      'did:plc:exact',
+      'did:plc:mismatch',
+      'did:plc:already',
+    ]);
 
-    const promoted = promoteLoadedReposByDid(db, ['did:plc:exact']);
+    const promoted = promoteLoadedReposByDid(db, ['did:plc:exact'], stage);
     const rows = db
       .prepare('SELECT did, status FROM repos ORDER BY did')
       .all() as Array<{ did: string; status: string }>;
@@ -47,6 +49,25 @@ void describe('verifier promotion policy', () => {
       { did: 'did:plc:mismatch', status: 'loaded' },
       { did: 'did:plc:unstaged', status: 'loaded' },
     ]);
+    db.close();
+  });
+
+  void it('requires an explicit valid staging table boundary', () => {
+    const db = new Database(':memory:');
+    db.exec(`
+      CREATE TABLE repos (
+        did TEXT PRIMARY KEY,
+        status TEXT NOT NULL
+      );
+    `);
+    const stage: LoadedPromotionStage = {
+      stagedLoadedTable: 'verify_staged_loaded; DROP TABLE repos',
+    };
+
+    assert.throws(
+      () => promoteLoadedReposByDid(db, [], stage),
+      /Unsafe sqlite identifier/,
+    );
     db.close();
   });
 });

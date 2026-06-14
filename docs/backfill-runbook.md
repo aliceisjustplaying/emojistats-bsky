@@ -146,8 +146,9 @@ Settings that were tried and should not be repeated without a new hypothesis:
 - Multi-box is a per-box-ledger model, stated honestly: the ledger does not
   replicate or merge on its own. Run the full enumeration once, copy the
   finished `ledger.sqlite` to every box, and give each box a complementary,
-  non-overlapping set of shard indices — e.g. two boxes with `CRAWL_SHARDS=8`:
-  one runs shard indices 0–3, the other 4–7, four processes each.
+  non-overlapping set of shard indices. The current persisted bucket modulus is
+  6, so use `CRAWL_SHARDS=6` unless the ledger buckets have been rebuilt — e.g.
+  two boxes: one runs shard indices 0–2, the other 3–5.
 - Each box's ledger then records progress only for its own shards; rows
   belonging to the other box's shards sit in `pending` forever in the local
   file. That is expected, not a bug — but it means the final accounting must

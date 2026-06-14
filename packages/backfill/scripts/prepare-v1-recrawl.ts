@@ -1,4 +1,5 @@
-import { createWriteStream } from 'node:fs';
+import { once } from 'node:events';
+import { createWriteStream, type WriteStream } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
@@ -77,6 +78,11 @@ const stats: PartStats[] = Array.from({ length: parts }, (_unused, i) => ({
 const streams = stats.map((part) => createWriteStream(part.file));
 const hostStreams = stats.map((part) => createWriteStream(part.hostFile));
 
+async function writeLine(stream: WriteStream, line: string): Promise<void> {
+  if (stream.write(line)) return;
+  await once(stream, 'drain');
+}
+
 function nextPart(): number {
   let best = 0;
   for (let i = 1; i < stats.length; i += 1) {
@@ -102,8 +108,8 @@ const rows = db
 
 for (const row of rows) {
   const part = nextPart();
-  streams[part].write(`${row.did}\n`);
-  hostStreams[part].write(`${row.did}\t${row.pdsHost}\n`);
+  await writeLine(streams[part], `${row.did}\n`);
+  await writeLine(hostStreams[part], `${row.did}\t${row.pdsHost}\n`);
   stats[part].repos += 1;
   stats[part].posts += row.posts;
 }

@@ -71,8 +71,11 @@ import logger from './logger.js';
 import { parseRepoCar } from './parser.js';
 import type { RepoStatus } from './types.js';
 import {
+  createLoadedPromotionStage,
+  type LoadedPromotionStage,
   promoteLoadedReposByDid,
   promotionResultListSql,
+  stageLoadedReposForPromotion,
 } from './verify-promotion.js';
 import { VerifyTelemetry, type VerifyProgress } from './verify-telemetry.js';
 
@@ -113,6 +116,7 @@ interface Mismatch {
 interface ReconcileResult {
   exact: number;
   loose: number;
+  promotionStage: LoadedPromotionStage;
   // The LOOSE class itself (CH count >= ledger, divergent digest, expected > 0):
   // the only repos a digest reconciliation cannot prove, and therefore the only
   // ones a re-fetch needs to visit. Carried out so --sample-loose / --emit-loose
@@ -142,6 +146,11 @@ interface ReconcileOptions {
   includeOrphans: boolean;
   loadedOnly: boolean;
   promoteLoose: boolean;
+}
+
+interface StageExpectedReposResult {
+  reposTotal: number;
+  promotionStage: LoadedPromotionStage;
 }
 
 function positiveIntEnv(name: string, fallback: number): number {
@@ -282,7 +291,7 @@ async function stageExpectedRepos(
   ch: ClickHouseClient,
   telemetry: VerifyTelemetry,
   loadedOnly: boolean,
-): Promise<number> {
+): Promise<StageExpectedReposResult> {
   await ensureExpectedTable(ch);
   await resetExpectedRows(ch);
   const statusWhere = loadedOnly
@@ -317,12 +326,7 @@ async function stageExpectedRepos(
     `SELECT did, status, posts_total, pds_host, rev, rkey_digest
      FROM repos WHERE ${statusWhere}`,
   );
-  db.exec(`
-    DROP TABLE IF EXISTS verify_staged_loaded;
-    CREATE TEMP TABLE verify_staged_loaded (
-      did TEXT PRIMARY KEY
-    ) WITHOUT ROWID
-  `);
+  const promotionStage = createLoadedPromotionStage(db);
   const stagedLoadedDids: string[] = [];
   let staged = 0;
   let batch: VerifyExpectedInsertRow[] = [];
@@ -368,13 +372,7 @@ async function stageExpectedRepos(
   }
   await flush();
 
-  const insertStagedLoaded = db.prepare(
-    'INSERT INTO verify_staged_loaded (did) VALUES (?)',
-  );
-  const flushStagedLoaded = db.transaction((dids: string[]) => {
-    for (const did of dids) insertStagedLoaded.run(did);
-  });
-  flushStagedLoaded(stagedLoadedDids);
+  stageLoadedReposForPromotion(db, promotionStage, stagedLoadedDids);
 
   await telemetry.record(
     {
@@ -391,7 +389,7 @@ async function stageExpectedRepos(
     },
     true,
   );
-  return staged;
+  return { reposTotal: staged, promotionStage };
 }
 
 function classifiedSql(selectSql: string): string {
@@ -738,7 +736,7 @@ async function reconcile(
   telemetry: VerifyTelemetry,
   options: ReconcileOptions,
 ): Promise<ReconcileResult> {
-  const reposTotal = await stageExpectedRepos(
+  const { reposTotal, promotionStage } = await stageExpectedRepos(
     db,
     ch,
     telemetry,
@@ -814,7 +812,7 @@ async function reconcile(
     ch,
     options.promoteLoose,
   );
-  const promoted = promoteLoadedReposByDid(db, promotableDids);
+  const promoted = promoteLoadedReposByDid(db, promotableDids, promotionStage);
 
   const orphans = options.includeOrphans
     ? await orphanExamples(ch)
@@ -854,6 +852,7 @@ async function reconcile(
     looseEmitted,
     mismatchCount: counts.mismatchCount,
     mismatches,
+    promotionStage,
   };
 }
 
@@ -1172,18 +1171,25 @@ async function main(): Promise<void> {
 
     let exact = 0;
     let loose = 0;
+    let promotionStage: LoadedPromotionStage | null = null;
     let looseRepos: LedgerRepo[] = [];
     let mismatchCount = 0;
     if (!noReconcile) {
       let looseEmitted = 0;
-      ({ exact, loose, looseRepos, looseEmitted, mismatchCount } =
-        await reconcile(db, ch, telemetry, {
-          emitLoosePath: emitLoose,
-          collectLooseRepos: sampleLooseSize !== null,
-          includeOrphans: values.orphans ?? false,
-          loadedOnly,
-          promoteLoose: false,
-        }));
+      ({
+        exact,
+        loose,
+        promotionStage,
+        looseRepos,
+        looseEmitted,
+        mismatchCount,
+      } = await reconcile(db, ch, telemetry, {
+        emitLoosePath: emitLoose,
+        collectLooseRepos: sampleLooseSize !== null,
+        includeOrphans: values.orphans ?? false,
+        loadedOnly,
+        promoteLoose: false,
+      }));
       latestProgress = {
         phase: 'reconciled',
         reposTotal: exact + loose + mismatchCount,
@@ -1251,9 +1257,13 @@ async function main(): Promise<void> {
         },
         true,
       );
+      if (promotionStage === null) {
+        throw new Error('cannot promote LOOSE repos without reconciliation');
+      }
       const promoted = promoteLoadedReposByDid(
         db,
         await collectPromotableLoadedDids(ch, true),
+        promotionStage,
       );
       logger.info(
         { promotedToVerified: promoted },
