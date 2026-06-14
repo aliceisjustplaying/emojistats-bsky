@@ -54,6 +54,7 @@ export function createRepoPipeline(
   // ClickHouse being down fails every repo post-download; trip after a few in a
   // row so we stop burning bandwidth and drain (repos re-fetch on the next run).
   const LOADER_TRIP_THRESHOLD = 5;
+  const MAX_IMMEDIATE_HOST_REFRESH_RETRIES = 1;
   let consecutiveLoaderFailures = 0;
   // Archive doctrine: full text lives ONLY in the parquet archive, so a single
   // failed append trips the whole run (unlike telemetry, which is lossy).
@@ -106,7 +107,10 @@ export function createRepoPipeline(
     );
   };
 
-  return async function processRepo(repo: RepoRow): Promise<void> {
+  async function processRepoAttempt(
+    repo: RepoRow,
+    immediateRetryCount: number,
+  ): Promise<void> {
     const startedAt = Date.now();
     const preserveExisting = repo.preserveExisting === true;
     try {
@@ -278,14 +282,24 @@ export function createRepoPipeline(
         );
       }
     } catch (err) {
-      // Parse failures (quarantine included) surface before any row is
-      // appended anywhere — the worker materializes the full repo first. Rows
-      // can still partially land if archive/loader I/O fails mid-loop; those
-      // park as retryable and the re-fetch collapses into ReplacingMergeTree
-      // + the dedup tokens like any other at-least-once replay.
+      // Row batches can already be in the archive/loader when a later batch or
+      // final parse result fails. Those repos park as retryable, and the re-fetch
+      // collapses into ReplacingMergeTree + dedup tokens like any other
+      // at-least-once replay.
       if ((await retry.handleRepoError(repo, err)) === 'retry-now') {
-        await processRepo(repo);
+        if (immediateRetryCount >= MAX_IMMEDIATE_HOST_REFRESH_RETRIES) {
+          logger.warn(
+            { did: repo.did, pdsHost: repo.pdsHost },
+            'immediate host-refresh retry limit reached',
+          );
+          return;
+        }
+        await processRepoAttempt(repo, immediateRetryCount + 1);
       }
     }
+  }
+
+  return async function processRepo(repo: RepoRow): Promise<void> {
+    await processRepoAttempt(repo, 0);
   };
 }

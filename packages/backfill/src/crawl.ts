@@ -64,6 +64,8 @@ async function main(): Promise<void> {
     // retry path rebuilds the client on connection-level failures.
     recreateClient: () => createClickHouseClient(),
   });
+  const { telemetry } = createTelemetry();
+  await telemetry.assertEventColumns();
 
   const archiveSink = await openArchiveSink(policy);
 
@@ -127,7 +129,6 @@ async function main(): Promise<void> {
   const stats = createCrawlStats();
   const control: CrawlControl = { stopClaiming: false };
 
-  const { telemetry } = createTelemetry();
   const hostPressure = createHostPressure();
   const hostHealth = createHostHealth();
   const retry = createRetryPolicy({

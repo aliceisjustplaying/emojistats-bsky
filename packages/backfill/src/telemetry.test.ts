@@ -135,6 +135,64 @@ void describe('crawl telemetry', () => {
     assert.ok(progressTables.every((table) => table === 'backfill_progress'));
   });
 
+  void it('fails startup when backfill_repo_events is missing run scope columns', async () => {
+    const telemetry = new CrawlTelemetry(
+      {
+        progress: {
+          insert: async () => undefined,
+        } as unknown as ClickHouseClient,
+        events: {
+          query: async (params: { query: string; format: string }) => {
+            assert.equal(params.query, 'DESCRIBE TABLE backfill_repo_events');
+            assert.equal(params.format, 'JSONEachRow');
+            return {
+              json: async () => [{ name: 'ts' }, { name: 'did' }],
+            };
+          },
+          insert: async () => undefined,
+        } as unknown as ClickHouseClient,
+      },
+      {
+        runId: 'test',
+        shard: 'shard0',
+        intervalMs: 5,
+      },
+    );
+
+    await assert.rejects(
+      () => telemetry.assertEventColumns(),
+      /missing run_id, shard/,
+    );
+  });
+
+  void it('accepts backfill_repo_events with run scope columns', async () => {
+    const telemetry = new CrawlTelemetry(
+      {
+        progress: {
+          insert: async () => undefined,
+        } as unknown as ClickHouseClient,
+        events: {
+          query: async () => ({
+            json: async () => [
+              { name: 'ts' },
+              { name: 'run_id' },
+              { name: 'shard' },
+              { name: 'did' },
+            ],
+          }),
+          insert: async () => undefined,
+        } as unknown as ClickHouseClient,
+      },
+      {
+        runId: 'test',
+        shard: 'shard0',
+        intervalMs: 5,
+      },
+    );
+
+    await telemetry.assertEventColumns();
+  });
+
   void it('rebuilds the progress client after a connection error', async () => {
     let oldClosed = 0;
     const replacementRows: unknown[] = [];

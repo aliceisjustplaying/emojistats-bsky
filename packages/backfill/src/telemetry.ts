@@ -132,6 +132,30 @@ export class CrawlTelemetry {
     }
   }
 
+  /**
+   * Fail-fast startup check: events are lossy by policy, so a schema mismatch
+   * would otherwise drop run-scoped event batches for the whole crawl.
+   */
+  async assertEventColumns(): Promise<void> {
+    const result = await this.#eventClient.query({
+      query: 'DESCRIBE TABLE backfill_repo_events',
+      format: 'JSONEachRow',
+    });
+    const columns = new Set(
+      (await result.json<{ name: string }>()).map((row) => row.name),
+    );
+    const missing = ['run_id', 'shard'].filter(
+      (column) => !columns.has(column),
+    );
+    if (missing.length > 0) {
+      throw new Error(
+        `backfill_repo_events is missing ${missing.join(
+          ', ',
+        )}; run the ClickHouse migration before starting crawl`,
+      );
+    }
+  }
+
   /** Buffers; the row rides out with the next tick (or the final flush). */
   recordEvent(event: RepoEvent): void {
     this.#events.push({

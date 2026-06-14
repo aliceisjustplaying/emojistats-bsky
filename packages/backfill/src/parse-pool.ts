@@ -33,11 +33,14 @@ export interface RepoRowBatch {
   rows: ArchiveRow[];
 }
 
-interface PendingJob {
+interface ReplyTimerJob {
+  timer: NodeJS.Timeout;
+}
+
+interface PendingJob extends ReplyTimerJob {
   resolve: (result: RepoJobResult) => void;
   reject: (err: Error) => void;
   onRows: (batch: RepoRowBatch) => Promise<void> | void;
-  timer: NodeJS.Timeout;
 }
 
 /**
@@ -48,16 +51,34 @@ interface PendingJob {
  * stalled fetch normally rejects there and frees the slot cleanly; the leak is
  * the residual case where that abort does NOT fire (dead socket the runtime
  * never surfaces). This ceiling sits a full fetch-budget ABOVE that timeout so
- * it never races the fetcher. Two cases can reach this ceiling: (a) a residual
- * fetch stall where the fetcher's own 300s abort failed to fire (the leak this
- * targets), or (b) a successful fetch (<= 300s) followed by a parse/materialize
- * that exceeds the remaining ~300s. (b) is the only theoretical false-kill, and
- * it is pathological — CBOR decode + MST walk + row build is CPU-bound seconds
- * even for GB-scale CARs — and harmless besides, since the repo just requeues.
- * On trip the job rejects RetryableError (repo requeues, at-least-once) and any
- * late reply is dropped by the unknown-seq guard.
+ * it never races the fetcher. Row batches reset the ceiling because large repos
+ * now wait on main-thread archive/ClickHouse backpressure between worker
+ * replies. On trip the job rejects RetryableError (repo requeues,
+ * at-least-once) and any late reply is dropped by the unknown-seq guard.
  */
 const REPLY_TIMEOUT_MS = REPO_FETCH_TIMEOUT_MS + 300_000;
+
+function armReplyTimer(
+  worker: Worker,
+  seq: number,
+  failWorker: (worker: Worker, cause: string, terminate?: boolean) => void,
+): NodeJS.Timeout {
+  const timer = setTimeout(() => {
+    failWorker(worker, `reply timeout after ${REPLY_TIMEOUT_MS}ms`, true);
+  }, REPLY_TIMEOUT_MS);
+  timer.unref();
+  return timer;
+}
+
+export function refreshReplyTimer(
+  job: ReplyTimerJob,
+  worker: Worker,
+  seq: number,
+  failWorker: (worker: Worker, cause: string, terminate?: boolean) => void,
+): void {
+  clearTimeout(job.timer);
+  job.timer = armReplyTimer(worker, seq, failWorker);
+}
 
 function rehydrate(err: RepoJobError): Error {
   switch (err.kind) {
@@ -145,6 +166,7 @@ export function createParsePool(): ParsePool {
       const job = pending?.get(reply.seq);
       if (job === undefined) return;
       if ('rows' in reply) {
+        refreshReplyTimer(job, worker, reply.seq, failWorker);
         void (async () => {
           try {
             await job.onRows({ rev: reply.rev, rows: reply.rows });
@@ -208,11 +230,6 @@ export function createParsePool(): ParsePool {
         const pending = pendingByWorker.get(worker)!;
         // If a worker never replies, the worker itself is suspect: reject every
         // job on it, terminate it, and respawn so hidden work cannot pile up.
-        const timer = setTimeout(() => {
-          if (!pending.has(jobSeq)) return;
-          failWorker(worker, `reply timeout after ${REPLY_TIMEOUT_MS}ms`, true);
-        }, REPLY_TIMEOUT_MS);
-        timer.unref();
         pending.set(jobSeq, {
           resolve: (result) => {
             resolve(result);
@@ -221,7 +238,10 @@ export function createParsePool(): ParsePool {
             reject(err);
           },
           onRows,
-          timer,
+          timer: armReplyTimer(worker, jobSeq, (timedOutWorker, cause) => {
+            if (!pending.has(jobSeq)) return;
+            failWorker(timedOutWorker, cause, true);
+          }),
         });
         worker.postMessage({ seq: jobSeq, did, pdsHost, fetchTimeUs });
       });
