@@ -1732,6 +1732,57 @@ The review agent (102 lines in at time of writing) is flagging structural risk i
 normalization. The first backfill is not done (verify still open, cutover still ahead), but the
 planning for a second run is now concurrent with closing out the first.
 
+### 2026-06-14 evening (19:10–19:44 UTC) — the safety refactor lands, the dashboard stops lying about "fail", and the review says don't run yet
+
+Three things happened in quick succession across four parallel Codex sessions.
+
+**The verifier safety refactor shipped.** The second Claude review passed the core logic with one
+hardening note — tighten `--loaded-only` to an allowlist of `fail-shardN` labels rather than a
+denylist of canonical ones, and block `--loaded-only --orphans`. The agent applied both and pushed
+(`73cfb17` progress-header disable, `712a8e9` safe loaded-only reconciliation). No verifier was
+deployed or run — the code is on origin, gated behind Alice's explicit go.
+
+Alice then found a scalability regression the reviews had missed: `verify.ts:717` pulled every
+successful DID through Node/SQLite for promotion. On a full shard that's millions of rows through a
+single-threaded bottleneck. The agent patched promotion back to a small-list pattern — fetch only the
+blocked DIDs from ClickHouse, stage those in SQLite, promote everything not blocked. The fix is local
+on pix2, pending yet another review round.
+
+**The dashboard's "fail 8" was a lie — a different kind.** Alice asked whether the 8 hard mismatches
+had reconciled and found the dashboard still showing `fail 8` as if it were a current count. It
+wasn't: the card was displaying the *historical digest-layer mismatch count* as though it were the
+*current unresolved state*. The agent split the card into two concepts: `loaded open` (how many
+mismatch repos are still unresolved after recrawl) and `digest diff` (the historical full-pass
+classification). Committed as `b05173a`, hit a ClickHouse alias collision on deploy, fixed in
+`1b573b4`, redeployed to the serving box and browser-verified. The ops dashboard now shows `loaded
+open 8` and `digest diff 8` — honest about what each number means.
+
+This is the fifth time a dashboard metric has told a story that turned out to be wrong (after the
+run-id scoping, the unbounded window, the frozen-shard-as-active, and the four-of-six miss). The
+recurring pattern: a dashboard that *looks* right at the moment it's built but silently becomes stale
+as the underlying state moves. The dashboard never *lied*; it just never had enough context to know
+its truth had expired.
+
+**The thermo-nuclear review verdict: don't run the second backfill yet.** The code quality review
+(session `rollout-2026-06-14T19-41-38`, still active) found three structural blockers for a clean
+second run: the promotion path flips from allowlist to denylist (risky inversion); `verify.ts` is
+1,458 lines with duplicated invariants in comments instead of types; and event telemetry has no
+`run_id` or `shard` scope, so the dashboard cannot distinguish run 1 from run 2. That last one is
+exactly the instrument-scoping problem the retro has documented since the beginning — the same class
+of bug that made every progress metric unreliable until it was fixed, now blocking the second run's
+ability to measure itself against the first.
+
+- **Process note:** Alice had to abort two turns in the old session because the agent started running
+  duplicate Claude review processes simultaneously (a capped and an uncapped review of the same
+  diff). *"please… why are you running two claude reviews."* The context was exhausted; Alice asked
+  for a handover to a fresh agent. Agent process management — knowing what's running and not
+  duplicating expensive operations — is a failure mode distinct from the code quality the reviews are
+  checking.
+- **Status, held to the line:** the safety refactor is on origin, the dashboard is honest, but
+  nothing has been *run*. No loose numbers, no reconciled mismatches, no convergence. The 631k loose
+  and 8 hard mismatches remain exactly as open as before — just now with better tooling for when they
+  do get closed.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
