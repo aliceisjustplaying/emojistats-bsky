@@ -147,11 +147,15 @@ const VERIFY_INSERT_BATCH_ROWS = positiveIntEnv(
 );
 const VERIFY_EXTERNAL_GROUP_BY_BYTES = positiveIntEnv(
   'VERIFY_EXTERNAL_GROUP_BY_BYTES',
-  2 * 1024 ** 3,
+  8 * 1024 ** 3,
 );
 const VERIFY_EXTERNAL_SORT_BYTES = positiveIntEnv(
   'VERIFY_EXTERNAL_SORT_BYTES',
-  2 * 1024 ** 3,
+  8 * 1024 ** 3,
+);
+const VERIFY_CLICKHOUSE_REQUEST_TIMEOUT_MS = positiveIntEnv(
+  'VERIFY_CLICKHOUSE_REQUEST_TIMEOUT_MS',
+  60 * 60_000,
 );
 const VERIFY_QUERY_SETTINGS: ClickHouseSettings = {
   max_bytes_before_external_group_by: String(VERIFY_EXTERNAL_GROUP_BY_BYTES),
@@ -644,6 +648,24 @@ async function queryMismatchExamples(
   }));
 }
 
+async function collectMismatchDids(ch: ClickHouseClient): Promise<string[]> {
+  const result = await ch.query({
+    query: `
+      SELECT did
+      FROM ${VERIFY_RESULT_TABLE}
+      WHERE
+        run_id = {run_id:String}
+        AND shard = {shard:String}
+        AND result IN ('count-short', 'digest-mismatch')
+      ORDER BY did
+    `,
+    query_params: verifyQueryParams(),
+    format: 'JSONEachRow',
+  });
+  const rows = await result.json<{ did: string }>();
+  return rows.map((row) => row.did);
+}
+
 async function collectLooseRepos(ch: ClickHouseClient): Promise<LedgerRepo[]> {
   const result = await ch.query({
     query: `
@@ -826,6 +848,8 @@ async function reconcile(
   );
 
   const mismatches = await queryMismatchExamples(ch);
+  const mismatchDids =
+    counts.mismatchCount === 0 ? [] : await collectMismatchDids(ch);
   const looseRepos = options.collectLooseRepos
     ? await collectLooseRepos(ch)
     : [];
@@ -850,16 +874,27 @@ async function reconcile(
     true,
   );
 
-  const promoted =
-    counts.mismatchCount === 0
-      ? db
-          .prepare(
-            `UPDATE repos SET status = 'verified'
-             WHERE status = 'loaded'
-               AND did IN (SELECT did FROM verify_staged_loaded)`,
-          )
-          .run().changes
-      : 0;
+  db.exec(`
+    DROP TABLE IF EXISTS verify_mismatched;
+    CREATE TEMP TABLE verify_mismatched (
+      did TEXT PRIMARY KEY
+    ) WITHOUT ROWID
+  `);
+  const insertMismatch = db.prepare(
+    'INSERT INTO verify_mismatched (did) VALUES (?)',
+  );
+  const stageMismatches = db.transaction((dids: string[]) => {
+    for (const did of dids) insertMismatch.run(did);
+  });
+  stageMismatches(mismatchDids);
+  const promoted = db
+    .prepare(
+      `UPDATE repos SET status = 'verified'
+       WHERE status = 'loaded'
+         AND did IN (SELECT did FROM verify_staged_loaded)
+         AND did NOT IN (SELECT did FROM verify_mismatched)`,
+    )
+    .run().changes;
 
   const orphans = options.includeOrphans
     ? await orphanExamples(ch)
@@ -1094,6 +1129,7 @@ async function main(): Promise<void> {
       // per 1000 loaded DIDs with FINAL, heavy on a busy ClickHouse). Incompatible
       // with --sample-loose / --emit-loose, which are derived FROM reconciliation.
       'no-reconcile': { type: 'boolean', default: false },
+      'terminal-report': { type: 'boolean', default: false },
     },
   });
   const noReconcile = values['no-reconcile'] ?? false;
@@ -1155,7 +1191,10 @@ async function main(): Promise<void> {
 
   const db = new Database(LEDGER_DB_PATH);
   db.pragma('busy_timeout = 5000');
-  const ch = createClickHouseClient();
+  const ch = createClickHouseClient(
+    'emojistats-backfill-verify',
+    VERIFY_CLICKHOUSE_REQUEST_TIMEOUT_MS,
+  );
   const telemetry = new VerifyTelemetry(
     ch,
     VERIFY_RUN_ID,
@@ -1204,7 +1243,7 @@ async function main(): Promise<void> {
         sampleFailures: 0,
         done: false,
       };
-      terminalStateReport(db);
+      if (values['terminal-report'] ?? false) terminalStateReport(db);
 
       if (emitLoose !== undefined) {
         logger.info(

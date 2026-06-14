@@ -15,6 +15,7 @@ import {
  */
 export function createClickHouseClient(
   application = 'emojistats-backfill',
+  requestTimeoutMs = CLICKHOUSE_REQUEST_TIMEOUT_MS,
 ): ClickHouseClient {
   return createClient({
     url: CLICKHOUSE_URL,
@@ -22,7 +23,7 @@ export function createClickHouseClient(
     password: CLICKHOUSE_PASSWORD,
     database: CLICKHOUSE_DATABASE,
     application,
-    request_timeout: CLICKHOUSE_REQUEST_TIMEOUT_MS,
+    request_timeout: requestTimeoutMs,
     // JSONEachRow post batches are very repetitive but large. Compressing the
     // request body cuts upload time and avoids ClickHouse seeing truncated
     // HTTP bodies when a client-side socket resets mid-upload.
