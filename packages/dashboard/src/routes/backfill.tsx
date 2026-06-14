@@ -810,6 +810,7 @@ function RecrawlStatus({
 
 function VerificationStatus({ status }: { status: BackfillVerifyStatus }) {
   const prepared = status.runId === null;
+  const failed = status.failedShards > 0;
   const pct =
     status.reposTotal > 0 ? (status.reposChecked / status.reposTotal) * 100 : 0;
   return (
@@ -821,7 +822,9 @@ function VerificationStatus({ status }: { status: BackfillVerifyStatus }) {
             <CardDescription>
               {prepared
                 ? 'ready; waiting for manual kickoff'
-                : `${status.runId} · ${status.phase}`}
+                : failed && !status.active
+                  ? `last attempt: ${status.runId} · ${status.phase}`
+                  : `${status.runId} · ${status.phase}`}
             </CardDescription>
           </div>
           <Badge
@@ -835,8 +838,10 @@ function VerificationStatus({ status }: { status: BackfillVerifyStatus }) {
           >
             {prepared
               ? 'ready'
-              : status.failedShards > 0
-                ? 'failed'
+              : failed
+                ? status.active
+                  ? 'failing'
+                  : 'last failed'
                 : status.active
                   ? 'running'
                   : 'seen'}
@@ -854,7 +859,7 @@ function VerificationStatus({ status }: { status: BackfillVerifyStatus }) {
           <p className="text-right text-xs text-muted-foreground tabular-nums">
             {prepared
               ? 'not started'
-              : `${integer.format(status.reposChecked)} / ${integer.format(status.reposTotal)} repos · ${pct.toFixed(1)}%`}
+              : `${integer.format(status.reposChecked)} / ${integer.format(status.reposTotal)} repos in this run · ${pct.toFixed(1)}%`}
           </p>
         </div>
         <div className="grid grid-cols-3 gap-3 text-sm">
@@ -873,10 +878,15 @@ function VerificationStatus({ status }: { status: BackfillVerifyStatus }) {
             value={integer.format(status.sampleChecked)}
           />
           <RecrawlMetric
-            label="shards done"
+            label="run shards"
             value={`${integer.format(status.doneShards)} / ${integer.format(status.shards)}`}
           />
         </div>
+        {failed && !status.active ? (
+          <p className="text-xs text-muted-foreground">
+            full verification is not running; this is the last failed canary
+          </p>
+        ) : null}
         {status.runId !== null ? (
           <p className="text-xs text-muted-foreground tabular-nums">
             {status.freshnessSeconds === null
@@ -886,7 +896,7 @@ function VerificationStatus({ status }: { status: BackfillVerifyStatus }) {
         ) : null}
         {status.error !== null ? (
           <p className="line-clamp-2 text-xs break-all text-red-600/90">
-            {status.error}
+            last attempt error: {status.error}
           </p>
         ) : null}
       </CardContent>
