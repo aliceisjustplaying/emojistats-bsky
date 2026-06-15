@@ -13,7 +13,7 @@ use bytes::Bytes;
 use cid::Cid as IpldCid;
 use jacquard_api::app_bsky::{actor::profile::Profile, feed::post::Post};
 use jacquard_repo::{
-    DAG_CBOR_CID_CODEC, Mst, car,
+    DAG_CBOR_CID_CODEC, Mst,
     commit::Commit,
     error::RepoError,
     mst::{
@@ -22,6 +22,7 @@ use jacquard_repo::{
     },
     storage::BlockStore,
 };
+use serde::Deserialize;
 use smol_str::SmolStr;
 
 /// Parsed one-repo output from Stage C.
@@ -379,9 +380,7 @@ async fn parse_repo_async(
     config: ParseConfig,
 ) -> Result<ParsedRepo, ParseError> {
     let deadline = ParseDeadline::start(config.max_parse_wall_clock);
-    let stream_summary = verify_streamed_car(car_path, config, deadline).await?;
-    deadline.ensure_not_exceeded()?;
-    let store = IndexedCarBlockStore::load(car_path, config)?;
+    let (stream_summary, store) = IndexedCarBlockStore::load(car_path, config, deadline)?;
     deadline.ensure_not_exceeded()?;
     let commit_root = single_car_root(&stream_summary.roots)?;
     let (commit_cid, commit) = load_commit(commit_root, &store).await?;
@@ -419,39 +418,6 @@ async fn parse_repo_async(
         profile,
         profile_decode_error,
         record_decode_errors,
-    })
-}
-
-async fn verify_streamed_car(
-    car_path: &Path,
-    config: ParseConfig,
-    deadline: ParseDeadline,
-) -> Result<CarStreamSummary, ParseError> {
-    let mut stream = car::stream_car(car_path).await?;
-    let roots = stream.roots().to_vec();
-    let mut verified_block_count = 0_u64;
-
-    while let Some((cid, bytes)) = stream.next().await? {
-        ensure_usize_at_most(
-            bytes.len(),
-            config.max_block_bytes,
-            "max_block_bytes",
-            "raise parser max_block_bytes only for a known-good repo",
-        )?;
-        verify_block_cid(cid, bytes.as_ref())?;
-        verified_block_count = checked_increment(verified_block_count, "verified_block_count")?;
-        deadline.ensure_not_exceeded()?;
-        ensure_u64_at_most(
-            verified_block_count,
-            config.max_car_blocks,
-            "max_car_blocks",
-            "raise parser max_car_blocks only for a known-good repo",
-        )?;
-    }
-
-    Ok(CarStreamSummary {
-        roots,
-        verified_block_count,
     })
 }
 
@@ -533,8 +499,9 @@ async fn walk_mst_records(
 
     cursor.advance().await?;
     while !cursor.is_end() {
+        let cursor_layer = cursor.layer().await?;
         ensure_usize_at_most(
-            cursor.layer().await?,
+            cursor_layer,
             config.max_mst_depth,
             "max_mst_depth",
             "raise parser max_mst_depth only after inspecting the repo MST",
@@ -702,12 +669,21 @@ struct IndexedCarBlockStore {
 }
 
 impl IndexedCarBlockStore {
-    fn load(path: &Path, config: ParseConfig) -> Result<Self, ParseError> {
-        let index = index_car_blocks(path, config)?;
-        Ok(Self {
+    fn load(
+        path: &Path,
+        config: ParseConfig,
+        deadline: ParseDeadline,
+    ) -> Result<(CarStreamSummary, Self), ParseError> {
+        let indexed_car = index_car_blocks(path, config, deadline)?;
+        let summary = CarStreamSummary {
+            roots: indexed_car.roots,
+            verified_block_count: indexed_car.verified_block_count,
+        };
+        let store = Self {
             path: Arc::new(path.to_path_buf()),
-            index: Arc::new(index),
-        })
+            index: Arc::new(indexed_car.index),
+        };
+        Ok((summary, store))
     }
 }
 
@@ -754,11 +730,29 @@ impl BlockStore for IndexedCarBlockStore {
 fn index_car_blocks(
     path: &Path,
     config: ParseConfig,
-) -> Result<BTreeMap<IpldCid, BlockLocation>, ParseError> {
+    deadline: ParseDeadline,
+) -> Result<IndexedCar, ParseError> {
     let mut file = open_file(path)?;
     let Some(header_len) = read_varint(&mut file)? else {
         return Err(ParseError::InvalidRoots("CAR file is empty".to_owned()));
     };
+    ensure_u64_at_most(
+        header_len.value,
+        config.max_block_bytes,
+        "max_block_bytes",
+        "raise parser max_block_bytes only for a known-good repo",
+    )?;
+    let header_len_usize =
+        usize::try_from(header_len.value).map_err(|_err| ParseError::CarLengthOverflow {
+            field: "header length",
+        })?;
+    let mut header_bytes = vec![0_u8; header_len_usize];
+    file.read_exact(&mut header_bytes)
+        .map_err(|source| ParseError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let header = parse_car_header(&header_bytes)?;
     let mut offset = checked_add_u64(header_len.bytes_read, header_len.value, "header")?;
     file.seek(SeekFrom::Start(offset))
         .map_err(|source| ParseError::Io {
@@ -828,10 +822,27 @@ fn index_car_blocks(
             "max_car_blocks",
             "raise parser max_car_blocks only for a known-good repo",
         )?;
+        deadline.ensure_not_exceeded()?;
         offset = checked_add_u64(section_start, section_len.value, "section end")?;
     }
 
-    Ok(index)
+    Ok(IndexedCar {
+        roots: header.roots,
+        verified_block_count: indexed_block_count,
+        index,
+    })
+}
+
+fn parse_car_header(bytes: &[u8]) -> Result<CarHeader, ParseError> {
+    let header = serde_ipld_dagcbor::from_slice::<CarHeader>(bytes).map_err(|source| {
+        ParseError::MalformedCar(format!("failed to decode CAR header: {source}"))
+    })?;
+    if header.version != 1 {
+        return Err(ParseError::Unsupported {
+            feature: "non-v1 CAR",
+        });
+    }
+    Ok(header)
 }
 
 fn read_block_at(path: &Path, location: &BlockLocation) -> std::io::Result<Vec<u8>> {
@@ -979,6 +990,19 @@ fn read_only_store_error() -> RepoError {
 struct CarStreamSummary {
     roots: Vec<IpldCid>,
     verified_block_count: u64,
+}
+
+#[derive(Debug)]
+struct IndexedCar {
+    roots: Vec<IpldCid>,
+    verified_block_count: u64,
+    index: BTreeMap<IpldCid, BlockLocation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CarHeader {
+    roots: Vec<IpldCid>,
+    version: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
