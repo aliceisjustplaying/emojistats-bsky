@@ -17,9 +17,11 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
 - **Next-lane foundations started:** `ledger.rs` has retry/account-state transition types,
   shard buckets, host overrides, and a SQLite store; `commit.rs` has a local Storage
   Box-shaped committed-artifact protocol; `derive.rs` has manifest-to-ClickHouse DTOs and
-  dedupe tokening; `manifest_derive.rs` reads committed raw-archive manifests into derive
-  inputs; `clickhouse.rs` has schema, `JSONEachRow` request builders, and ordered insert
-  execution; and `canary.rs` encodes the stratified canary policy/gate model.
+  dedupe tokening; `manifest_derive.rs` reads committed raw-archive manifests, verifies
+  referenced local `Parquet` bytes/hash/receipts when present, reloads archive rows, and
+  builds `ClickHouseDeriveBatch` values; `clickhouse.rs` has schema, `JSONEachRow` request
+  builders, and ordered insert execution; and `canary.rs` encodes the stratified canary
+  policy/gate model.
 - **Committed-object path partially wired:** `write_archive_artifacts` now writes the
   Parquet object and profile sidecar through the local committed-artifact protocol,
   producing object receipts and append-only manifest entries after final object promotion.
@@ -30,11 +32,15 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   parse, archive, account-state, resource-cap, retryable, and permanent failures into
   explicit attempt outcomes. `run-fleet <dids_file>` now seeds missing DIDs into
   `SqliteLedger`, requeues stale claimed rows from the seed file, claims repeatedly until
-  `--claim-limit` or idle, runs bounded concurrent attempts via `--concurrency`, applies
-  host retry-after cooldowns, and persists claimed/completed transitions.
+  `--claim-limit` or idle, filters persisted shard buckets via `--shard-bucket`, runs
+  bounded concurrent attempts via `--concurrency`, applies host retry-after cooldowns,
+  loads persisted host overrides by resolved PDS host, and persists claimed/completed
+  transitions. `force_mode = list_records` currently stops loudly because the
+  `listRecords` fetch lane is not implemented yet.
 - `emoji-normalizer` is a new shared Rust crate. Current parity scope is ordered/repeated
-  extraction, heart variation normalization, skin-tone sequences, ZWJ sequences, and
-  version metadata. Broad TS `non_qualified`/variation-table parity is still pending.
+  extraction, heart variation normalization, non-qualified keycaps, regional flags,
+  skin-tone sequences, ZWJ sequences, and version metadata. Broad TS
+  `non_qualified`/variation-table parity is still pending.
 - Fixture coverage now checks malformed `CAR` headers, empty/missing/non-commit roots,
   requested-DID mismatch, `createdAt` classification, and archive row-hash sensitivity.
 - Real stress DID verified:
@@ -64,14 +70,13 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
 
 ## Next roadmap
 
-- Wire `run-fleet` to use persisted shard filters and host overrides in the claim path,
-  then add the remaining real scheduler controls: per-host concurrency, advertised
-  rate-limit pacing, host deadness, and durable fleet telemetry.
+- Add the remaining real scheduler controls: per-host concurrency caps from
+  `host_overrides`, advertised rate-limit pacing, host deadness, durable fleet telemetry,
+  and the `listRecords` fallback lane for hosts forced away from `getRepo`.
 - Wire remaining archive artifacts through the committed-artifact protocol, then configure
   the `storage_box.rs` `ssh` transport for the real Storage Box.
-- Finish derive-from-committed-manifest: read Parquet rows, recompute Parquet/receipt
-  hashes, build `ClickHouseDeriveBatch`, and send inserts with retry/idempotency around
-  dedupe tokens.
+- Finish derive-from-committed-manifest by wiring verified `ClickHouseDeriveBatch` values
+  into ordered inserts with retry/idempotency around dedupe tokens.
 - Finish emoji normalization parity with the TypeScript data tables, then add WASM bindings
   before the browser/server serving path depends on it.
 - Wire derive/ClickHouse ingest from committed manifest entries, then run the stratified
