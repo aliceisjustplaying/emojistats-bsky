@@ -2,6 +2,7 @@
 
 pub mod archive;
 pub mod canary;
+pub mod clickhouse;
 pub mod commit;
 pub mod derive;
 pub mod ledger;
