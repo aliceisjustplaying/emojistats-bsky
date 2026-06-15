@@ -709,13 +709,17 @@ fn insert_optional_json<T: Serialize>(
     Ok(())
 }
 
-struct ClassifiedCreatedAt {
-    raw: Option<String>,
-    normalized: Option<String>,
-    status: CreatedAtParseStatus,
+/// Archive classification for an author-supplied `createdAt` value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifiedCreatedAt {
+    pub raw: Option<String>,
+    pub normalized: Option<String>,
+    pub status: CreatedAtParseStatus,
 }
 
-fn classify_created_at(value: Option<&str>) -> ClassifiedCreatedAt {
+/// Classify an author-supplied `createdAt` value for archive rows.
+#[must_use]
+pub fn classify_created_at(value: Option<&str>) -> ClassifiedCreatedAt {
     value.map_or_else(
         || ClassifiedCreatedAt {
             raw: None,
