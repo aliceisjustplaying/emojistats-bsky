@@ -232,6 +232,112 @@ pub fn required_hard_gates() -> BTreeSet<CanaryHardGate> {
     ])
 }
 
+/// Convert measured storage-box free headroom into the archive fit gate.
+#[must_use]
+pub fn observe_storage_box_headroom(
+    thresholds: &CanaryThresholds,
+    measured_headroom_ratio: f64,
+) -> CanaryGateObservation {
+    observe_minimum_ratio_gate(
+        CanaryHardGate::ArchiveFitsStorageBox,
+        measured_headroom_ratio,
+        thresholds.min_storage_box_headroom_ratio,
+        "storage box headroom ratio",
+    )
+}
+
+/// Convert measured `ClickHouse` serving-box utilization into the serving fit gate.
+#[must_use]
+pub fn observe_clickhouse_serving_box_fit(
+    thresholds: &CanaryThresholds,
+    measured_serving_box_ratio: f64,
+) -> CanaryGateObservation {
+    observe_maximum_ratio_gate(
+        CanaryHardGate::ClickHouseFitsServingBox,
+        measured_serving_box_ratio,
+        thresholds.max_clickhouse_serving_box_ratio,
+        "clickhouse serving box ratio",
+    )
+}
+
+/// Convert measured derive/crawl throughput ratio into the pace gate.
+#[must_use]
+pub fn observe_derive_crawl_pace(
+    thresholds: &CanaryThresholds,
+    measured_derive_to_crawl_ratio: f64,
+) -> CanaryGateObservation {
+    observe_minimum_ratio_gate(
+        CanaryHardGate::DeriveKeepsPaceWithCrawl,
+        measured_derive_to_crawl_ratio,
+        thresholds.min_derive_to_crawl_ratio,
+        "derive to crawl ratio",
+    )
+}
+
+/// Convert measured sustained crawl throughput into the launch projection gate.
+#[must_use]
+pub fn observe_sustained_throughput(
+    thresholds: &CanaryThresholds,
+    measured_repos_per_second: f64,
+) -> CanaryGateObservation {
+    observe_minimum_ratio_gate(
+        CanaryHardGate::HealthyThroughputProjection,
+        measured_repos_per_second,
+        thresholds.min_sustained_repos_per_second,
+        "sustained repos per second",
+    )
+}
+
+/// Convert measured mushroom budget utilization and 429 rate into the mushroom gate.
+#[must_use]
+pub fn observe_mushroom_budget_and_429s(
+    thresholds: &CanaryThresholds,
+    measured_budget_utilization_ratio: f64,
+    measured_429_ratio: f64,
+) -> CanaryGateObservation {
+    if let Some(detail) = invalid_measurement_detail(
+        "mushroom budget utilization ratio",
+        measured_budget_utilization_ratio,
+    )
+    .or_else(|| invalid_measurement_detail("mushroom 429 ratio", measured_429_ratio))
+    {
+        return gate_observation(
+            CanaryHardGate::MushroomBudgetSaturatedWithoutStorm,
+            CanaryStatus::Fail,
+            detail,
+        );
+    }
+
+    let passes = measured_budget_utilization_ratio
+        >= thresholds.min_mushroom_budget_utilization_ratio
+        && measured_429_ratio <= thresholds.max_mushroom_429_ratio;
+    let detail = format!(
+        "mushroom budget utilization ratio {measured_budget_utilization_ratio} \
+         must be >= {}; mushroom 429 ratio {measured_429_ratio} must be <= {}",
+        thresholds.min_mushroom_budget_utilization_ratio, thresholds.max_mushroom_429_ratio
+    );
+
+    gate_observation(
+        CanaryHardGate::MushroomBudgetSaturatedWithoutStorm,
+        status_for(passes),
+        detail,
+    )
+}
+
+/// Convert measured aggregate rebuild runtime into the launch-budget gate.
+#[must_use]
+pub fn observe_aggregate_rebuild_hours(
+    thresholds: &CanaryThresholds,
+    measured_hours: f64,
+) -> CanaryGateObservation {
+    observe_maximum_ratio_gate(
+        CanaryHardGate::AggregateRebuildWithinLaunchBudget,
+        measured_hours,
+        thresholds.max_aggregate_rebuild_hours,
+        "aggregate rebuild hours",
+    )
+}
+
 /// Evaluate canary evidence against a policy.
 #[must_use]
 pub fn evaluate_canary(policy: &CanaryPolicy, evidence: &CanaryEvidence) -> CanaryReport {
@@ -368,6 +474,70 @@ fn evaluate_required_gates(
         }
     }
     passed
+}
+
+fn observe_minimum_ratio_gate(
+    gate: CanaryHardGate,
+    measured: f64,
+    minimum: f64,
+    label: &str,
+) -> CanaryGateObservation {
+    invalid_measurement_detail(label, measured).map_or_else(
+        || {
+            gate_observation(
+                gate,
+                status_for(measured >= minimum),
+                format!("{label} {measured} must be >= {minimum}"),
+            )
+        },
+        |detail| gate_observation(gate, CanaryStatus::Fail, detail),
+    )
+}
+
+fn observe_maximum_ratio_gate(
+    gate: CanaryHardGate,
+    measured: f64,
+    maximum: f64,
+    label: &str,
+) -> CanaryGateObservation {
+    invalid_measurement_detail(label, measured).map_or_else(
+        || {
+            gate_observation(
+                gate,
+                status_for(measured <= maximum),
+                format!("{label} {measured} must be <= {maximum}"),
+            )
+        },
+        |detail| gate_observation(gate, CanaryStatus::Fail, detail),
+    )
+}
+
+const fn gate_observation(
+    gate: CanaryHardGate,
+    status: CanaryStatus,
+    detail: String,
+) -> CanaryGateObservation {
+    CanaryGateObservation {
+        gate,
+        status,
+        detail: Some(detail),
+    }
+}
+
+const fn status_for(passes: bool) -> CanaryStatus {
+    if passes {
+        CanaryStatus::Pass
+    } else {
+        CanaryStatus::Fail
+    }
+}
+
+fn invalid_measurement_detail(label: &str, measured: f64) -> Option<String> {
+    if measured.is_finite() {
+        None
+    } else {
+        Some(format!("{label} measurement {measured} is not finite"))
+    }
 }
 
 const fn increment_passed(value: usize) -> usize {
@@ -539,7 +709,10 @@ mod tests {
         CanaryEvidence, CanaryFailureInjection, CanaryFindingKind, CanaryGateObservation,
         CanaryHardGate, CanaryInjectionObservation, CanaryPolicy, CanarySampleCategory,
         CanarySampleObservation, CanaryStatus, CanaryThresholds, evaluate_canary,
-        required_failure_injections, required_hard_gates, required_sample_categories,
+        observe_aggregate_rebuild_hours, observe_clickhouse_serving_box_fit,
+        observe_derive_crawl_pace, observe_mushroom_budget_and_429s, observe_storage_box_headroom,
+        observe_sustained_throughput, required_failure_injections, required_hard_gates,
+        required_sample_categories,
     };
 
     #[test]
@@ -618,6 +791,155 @@ mod tests {
             report.summary.passed_hard_gates,
             policy.required_hard_gates.len()
         );
+    }
+
+    #[test]
+    fn storage_headroom_gate_passes_at_minimum_and_fails_below() {
+        let thresholds = test_thresholds();
+
+        assert_gate(
+            &observe_storage_box_headroom(&thresholds, thresholds.min_storage_box_headroom_ratio),
+            CanaryHardGate::ArchiveFitsStorageBox,
+            CanaryStatus::Pass,
+        );
+        assert_gate(
+            &observe_storage_box_headroom(
+                &thresholds,
+                thresholds.min_storage_box_headroom_ratio - 0.01,
+            ),
+            CanaryHardGate::ArchiveFitsStorageBox,
+            CanaryStatus::Fail,
+        );
+    }
+
+    #[test]
+    fn clickhouse_fit_gate_passes_at_maximum_and_fails_above() {
+        let thresholds = test_thresholds();
+
+        assert_gate(
+            &observe_clickhouse_serving_box_fit(
+                &thresholds,
+                thresholds.max_clickhouse_serving_box_ratio,
+            ),
+            CanaryHardGate::ClickHouseFitsServingBox,
+            CanaryStatus::Pass,
+        );
+        assert_gate(
+            &observe_clickhouse_serving_box_fit(
+                &thresholds,
+                thresholds.max_clickhouse_serving_box_ratio + 0.01,
+            ),
+            CanaryHardGate::ClickHouseFitsServingBox,
+            CanaryStatus::Fail,
+        );
+    }
+
+    #[test]
+    fn derive_crawl_pace_gate_passes_at_minimum_and_fails_below() {
+        let thresholds = test_thresholds();
+
+        assert_gate(
+            &observe_derive_crawl_pace(&thresholds, thresholds.min_derive_to_crawl_ratio),
+            CanaryHardGate::DeriveKeepsPaceWithCrawl,
+            CanaryStatus::Pass,
+        );
+        assert_gate(
+            &observe_derive_crawl_pace(&thresholds, thresholds.min_derive_to_crawl_ratio - 0.01),
+            CanaryHardGate::DeriveKeepsPaceWithCrawl,
+            CanaryStatus::Fail,
+        );
+    }
+
+    #[test]
+    fn sustained_throughput_gate_passes_at_minimum_and_fails_below() {
+        let thresholds = test_thresholds();
+
+        assert_gate(
+            &observe_sustained_throughput(&thresholds, thresholds.min_sustained_repos_per_second),
+            CanaryHardGate::HealthyThroughputProjection,
+            CanaryStatus::Pass,
+        );
+        assert_gate(
+            &observe_sustained_throughput(
+                &thresholds,
+                thresholds.min_sustained_repos_per_second - 0.01,
+            ),
+            CanaryHardGate::HealthyThroughputProjection,
+            CanaryStatus::Fail,
+        );
+    }
+
+    #[test]
+    fn mushroom_gate_passes_at_boundaries_and_fails_on_budget_or_429_side() {
+        let thresholds = test_thresholds();
+
+        assert_gate(
+            &observe_mushroom_budget_and_429s(
+                &thresholds,
+                thresholds.min_mushroom_budget_utilization_ratio,
+                thresholds.max_mushroom_429_ratio,
+            ),
+            CanaryHardGate::MushroomBudgetSaturatedWithoutStorm,
+            CanaryStatus::Pass,
+        );
+        assert_gate(
+            &observe_mushroom_budget_and_429s(
+                &thresholds,
+                thresholds.min_mushroom_budget_utilization_ratio - 0.01,
+                thresholds.max_mushroom_429_ratio,
+            ),
+            CanaryHardGate::MushroomBudgetSaturatedWithoutStorm,
+            CanaryStatus::Fail,
+        );
+        assert_gate(
+            &observe_mushroom_budget_and_429s(
+                &thresholds,
+                thresholds.min_mushroom_budget_utilization_ratio,
+                thresholds.max_mushroom_429_ratio + 0.01,
+            ),
+            CanaryHardGate::MushroomBudgetSaturatedWithoutStorm,
+            CanaryStatus::Fail,
+        );
+    }
+
+    #[test]
+    fn aggregate_rebuild_gate_passes_at_maximum_and_fails_above() {
+        let thresholds = test_thresholds();
+
+        assert_gate(
+            &observe_aggregate_rebuild_hours(&thresholds, thresholds.max_aggregate_rebuild_hours),
+            CanaryHardGate::AggregateRebuildWithinLaunchBudget,
+            CanaryStatus::Pass,
+        );
+        assert_gate(
+            &observe_aggregate_rebuild_hours(
+                &thresholds,
+                thresholds.max_aggregate_rebuild_hours + 0.01,
+            ),
+            CanaryHardGate::AggregateRebuildWithinLaunchBudget,
+            CanaryStatus::Fail,
+        );
+    }
+
+    #[test]
+    fn numeric_gate_measurement_nan_fails() {
+        let thresholds = test_thresholds();
+
+        assert_gate(
+            &observe_storage_box_headroom(&thresholds, f64::NAN),
+            CanaryHardGate::ArchiveFitsStorageBox,
+            CanaryStatus::Fail,
+        );
+    }
+
+    fn assert_gate(
+        observation: &CanaryGateObservation,
+        gate: CanaryHardGate,
+        status: CanaryStatus,
+    ) {
+        assert_eq!(observation.gate, gate);
+        assert_eq!(observation.status, status);
+        assert!(observation.detail.is_some());
     }
 
     fn passing_evidence() -> CanaryEvidence {

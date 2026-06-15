@@ -4,7 +4,7 @@ use std::{
     error::Error,
     fmt, fs,
     fs::File,
-    io::{self, Read, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -21,12 +21,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::parse::{ParsedRepo, PostRecord, ProfileRecord};
+use crate::{
+    commit::{LocalStore, ManifestMode, Metadata, Request},
+    parse::{ParsedRepo, PostRecord, ProfileRecord},
+};
 
 const POST_COLLECTION: &str = "app.bsky.feed.post";
 const ARCHIVE_SCHEMA_VERSION: u16 = 1;
 const PARQUET_BATCH_ROWS: usize = 1_024;
-const HASH_BUFFER_BYTES: usize = 65_536;
 
 /// Version identity for emoji normalization outputs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +160,7 @@ pub struct LocalManifestEntry {
 pub struct ArchiveArtifacts {
     pub parquet_path: PathBuf,
     pub receipt_path: PathBuf,
+    pub object_receipt_path: PathBuf,
     pub manifest_path: PathBuf,
     pub emoji_projection_path: PathBuf,
     pub profile_sidecar_path: Option<PathBuf>,
@@ -172,6 +175,7 @@ pub enum ArchiveError {
     Parquet(parquet::errors::ParquetError),
     Arrow(arrow_schema::ArrowError),
     Json(serde_json::Error),
+    Commit(crate::commit::Error),
     CountOverflow { field: &'static str },
     InvalidCompression(String),
     InvalidPath { path: PathBuf },
@@ -242,15 +246,26 @@ pub fn write_archive_artifacts(
 ) -> Result<ArchiveArtifacts, ArchiveError> {
     fs::create_dir_all(output_dir)?;
     let safe_did = safe_file_component(did);
-    let parquet_path = output_dir.join(format!("{safe_did}.posts.parquet"));
+    let parquet_object_path = PathBuf::from(format!("{safe_did}.posts.parquet"));
     let receipt_path = output_dir.join(format!("{safe_did}.receipt.json"));
-    let manifest_path = output_dir.join(format!("{safe_did}.manifest.json"));
+    let object_receipt_object_path = PathBuf::from(format!("{safe_did}.object-receipt.json"));
+    let manifest_object_path = PathBuf::from(format!("{safe_did}.manifest.jsonl"));
     let emoji_projection_path = output_dir.join(format!("{safe_did}.emoji.jsonl"));
     let profile_sidecar_path =
         profile.map(|_profile| output_dir.join(format!("{safe_did}.profile.json")));
 
-    write_temp_rename(&parquet_path, |path| write_posts_parquet(path, rows))?;
     write_temp_rename(&receipt_path, |path| write_json_pretty(path, receipt))?;
+    let commit_request = Request {
+        object_path: parquet_object_path,
+        receipt_path: object_receipt_object_path,
+        manifest_path: manifest_object_path,
+        manifest_mode: ManifestMode::AppendJsonl,
+        metadata: build_commit_metadata(rows, receipt)?,
+    };
+    let committed = LocalStore::new(output_dir).commit(&commit_request, |file| {
+        write_posts_parquet_to_writer(file, rows)
+            .map_err(|error| crate::commit::Error::writer(format!("write posts parquet: {error}")))
+    })?;
     let emoji_projection_rows = derive_emoji_projection_rows(rows)?;
     let emoji_rows = u64::try_from(emoji_projection_rows.len()).map_err(|_error| {
         ArchiveError::CountOverflow {
@@ -264,13 +279,13 @@ pub fn write_archive_artifacts(
         write_temp_rename(path, |path| write_profile_sidecar_json(path, profile))?;
     }
 
-    let manifest = build_manifest(&parquet_path, rows, receipt)?;
-    write_temp_rename(&manifest_path, |path| write_json_pretty(path, &manifest))?;
+    let manifest = local_manifest_from_committed(&committed, receipt);
 
     Ok(ArchiveArtifacts {
-        parquet_path,
+        parquet_path: committed.object_path,
         receipt_path,
-        manifest_path,
+        object_receipt_path: committed.receipt_path,
+        manifest_path: committed.manifest_path,
         emoji_projection_path,
         profile_sidecar_path,
         manifest,
@@ -365,7 +380,10 @@ fn hash_emoji_projection_rows(rows: &[EmojiProjectionRow]) -> Result<String, Arc
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn write_posts_parquet(path: &Path, rows: &[ArchivePostRow]) -> Result<(), ArchiveError> {
+fn write_posts_parquet_to_writer<W>(writer: W, rows: &[ArchivePostRow]) -> Result<(), ArchiveError>
+where
+    W: Write + Send,
+{
     let schema = Arc::new(Schema::new(vec![
         Field::new("did", DataType::Utf8, false),
         Field::new("rkey", DataType::Utf8, false),
@@ -387,20 +405,18 @@ fn write_posts_parquet(path: &Path, rows: &[ArchivePostRow]) -> Result<(), Archi
         Field::new("extras_json", DataType::Utf8, false),
     ]));
 
-    let file = File::create(path)?;
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(
             ZstdLevel::try_new(3)
                 .map_err(|error| ArchiveError::InvalidCompression(error.to_string()))?,
         ))
         .build();
-    let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), Some(props))?;
+    let mut writer = ArrowWriter::try_new(writer, Arc::clone(&schema), Some(props))?;
     for chunk in rows.chunks(PARQUET_BATCH_ROWS) {
         let batch = post_record_batch(&schema, chunk)?;
         writer.write(&batch)?;
     }
     writer.close()?;
-    sync_file(path)?;
     Ok(())
 }
 
@@ -442,28 +458,44 @@ fn post_record_batch(
     )?)
 }
 
-fn build_manifest(
-    parquet_path: &Path,
+fn build_commit_metadata(
     rows: &[ArchivePostRow],
     receipt: &RepoReceipt,
-) -> Result<LocalManifestEntry, ArchiveError> {
-    let metadata = fs::metadata(parquet_path)?;
-    Ok(LocalManifestEntry {
+) -> Result<Metadata, ArchiveError> {
+    Ok(Metadata {
         run_id: "fetch-one-local".to_owned(),
         shard: "single".to_owned(),
         file_sequence: 1,
         dataset: "raw_archive_posts".to_owned(),
-        local_path: parquet_path.to_path_buf(),
         row_count: u64::try_from(rows.len())
             .map_err(|_error| ArchiveError::CountOverflow { field: "row_count" })?,
-        bytes: metadata.len(),
-        content_hash: hash_file(parquet_path)?,
         min_created_at_normalized: min_created_at(rows),
         max_created_at_normalized: max_created_at(rows),
         receipt_hash: hash_serialized(receipt)?,
-        schema_version: ARCHIVE_SCHEMA_VERSION,
         normalizer: receipt.normalizer.clone(),
+        schema_version: ARCHIVE_SCHEMA_VERSION,
     })
+}
+
+fn local_manifest_from_committed(
+    committed: &crate::commit::Artifact,
+    receipt: &RepoReceipt,
+) -> LocalManifestEntry {
+    LocalManifestEntry {
+        run_id: committed.entry.run_id.clone(),
+        shard: committed.entry.shard.clone(),
+        file_sequence: committed.entry.file_sequence,
+        dataset: committed.entry.dataset.clone(),
+        local_path: committed.object_path.clone(),
+        row_count: committed.entry.row_count,
+        bytes: committed.entry.bytes,
+        content_hash: committed.entry.content_hash.clone(),
+        min_created_at_normalized: committed.entry.min_created_at_normalized.clone(),
+        max_created_at_normalized: committed.entry.max_created_at_normalized.clone(),
+        receipt_hash: committed.entry.receipt_hash.clone(),
+        schema_version: committed.entry.schema_version,
+        normalizer: receipt.normalizer.clone(),
+    }
 }
 
 fn write_emoji_projection_jsonl(
@@ -584,23 +616,6 @@ fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), Archive
     file.write_all(b"\n")?;
     file.sync_all()?;
     Ok(())
-}
-
-fn hash_file(path: &Path) -> Result<String, ArchiveError> {
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; HASH_BUFFER_BYTES];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        let chunk = buffer.get(..read).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "hash read exceeded buffer")
-        })?;
-        hasher.update(chunk);
-    }
-    Ok(hex::encode(hasher.finalize()))
 }
 
 fn hash_serialized<T: Serialize>(value: &T) -> Result<String, ArchiveError> {
@@ -960,6 +975,7 @@ impl fmt::Display for ArchiveError {
             Self::Parquet(error) => write!(f, "Parquet error: {error}"),
             Self::Arrow(error) => write!(f, "Arrow error: {error}"),
             Self::Json(error) => write!(f, "JSON error: {error}"),
+            Self::Commit(error) => write!(f, "commit protocol error: {error}"),
             Self::CountOverflow { field } => write!(f, "count overflow for {field}"),
             Self::InvalidCompression(error) => write!(f, "invalid compression level: {error}"),
             Self::InvalidPath { path } => write!(f, "invalid archive path: {}", path.display()),
@@ -975,6 +991,7 @@ impl Error for ArchiveError {
             Self::Parquet(error) => Some(error),
             Self::Arrow(error) => Some(error),
             Self::Json(error) => Some(error),
+            Self::Commit(error) => Some(error),
             Self::CountOverflow { .. }
             | Self::InvalidCompression(_)
             | Self::InvalidPath { .. }
@@ -1004,6 +1021,12 @@ impl From<arrow_schema::ArrowError> for ArchiveError {
 impl From<serde_json::Error> for ArchiveError {
     fn from(error: serde_json::Error) -> Self {
         Self::Json(error)
+    }
+}
+
+impl From<crate::commit::Error> for ArchiveError {
+    fn from(error: crate::commit::Error) -> Self {
+        Self::Commit(error)
     }
 }
 

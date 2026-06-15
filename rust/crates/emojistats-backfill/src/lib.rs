@@ -6,4 +6,5 @@ pub mod commit;
 pub mod derive;
 pub mod ledger;
 pub mod parse;
+pub mod storage_box;
 pub mod transport;

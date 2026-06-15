@@ -18,6 +18,11 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   `commit.rs` has a local Storage Box-shaped committed-artifact protocol, `derive.rs` has
   manifest-to-ClickHouse DTOs and dedupe tokening, and `canary.rs` encodes the stratified
   canary policy/gate model. These are library foundations, not a wired fleet runner yet.
+- **Committed-object path partially wired:** `write_archive_artifacts` now writes the
+  Parquet object through the local committed-artifact protocol, producing object receipt
+  and append-only manifest entries after final object promotion. `storage_box.rs` adds the
+  remote backend skeleton with temp upload, size/hash/readback verification, rename, and
+  manifest append ordering behind a command trait.
 - Real stress DID verified:
   `did:plc:vwzwgnygau7ed7b7wt5ux7y2` from `shiitake.us-east.host.bsky.network` spooled
   41,051,855 bytes, produced 6,407 post rows, 228 emoji rows, and carried 23,656 typed
@@ -46,9 +51,8 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
 ## Next roadmap
 
 - Persist crawler ledger state and wire retry/account-state transitions around `fetch-one`.
-- Wire archive artifact writes through the committed-artifact protocol and add the remote
-  Storage Box backend: temp upload, verify, final rename, receipt sidecar, manifest append
-  only after the final object exists.
+- Wire the remaining sidecars and CLI/fleet flow through the committed-artifact protocol;
+  then bind the `storage_box.rs` command trait to the real Storage Box transport.
 - Move emoji normalization into the shared WASM-able crate from the design before the
   browser/server serving path depends on it.
 - Wire derive/ClickHouse ingest from committed manifest entries, then run the stratified
