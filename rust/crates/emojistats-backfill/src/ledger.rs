@@ -7,8 +7,58 @@ use std::{
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::transport::AccountState;
+
+/// Pinned v2 shard bucket count for persisted repo ledger rows.
+pub const DID_SHARD_BUCKET_MODULUS: u64 = 8;
+
+/// Return the stable persisted shard bucket for a DID.
+#[must_use]
+pub fn did_shard_bucket(did: &str) -> u64 {
+    let digest = Sha256::digest(did.as_bytes());
+    let mut bytes = [0_u8; 8];
+    for (destination, source) in bytes.iter_mut().zip(digest) {
+        *destination = source;
+    }
+    u64::from_be_bytes(bytes).wrapping_rem(DID_SHARD_BUCKET_MODULUS)
+}
+
+/// A single shard bucket visible to one crawler worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardFilter {
+    bucket: u64,
+}
+
+impl ShardFilter {
+    /// Build a shard filter for one persisted bucket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] when `bucket` is outside the pinned bucket modulus.
+    pub const fn new(bucket: u64) -> Result<Self, LedgerError> {
+        if bucket >= DID_SHARD_BUCKET_MODULUS {
+            return Err(LedgerError::InvalidShardBucket {
+                bucket,
+                modulus: DID_SHARD_BUCKET_MODULUS,
+            });
+        }
+        Ok(Self { bucket })
+    }
+
+    /// Return the persisted bucket selected by this filter.
+    #[must_use]
+    pub const fn bucket(self) -> u64 {
+        self.bucket
+    }
+
+    /// Return whether `did` belongs to this shard filter.
+    #[must_use]
+    pub fn contains_did(self, did: &str) -> bool {
+        did_shard_bucket(did) == self.bucket
+    }
+}
 
 /// Stable identifier for one fetch attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +162,23 @@ pub enum AttemptOutcome {
     RetryableFailure { message: String },
     ResourceLimitExceeded { message: String },
     PermanentFailure { message: String },
+}
+
+/// Forced fetch path for a host override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForcedFetchMode {
+    GetRepo,
+    ListRecords,
+}
+
+/// Operator-controlled host override persisted in the ledger database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostOverride {
+    pub host: String,
+    pub disabled: bool,
+    pub concurrency_cap: Option<u32>,
+    pub revive_after: Option<SystemTime>,
+    pub force_mode: Option<ForcedFetchMode>,
 }
 
 /// Mark a pending repo as claimed by a concrete attempt.
@@ -247,6 +314,7 @@ impl SqliteLedger {
             "
             CREATE TABLE IF NOT EXISTS repo_ledger (
                 did TEXT PRIMARY KEY NOT NULL,
+                shard_bucket INTEGER NOT NULL CHECK (shard_bucket >= 0),
                 status TEXT NOT NULL,
                 terminal_account_state TEXT,
                 attempts INTEGER NOT NULL CHECK (attempts >= 0),
@@ -264,6 +332,25 @@ impl SqliteLedger {
                     OR (last_attempt_run_id IS NOT NULL AND last_attempt_did IS NOT NULL AND last_attempt_sequence IS NOT NULL)
                 )
             );
+
+            CREATE TABLE IF NOT EXISTS host_overrides (
+                host TEXT PRIMARY KEY NOT NULL,
+                disabled INTEGER NOT NULL CHECK (disabled IN (0, 1)),
+                concurrency_cap INTEGER CHECK (concurrency_cap IS NULL OR concurrency_cap > 0),
+                revive_after_ms INTEGER,
+                force_mode TEXT CHECK (
+                    force_mode IS NULL OR force_mode IN ('get_repo', 'list_records')
+                )
+            );
+            ",
+        )?;
+        self.ensure_repo_ledger_shard_bucket()?;
+        self.connection.execute_batch(
+            "
+            CREATE INDEX IF NOT EXISTS idx_repo_ledger_claim
+                ON repo_ledger (status, shard_bucket, did);
+            CREATE INDEX IF NOT EXISTS idx_repo_ledger_retry
+                ON repo_ledger (status, shard_bucket, next_attempt_after_ms);
             ",
         )?;
         Ok(())
@@ -283,10 +370,12 @@ impl SqliteLedger {
             .map(|attempt| i64::try_from(attempt.sequence))
             .transpose()
             .map_err(|_err| LedgerStoreError::IntegerOverflow)?;
+        let shard_bucket = shard_bucket_to_i64(did_shard_bucket(&entry.did))?;
         self.connection.execute(
             "
             INSERT INTO repo_ledger (
                 did,
+                shard_bucket,
                 status,
                 terminal_account_state,
                 attempts,
@@ -295,8 +384,9 @@ impl SqliteLedger {
                 last_attempt_did,
                 last_attempt_sequence,
                 last_error
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             ON CONFLICT(did) DO UPDATE SET
+                shard_bucket = excluded.shard_bucket,
                 status = excluded.status,
                 terminal_account_state = excluded.terminal_account_state,
                 attempts = excluded.attempts,
@@ -308,6 +398,7 @@ impl SqliteLedger {
             ",
             params![
                 entry.did.as_str(),
+                shard_bucket,
                 status.status,
                 status.terminal_account_state,
                 i64::from(entry.attempts),
@@ -376,8 +467,90 @@ impl SqliteLedger {
         now: SystemTime,
         limit: u32,
     ) -> Result<Vec<RepoLedgerEntry>, LedgerStoreError> {
+        self.claimable_entries_with_shard(now, limit, None)
+    }
+
+    /// Return claimable entries for one shard bucket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerStoreError`] when SQLite fails or a stored row cannot be decoded.
+    pub fn claimable_entries_for_shard(
+        &self,
+        now: SystemTime,
+        limit: u32,
+        shard: ShardFilter,
+    ) -> Result<Vec<RepoLedgerEntry>, LedgerStoreError> {
+        self.claimable_entries_with_shard(now, limit, Some(shard))
+    }
+
+    /// Insert or replace a host override record by host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerStoreError`] when the record cannot be encoded or persisted.
+    pub fn upsert_host_override(&self, record: &HostOverride) -> Result<(), LedgerStoreError> {
+        validate_host_override(record)?;
+        let concurrency_cap = record.concurrency_cap.map(i64::from);
+        let revive_after_ms = optional_time_to_millis(record.revive_after)?;
+        self.connection.execute(
+            "
+            INSERT INTO host_overrides (
+                host,
+                disabled,
+                concurrency_cap,
+                revive_after_ms,
+                force_mode
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(host) DO UPDATE SET
+                disabled = excluded.disabled,
+                concurrency_cap = excluded.concurrency_cap,
+                revive_after_ms = excluded.revive_after_ms,
+                force_mode = excluded.force_mode
+            ",
+            params![
+                record.host.as_str(),
+                bool_to_i64(record.disabled),
+                concurrency_cap,
+                revive_after_ms,
+                record.force_mode.map(force_mode_name),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load one host override by host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerStoreError`] when SQLite fails or a stored row cannot be decoded.
+    pub fn load_host_override(&self, host: &str) -> Result<Option<HostOverride>, LedgerStoreError> {
+        self.connection
+            .query_row(
+                "
+                SELECT host, disabled, concurrency_cap, revive_after_ms, force_mode
+                FROM host_overrides
+                WHERE host = ?1
+                ",
+                params![host],
+                row_to_host_override,
+            )
+            .optional()
+            .map_err(Into::into)
+            .and_then(Option::transpose)
+    }
+
+    fn claimable_entries_with_shard(
+        &self,
+        now: SystemTime,
+        limit: u32,
+        shard: Option<ShardFilter>,
+    ) -> Result<Vec<RepoLedgerEntry>, LedgerStoreError> {
         let now_ms = time_to_millis(now)?;
         let limit = i64::from(limit);
+        let shard_bucket = shard
+            .map(|filter| shard_bucket_to_i64(filter.bucket()))
+            .transpose()?;
         let mut statement = self.connection.prepare(
             "
             SELECT
@@ -393,21 +566,59 @@ impl SqliteLedger {
             FROM repo_ledger
             WHERE
                 (
-                    status IN ('pending', 'retryable_failure')
-                    AND (next_attempt_after_ms IS NULL OR next_attempt_after_ms <= ?1)
+                    (
+                        status IN ('pending', 'retryable_failure')
+                        AND (next_attempt_after_ms IS NULL OR next_attempt_after_ms <= ?1)
+                    )
+                    OR (
+                        status = 'throttled'
+                        AND next_attempt_after_ms IS NOT NULL
+                        AND next_attempt_after_ms <= ?1
+                    )
                 )
-                OR (
-                    status = 'throttled'
-                    AND next_attempt_after_ms IS NOT NULL
-                    AND next_attempt_after_ms <= ?1
-                )
+                AND (?3 IS NULL OR shard_bucket = ?3)
             ORDER BY COALESCE(next_attempt_after_ms, 0), did
             LIMIT ?2
             ",
         )?;
-        let rows = statement.query_map(params![now_ms, limit], row_to_entry)?;
+        let rows = statement.query_map(params![now_ms, limit, shard_bucket], row_to_entry)?;
         let entries = rows.collect::<Result<Vec<_>, _>>()?;
         entries.into_iter().collect()
+    }
+
+    fn ensure_repo_ledger_shard_bucket(&self) -> Result<(), LedgerStoreError> {
+        let mut statement = self.connection.prepare("PRAGMA table_info(repo_ledger)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !columns.iter().any(|column| column == "shard_bucket") {
+            self.connection.execute(
+                "ALTER TABLE repo_ledger ADD COLUMN shard_bucket INTEGER",
+                [],
+            )?;
+        }
+        self.backfill_missing_shard_buckets()
+    }
+
+    fn backfill_missing_shard_buckets(&self) -> Result<(), LedgerStoreError> {
+        let dids = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT did FROM repo_ledger WHERE shard_bucket IS NULL")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut statement = self
+            .connection
+            .prepare("UPDATE repo_ledger SET shard_bucket = ?1 WHERE did = ?2")?;
+        for did in dids {
+            statement.execute(params![
+                shard_bucket_to_i64(did_shard_bucket(&did))?,
+                did.as_str(),
+            ])?;
+        }
+        Ok(())
     }
 }
 
@@ -443,6 +654,8 @@ pub enum LedgerError {
     AttemptOverflow,
     #[error("ledger time overflow")]
     TimeOverflow,
+    #[error("invalid shard bucket {bucket}; expected 0 <= bucket < {modulus}")]
+    InvalidShardBucket { bucket: u64, modulus: u64 },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -461,6 +674,12 @@ pub enum LedgerStoreError {
     InconsistentAttemptIdentity,
     #[error("ledger row has inconsistent terminal status")]
     InconsistentTerminalStatus,
+    #[error("invalid host override: {message}")]
+    InvalidHostOverride { message: String },
+    #[error("invalid host override disabled value {value}")]
+    InvalidHostOverrideDisabled { value: i64 },
+    #[error("invalid forced fetch mode {mode}")]
+    InvalidForcedFetchMode { mode: String },
 }
 
 struct StoredStatus {
@@ -529,6 +748,53 @@ fn row_to_entry(
         last_attempt_sequence,
         row.get(8)?,
     ))
+}
+
+fn row_to_host_override(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Result<HostOverride, LedgerStoreError>> {
+    let host: String = row.get(0)?;
+    let disabled: i64 = row.get(1)?;
+    let concurrency_cap: Option<i64> = row.get(2)?;
+    let revive_after_ms: Option<i64> = row.get(3)?;
+    let force_mode: Option<String> = row.get(4)?;
+
+    Ok(build_host_override(
+        host,
+        disabled,
+        concurrency_cap,
+        revive_after_ms,
+        force_mode,
+    ))
+}
+
+fn build_host_override(
+    host: String,
+    disabled: i64,
+    concurrency_cap: Option<i64>,
+    revive_after_ms: Option<i64>,
+    force_mode: Option<String>,
+) -> Result<HostOverride, LedgerStoreError> {
+    let disabled = match disabled {
+        0 => false,
+        1 => true,
+        value => return Err(LedgerStoreError::InvalidHostOverrideDisabled { value }),
+    };
+    let concurrency_cap = concurrency_cap
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_err| LedgerStoreError::IntegerOverflow)?;
+    let revive_after = revive_after_ms.map(time_from_millis).transpose()?;
+    let force_mode = force_mode.map(|mode| parse_force_mode(&mode)).transpose()?;
+    let record = HostOverride {
+        host,
+        disabled,
+        concurrency_cap,
+        revive_after,
+        force_mode,
+    };
+    validate_host_override(&record)?;
+    Ok(record)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -616,6 +882,45 @@ const fn account_state_name(state: AccountState) -> &'static str {
     }
 }
 
+const fn force_mode_name(mode: ForcedFetchMode) -> &'static str {
+    match mode {
+        ForcedFetchMode::GetRepo => "get_repo",
+        ForcedFetchMode::ListRecords => "list_records",
+    }
+}
+
+fn parse_force_mode(mode: &str) -> Result<ForcedFetchMode, LedgerStoreError> {
+    match mode {
+        "get_repo" => Ok(ForcedFetchMode::GetRepo),
+        "list_records" => Ok(ForcedFetchMode::ListRecords),
+        _ => Err(LedgerStoreError::InvalidForcedFetchMode {
+            mode: mode.to_owned(),
+        }),
+    }
+}
+
+fn validate_host_override(record: &HostOverride) -> Result<(), LedgerStoreError> {
+    if record.host.trim().is_empty() {
+        return Err(LedgerStoreError::InvalidHostOverride {
+            message: "host must not be blank".to_owned(),
+        });
+    }
+    if record.concurrency_cap == Some(0) {
+        return Err(LedgerStoreError::InvalidHostOverride {
+            message: "concurrency cap must be greater than zero".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+const fn bool_to_i64(value: bool) -> i64 {
+    if value { 1 } else { 0 }
+}
+
+fn shard_bucket_to_i64(bucket: u64) -> Result<i64, LedgerStoreError> {
+    i64::try_from(bucket).map_err(|_err| LedgerStoreError::IntegerOverflow)
+}
+
 fn optional_time_to_millis(time: Option<SystemTime>) -> Result<Option<i64>, LedgerStoreError> {
     time.map(time_to_millis).transpose()
 }
@@ -643,10 +948,13 @@ fn time_from_millis(millis: i64) -> Result<SystemTime, LedgerStoreError> {
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
+    use rusqlite::params;
+
     use crate::{
         ledger::{
-            AttemptId, AttemptOutcome, LedgerError, RepoLedgerEntry, RepoLedgerStatus, RetryPolicy,
-            SqliteLedger, claim_repo, complete_attempt,
+            AttemptId, AttemptOutcome, DID_SHARD_BUCKET_MODULUS, ForcedFetchMode, HostOverride,
+            LedgerError, LedgerStoreError, RepoLedgerEntry, RepoLedgerStatus, RetryPolicy,
+            ShardFilter, SqliteLedger, claim_repo, complete_attempt, did_shard_bucket,
         },
         transport::AccountState,
     };
@@ -775,6 +1083,21 @@ mod tests {
     }
 
     #[test]
+    fn did_shard_bucket_is_deterministic_and_bounded() {
+        let did = "did:plc:abc";
+
+        let bucket = did_shard_bucket(did);
+
+        assert_eq!(bucket, did_shard_bucket(did));
+        assert!(bucket < DID_SHARD_BUCKET_MODULUS);
+        assert!(ShardFilter::new(bucket).unwrap().contains_did(did));
+        assert!(matches!(
+            ShardFilter::new(DID_SHARD_BUCKET_MODULUS),
+            Err(LedgerError::InvalidShardBucket { .. })
+        ));
+    }
+
+    #[test]
     fn sqlite_upsert_loads_full_entry() {
         let store = SqliteLedger::open_in_memory().unwrap();
         let entry = RepoLedgerEntry {
@@ -789,6 +1112,17 @@ mod tests {
         store.upsert_entry(&entry).unwrap();
 
         assert_eq!(store.load_entry("did:plc:abc").unwrap(), Some(entry));
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT shard_bucket FROM repo_ledger WHERE did = ?1",
+                    params!["did:plc:abc"],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            i64::try_from(did_shard_bucket("did:plc:abc")).unwrap()
+        );
     }
 
     #[test]
@@ -832,6 +1166,112 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(dids, vec!["did:plc:pending", "did:plc:due"]);
+    }
+
+    #[test]
+    fn sqlite_claimable_entries_can_filter_by_shard() {
+        let store = SqliteLedger::open_in_memory().unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let target = RepoLedgerEntry::pending("did:plc:target");
+        let target_bucket = did_shard_bucket(&target.did);
+        let other = (0_u64..1_000)
+            .map(|index| RepoLedgerEntry::pending(format!("did:plc:other{index}")))
+            .find(|entry| did_shard_bucket(&entry.did) != target_bucket)
+            .unwrap();
+
+        store.upsert_entry(&target).unwrap();
+        store.upsert_entry(&other).unwrap();
+
+        let claimable = store
+            .claimable_entries_for_shard(now, 10, ShardFilter::new(target_bucket).unwrap())
+            .unwrap();
+
+        assert_eq!(claimable, vec![target]);
+    }
+
+    #[test]
+    fn sqlite_migrates_missing_shard_bucket_column() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE repo_ledger (
+                    did TEXT PRIMARY KEY NOT NULL,
+                    status TEXT NOT NULL,
+                    terminal_account_state TEXT,
+                    attempts INTEGER NOT NULL CHECK (attempts >= 0),
+                    next_attempt_after_ms INTEGER,
+                    last_attempt_run_id TEXT,
+                    last_attempt_did TEXT,
+                    last_attempt_sequence INTEGER,
+                    last_error TEXT
+                );
+                INSERT INTO repo_ledger (did, status, attempts)
+                VALUES ('did:plc:legacy', 'pending', 0);
+                ",
+            )
+            .unwrap();
+
+        let store = SqliteLedger::from_connection(connection).unwrap();
+
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT shard_bucket FROM repo_ledger WHERE did = ?1",
+                    params!["did:plc:legacy"],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            i64::try_from(did_shard_bucket("did:plc:legacy")).unwrap()
+        );
+    }
+
+    #[test]
+    fn sqlite_host_overrides_round_trip() {
+        let store = SqliteLedger::open_in_memory().unwrap();
+        let override_record = HostOverride {
+            host: "pds.example.com".to_owned(),
+            disabled: true,
+            concurrency_cap: Some(3),
+            revive_after: Some(UNIX_EPOCH + Duration::from_secs(60)),
+            force_mode: Some(ForcedFetchMode::ListRecords),
+        };
+
+        store.upsert_host_override(&override_record).unwrap();
+
+        assert_eq!(
+            store.load_host_override("pds.example.com").unwrap(),
+            Some(override_record)
+        );
+    }
+
+    #[test]
+    fn sqlite_host_overrides_reject_blank_hosts_and_zero_caps() {
+        let store = SqliteLedger::open_in_memory().unwrap();
+        let blank_host = HostOverride {
+            host: " ".to_owned(),
+            disabled: true,
+            concurrency_cap: None,
+            revive_after: None,
+            force_mode: None,
+        };
+        let zero_cap = HostOverride {
+            host: "pds.example.com".to_owned(),
+            disabled: false,
+            concurrency_cap: Some(0),
+            revive_after: None,
+            force_mode: Some(ForcedFetchMode::GetRepo),
+        };
+
+        assert!(matches!(
+            store.upsert_host_override(&blank_host),
+            Err(LedgerStoreError::InvalidHostOverride { .. })
+        ));
+        assert!(matches!(
+            store.upsert_host_override(&zero_cap),
+            Err(LedgerStoreError::InvalidHostOverride { .. })
+        ));
     }
 
     #[test]
