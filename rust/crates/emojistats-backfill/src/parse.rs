@@ -6,6 +6,7 @@ use std::{
     io::{Cursor, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -40,6 +41,36 @@ pub struct ParsedRepo {
     pub profile_decode_error: Option<String>,
     /// Typed record decode failures observed while walking reachable records.
     pub record_decode_errors: Vec<RecordDecodeFailure>,
+}
+
+/// Resource caps for Stage C parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseConfig {
+    /// Maximum number of `CAR` blocks accepted while verifying or indexing.
+    pub max_car_blocks: u64,
+    /// Maximum encoded `CAR` block section size accepted before allocation.
+    pub max_block_bytes: u64,
+    /// Maximum number of reachable repo records accepted while walking the `MST`.
+    pub max_records: u64,
+    /// Maximum `MST` cursor layer accepted while walking records.
+    pub max_mst_depth: u64,
+    /// Maximum number of non-fatal typed record decode errors accepted.
+    pub max_decode_errors: u64,
+    /// Maximum best-effort parser wall-clock time.
+    pub max_parse_wall_clock: Duration,
+}
+
+impl Default for ParseConfig {
+    fn default() -> Self {
+        Self {
+            max_car_blocks: 10_000_000,
+            max_block_bytes: 67_108_864,
+            max_records: 10_000_000,
+            max_mst_depth: 256,
+            max_decode_errors: 1_000_000,
+            max_parse_wall_clock: Duration::from_mins(15),
+        }
+    }
 }
 
 /// Commit metadata needed by downstream archive and receipt code.
@@ -173,6 +204,22 @@ pub enum ParseError {
         /// Root `CID` declared by the `CAR`.
         root: String,
     },
+    /// The single `CAR` root did not decode as a repo commit.
+    #[error("CAR root {root} did not decode as a repo commit: {message}")]
+    RootCommitDecode {
+        /// Root `CID` declared by the `CAR`.
+        root: String,
+        /// Decode error message.
+        message: String,
+    },
+    /// The repo commit claimed a different `DID` than the caller requested.
+    #[error("commit DID mismatch: requested={requested}, actual={actual}")]
+    CommitDidMismatch {
+        /// Requested repo `DID`.
+        requested: String,
+        /// Commit repo `DID`.
+        actual: String,
+    },
     /// A reachable block was missing from the `CAR`.
     #[error("reachable block missing from CAR: {cid}")]
     MissingBlock {
@@ -205,6 +252,16 @@ pub enum ParseError {
     ResourceCountOverflow {
         /// Counter name.
         field: &'static str,
+    },
+    /// Configured parser resource cap was exceeded.
+    #[error("parser resource limit exceeded: {limit} observed={observed}; recovery={recovery}")]
+    ResourceLimitExceeded {
+        /// Limit name.
+        limit: &'static str,
+        /// Observed value.
+        observed: u64,
+        /// Operator recovery hint.
+        recovery: &'static str,
     },
     /// Unsupported parse case with an explicit status.
     #[error("unsupported Stage C parse case: {feature}")]
@@ -251,6 +308,52 @@ pub enum ParseError {
 /// Returns [`ParseError`] for malformed `CAR`s, `CID` mismatches, missing reachable blocks,
 /// invalid commits, `MST` traversal failures, typed record decode failures, and local I/O errors.
 pub fn parse_repo(car_path: &Path) -> Result<ParsedRepo, ParseError> {
+    parse_repo_with_config(car_path, ParseConfig::default())
+}
+
+/// Parse a spooled repo `CAR` from disk with explicit resource caps.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] for malformed `CAR`s, `CID` mismatches, missing reachable blocks,
+/// invalid commits, `MST` traversal failures, typed record decode failures, configured resource
+/// limits, and local I/O errors.
+pub fn parse_repo_with_config(
+    car_path: &Path,
+    config: ParseConfig,
+) -> Result<ParsedRepo, ParseError> {
+    parse_repo_thread(car_path, None, config)
+}
+
+/// Parse a spooled repo `CAR` and assert that the commit `DID` matches the requested repo.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] for the same cases as [`parse_repo`], plus a loud commit `DID`
+/// mismatch when the root commit does not claim `requested_did`.
+pub fn parse_repo_for_did(car_path: &Path, requested_did: &str) -> Result<ParsedRepo, ParseError> {
+    parse_repo_for_did_with_config(car_path, requested_did, ParseConfig::default())
+}
+
+/// Parse a spooled repo `CAR` with explicit resource caps and a requested `DID` assertion.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] for malformed input, configured resource limits, traversal failures,
+/// local I/O errors, and commit `DID` mismatch.
+pub fn parse_repo_for_did_with_config(
+    car_path: &Path,
+    requested_did: &str,
+    config: ParseConfig,
+) -> Result<ParsedRepo, ParseError> {
+    parse_repo_thread(car_path, Some(requested_did.to_owned()), config)
+}
+
+fn parse_repo_thread(
+    car_path: &Path,
+    requested_did: Option<String>,
+    config: ParseConfig,
+) -> Result<ParsedRepo, ParseError> {
     let car_path = car_path.to_path_buf();
     std::thread::Builder::new()
         .name("emojistats-stage-c-parse".to_owned())
@@ -259,20 +362,33 @@ pub fn parse_repo(car_path: &Path) -> Result<ParsedRepo, ParseError> {
                 .enable_all()
                 .build()
                 .map_err(ParseError::Runtime)?;
-            runtime.block_on(parse_repo_async(&car_path))
+            runtime.block_on(parse_repo_async(
+                &car_path,
+                requested_did.as_deref(),
+                config,
+            ))
         })
         .map_err(ParseError::ThreadSpawn)?
         .join()
         .map_err(|_err| ParseError::RuntimeThreadTerminated)?
 }
 
-async fn parse_repo_async(car_path: &Path) -> Result<ParsedRepo, ParseError> {
-    let stream_summary = verify_streamed_car(car_path).await?;
-    let store = IndexedCarBlockStore::load(car_path)?;
+async fn parse_repo_async(
+    car_path: &Path,
+    requested_did: Option<&str>,
+    config: ParseConfig,
+) -> Result<ParsedRepo, ParseError> {
+    let deadline = ParseDeadline::start(config.max_parse_wall_clock);
+    let stream_summary = verify_streamed_car(car_path, config, deadline).await?;
+    deadline.ensure_not_exceeded()?;
+    let store = IndexedCarBlockStore::load(car_path, config)?;
+    deadline.ensure_not_exceeded()?;
     let commit_root = single_car_root(&stream_summary.roots)?;
     let (commit_cid, commit) = load_commit(commit_root, &store).await?;
+    deadline.ensure_not_exceeded()?;
+    assert_requested_did(requested_did, commit.did().as_str())?;
     let (posts, profile, profile_decode_error, record_decode_errors, rkey_digest) =
-        walk_mst_records(commit.data, &store).await?;
+        walk_mst_records(commit.data, &store, config, deadline).await?;
 
     let proof = CompletenessProof {
         class: CompletenessClass::SnapshotComplete,
@@ -306,14 +422,31 @@ async fn parse_repo_async(car_path: &Path) -> Result<ParsedRepo, ParseError> {
     })
 }
 
-async fn verify_streamed_car(car_path: &Path) -> Result<CarStreamSummary, ParseError> {
+async fn verify_streamed_car(
+    car_path: &Path,
+    config: ParseConfig,
+    deadline: ParseDeadline,
+) -> Result<CarStreamSummary, ParseError> {
     let mut stream = car::stream_car(car_path).await?;
     let roots = stream.roots().to_vec();
     let mut verified_block_count = 0_u64;
 
     while let Some((cid, bytes)) = stream.next().await? {
+        ensure_usize_at_most(
+            bytes.len(),
+            config.max_block_bytes,
+            "max_block_bytes",
+            "raise parser max_block_bytes only for a known-good repo",
+        )?;
         verify_block_cid(cid, bytes.as_ref())?;
         verified_block_count = checked_increment(verified_block_count, "verified_block_count")?;
+        deadline.ensure_not_exceeded()?;
+        ensure_u64_at_most(
+            verified_block_count,
+            config.max_car_blocks,
+            "max_car_blocks",
+            "raise parser max_car_blocks only for a known-good repo",
+        )?;
     }
 
     Ok(CarStreamSummary {
@@ -338,29 +471,40 @@ async fn load_commit(
     root: IpldCid,
     store: &IndexedCarBlockStore,
 ) -> Result<(IpldCid, Commit<SmolStr>), ParseError> {
-    if let Some(bytes) = store.get(&root).await?
-        && let Ok(commit) = Commit::<SmolStr>::from_cbor(bytes.as_ref())
-    {
-        return Ok((root, commit));
-    }
+    let Some(bytes) = store.get(&root).await? else {
+        return Err(ParseError::CommitNotFound {
+            root: root.to_string(),
+        });
+    };
 
-    for cid in store.cids() {
-        let Some(bytes) = store.get(&cid).await? else {
-            continue;
-        };
-        if let Ok(commit) = Commit::<SmolStr>::from_cbor(bytes.as_ref()) {
-            return Ok((cid, commit));
+    let commit = Commit::<SmolStr>::from_cbor(bytes.as_ref()).map_err(|source| {
+        ParseError::RootCommitDecode {
+            root: root.to_string(),
+            message: source.to_string(),
         }
+    })?;
+    Ok((root, commit))
+}
+
+fn assert_requested_did(requested_did: Option<&str>, actual_did: &str) -> Result<(), ParseError> {
+    let Some(requested) = requested_did else {
+        return Ok(());
+    };
+    if requested == actual_did {
+        return Ok(());
     }
 
-    Err(ParseError::CommitNotFound {
-        root: root.to_string(),
+    Err(ParseError::CommitDidMismatch {
+        requested: requested.to_owned(),
+        actual: actual_did.to_owned(),
     })
 }
 
 async fn walk_mst_records(
     root: IpldCid,
     store: &IndexedCarBlockStore,
+    config: ParseConfig,
+    deadline: ParseDeadline,
 ) -> Result<
     (
         Vec<PostRecord>,
@@ -389,6 +533,13 @@ async fn walk_mst_records(
 
     cursor.advance().await?;
     while !cursor.is_end() {
+        ensure_usize_at_most(
+            cursor.layer().await?,
+            config.max_mst_depth,
+            "max_mst_depth",
+            "raise parser max_mst_depth only after inspecting the repo MST",
+        )?;
+        deadline.ensure_not_exceeded()?;
         match cursor.current().clone() {
             CursorPosition::Leaf { key, cid } => {
                 let key_text = key.to_string();
@@ -399,16 +550,14 @@ async fn walk_mst_records(
                         .ok_or_else(|| ParseError::MissingBlock {
                             cid: cid.to_string(),
                         })?;
-                update_digest(&mut digest, &key_text)?;
-                extract_known_record(
-                    &key_text,
-                    cid,
-                    record_bytes.as_ref(),
-                    &mut posts,
-                    &mut profile,
-                    &mut profile_decode_error,
-                    &mut record_decode_errors,
-                );
+                update_digest(&mut digest, &key_text, config)?;
+                let mut sinks = RecordSinks {
+                    posts: &mut posts,
+                    profile: &mut profile,
+                    profile_decode_error: &mut profile_decode_error,
+                    record_decode_errors: &mut record_decode_errors,
+                };
+                extract_known_record(&key_text, cid, record_bytes.as_ref(), &mut sinks, config)?;
                 cursor.advance().await?;
             }
             CursorPosition::Tree { .. } => {
@@ -431,33 +580,37 @@ fn extract_known_record(
     key: &str,
     cid: IpldCid,
     record_bytes: &[u8],
-    posts: &mut Vec<PostRecord>,
-    profile: &mut Option<ProfileRecord>,
-    profile_decode_error: &mut Option<String>,
-    record_decode_errors: &mut Vec<RecordDecodeFailure>,
-) {
+    sinks: &mut RecordSinks<'_>,
+    config: ParseConfig,
+) -> Result<(), ParseError> {
     let Some((collection, rkey)) = split_repo_key(key) else {
-        return;
+        return Ok(());
     };
 
     match collection {
         POST_COLLECTION => match serde_ipld_dagcbor::from_slice::<Post<SmolStr>>(record_bytes) {
-            Ok(record) => posts.push(PostRecord {
+            Ok(record) => sinks.posts.push(PostRecord {
                 rkey: rkey.to_owned(),
                 cid: cid.to_string(),
                 record,
             }),
-            Err(error) => record_decode_errors.push(RecordDecodeFailure {
-                key: key.to_owned(),
-                collection: POST_COLLECTION,
-                cid: cid.to_string(),
-                message: error.to_string(),
-            }),
+            Err(error) => {
+                sinks.record_decode_errors.push(RecordDecodeFailure {
+                    key: key.to_owned(),
+                    collection: POST_COLLECTION,
+                    cid: cid.to_string(),
+                    message: error.to_string(),
+                });
+                enforce_decode_error_limit(
+                    sinks.record_decode_errors.len(),
+                    config.max_decode_errors,
+                )?;
+            }
         },
         PROFILE_COLLECTION if rkey == PROFILE_RKEY => {
             match serde_ipld_dagcbor::from_slice::<Profile<SmolStr>>(record_bytes) {
                 Ok(record) => {
-                    *profile = Some(ProfileRecord {
+                    *sinks.profile = Some(ProfileRecord {
                         rkey: rkey.to_owned(),
                         cid: cid.to_string(),
                         record,
@@ -465,23 +618,46 @@ fn extract_known_record(
                 }
                 Err(error) => {
                     let message = error.to_string();
-                    *profile_decode_error =
+                    *sinks.profile_decode_error =
                         Some(format!("{PROFILE_COLLECTION}/{rkey} at {cid}: {message}"));
-                    record_decode_errors.push(RecordDecodeFailure {
+                    sinks.record_decode_errors.push(RecordDecodeFailure {
                         key: key.to_owned(),
                         collection: PROFILE_COLLECTION,
                         cid: cid.to_string(),
                         message,
                     });
+                    enforce_decode_error_limit(
+                        sinks.record_decode_errors.len(),
+                        config.max_decode_errors,
+                    )?;
                 }
             }
         }
         _other => {}
     }
+
+    Ok(())
 }
 
-fn update_digest(digest: &mut RkeyDigest, key: &str) -> Result<(), ParseError> {
+struct RecordSinks<'a> {
+    posts: &'a mut Vec<PostRecord>,
+    profile: &'a mut Option<ProfileRecord>,
+    profile_decode_error: &'a mut Option<String>,
+    record_decode_errors: &'a mut Vec<RecordDecodeFailure>,
+}
+
+fn update_digest(
+    digest: &mut RkeyDigest,
+    key: &str,
+    config: ParseConfig,
+) -> Result<(), ParseError> {
     digest.all_records_count = checked_increment(digest.all_records_count, "all_records_count")?;
+    ensure_u64_at_most(
+        digest.all_records_count,
+        config.max_records,
+        "max_records",
+        "raise parser max_records only for a known-good repo",
+    )?;
     if digest.first_key.is_none() {
         digest.first_key = Some(key.to_owned());
     }
@@ -526,16 +702,12 @@ struct IndexedCarBlockStore {
 }
 
 impl IndexedCarBlockStore {
-    fn load(path: &Path) -> Result<Self, ParseError> {
-        let index = index_car_blocks(path)?;
+    fn load(path: &Path, config: ParseConfig) -> Result<Self, ParseError> {
+        let index = index_car_blocks(path, config)?;
         Ok(Self {
             path: Arc::new(path.to_path_buf()),
             index: Arc::new(index),
         })
-    }
-
-    fn cids(&self) -> Vec<IpldCid> {
-        self.index.keys().copied().collect()
     }
 }
 
@@ -579,7 +751,10 @@ impl BlockStore for IndexedCarBlockStore {
     }
 }
 
-fn index_car_blocks(path: &Path) -> Result<BTreeMap<IpldCid, BlockLocation>, ParseError> {
+fn index_car_blocks(
+    path: &Path,
+    config: ParseConfig,
+) -> Result<BTreeMap<IpldCid, BlockLocation>, ParseError> {
     let mut file = open_file(path)?;
     let Some(header_len) = read_varint(&mut file)? else {
         return Err(ParseError::InvalidRoots("CAR file is empty".to_owned()));
@@ -592,9 +767,16 @@ fn index_car_blocks(path: &Path) -> Result<BTreeMap<IpldCid, BlockLocation>, Par
         })?;
 
     let mut index = BTreeMap::new();
+    let mut indexed_block_count = 0_u64;
     while let Some(section_len) = read_varint(&mut file)? {
         offset = checked_add_u64(offset, section_len.bytes_read, "section varint")?;
         let section_start = offset;
+        ensure_u64_at_most(
+            section_len.value,
+            config.max_block_bytes,
+            "max_block_bytes",
+            "raise parser max_block_bytes only for a known-good repo",
+        )?;
         let section_len_usize =
             usize::try_from(section_len.value).map_err(|_err| ParseError::CarLengthOverflow {
                 field: "section length",
@@ -639,6 +821,13 @@ fn index_car_blocks(path: &Path) -> Result<BTreeMap<IpldCid, BlockLocation>, Par
             Entry::Occupied(_entry) => {}
         }
 
+        indexed_block_count = checked_increment(indexed_block_count, "indexed_block_count")?;
+        ensure_u64_at_most(
+            indexed_block_count,
+            config.max_car_blocks,
+            "max_car_blocks",
+            "raise parser max_car_blocks only for a known-good repo",
+        )?;
         offset = checked_add_u64(section_start, section_len.value, "section end")?;
     }
 
@@ -715,6 +904,71 @@ fn checked_add_u64(lhs: u64, rhs: u64, field: &'static str) -> Result<u64, Parse
         .ok_or(ParseError::CarLengthOverflow { field })
 }
 
+const fn ensure_u64_at_most(
+    observed: u64,
+    limit: u64,
+    limit_name: &'static str,
+    recovery: &'static str,
+) -> Result<(), ParseError> {
+    if observed <= limit {
+        return Ok(());
+    }
+
+    Err(ParseError::ResourceLimitExceeded {
+        limit: limit_name,
+        observed,
+        recovery,
+    })
+}
+
+fn ensure_usize_at_most(
+    observed: usize,
+    limit: u64,
+    limit_name: &'static str,
+    recovery: &'static str,
+) -> Result<(), ParseError> {
+    let observed_u64 = u64::try_from(observed).map_err(|_err| ParseError::CarLengthOverflow {
+        field: "usize observed length",
+    })?;
+    ensure_u64_at_most(observed_u64, limit, limit_name, recovery)
+}
+
+fn enforce_decode_error_limit(observed: usize, limit: u64) -> Result<(), ParseError> {
+    ensure_usize_at_most(
+        observed,
+        limit,
+        "max_decode_errors",
+        "raise parser max_decode_errors only after inspecting malformed records",
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ParseDeadline {
+    started_at: Instant,
+    max_wall_clock: Duration,
+}
+
+impl ParseDeadline {
+    fn start(max_wall_clock: Duration) -> Self {
+        Self {
+            started_at: Instant::now(),
+            max_wall_clock,
+        }
+    }
+
+    fn ensure_not_exceeded(self) -> Result<(), ParseError> {
+        let elapsed = self.started_at.elapsed();
+        if elapsed <= self.max_wall_clock {
+            return Ok(());
+        }
+        Err(ParseError::ResourceLimitExceeded {
+            limit: "max_parse_wall_clock",
+            observed: elapsed.as_secs(),
+            recovery: "raise parser max_parse_wall_clock only for a known-good repo",
+        })
+    }
+}
+
 fn read_only_store_error() -> RepoError {
     RepoError::storage(std::io::Error::other(
         "indexed CAR block store is read-only",
@@ -746,7 +1000,10 @@ const PROFILE_RKEY: &str = "self";
 
 #[cfg(test)]
 mod tests {
-    use super::{RkeyDigest, Varint, read_varint, split_repo_key, update_digest};
+    use super::{
+        ParseConfig, ParseError, RkeyDigest, Varint, assert_requested_did,
+        enforce_decode_error_limit, read_varint, split_repo_key, update_digest,
+    };
 
     #[test]
     fn splits_repo_key_into_collection_and_rkey() {
@@ -772,9 +1029,10 @@ mod tests {
     #[test]
     fn digest_tracks_first_last_and_post_counts() {
         let mut digest = RkeyDigest::default();
+        let config = ParseConfig::default();
 
-        update_digest(&mut digest, "app.bsky.actor.profile/self").unwrap();
-        update_digest(&mut digest, "app.bsky.feed.post/3kabc").unwrap();
+        update_digest(&mut digest, "app.bsky.actor.profile/self", config).unwrap();
+        update_digest(&mut digest, "app.bsky.feed.post/3kabc", config).unwrap();
 
         assert_eq!(digest.all_records_count, 2);
         assert_eq!(digest.post_records_count, 1);
@@ -783,5 +1041,55 @@ mod tests {
             Some("app.bsky.actor.profile/self")
         );
         assert_eq!(digest.last_key.as_deref(), Some("app.bsky.feed.post/3kabc"));
+    }
+
+    #[test]
+    fn requested_did_mismatch_is_loud() {
+        let error = assert_requested_did(Some("did:plc:requested"), "did:plc:actual")
+            .expect_err("mismatch should fail");
+
+        assert!(matches!(
+            error,
+            ParseError::CommitDidMismatch {
+                requested,
+                actual
+            } if requested == "did:plc:requested" && actual == "did:plc:actual"
+        ));
+    }
+
+    #[test]
+    fn record_limit_is_loud() {
+        let mut digest = RkeyDigest::default();
+        let config = ParseConfig {
+            max_records: 1,
+            ..ParseConfig::default()
+        };
+
+        update_digest(&mut digest, "app.bsky.feed.post/3kabc", config).unwrap();
+        let error = update_digest(&mut digest, "app.bsky.feed.post/3kdef", config)
+            .expect_err("second record should exceed cap");
+
+        assert!(matches!(
+            error,
+            ParseError::ResourceLimitExceeded {
+                limit: "max_records",
+                observed: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_error_limit_is_loud() {
+        let error = enforce_decode_error_limit(2, 1).expect_err("decode cap should fail");
+
+        assert!(matches!(
+            error,
+            ParseError::ResourceLimitExceeded {
+                limit: "max_decode_errors",
+                observed: 2,
+                ..
+            }
+        ));
     }
 }

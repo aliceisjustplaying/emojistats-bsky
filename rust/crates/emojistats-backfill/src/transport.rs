@@ -3,10 +3,10 @@
 use std::{
     error::Error,
     fmt,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use futures_util::StreamExt as _;
@@ -301,10 +301,30 @@ async fn stream_to_file(
     chunk_idle_timeout: Duration,
     max_bytes: u64,
 ) -> Result<u64, FetchError> {
+    let temp_path = temp_spool_path(car_path)?;
+    match stream_to_temp_file(body, &temp_path, chunk_idle_timeout, max_bytes).await {
+        Ok(bytes) => {
+            fs::rename(&temp_path, car_path)?;
+            sync_parent_dir(car_path)?;
+            Ok(bytes)
+        }
+        Err(error) => {
+            let _ignored = fs::remove_file(&temp_path);
+            Err(error)
+        }
+    }
+}
+
+async fn stream_to_temp_file(
+    body: ByteStream,
+    temp_path: &Path,
+    chunk_idle_timeout: Duration,
+    max_bytes: u64,
+) -> Result<u64, FetchError> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(car_path)?;
+        .open(temp_path)?;
     let mut bytes = 0_u64;
     let mut stream = body.into_inner();
 
@@ -340,6 +360,32 @@ async fn stream_to_file(
 
     file.sync_all()?;
     Ok(bytes)
+}
+
+fn temp_spool_path(car_path: &Path) -> Result<PathBuf, FetchError> {
+    let file_name = car_path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "spool path has no file name")
+        })?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| io::Error::other(format!("system clock before UNIX epoch: {error}")))?;
+    let temp_name = format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        timestamp.as_nanos()
+    );
+    Ok(car_path.with_file_name(temp_name))
+}
+
+fn sync_parent_dir(path: &Path) -> Result<(), FetchError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 async fn collect_body_with_cap(

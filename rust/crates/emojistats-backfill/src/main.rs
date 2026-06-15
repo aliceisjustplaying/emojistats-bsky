@@ -10,10 +10,10 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use emojistats_backfill::{
     archive::{
-        archive_rows_from_parsed_repo, build_repo_receipt, current_normalizer,
-        write_archive_artifacts,
+        RepoReceiptInput, archive_rows_from_parsed_repo, build_repo_receipt, current_normalizer,
+        hash_profile_record, write_archive_artifacts,
     },
-    parse::parse_repo,
+    parse::parse_repo_for_did,
     transport::{FetchConfig, fetch_repo},
 };
 use jacquard_common::types::did::Did;
@@ -95,22 +95,36 @@ async fn fetch_one(
         spooled.car_path.display()
     );
 
-    let parsed = parse_repo(&spooled.car_path)
+    let parsed = parse_repo_for_did(&spooled.car_path, did_str)
         .map_err(|err| anyhow::anyhow!("parse CAR for {did_str}: {err}"))?;
-    let rows = archive_rows_from_parsed_repo(&parsed);
-    let receipt = build_repo_receipt(
-        &rows,
-        parsed.rkey_digest.all_records_count,
-        Some(parsed.commit.data.clone()),
-        Some(parsed.commit.cid.clone()),
-        current_normalizer(),
-    );
+    let rows = archive_rows_from_parsed_repo(&parsed)
+        .map_err(|err| anyhow::anyhow!("build archive rows for {did_str}: {err}"))?;
+    let profile_row_hash = hash_profile_record(parsed.profile.as_ref())
+        .map_err(|err| anyhow::anyhow!("hash profile row for {did_str}: {err}"))?;
+    let post_decode_error_count = parsed
+        .record_decode_errors
+        .iter()
+        .filter(|error| error.collection == "app.bsky.feed.post")
+        .count()
+        .try_into()
+        .map_err(|_err| anyhow::anyhow!("post decode error count overflow for {did_str}"))?;
+    let receipt = build_repo_receipt(RepoReceiptInput {
+        rows: &rows,
+        reachable_records_count: parsed.rkey_digest.all_records_count,
+        reachable_post_records_count: parsed.rkey_digest.post_records_count,
+        post_decode_error_count,
+        profile_row_hash,
+        mst_root_cid: Some(parsed.commit.data.clone()),
+        commit_cid: Some(parsed.commit.cid.clone()),
+        normalizer: current_normalizer(),
+    })
+    .map_err(|err| anyhow::anyhow!("build receipt for {did_str}: {err}"))?;
     let artifacts = write_archive_artifacts(&archive_dir, did_str, &rows, &receipt)
         .map_err(|err| anyhow::anyhow!("write archive artifacts for {did_str}: {err}"))?;
     println!(
         "parsed {} records, {} posts, {} decode errors, {} emoji rows, receipt {}",
         parsed.rkey_digest.all_records_count,
-        receipt.all_posts_count,
+        receipt.archived_post_rows_count,
         parsed.record_decode_errors.len(),
         artifacts.emoji_rows,
         receipt.post_rows_hash
