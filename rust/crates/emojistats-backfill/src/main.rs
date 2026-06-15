@@ -8,7 +8,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use clap::{Parser, Subcommand};
@@ -18,12 +18,14 @@ use emojistats_backfill::{
         current_normalizer, hash_profile_record, write_archive_artifacts,
     },
     ledger::{
-        AttemptId, AttemptOutcome, RepoLedgerEntry, RetryPolicy, SqliteLedger, claim_repo,
-        complete_attempt,
+        AttemptId, AttemptOutcome, RepoLedgerEntry, RepoLedgerStatus, RetryPolicy, SqliteLedger,
+        claim_repo, complete_attempt,
     },
     parse::{ParseError, parse_repo_for_did},
+    scheduler::{ClaimScope, HostPacer, SchedulerError, SharedHostPacer, checked_concurrency},
     transport::{FetchConfig, FetchError, fetch_repo},
 };
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use jacquard_common::types::did::Did;
 use jacquard_identity::{PublicResolver, resolver::IdentityResolver};
 
@@ -64,6 +66,9 @@ enum Command {
         /// Maximum claimable repos to process in this invocation.
         #[arg(long, default_value_t = 1, value_parser = parse_positive_u32)]
         claim_limit: u32,
+        /// Maximum concurrent repo attempts.
+        #[arg(long, default_value_t = 4, value_parser = parse_positive_usize)]
+        concurrency: usize,
         /// Directory for local `CAR` spooling.
         #[arg(long, default_value = "data/spool")]
         spool_dir: PathBuf,
@@ -91,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
             ledger_path,
             run_id,
             claim_limit,
+            concurrency,
             spool_dir,
             max_bytes,
             archive_dir,
@@ -100,9 +106,11 @@ async fn main() -> anyhow::Result<()> {
                 ledger_path,
                 run_id,
                 claim_limit,
+                concurrency,
                 spool_dir,
                 max_bytes,
                 archive_dir,
+                claim_scope: ClaimScope::default(),
             })
             .await
         }
@@ -148,9 +156,11 @@ struct FleetConfig {
     ledger_path: PathBuf,
     run_id: String,
     claim_limit: u32,
+    concurrency: usize,
     spool_dir: PathBuf,
     max_bytes: u64,
     archive_dir: PathBuf,
+    claim_scope: ClaimScope,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -163,12 +173,14 @@ struct SeedSummary {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct FleetSummary {
     seed: SeedSummary,
+    stale_recovered: u64,
     claimed: u64,
     succeeded: u64,
     failed: u64,
 }
 
 async fn run_fleet(config: FleetConfig) -> anyhow::Result<()> {
+    checked_concurrency(config.concurrency)?;
     if let Some(parent) = config
         .ledger_path
         .parent()
@@ -181,55 +193,178 @@ async fn run_fleet(config: FleetConfig) -> anyhow::Result<()> {
         seed: seed_ledger_from_file(&ledger, &config.dids_file)?,
         ..FleetSummary::default()
     };
-    let claimable = ledger.claimable_entries(SystemTime::now(), config.claim_limit)?;
+    summary.stale_recovered =
+        recover_stale_claimed_entries(&ledger, &config.dids_file, SystemTime::now())?;
+    let host_pacer = HostPacer::shared();
+    let mut active = FuturesUnordered::new();
+    let claim_limit = u64::from(config.claim_limit);
 
-    for entry in claimable {
-        let did = entry.did.clone();
-        let attempt = AttemptId::new(&config.run_id, &did, next_attempt_sequence(&entry)?);
-        let claimed = claim_repo(&entry, attempt, SystemTime::now())
-            .map_err(|err| anyhow::anyhow!("claim ledger entry for {did}: {err}"))?;
-        ledger.save_transitioned_entry(&claimed)?;
-        increment(&mut summary.claimed, "claimed repo count")?;
+    loop {
+        while active.len() < config.concurrency && summary.claimed < claim_limit {
+            let remaining = claim_limit
+                .checked_sub(summary.claimed)
+                .ok_or(SchedulerError::ClaimLimitOverflow)?;
+            let batch_limit = claim_batch_limit(config.concurrency, active.len(), remaining)?;
+            let claimable = ledger.claimable_entries(SystemTime::now(), batch_limit)?;
+            if claimable.is_empty() {
+                break;
+            }
 
-        let result = fetch_one_attempt(
-            &did,
-            config.spool_dir.clone(),
-            config.max_bytes,
-            config.archive_dir.clone(),
-        )
-        .await;
-        let outcome = result.as_ref().map_or_else(
-            |failure| failure.outcome.clone(),
-            |_success| AttemptOutcome::Succeeded,
-        );
-        let completed =
-            complete_attempt(&claimed, outcome, SystemTime::now(), RetryPolicy::default())
-                .map_err(|err| anyhow::anyhow!("complete ledger entry for {did}: {err}"))?;
-        ledger.save_transitioned_entry(&completed)?;
-
-        match result {
-            Ok(()) => increment(&mut summary.succeeded, "succeeded repo count")?,
-            Err(failure) => {
-                increment(&mut summary.failed, "failed repo count")?;
-                eprintln!("attempt failed for {did}: {}", failure.error);
+            for entry in claimable {
+                let did = entry.did.clone();
+                if !config.claim_scope.includes_did(&did) {
+                    continue;
+                }
+                let attempt = AttemptId::new(&config.run_id, &did, next_attempt_sequence(&entry)?);
+                let claimed = claim_repo(&entry, attempt, SystemTime::now())
+                    .map_err(|err| anyhow::anyhow!("claim ledger entry for {did}: {err}"))?;
+                ledger.save_transitioned_entry(&claimed)?;
+                increment(&mut summary.claimed, "claimed repo count")?;
+                active.push(run_fleet_attempt(FleetAttemptConfig {
+                    did,
+                    claimed,
+                    spool_dir: config.spool_dir.clone(),
+                    max_bytes: config.max_bytes,
+                    archive_dir: config.archive_dir.clone(),
+                    host_pacer: host_pacer.clone(),
+                    claim_scope: config.claim_scope.clone(),
+                }));
             }
         }
-        println!(
-            "ledger status for {} after {} attempt(s): {:?}",
-            completed.did, completed.attempts, completed.status
-        );
+
+        let Some(attempt_result) = active.next().await else {
+            break;
+        };
+        complete_fleet_attempt(&ledger, &mut summary, attempt_result)?;
     }
 
     println!(
-        "fleet summary: seeded {}, existing {}, blank {}, claimed {}, succeeded {}, failed {}",
+        "fleet summary: seeded {}, existing {}, blank {}, stale_recovered {}, claimed {}, succeeded {}, failed {}",
         summary.seed.inserted,
         summary.seed.existing,
         summary.seed.blank,
+        summary.stale_recovered,
         summary.claimed,
         summary.succeeded,
         summary.failed
     );
     Ok(())
+}
+
+#[derive(Debug)]
+struct FleetAttemptConfig {
+    did: String,
+    claimed: RepoLedgerEntry,
+    spool_dir: PathBuf,
+    max_bytes: u64,
+    archive_dir: PathBuf,
+    host_pacer: SharedHostPacer,
+    claim_scope: ClaimScope,
+}
+
+#[derive(Debug)]
+struct FleetAttemptResult {
+    did: String,
+    claimed: RepoLedgerEntry,
+    result: Result<(), FetchOneFailure>,
+}
+
+async fn run_fleet_attempt(config: FleetAttemptConfig) -> FleetAttemptResult {
+    let result = fetch_one_attempt_with_pacer(
+        &config.did,
+        config.spool_dir,
+        config.max_bytes,
+        config.archive_dir,
+        Some(config.host_pacer),
+        &config.claim_scope,
+    )
+    .await;
+    FleetAttemptResult {
+        did: config.did,
+        claimed: config.claimed,
+        result,
+    }
+}
+
+fn complete_fleet_attempt(
+    ledger: &SqliteLedger,
+    summary: &mut FleetSummary,
+    attempt_result: FleetAttemptResult,
+) -> anyhow::Result<()> {
+    let outcome = attempt_result.result.as_ref().map_or_else(
+        |failure| failure.outcome.clone(),
+        |_success| AttemptOutcome::Succeeded,
+    );
+    let completed = complete_attempt(
+        &attempt_result.claimed,
+        outcome,
+        SystemTime::now(),
+        RetryPolicy::default(),
+    )
+    .map_err(|err| anyhow::anyhow!("complete ledger entry for {}: {err}", attempt_result.did))?;
+    ledger.save_transitioned_entry(&completed)?;
+
+    match attempt_result.result {
+        Ok(()) => increment(&mut summary.succeeded, "succeeded repo count")?,
+        Err(failure) => {
+            increment(&mut summary.failed, "failed repo count")?;
+            eprintln!(
+                "attempt failed for {}: {}",
+                attempt_result.did, failure.error
+            );
+        }
+    }
+    println!(
+        "ledger status for {} after {} attempt(s): {:?}",
+        completed.did, completed.attempts, completed.status
+    );
+    Ok(())
+}
+
+fn claim_batch_limit(concurrency: usize, in_flight: usize, remaining: u64) -> anyhow::Result<u32> {
+    let available = concurrency
+        .checked_sub(in_flight)
+        .ok_or(SchedulerError::InvalidConcurrency)?;
+    let available = u64::try_from(available)?;
+    let limit = available.min(remaining).min(u64::from(u32::MAX));
+    u32::try_from(limit).map_err(Into::into)
+}
+
+fn recover_stale_claimed_entries(
+    ledger: &SqliteLedger,
+    dids_file: &Path,
+    now: SystemTime,
+) -> anyhow::Result<u64> {
+    let contents = fs::read_to_string(dids_file)?;
+    let mut recovered = 0_u64;
+    for line in contents.lines() {
+        let did = line.trim();
+        if did.is_empty() {
+            continue;
+        }
+        let Some(entry) = ledger.load_entry(did)? else {
+            continue;
+        };
+        if entry.status != RepoLedgerStatus::Claimed {
+            continue;
+        }
+        let recovered_entry = complete_attempt(
+            &entry,
+            AttemptOutcome::RetryableFailure {
+                message: "stale claimed state at fleet startup".to_owned(),
+            },
+            now,
+            RetryPolicy {
+                max_attempts: u32::MAX,
+                base_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+            },
+        )
+        .map_err(|err| anyhow::anyhow!("recover stale claimed ledger entry for {did}: {err}"))?;
+        ledger.save_transitioned_entry(&recovered_entry)?;
+        increment(&mut recovered, "stale claimed recovery count")?;
+    }
+    Ok(recovered)
 }
 
 fn seed_ledger_from_file(ledger: &SqliteLedger, dids_file: &Path) -> anyhow::Result<SeedSummary> {
@@ -281,11 +416,41 @@ fn parse_positive_u32(value: &str) -> Result<u32, String> {
     Ok(parsed)
 }
 
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|err| format!("expected a positive integer: {err}"))?;
+    if parsed == 0 {
+        return Err("expected a positive integer".to_owned());
+    }
+    Ok(parsed)
+}
+
 async fn fetch_one_attempt(
     did_str: &str,
     spool_dir: PathBuf,
     max_bytes: u64,
     archive_dir: PathBuf,
+) -> Result<(), FetchOneFailure> {
+    let claim_scope = ClaimScope::default();
+    fetch_one_attempt_with_pacer(
+        did_str,
+        spool_dir,
+        max_bytes,
+        archive_dir,
+        None,
+        &claim_scope,
+    )
+    .await
+}
+
+async fn fetch_one_attempt_with_pacer(
+    did_str: &str,
+    spool_dir: PathBuf,
+    max_bytes: u64,
+    archive_dir: PathBuf,
+    host_pacer: Option<SharedHostPacer>,
+    claim_scope: &ClaimScope,
 ) -> Result<(), FetchOneFailure> {
     let did: Did = Did::new_owned(did_str)
         .map_err(|err| permanent_failure(format!("invalid DID {did_str:?}: {err}")))?;
@@ -297,13 +462,29 @@ async fn fetch_one_attempt(
         .map_err(|err| retryable_failure(format!("resolve PDS for {did_str}: {err}")))?;
 
     println!("{did_str} -> PDS {pds}");
+    let host = claim_scope.host_for(did_str, pds.as_ref());
+    if let Some(pacer) = &host_pacer {
+        HostPacer::wait_until_ready(pacer, &host)
+            .await
+            .map_err(|err| retryable_failure(format!("host pacing for {host}: {err}")))?;
+    }
     let http = reqwest::Client::new();
     let mut config = FetchConfig::new(spool_dir);
     config.max_bytes = max_bytes;
 
-    let spooled = fetch_repo(&http, &pds, &did, &config)
-        .await
-        .map_err(|err| classify_fetch_error(did_str, &err))?;
+    let spooled = match fetch_repo(&http, &pds, &did, &config).await {
+        Ok(spooled) => spooled,
+        Err(err) => {
+            let failure = classify_fetch_error(did_str, &err);
+            if let AttemptOutcome::RateLimited { retry_after } = &failure.outcome
+                && let Some(pacer) = &host_pacer
+                && let Err(pacer_error) = HostPacer::record_retry_after(pacer, &host, *retry_after)
+            {
+                eprintln!("failed to record host cooldown for {host}: {pacer_error}");
+            }
+            return Err(failure);
+        }
+    };
     println!(
         "spooled {} bytes from HTTP {} to {}",
         spooled.bytes,
@@ -501,6 +682,8 @@ fn resource_failure(message: String) -> FetchOneFailure {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::arithmetic_side_effects)]
+
     use std::{
         fs,
         path::PathBuf,
@@ -508,9 +691,14 @@ mod tests {
     };
 
     use clap::Parser;
-    use emojistats_backfill::ledger::{RepoLedgerEntry, RepoLedgerStatus, SqliteLedger};
+    use emojistats_backfill::ledger::{
+        AttemptId, RepoLedgerEntry, RepoLedgerStatus, SqliteLedger, claim_repo,
+    };
 
-    use super::{Cli, Command, SeedSummary, seed_ledger_from_file};
+    use super::{
+        Cli, Command, SeedSummary, claim_batch_limit, recover_stale_claimed_entries,
+        seed_ledger_from_file,
+    };
 
     #[test]
     fn parses_fetch_one_did() {
@@ -544,6 +732,7 @@ mod tests {
             ledger_path,
             run_id,
             claim_limit,
+            concurrency,
             spool_dir,
             max_bytes,
             archive_dir,
@@ -555,6 +744,7 @@ mod tests {
         assert_eq!(ledger_path, PathBuf::from("data/ledger/backfill.sqlite"));
         assert_eq!(run_id, "fleet-local");
         assert_eq!(claim_limit, 1);
+        assert_eq!(concurrency, 4);
         assert_eq!(spool_dir, PathBuf::from("data/spool"));
         assert_eq!(max_bytes, 2_147_483_648);
         assert_eq!(archive_dir, PathBuf::from("data/archive"));
@@ -572,6 +762,26 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn run_fleet_rejects_zero_concurrency() {
+        assert!(
+            Cli::try_parse_from([
+                "emojistats-backfill",
+                "run-fleet",
+                "dids.txt",
+                "--concurrency",
+                "0",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn claim_batch_is_bounded_by_free_slots_and_remaining_limit() {
+        assert_eq!(claim_batch_limit(4, 2, 10).unwrap(), 2);
+        assert_eq!(claim_batch_limit(4, 0, 3).unwrap(), 3);
     }
 
     #[test]
@@ -610,6 +820,35 @@ mod tests {
         assert_eq!(
             store.load_entry("did:plc:newrepo").unwrap().unwrap().status,
             RepoLedgerStatus::Pending
+        );
+
+        fs::remove_file(dids_file).unwrap();
+    }
+
+    #[test]
+    fn stale_claimed_entries_from_seed_file_requeue_on_startup() {
+        let store = SqliteLedger::open_in_memory().unwrap();
+        let now = UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let pending = RepoLedgerEntry::pending("did:plc:stale");
+        let claimed = claim_repo(
+            &pending,
+            AttemptId::new("previous-run", "did:plc:stale", 1),
+            now,
+        )
+        .unwrap();
+        store.upsert_entry(&claimed).unwrap();
+        let dids_file = temp_file_path("stale-claimed");
+        fs::write(&dids_file, "did:plc:stale\n").unwrap();
+
+        let recovered = recover_stale_claimed_entries(&store, &dids_file, now).unwrap();
+        let entry = store.load_entry("did:plc:stale").unwrap().unwrap();
+
+        assert_eq!(recovered, 1);
+        assert_eq!(entry.status, RepoLedgerStatus::RetryableFailure);
+        assert!(entry.can_claim_at(now));
+        assert_eq!(
+            entry.last_error,
+            Some("stale claimed state at fleet startup".to_owned())
         );
 
         fs::remove_file(dids_file).unwrap();
