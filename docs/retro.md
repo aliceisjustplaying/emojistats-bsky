@@ -2044,6 +2044,39 @@ Meanwhile, the loose recrawl continues running on the v1 fleet. The parquet arch
 Box is 297.8 GiB across 4,958 files. Alice noted only two shards appear to still have active
 recrawlers. The v1 end-game and the v2 design are running concurrently.
 
+### 2026-06-15 evening (18:39–19:36 UTC) — v2 Rust code starts building, and the loose recrawl breaks the public counters
+
+Two things in parallel:
+
+**The v2 Rust rewrite started building.** Branch `v2-rust-backfill` on pix2 now has working code:
+checkpoint A (scaffold/fixtures) was done before the session, and B (transport), C (parse), D
+(receipts/manifests) were built in the same session — B and C delegated to parallel subagents,
+integrated by the main agent. The `fetch-one` pipeline (A→B→C→D) is wired locally and compiling.
+The Jacquard crate provides CAR/MST codec and API types as designed; the hand-rolled layers
+(reqwest HttpClient, on-disk BlockStore, self-driven inactivity timeout, error classifier) are
+in progress. First real-CAR test pending. The transition from design to implementation took ~2
+hours from "can we start building" to a compiling pipeline.
+
+**The loose recrawl inflated the public site's post count.** Alice noticed the public emoji site
+showed an impossibly high post count. Root cause: the loose recrawl re-inserts posts that already
+exist in ClickHouse (by design — `preserveExisting` re-fetches the repo and the
+`ReplacingMergeTree` deduplicates on merge). But the **materialized views** (`posts_hourly`,
+`emoji_hourly`, aggregate totals) increment on *insert*, not on *final merged state* — so every
+re-inserted row inflated the aggregate without retracting the replaced row. ~898.6M backfill rows
+inserted on the day, each one counted by the MV regardless of whether it was new or a duplicate.
+
+This is not data loss — `posts FINAL` returns the correct deduplicated count, and the parquet
+archive is unaffected. It's a **derived cache integrity failure**: the aggregates diverged from
+the source table because they're append-only projections of an at-least-once write path. The fix
+is an aggregate rebuild from `posts FINAL`, which the v2 design document already requires as a
+post-backfill step (and one of the reasons v2 treats ClickHouse as a derived, rebuildable
+projection rather than the truth).
+
+The irony: this is the same class of bug the retro has documented ten times — a number displayed
+as current that's actually stale against the underlying truth. The aggregate tables are one more
+dashboard that lies by not knowing its own truth has expired. And it's one more argument for the
+v2 architecture where Parquet is the truth and ClickHouse is explicitly disposable.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
