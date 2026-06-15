@@ -1,0 +1,6 @@
+# Restriction lints (unwrap/expect/panic) are denied in library/bin code but relaxed in
+# tests, where they're idiomatic for assertions. indexing_slicing / arithmetic_side_effects
+# have no test-allow knob — relax those per-test-module with a scoped #[allow] when needed.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

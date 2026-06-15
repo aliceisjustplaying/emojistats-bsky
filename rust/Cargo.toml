@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+# Jacquard 0.12.0 comes from our GitHub fork-mirror as SHA-pinned git dependencies
+# (github.com/aliceisjustplaying/jacquard @ 39648622 == tag 0.12.0), added per-crate in the
+# member crates as they're used — not vendored in-repo (avoids ~55 MB of ecosystem lexicons).
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/aliceisjustplaying/emojistats-bsky"
+authors = ["alice <aliceisjustplaying@gmail.com>"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+warnings = "deny"
+
+[workspace.lints.clippy]
+# Lint groups (priority -1 so the specific overrides below take precedence).
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+# Restriction lints — the retro's silent-failure / overflow / panic foot-guns. Denied in
+# library/bin code; relaxed in tests via clippy.toml.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+# Justified exception: transitive dependency trees we don't control will duplicate crate
+# versions. Per-crate metadata (cargo_common_metadata) is still enforced.
+multiple_crate_versions = "allow"

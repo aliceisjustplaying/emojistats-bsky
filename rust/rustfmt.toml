@@ -1,0 +1,5 @@
+max_width = 100
+# Nightly rustfmt options (the toolchain is nightly): group std / external / crate imports
+# and merge each crate's imports into one statement.
+group_imports = "StdExternalCrate"
+imports_granularity = "Crate"

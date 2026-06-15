@@ -1,0 +1,21 @@
+[package]
+name = "emojistats-backfill"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "emojistats v2 backfill: fetch a Bluesky repo, prove snapshot completeness, archive posts, derive emoji rows."
+readme = "README.md"
+keywords = ["bluesky", "atproto", "backfill", "emoji"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "emojistats-backfill"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+
+[lints]
+workspace = true
