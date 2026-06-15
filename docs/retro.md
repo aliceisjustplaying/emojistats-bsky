@@ -1946,6 +1946,46 @@ partly phantom (replayed DIDs inflating the denominator without advancing the nu
   shards. 70,908 of 684,873 loose DIDs processed (~10%). ClickHouse is stable at the lower
   insertion rate. The checkpoint fix is local, not yet pushed. Nothing has converged to closure.
 
+### 2026-06-14/15 night (23:37–01:10 UTC) — the second-time playbook implemented mid-first-run: dynamic host caps from rate-limit headers
+
+The retro's "If I did this again" section ranked "parse rate-limit headers and pace proactively —
+from line one" as the #2 time-saver. Alice just implemented it — not for run 2, but mid-run-1's
+loose convergence, because the ETA was >24 hours and she wanted to know why.
+
+The diagnosis: the crawlers were using ~20 of 512 available fetch slots per host, because a
+**static per-host concurrency cap** was the gatekeeper, not the PDS rate limits. The crawl was
+rate-limited by its own code, not by the mushroom hosts. Alice asked the question that broke it
+open: *"we literally parse the headers. why aren't we going as close as possible to those
+limits?"* The answer was that the code parsed headers for pacing (spacing between requests) but
+never used them to raise the cap (how many concurrent requests per host).
+
+The fix (`8b6f626`): `host-pressure` now computes a dynamic cap from advertised rate-limit headers
+— 60 seconds of advertised queue depth by default, capped at 1024 per host/process. The scheduler
+updates `p-limit.concurrency` live as headers arrive. 429s and stalls still clamp via AIMD. The
+`p-limit` library supports changing `.concurrency` at runtime, so the host queue expands after
+headers arrive and contracts under pressure — the exact behavior the retro described.
+
+Result on the canary (crawl0): active fetches climbed from ~20 to 256, zero retries, ClickHouse
+memory stable at 4.1 GiB. Rolled to all 4 boxes. The ETA should drop substantially once the rate
+window fills with the new throughput, but no number yet — the first waves are large CARs and the
+10-minute rate sample needs time to settle.
+
+Three other fixes landed in the same session:
+
+- **DID-file checkpoint pushed** (`a434dbb`): the restart-duplication fix from the previous entry.
+  72,613 DIDs checkpointed, remaining-file recrawlers restarted on fixed code.
+- **Dashboard asset serving** (`adb1c1d`): the dashboard's JavaScript/CSS assets were 404ing from
+  the bun server, so the page rendered as SSR HTML only — no hydration, no polling, no live
+  refresh. The card that "looked stale" was actually a dead SPA. Fixed by adding an asset route.
+- **Dashboard labels** (`738e81a`, `e3d4cdb`): raw event rows and unique DIDs were mixed in the
+  same card without labels. The loose progress card now shows unique completed repos, unique loaded,
+  unique issues, and raw event rows — each labeled for what it is.
+
+- **Status, held to the line:** loose recrawl is running at full dynamic host caps across all 4
+  shards. ~75k of 684,873 loose DIDs processed. The new throughput is still warming up — no
+  reliable ETA yet, but the static bottleneck that was causing the >24h estimate is gone. Nothing
+  has converged to closure.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
