@@ -2038,7 +2038,18 @@ original napkin when the crawl completes.)*
 - Momentum past approval boundaries (`--apply`), fire-and-forget monitoring, scope
   creep mid-incident (a toolchain migration during a fleet outage).
 - Tool friction: edit-before-read streaks, tsx-in-/tmp module resolution (≥3×),
-  rsync-cwd bugs (2×), `pkill -f` self-match (2×).
+  rsync-cwd bugs (2×), `pkill -f` self-match (3× and counting).
+- **Operational re-derivation:** the agent composes multi-parameter SSH launch commands
+  from scratch every time instead of calling a script. A simple concurrency change
+  (512→384) produced three cascading mistakes in five minutes: `pkill` self-match (again),
+  wrong env file path (`emojistats-env` vs `emojistats-crawl-env`), and missing
+  `CRAWL_SHARD_INDEX` / `CRAWL_SHARDS`. Each fix introduced the next bug. A human who'd
+  done this once would have a launch script; the agent has no persistent operational
+  memory between commands and re-derives (and re-breaks) the same invocation every time.
+  Code reviews can't catch this because the bugs are in the *execution*, not the *code*.
+  The fix is the same as write-time receipts: don't trust the operator to remember — make
+  the system enforce it. Operations that are repeated more than once belong in a script,
+  not in an agent's ad-hoc SSH composition.
 - Degradation in long incident loops (the Nov 2025 hallucination call-out) — blunt
   human check-ins reset it.
 - Reviewer fallibility both directions: a round-5 "native ABI mismatch" was actually
@@ -2199,6 +2210,14 @@ when this was written.)
   sort key is precisely what made the digest unable to prove zero-loss
 - everything load-bearing in the nix flake / IaC; no ad-hoc host scripts or `/run`-only drop-ins
   that the next rebuild silently erases
+- **scriptable fleet operations**: a `scripts/fleet-crawl.sh` (or equivalent) that takes
+  concurrency, shard index, run ID, and DID file as arguments, handles env file sourcing, shard
+  labels, process management (kill-without-self-match), and health verification. The agent (or
+  human) calls one command instead of composing 6-parameter SSH invocations from memory — the
+  same principle as write-time receipts: don't trust the operator to remember, make the system
+  enforce it. Every operational mistake in the late-night sessions (wrong env path, missing shard
+  index, pkill self-match) would have been prevented by a script that encodes the right parameters
+  once
 - the dashboard scoped to **project lifetime, not the latest `run_id`**, and its numbers
   data-backed (aggregate tables), never hardcoded and never raw-`posts` scans at live cadence
 - quote an ETA only from **sustained measured throughput on healthy software**, and report
