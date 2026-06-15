@@ -13,7 +13,7 @@ import pLimit, { type LimitFunction } from 'p-limit';
 
 import { GLOBAL_CONCURRENCY, MAX_ATTEMPTS } from './config.js';
 import type { HostHealth } from './host-health.js';
-import { hostCapFor, type HostPressure } from './host-pressure.js';
+import type { HostPressure } from './host-pressure.js';
 import logger from './logger.js';
 import type { CrawlControl, CrawlStats } from './run-state.js';
 import type { Ledger, RepoRow } from './types.js';
@@ -253,10 +253,13 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
   // and endsWith below is scheme-tolerant by construction.
   const hostLimits = new Map<string, LimitFunction>();
   const hostLimitFor = (host: string): LimitFunction => {
+    const effectiveCap = hostPressure.effectiveCap(host);
     let limit = hostLimits.get(host);
     if (limit === undefined) {
-      limit = pLimit(hostCapFor(host));
+      limit = pLimit(effectiveCap);
       hostLimits.set(host, limit);
+    } else if (limit.concurrency !== effectiveCap) {
+      limit.concurrency = effectiveCap;
     }
     return limit;
   };

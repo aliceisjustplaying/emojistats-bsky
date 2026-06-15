@@ -57,6 +57,14 @@ export const PER_HOST_CONCURRENCY = num('PER_HOST_CONCURRENCY', 2);
 // (operator experience: Alice). The protocol signals are the real governor —
 // 429/Retry-After always wins, so err high and let the fleet push back.
 export const PER_HOST_CONCURRENCY_BSKY = num('PER_HOST_CONCURRENCY_BSKY', 16);
+// When a host advertises ratelimit headers, keep enough per-host queue depth to
+// keep the advertised request-start budget fed even when repos are large/slow.
+// The token pacing still controls starts; this is only queue/concurrency depth.
+export const PER_HOST_RATE_LIMIT_QUEUE_SECONDS = num(
+  'PER_HOST_RATE_LIMIT_QUEUE_SECONDS',
+  60,
+);
+export const PER_HOST_DYNAMIC_CAP_MAX = num('PER_HOST_DYNAMIC_CAP_MAX', 1024);
 export const REPO_FETCH_TIMEOUT_MS = num('REPO_FETCH_TIMEOUT_MS', 300_000);
 // Max time a getRepo may make NO forward progress — no response headers, or no
 // body bytes since the last chunk — before the socket is declared dead. This is

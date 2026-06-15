@@ -54,6 +54,35 @@ void describe('host pressure', () => {
     }
   });
 
+  void it('raises the host cap from advertised rate-limit capacity', () => {
+    let clock = 1_000_000;
+    const now = mock.method(Date, 'now', () => clock);
+    try {
+      const pressure = createHostPressure();
+      const host = 'morel.us-east.host.bsky.network';
+      const staticCap = hostCapFor(host);
+
+      pressure.observeRateLimit(host, {
+        limit: 3000,
+        remaining: 2999,
+        resetAtMs: clock + 300_000,
+        windowMs: 300_000,
+      });
+
+      assert.equal(pressure.effectiveCap(host), 600);
+      assert.ok(pressure.effectiveCap(host) > staticCap);
+
+      pressure.record429(host);
+      assert.equal(pressure.effectiveCap(host), 300);
+
+      clock += 10_000;
+      for (let i = 0; i < 40; i += 1) pressure.recordSuccess(host);
+      assert.equal(pressure.effectiveCap(host), 302);
+    } finally {
+      now.mock.restore();
+    }
+  });
+
   void it('counts concurrent 429s as one cooldown burst', () => {
     const now = mock.method(Date, 'now', () => 1_000_000);
     try {

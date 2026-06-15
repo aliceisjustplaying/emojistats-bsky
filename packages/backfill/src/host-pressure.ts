@@ -1,4 +1,9 @@
-import { PER_HOST_CONCURRENCY, PER_HOST_CONCURRENCY_BSKY } from './config.js';
+import {
+  PER_HOST_CONCURRENCY,
+  PER_HOST_CONCURRENCY_BSKY,
+  PER_HOST_DYNAMIC_CAP_MAX,
+  PER_HOST_RATE_LIMIT_QUEUE_SECONDS,
+} from './config.js';
 import type { RateLimitHint } from './fetcher.js';
 import logger from './logger.js';
 
@@ -26,8 +31,10 @@ interface HostState {
   strikes: number;
   until: number;
   lastStrike: number;
-  /** Dynamic concurrency cap; undefined until the first 429. */
-  cap?: number;
+  /** AIMD clamp after 429/stall; undefined means no backpressure clamp. */
+  aimdCap?: number;
+  /** Header-derived cap ceiling; undefined until rate-limit headers arrive. */
+  rateLimitCap?: number;
   successStreak: number;
   rateLimit?: {
     limit: number;
@@ -94,6 +101,14 @@ export interface HostPressure {
 export function createHostPressure(): HostPressure {
   const state = new Map<string, HostState>();
 
+  const capCeilingFor = (host: string, current?: HostState): number =>
+    current?.rateLimitCap ?? hostCapFor(host);
+
+  const effectiveCapFor = (host: string, current?: HostState): number => {
+    const ceiling = capCeilingFor(host, current);
+    return Math.max(1, Math.min(ceiling, current?.aimdCap ?? ceiling));
+  };
+
   const update = (
     host: string,
     patch: (prev: HostState) => HostState,
@@ -131,12 +146,12 @@ export function createHostPressure(): HostPressure {
       }));
       return;
     }
-    const staticCap = hostCapFor(host);
+    const currentCap = effectiveCapFor(host, prev);
     const strikes =
       prev !== undefined && now - prev.lastStrike < STRIKE_DECAY_MS
         ? prev.strikes + 1
         : 1;
-    const cap = Math.max(1, Math.floor((prev?.cap ?? staticCap) / 2));
+    const aimdCap = Math.max(1, Math.floor(currentCap / 2));
     const cooldown = Math.min(
       COOLDOWN_BASE_MS * 2 ** (strikes - 1),
       COOLDOWN_MAX_MS,
@@ -147,12 +162,12 @@ export function createHostPressure(): HostPressure {
       // Never shorten an existing cooldown: the longest window must win.
       until: Math.max(now + cooldown, prev?.until ?? 0),
       lastStrike: now,
-      cap,
+      aimdCap,
       successStreak: 0,
     }));
     if (strikes === 1 || strikes % 10 === 0) {
       logger.warn(
-        { host, strikes, cap, cooldownMs: cooldown, reason },
+        { host, strikes, cap: aimdCap, cooldownMs: cooldown, reason },
         'host cooling',
       );
     }
@@ -169,19 +184,24 @@ export function createHostPressure(): HostPressure {
 
     recordSuccess(host: string): void {
       const prev = state.get(host);
-      if (prev?.cap === undefined) return;
-      const staticCap = hostCapFor(host);
+      if (prev?.aimdCap === undefined) return;
+      const ceiling = capCeilingFor(host, prev);
       const now = Date.now();
       if (now - prev.lastStrike >= CAP_AMNESTY_MS) {
-        state.delete(host);
+        state.set(host, {
+          ...prev,
+          aimdCap: undefined,
+          strikes: 0,
+          successStreak: 0,
+        });
         return;
       }
       const successStreak = prev.successStreak + 1;
-      const cap =
+      const aimdCap =
         successStreak % CAP_RAISE_EVERY === 0
-          ? Math.min(staticCap, prev.cap + 1)
-          : prev.cap;
-      state.set(host, { ...prev, cap, successStreak });
+          ? Math.min(ceiling, prev.aimdCap + 1)
+          : prev.aimdCap;
+      state.set(host, { ...prev, aimdCap, successStreak });
     },
 
     observeRateLimit(host: string, hint: RateLimitHint): void {
@@ -195,8 +215,18 @@ export function createHostPressure(): HostPressure {
       if (windowMs === undefined || windowMs <= 0) return;
       const minIntervalMs = Math.max(1, Math.ceil(windowMs / limit));
       const remaining = Math.max(0, Math.floor(hint.remaining ?? limit));
+      const rateLimitCap = Math.min(
+        PER_HOST_DYNAMIC_CAP_MAX,
+        Math.max(
+          hostCapFor(host),
+          Math.ceil(
+            (limit / windowMs) * PER_HOST_RATE_LIMIT_QUEUE_SECONDS * 1000,
+          ),
+        ),
+      );
       update(host, (prev) => ({
         ...prev,
+        rateLimitCap,
         rateLimit: {
           limit,
           remaining,
@@ -264,9 +294,7 @@ export function createHostPressure(): HostPressure {
     },
 
     effectiveCap(host: string): number {
-      const staticCap = hostCapFor(host);
-      const cap = state.get(host)?.cap;
-      return cap === undefined ? staticCap : Math.min(staticCap, cap);
+      return effectiveCapFor(host, state.get(host));
     },
 
     nextWake(): number | undefined {
