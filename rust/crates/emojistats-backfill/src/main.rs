@@ -119,8 +119,14 @@ async fn fetch_one(
         normalizer: current_normalizer(),
     })
     .map_err(|err| anyhow::anyhow!("build receipt for {did_str}: {err}"))?;
-    let artifacts = write_archive_artifacts(&archive_dir, did_str, &rows, &receipt)
-        .map_err(|err| anyhow::anyhow!("write archive artifacts for {did_str}: {err}"))?;
+    let artifacts = write_archive_artifacts(
+        &archive_dir,
+        did_str,
+        &rows,
+        parsed.profile.as_ref(),
+        &receipt,
+    )
+    .map_err(|err| anyhow::anyhow!("write archive artifacts for {did_str}: {err}"))?;
     println!(
         "parsed {} records, {} posts, {} decode errors, {} emoji rows, receipt {}",
         parsed.rkey_digest.all_records_count,

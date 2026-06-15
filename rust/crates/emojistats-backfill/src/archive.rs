@@ -68,6 +68,14 @@ pub struct EmojiProjectionRow {
     pub langs: Vec<String>,
 }
 
+/// Local profile sidecar row for one repo, when present.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProfileSidecarRow<'a> {
+    pub rkey: &'a str,
+    pub cid: &'a str,
+    pub record: &'a jacquard_api::app_bsky::actor::profile::Profile<smol_str::SmolStr>,
+}
+
 /// Classification for author-supplied `createdAt`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -152,6 +160,7 @@ pub struct ArchiveArtifacts {
     pub receipt_path: PathBuf,
     pub manifest_path: PathBuf,
     pub emoji_projection_path: PathBuf,
+    pub profile_sidecar_path: Option<PathBuf>,
     pub manifest: LocalManifestEntry,
     pub emoji_rows: u64,
 }
@@ -228,6 +237,7 @@ pub fn write_archive_artifacts(
     output_dir: &Path,
     did: &str,
     rows: &[ArchivePostRow],
+    profile: Option<&ProfileRecord>,
     receipt: &RepoReceipt,
 ) -> Result<ArchiveArtifacts, ArchiveError> {
     fs::create_dir_all(output_dir)?;
@@ -236,6 +246,8 @@ pub fn write_archive_artifacts(
     let receipt_path = output_dir.join(format!("{safe_did}.receipt.json"));
     let manifest_path = output_dir.join(format!("{safe_did}.manifest.json"));
     let emoji_projection_path = output_dir.join(format!("{safe_did}.emoji.jsonl"));
+    let profile_sidecar_path =
+        profile.map(|_profile| output_dir.join(format!("{safe_did}.profile.json")));
 
     write_temp_rename(&parquet_path, |path| write_posts_parquet(path, rows))?;
     write_temp_rename(&receipt_path, |path| write_json_pretty(path, receipt))?;
@@ -248,6 +260,9 @@ pub fn write_archive_artifacts(
     write_temp_rename(&emoji_projection_path, |path| {
         write_emoji_projection_jsonl(path, &emoji_projection_rows)
     })?;
+    if let (Some(path), Some(profile)) = (&profile_sidecar_path, profile) {
+        write_temp_rename(path, |path| write_profile_sidecar_json(path, profile))?;
+    }
 
     let manifest = build_manifest(&parquet_path, rows, receipt)?;
     write_temp_rename(&manifest_path, |path| write_json_pretty(path, &manifest))?;
@@ -257,6 +272,7 @@ pub fn write_archive_artifacts(
         receipt_path,
         manifest_path,
         emoji_projection_path,
+        profile_sidecar_path,
         manifest,
         emoji_rows,
     })
@@ -337,9 +353,7 @@ pub fn hash_profile_record(
 
 fn hash_one_profile_record(profile: &ProfileRecord) -> Result<String, ArchiveError> {
     let mut hasher = Sha256::new();
-    hash_field(&mut hasher, &profile.rkey)?;
-    hash_field(&mut hasher, &profile.cid)?;
-    hash_field(&mut hasher, &json_string(&profile.record)?)?;
+    hash_field(&mut hasher, &json_string(&profile_sidecar_row(profile))?)?;
     Ok(hex::encode(hasher.finalize()))
 }
 
@@ -463,6 +477,18 @@ fn write_emoji_projection_jsonl(
     }
     file.sync_all()?;
     Ok(())
+}
+
+fn write_profile_sidecar_json(path: &Path, profile: &ProfileRecord) -> Result<(), ArchiveError> {
+    write_json_pretty(path, &profile_sidecar_row(profile))
+}
+
+fn profile_sidecar_row(profile: &ProfileRecord) -> ProfileSidecarRow<'_> {
+    ProfileSidecarRow {
+        rkey: &profile.rkey,
+        cid: &profile.cid,
+        record: &profile.record,
+    }
 }
 
 fn derive_emoji_projection_rows(
