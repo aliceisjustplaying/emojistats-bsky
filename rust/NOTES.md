@@ -14,15 +14,21 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   `getRepo` to a spooled `CAR`, parses from the `CAR` path with block `CID` verification
   and `MST` completeness, writes `Parquet` posts, writes receipt + local manifest JSON, and
   derives compact emoji JSONL rows.
-- **Next-lane foundations started:** `ledger.rs` has retry/account-state transition types,
-  `commit.rs` has a local Storage Box-shaped committed-artifact protocol, `derive.rs` has
-  manifest-to-ClickHouse DTOs and dedupe tokening, and `canary.rs` encodes the stratified
+- **Next-lane foundations started:** `ledger.rs` has retry/account-state transition types
+  plus a SQLite store, `commit.rs` has a local Storage Box-shaped committed-artifact
+  protocol, `derive.rs` has manifest-to-ClickHouse DTOs and dedupe tokening, `clickhouse.rs`
+  has schema and `JSONEachRow` request builders, and `canary.rs` encodes the stratified
   canary policy/gate model. These are library foundations, not a wired fleet runner yet.
 - **Committed-object path partially wired:** `write_archive_artifacts` now writes the
   Parquet object through the local committed-artifact protocol, producing object receipt
   and append-only manifest entries after final object promotion. `storage_box.rs` adds the
-  remote backend skeleton with temp upload, size/hash/readback verification, rename, and
-  manifest append ordering behind a command trait.
+  remote backend skeleton plus `ssh` command binding with temp upload, size/hash/readback
+  verification, rename, and manifest append ordering behind a command trait.
+- `fetch-one` now wraps the vertical slice in a local ledger attempt and maps transport,
+  parse, archive, account-state, resource-cap, retryable, and permanent failures into
+  explicit attempt outcomes.
+- Fixture coverage now checks malformed `CAR` headers, empty/missing/non-commit roots,
+  requested-DID mismatch, `createdAt` classification, and archive row-hash sensitivity.
 - Real stress DID verified:
   `did:plc:vwzwgnygau7ed7b7wt5ux7y2` from `shiitake.us-east.host.bsky.network` spooled
   41,051,855 bytes, produced 6,407 post rows, 228 emoji rows, and carried 23,656 typed
@@ -50,9 +56,12 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
 
 ## Next roadmap
 
-- Persist crawler ledger state and wire retry/account-state transitions around `fetch-one`.
-- Wire the remaining sidecars and CLI/fleet flow through the committed-artifact protocol;
-  then bind the `storage_box.rs` command trait to the real Storage Box transport.
+- Wire SQLite ledger persistence into the CLI/fleet runner and seed/claim repos from the
+  actual crawl queue.
+- Wire profile sidecar and remaining archive artifacts through the committed-artifact
+  protocol; then configure the `storage_box.rs` `ssh` transport for the real Storage Box.
+- Build the ClickHouse loader that sends `clickhouse.rs` insert requests from committed
+  manifest entries, including retry/idempotency around dedupe tokens.
 - Move emoji normalization into the shared WASM-able crate from the design before the
   browser/server serving path depends on it.
 - Wire derive/ClickHouse ingest from committed manifest entries, then run the stratified
