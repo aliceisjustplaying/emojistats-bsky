@@ -18,15 +18,15 @@ use emojistats_backfill::{
         current_normalizer, hash_profile_record, write_archive_artifacts,
     },
     ledger::{
-        AttemptId, AttemptOutcome, RepoLedgerEntry, RepoLedgerStatus, RetryPolicy, SqliteLedger,
-        claim_repo, complete_attempt,
+        AttemptId, AttemptOutcome, ForcedFetchMode, HostOverride, RepoLedgerEntry,
+        RepoLedgerStatus, RetryPolicy, ShardFilter, SqliteLedger, claim_repo, complete_attempt,
     },
     parse::{ParseError, parse_repo_for_did},
     scheduler::{ClaimScope, HostPacer, SchedulerError, SharedHostPacer, checked_concurrency},
     transport::{FetchConfig, FetchError, fetch_repo},
 };
 use futures_util::{StreamExt, stream::FuturesUnordered};
-use jacquard_common::types::did::Did;
+use jacquard_common::{deps::fluent_uri::Uri, types::did::Did};
 use jacquard_identity::{PublicResolver, resolver::IdentityResolver};
 
 /// emojistats v2 backfill tool.
@@ -69,6 +69,9 @@ enum Command {
         /// Maximum concurrent repo attempts.
         #[arg(long, default_value_t = 4, value_parser = parse_positive_usize)]
         concurrency: usize,
+        /// Restrict claims to one persisted DID shard bucket.
+        #[arg(long, value_name = "BUCKET", value_parser = parse_shard_filter)]
+        shard_bucket: Option<ShardFilter>,
         /// Directory for local `CAR` spooling.
         #[arg(long, default_value = "data/spool")]
         spool_dir: PathBuf,
@@ -97,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
             run_id,
             claim_limit,
             concurrency,
+            shard_bucket,
             spool_dir,
             max_bytes,
             archive_dir,
@@ -110,7 +114,9 @@ async fn main() -> anyhow::Result<()> {
                 spool_dir,
                 max_bytes,
                 archive_dir,
-                claim_scope: ClaimScope::default(),
+                claim_scope: ClaimScope {
+                    shard_filter: shard_bucket,
+                },
             })
             .await
         }
@@ -205,16 +211,18 @@ async fn run_fleet(config: FleetConfig) -> anyhow::Result<()> {
                 .checked_sub(summary.claimed)
                 .ok_or(SchedulerError::ClaimLimitOverflow)?;
             let batch_limit = claim_batch_limit(config.concurrency, active.len(), remaining)?;
-            let claimable = ledger.claimable_entries(SystemTime::now(), batch_limit)?;
+            let claimable = claimable_entries_for_scope(
+                &ledger,
+                SystemTime::now(),
+                batch_limit,
+                &config.claim_scope,
+            )?;
             if claimable.is_empty() {
                 break;
             }
 
             for entry in claimable {
                 let did = entry.did.clone();
-                if !config.claim_scope.includes_did(&did) {
-                    continue;
-                }
                 let attempt = AttemptId::new(&config.run_id, &did, next_attempt_sequence(&entry)?);
                 let claimed = claim_repo(&entry, attempt, SystemTime::now())
                     .map_err(|err| anyhow::anyhow!("claim ledger entry for {did}: {err}"))?;
@@ -228,6 +236,7 @@ async fn run_fleet(config: FleetConfig) -> anyhow::Result<()> {
                     archive_dir: config.archive_dir.clone(),
                     host_pacer: host_pacer.clone(),
                     claim_scope: config.claim_scope.clone(),
+                    ledger_path: config.ledger_path.clone(),
                 }));
             }
         }
@@ -260,6 +269,7 @@ struct FleetAttemptConfig {
     archive_dir: PathBuf,
     host_pacer: SharedHostPacer,
     claim_scope: ClaimScope,
+    ledger_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -277,6 +287,7 @@ async fn run_fleet_attempt(config: FleetAttemptConfig) -> FleetAttemptResult {
         config.archive_dir,
         Some(config.host_pacer),
         &config.claim_scope,
+        Some(&config.ledger_path),
     )
     .await;
     FleetAttemptResult {
@@ -328,6 +339,22 @@ fn claim_batch_limit(concurrency: usize, in_flight: usize, remaining: u64) -> an
     let available = u64::try_from(available)?;
     let limit = available.min(remaining).min(u64::from(u32::MAX));
     u32::try_from(limit).map_err(Into::into)
+}
+
+fn claimable_entries_for_scope(
+    ledger: &SqliteLedger,
+    now: SystemTime,
+    limit: u32,
+    claim_scope: &ClaimScope,
+) -> anyhow::Result<Vec<RepoLedgerEntry>> {
+    claim_scope.shard_filter().map_or_else(
+        || ledger.claimable_entries(now, limit).map_err(Into::into),
+        |shard_filter| {
+            ledger
+                .claimable_entries_for_shard(now, limit, shard_filter)
+                .map_err(Into::into)
+        },
+    )
 }
 
 fn recover_stale_claimed_entries(
@@ -426,6 +453,13 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
     Ok(parsed)
 }
 
+fn parse_shard_filter(value: &str) -> Result<ShardFilter, String> {
+    let bucket = value
+        .parse::<u64>()
+        .map_err(|err| format!("expected a shard bucket integer: {err}"))?;
+    ShardFilter::new(bucket).map_err(|err| err.to_string())
+}
+
 async fn fetch_one_attempt(
     did_str: &str,
     spool_dir: PathBuf,
@@ -440,6 +474,7 @@ async fn fetch_one_attempt(
         archive_dir,
         None,
         &claim_scope,
+        None,
     )
     .await
 }
@@ -451,6 +486,7 @@ async fn fetch_one_attempt_with_pacer(
     archive_dir: PathBuf,
     host_pacer: Option<SharedHostPacer>,
     claim_scope: &ClaimScope,
+    host_override_ledger_path: Option<&Path>,
 ) -> Result<(), FetchOneFailure> {
     let did: Did = Did::new_owned(did_str)
         .map_err(|err| permanent_failure(format!("invalid DID {did_str:?}: {err}")))?;
@@ -462,12 +498,14 @@ async fn fetch_one_attempt_with_pacer(
         .map_err(|err| retryable_failure(format!("resolve PDS for {did_str}: {err}")))?;
 
     println!("{did_str} -> PDS {pds}");
-    let host = claim_scope.host_for(did_str, pds.as_ref());
-    if let Some(pacer) = &host_pacer {
-        HostPacer::wait_until_ready(pacer, &host)
-            .await
-            .map_err(|err| retryable_failure(format!("host pacing for {host}: {err}")))?;
-    }
+    let host = prepare_fetch_host(
+        did_str,
+        &pds,
+        claim_scope,
+        host_override_ledger_path,
+        host_pacer.as_ref(),
+    )
+    .await?;
     let http = reqwest::Client::new();
     let mut config = FetchConfig::new(spool_dir);
     config.max_bytes = max_bytes;
@@ -545,6 +583,81 @@ async fn fetch_one_attempt_with_pacer(
         artifacts.emoji_projection_path.display()
     );
     Ok(())
+}
+
+async fn prepare_fetch_host(
+    did_str: &str,
+    pds: &Uri<String>,
+    claim_scope: &ClaimScope,
+    host_override_ledger_path: Option<&Path>,
+    host_pacer: Option<&SharedHostPacer>,
+) -> Result<String, FetchOneFailure> {
+    if !claim_scope.includes_did(did_str) {
+        return Err(retryable_failure(format!(
+            "DID {did_str} is outside configured shard scope"
+        )));
+    }
+    let host = pds_host_key(pds);
+    let host_override = load_host_override(host_override_ledger_path, &host)?;
+    let fetch_mode = fetch_mode_for_host(&host, host_override.as_ref(), SystemTime::now())?;
+    if fetch_mode == ForcedFetchMode::ListRecords {
+        return Err(retryable_failure(format!(
+            "host {host} is forced to list_records, but listRecords fetch is not implemented"
+        )));
+    }
+    if let Some(pacer) = host_pacer {
+        HostPacer::wait_until_ready(pacer, &host)
+            .await
+            .map_err(|err| retryable_failure(format!("host pacing for {host}: {err}")))?;
+    }
+    Ok(host)
+}
+
+fn pds_host_key(pds: &Uri<String>) -> String {
+    pds.authority().map_or_else(
+        || pds.as_str().to_owned(),
+        |authority| authority.host().to_owned(),
+    )
+}
+
+fn load_host_override(
+    ledger_path: Option<&Path>,
+    host: &str,
+) -> Result<Option<HostOverride>, FetchOneFailure> {
+    let Some(ledger_path) = ledger_path else {
+        return Ok(None);
+    };
+    let ledger = SqliteLedger::open(ledger_path)
+        .map_err(|err| retryable_failure(format!("open ledger for host override {host}: {err}")))?;
+    ledger
+        .load_host_override(host)
+        .map_err(|err| retryable_failure(format!("load host override for {host}: {err}")))
+}
+
+fn fetch_mode_for_host(
+    host: &str,
+    host_override: Option<&HostOverride>,
+    now: SystemTime,
+) -> Result<ForcedFetchMode, FetchOneFailure> {
+    let Some(host_override) = host_override else {
+        return Ok(ForcedFetchMode::GetRepo);
+    };
+    if host_override.disabled {
+        if let Some(revive_after) = host_override.revive_after
+            && let Ok(retry_after) = revive_after.duration_since(now)
+        {
+            return Err(FetchOneFailure {
+                outcome: AttemptOutcome::RateLimited { retry_after },
+                error: anyhow::anyhow!("host {host} disabled by override until {revive_after:?}"),
+            });
+        }
+        if host_override.revive_after.is_none() {
+            return Err(retryable_failure(format!(
+                "host {host} disabled by override"
+            )));
+        }
+    }
+    Ok(host_override.force_mode.unwrap_or(ForcedFetchMode::GetRepo))
 }
 
 #[derive(Debug)]
@@ -641,6 +754,9 @@ fn classify_archive_error(context: &str, error: &ArchiveError) -> FetchOneFailur
         ArchiveError::Parquet(_)
         | ArchiveError::Arrow(_)
         | ArchiveError::Json(_)
+        | ArchiveError::InvalidParquetColumn { .. }
+        | ArchiveError::InvalidParquetValue { .. }
+        | ArchiveError::UnexpectedParquetNull { .. }
         | ArchiveError::InvalidCompression(_)
         | ArchiveError::InvalidPath { .. }
         | ArchiveError::InvalidRecordJson => AttemptOutcome::PermanentFailure {
@@ -687,16 +803,22 @@ mod tests {
     use std::{
         fs,
         path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use clap::Parser;
-    use emojistats_backfill::ledger::{
-        AttemptId, RepoLedgerEntry, RepoLedgerStatus, SqliteLedger, claim_repo,
+    use emojistats_backfill::{
+        ledger::{
+            AttemptId, AttemptOutcome, ForcedFetchMode, HostOverride, RepoLedgerEntry,
+            RepoLedgerStatus, ShardFilter, SqliteLedger, claim_repo, did_shard_bucket,
+        },
+        scheduler::ClaimScope,
     };
+    use jacquard_common::deps::fluent_uri::Uri;
 
     use super::{
-        Cli, Command, SeedSummary, claim_batch_limit, recover_stale_claimed_entries,
+        Cli, Command, SeedSummary, claim_batch_limit, claimable_entries_for_scope,
+        fetch_mode_for_host, load_host_override, pds_host_key, recover_stale_claimed_entries,
         seed_ledger_from_file,
     };
 
@@ -733,6 +855,7 @@ mod tests {
             run_id,
             claim_limit,
             concurrency,
+            shard_bucket,
             spool_dir,
             max_bytes,
             archive_dir,
@@ -745,9 +868,41 @@ mod tests {
         assert_eq!(run_id, "fleet-local");
         assert_eq!(claim_limit, 1);
         assert_eq!(concurrency, 4);
+        assert_eq!(shard_bucket, None);
         assert_eq!(spool_dir, PathBuf::from("data/spool"));
         assert_eq!(max_bytes, 2_147_483_648);
         assert_eq!(archive_dir, PathBuf::from("data/archive"));
+    }
+
+    #[test]
+    fn parses_run_fleet_shard_bucket() {
+        let cli = Cli::try_parse_from([
+            "emojistats-backfill",
+            "run-fleet",
+            "dids.txt",
+            "--shard-bucket",
+            "3",
+        ])
+        .unwrap();
+        let Command::RunFleet { shard_bucket, .. } = cli.command else {
+            unreachable!("expected run-fleet command");
+        };
+
+        assert_eq!(shard_bucket, Some(ShardFilter::new(3).unwrap()));
+    }
+
+    #[test]
+    fn run_fleet_rejects_out_of_range_shard_bucket() {
+        assert!(
+            Cli::try_parse_from([
+                "emojistats-backfill",
+                "run-fleet",
+                "dids.txt",
+                "--shard-bucket",
+                "8",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -782,6 +937,86 @@ mod tests {
     fn claim_batch_is_bounded_by_free_slots_and_remaining_limit() {
         assert_eq!(claim_batch_limit(4, 2, 10).unwrap(), 2);
         assert_eq!(claim_batch_limit(4, 0, 3).unwrap(), 3);
+    }
+
+    #[test]
+    fn claimable_entries_for_scope_uses_shard_filter() {
+        let store = SqliteLedger::open_in_memory().unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let target_did = "did:plc:target";
+        let target_bucket = did_shard_bucket(target_did);
+        let mut other_did = "did:plc:other0".to_owned();
+        let mut suffix = 1_u32;
+        while did_shard_bucket(&other_did) == target_bucket {
+            other_did = format!("did:plc:other{suffix}");
+            suffix = suffix.checked_add(1).unwrap();
+        }
+        let target = RepoLedgerEntry::pending(target_did);
+        let other = RepoLedgerEntry::pending(&other_did);
+        store.upsert_entry(&other).unwrap();
+        store.upsert_entry(&target).unwrap();
+        let scope = ClaimScope {
+            shard_filter: Some(ShardFilter::new(target_bucket).unwrap()),
+        };
+
+        let claimable = claimable_entries_for_scope(&store, now, 10, &scope).unwrap();
+
+        assert_eq!(claimable, vec![target]);
+    }
+
+    #[test]
+    fn persisted_host_override_loads_by_resolved_pds_host() {
+        let store = SqliteLedger::open_in_memory().unwrap();
+        let db_path = temp_file_path("host-overrides").with_extension("sqlite");
+        drop(store);
+        let store = SqliteLedger::open(&db_path).unwrap();
+        let override_record = HostOverride {
+            host: "pds.example.com".to_owned(),
+            disabled: false,
+            concurrency_cap: None,
+            revive_after: None,
+            force_mode: Some(ForcedFetchMode::ListRecords),
+        };
+        store.upsert_host_override(&override_record).unwrap();
+        drop(store);
+        let pds = Uri::parse("https://pds.example.com").unwrap().to_owned();
+        let host = pds_host_key(&pds);
+
+        let loaded = load_host_override(Some(&db_path), &host).unwrap();
+
+        assert_eq!(loaded, Some(override_record));
+        fs::remove_file(db_path).unwrap();
+    }
+
+    #[test]
+    fn host_override_force_mode_and_disable_are_applied() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let list_records = HostOverride {
+            host: "pds.example.com".to_owned(),
+            disabled: false,
+            concurrency_cap: None,
+            revive_after: None,
+            force_mode: Some(ForcedFetchMode::ListRecords),
+        };
+        let disabled = HostOverride {
+            host: "pds.example.com".to_owned(),
+            disabled: true,
+            concurrency_cap: None,
+            revive_after: Some(now + Duration::from_secs(30)),
+            force_mode: Some(ForcedFetchMode::GetRepo),
+        };
+
+        assert_eq!(
+            fetch_mode_for_host("pds.example.com", Some(&list_records), now).unwrap(),
+            ForcedFetchMode::ListRecords
+        );
+        let failure = fetch_mode_for_host("pds.example.com", Some(&disabled), now).unwrap_err();
+        assert_eq!(
+            failure.outcome,
+            AttemptOutcome::RateLimited {
+                retry_after: Duration::from_secs(30)
+            }
+        );
     }
 
     #[test]

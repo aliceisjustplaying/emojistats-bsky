@@ -6,6 +6,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::ledger::ShardFilter;
+
 /// Shared per-host pacing state used by concurrent fleet attempts.
 pub type SharedHostPacer = Arc<Mutex<HostPacer>>;
 
@@ -89,22 +91,19 @@ impl HostPacer {
 /// shard-aware claiming.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClaimScope {
-    pub host_overrides: HashMap<String, String>,
-    pub shard_filter: Option<String>,
+    pub shard_filter: Option<ShardFilter>,
 }
 
 impl ClaimScope {
     #[must_use]
-    pub fn host_for(&self, did: &str, resolved_host: &str) -> String {
-        self.host_overrides
-            .get(did)
-            .cloned()
-            .unwrap_or_else(|| resolved_host.to_owned())
+    pub const fn shard_filter(&self) -> Option<ShardFilter> {
+        self.shard_filter
     }
 
     #[must_use]
-    pub const fn includes_did(&self, _did: &str) -> bool {
-        self.shard_filter.is_none()
+    pub fn includes_did(&self, did: &str) -> bool {
+        self.shard_filter
+            .is_none_or(|shard_filter| shard_filter.contains_did(did))
     }
 }
 
@@ -161,21 +160,21 @@ mod tests {
     }
 
     #[test]
-    fn claim_scope_applies_host_override() {
-        let mut scope = ClaimScope::default();
-        scope.host_overrides.insert(
-            "did:plc:abc".to_owned(),
-            "https://override.example".to_owned(),
-        );
+    fn claim_scope_includes_only_selected_shard_bucket() {
+        let did = "did:plc:abc";
+        let bucket = crate::ledger::did_shard_bucket(did);
+        let mut other_did = "did:plc:other0".to_owned();
+        let mut suffix = 1_u32;
+        while crate::ledger::did_shard_bucket(&other_did) == bucket {
+            other_did = format!("did:plc:other{suffix}");
+            suffix = suffix.checked_add(1).unwrap();
+        }
+        let scope = ClaimScope {
+            shard_filter: Some(crate::ledger::ShardFilter::new(bucket).unwrap()),
+        };
 
-        assert_eq!(
-            scope.host_for("did:plc:abc", "https://resolved.example"),
-            "https://override.example"
-        );
-        assert_eq!(
-            scope.host_for("did:plc:other", "https://resolved.example"),
-            "https://resolved.example"
-        );
+        assert!(scope.includes_did(did));
+        assert!(!scope.includes_did(&other_did));
     }
 
     #[test]
