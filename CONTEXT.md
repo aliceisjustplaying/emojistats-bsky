@@ -29,8 +29,8 @@ The serving-site catch-up phase that starts after the backfill and replays Jetst
 _Avoid_: live/backfill overlap, dual-write
 
 **Local Jetstream Fallback**:
-A self-operated Jetstream server started only if the backfill slips beyond the 24-hour target. It preserves live event coverage when the project no longer wants to rely only on the public Jetstream retention window.
-_Avoid_: primary live path, mandatory live overlap
+A self-operated Jetstream server or spooler used when public Jetstream retention is not enough to guarantee catch-up. For a gap-free launch it must start before the public retention window can no longer cover the backfill rewind point.
+_Avoid_: late-only fallback, mandatory live overlap
 
 **Stratified Canary**:
 The pre-fan-out test run that exercises representative normal and edge-case repository populations, storage publication, derive, ClickHouse, and failure injection. It must measure the launch-critical timings and sizes before the fleet run.
