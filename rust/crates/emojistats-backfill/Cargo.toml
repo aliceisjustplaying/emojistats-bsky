@@ -16,6 +16,10 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+jacquard-common = { version = "0.12.0", git = "https://github.com/aliceisjustplaying/jacquard", rev = "39648622522fa62c4c0b12ac22b8a5f6893c845a", default-features = false, features = ["std", "service-auth", "crypto", "reqwest-client", "streaming"] }
+jacquard-identity = { version = "0.12.0", git = "https://github.com/aliceisjustplaying/jacquard", rev = "39648622522fa62c4c0b12ac22b8a5f6893c845a" }
 
 [lints]
 workspace = true

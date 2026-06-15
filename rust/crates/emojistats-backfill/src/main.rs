@@ -1,11 +1,13 @@
-//! emojistats-backfill — v2 Rust backfill CLI (skeleton).
+//! emojistats-backfill — v2 Rust backfill CLI.
 //!
-//! This is the foundation scaffold for the emojistats v2 backfill rewrite. Only argument
-//! parsing exists today; no fetch/parse/verify/archive logic is implemented yet. See
-//! `docs/backfill-v2-design.md` ("First implementation milestone") for the vertical slice
-//! this binary will grow into.
+//! Vertical-slice milestone in progress: `fetch-one <did>` resolves a DID to its PDS, then
+//! (incrementally) fetches the repo via the streaming `getRepo` seam, proves snapshot
+//! completeness, archives posts, and derives emoji rows. See `docs/backfill-v2-design.md`
+//! ("First implementation milestone").
 
 use clap::{Parser, Subcommand};
+use jacquard_common::types::did::Did;
+use jacquard_identity::{PublicResolver, resolver::IdentityResolver};
 
 /// emojistats v2 backfill tool.
 #[derive(Parser, Debug)]
@@ -17,43 +19,40 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Fetch and process a single repo by DID (vertical-slice milestone; not yet implemented).
+    /// Fetch and process a single repo by DID (vertical-slice milestone).
     FetchOne {
         /// The DID to fetch, e.g. did:plc:....
         did: String,
     },
 }
 
-fn main() {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-
     match cli.command {
-        Command::FetchOne { did } => {
-            // TODO: First implementation milestone — `fetch-one <did>` must, in order:
-            //   - resolve DID/PDS (jacquard-identity);
-            //   - fetch `getRepo` with bounded streaming via the low-level
-            //     `client.xrpc(base).download()` seam over our own reqwest HttpClient,
-            //     capturing rate-limit response headers (no high-level Agent/send path);
-            //   - spool the CAR to local disk under Loud Resource Caps (every disk / repo
-            //     size / block size / block count / record count / MST depth / wall-clock /
-            //     idle / parse-progress / upload-progress limit emits an explicit status);
-            //   - parse through an on-disk BlockStore + MST walk (Jacquard's in-RAM
-            //     `Repository` cannot hold multi-GB whales; rkeys live in MST leaf keys);
-            //   - extract `app.bsky.feed.post` records;
-            //   - extract the profile sidecar (`app.bsky.actor.profile/self`) if present;
-            //   - compute Snapshot Completeness (reconstructed root CID == commit.data, every
-            //     reachable node/record block resolves by CID) — not authorship/identity;
-            //   - compute the canonical ordered row-content receipt (row hashes, counts,
-            //     normalizer/unicode/emoji-data versions, verification booleans);
-            //   - write local Parquet (Data-Model Lossless schema);
-            //   - write a local manifest entry (run/shard/sequence/dataset/path/counts/
-            //     bytes/content hash/min-max timestamp/receipt hash/versions);
-            //   - derive compact emoji serving rows locally (or into scratch ClickHouse).
-            println!(
-                "fetch-one {did}: not yet implemented — see docs/backfill-v2-design.md (First implementation milestone)"
-            );
-        }
+        Command::FetchOne { did } => fetch_one(&did).await,
     }
+}
+
+/// Resolve a DID to its PDS endpoint.
+///
+/// Remaining milestone steps build on this: `getRepo` via the `download()` seam over our
+/// own reqwest `HttpClient` (capturing rate-limit headers), spool the `CAR` under Loud
+/// Resource Caps, parse via an on-disk `BlockStore` + `MST` walk, prove Snapshot
+/// Completeness, compute the row-content receipt, write `Parquet` + a manifest entry, and
+/// derive emoji rows.
+async fn fetch_one(did_str: &str) -> anyhow::Result<()> {
+    let did: Did =
+        Did::new_owned(did_str).map_err(|err| anyhow::anyhow!("invalid DID {did_str:?}: {err}"))?;
+
+    let resolver = PublicResolver::default();
+    let pds = resolver
+        .pds_for_did(&did)
+        .await
+        .map_err(|err| anyhow::anyhow!("resolve PDS for {did_str}: {err}"))?;
+
+    println!("{did_str} -> PDS {pds}");
+    Ok(())
 }
 
 #[cfg(test)]
