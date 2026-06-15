@@ -5,7 +5,11 @@
 //! completeness, archives posts, and derives emoji rows. See `docs/backfill-v2-design.md`
 //! ("First implementation milestone").
 
-use std::{path::PathBuf, time::SystemTime};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
 
 use clap::{Parser, Subcommand};
 use emojistats_backfill::{
@@ -14,7 +18,8 @@ use emojistats_backfill::{
         current_normalizer, hash_profile_record, write_archive_artifacts,
     },
     ledger::{
-        AttemptId, AttemptOutcome, RepoLedgerEntry, RetryPolicy, claim_repo, complete_attempt,
+        AttemptId, AttemptOutcome, RepoLedgerEntry, RetryPolicy, SqliteLedger, claim_repo,
+        complete_attempt,
     },
     parse::{ParseError, parse_repo_for_did},
     transport::{FetchConfig, FetchError, fetch_repo},
@@ -46,6 +51,29 @@ enum Command {
         #[arg(long, default_value = "data/archive")]
         archive_dir: PathBuf,
     },
+    /// Seed, claim, and process repos from a newline-delimited DID file.
+    RunFleet {
+        /// Newline-delimited file of DIDs to seed into the SQLite ledger.
+        dids_file: PathBuf,
+        /// SQLite ledger path.
+        #[arg(long, default_value = "data/ledger/backfill.sqlite")]
+        ledger_path: PathBuf,
+        /// Stable run id stored on claimed attempts.
+        #[arg(long, default_value = "fleet-local")]
+        run_id: String,
+        /// Maximum claimable repos to process in this invocation.
+        #[arg(long, default_value_t = 1, value_parser = parse_positive_u32)]
+        claim_limit: u32,
+        /// Directory for local `CAR` spooling.
+        #[arg(long, default_value = "data/spool")]
+        spool_dir: PathBuf,
+        /// Loud single-repo byte cap for each spooled `CAR`.
+        #[arg(long, default_value_t = 2_147_483_648)]
+        max_bytes: u64,
+        /// Directory for local archive artifacts.
+        #[arg(long, default_value = "data/archive")]
+        archive_dir: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -58,6 +86,26 @@ async fn main() -> anyhow::Result<()> {
             max_bytes,
             archive_dir,
         } => fetch_one(&did, spool_dir, max_bytes, archive_dir).await,
+        Command::RunFleet {
+            dids_file,
+            ledger_path,
+            run_id,
+            claim_limit,
+            spool_dir,
+            max_bytes,
+            archive_dir,
+        } => {
+            run_fleet(FleetConfig {
+                dids_file,
+                ledger_path,
+                run_id,
+                claim_limit,
+                spool_dir,
+                max_bytes,
+                archive_dir,
+            })
+            .await
+        }
     }
 }
 
@@ -92,6 +140,145 @@ async fn fetch_one(
     );
 
     result.map_err(|failure| failure.error)
+}
+
+#[derive(Debug)]
+struct FleetConfig {
+    dids_file: PathBuf,
+    ledger_path: PathBuf,
+    run_id: String,
+    claim_limit: u32,
+    spool_dir: PathBuf,
+    max_bytes: u64,
+    archive_dir: PathBuf,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SeedSummary {
+    inserted: u64,
+    existing: u64,
+    blank: u64,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FleetSummary {
+    seed: SeedSummary,
+    claimed: u64,
+    succeeded: u64,
+    failed: u64,
+}
+
+async fn run_fleet(config: FleetConfig) -> anyhow::Result<()> {
+    if let Some(parent) = config
+        .ledger_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let ledger = SqliteLedger::open(&config.ledger_path)?;
+    let mut summary = FleetSummary {
+        seed: seed_ledger_from_file(&ledger, &config.dids_file)?,
+        ..FleetSummary::default()
+    };
+    let claimable = ledger.claimable_entries(SystemTime::now(), config.claim_limit)?;
+
+    for entry in claimable {
+        let did = entry.did.clone();
+        let attempt = AttemptId::new(&config.run_id, &did, next_attempt_sequence(&entry)?);
+        let claimed = claim_repo(&entry, attempt, SystemTime::now())
+            .map_err(|err| anyhow::anyhow!("claim ledger entry for {did}: {err}"))?;
+        ledger.save_transitioned_entry(&claimed)?;
+        increment(&mut summary.claimed, "claimed repo count")?;
+
+        let result = fetch_one_attempt(
+            &did,
+            config.spool_dir.clone(),
+            config.max_bytes,
+            config.archive_dir.clone(),
+        )
+        .await;
+        let outcome = result.as_ref().map_or_else(
+            |failure| failure.outcome.clone(),
+            |_success| AttemptOutcome::Succeeded,
+        );
+        let completed =
+            complete_attempt(&claimed, outcome, SystemTime::now(), RetryPolicy::default())
+                .map_err(|err| anyhow::anyhow!("complete ledger entry for {did}: {err}"))?;
+        ledger.save_transitioned_entry(&completed)?;
+
+        match result {
+            Ok(()) => increment(&mut summary.succeeded, "succeeded repo count")?,
+            Err(failure) => {
+                increment(&mut summary.failed, "failed repo count")?;
+                eprintln!("attempt failed for {did}: {}", failure.error);
+            }
+        }
+        println!(
+            "ledger status for {} after {} attempt(s): {:?}",
+            completed.did, completed.attempts, completed.status
+        );
+    }
+
+    println!(
+        "fleet summary: seeded {}, existing {}, blank {}, claimed {}, succeeded {}, failed {}",
+        summary.seed.inserted,
+        summary.seed.existing,
+        summary.seed.blank,
+        summary.claimed,
+        summary.succeeded,
+        summary.failed
+    );
+    Ok(())
+}
+
+fn seed_ledger_from_file(ledger: &SqliteLedger, dids_file: &Path) -> anyhow::Result<SeedSummary> {
+    let mut summary = SeedSummary::default();
+    let contents = fs::read_to_string(dids_file)?;
+
+    for line in contents.lines() {
+        let did = line.trim();
+        if did.is_empty() {
+            increment(&mut summary.blank, "blank line count")?;
+            continue;
+        }
+        let _parsed: Did = Did::new_owned(did).map_err(|err| {
+            anyhow::anyhow!("invalid DID {did:?} in {}: {err}", dids_file.display())
+        })?;
+
+        if ledger.load_entry(did)?.is_some() {
+            increment(&mut summary.existing, "existing seed count")?;
+            continue;
+        }
+
+        ledger.upsert_entry(&RepoLedgerEntry::pending(did))?;
+        increment(&mut summary.inserted, "inserted seed count")?;
+    }
+
+    Ok(summary)
+}
+
+fn next_attempt_sequence(entry: &RepoLedgerEntry) -> anyhow::Result<u64> {
+    u64::from(entry.attempts)
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("attempt sequence overflow for {}", entry.did))
+}
+
+fn increment(value: &mut u64, context: &str) -> anyhow::Result<()> {
+    *value = value
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("{context} overflow"))?;
+    Ok(())
+}
+
+fn parse_positive_u32(value: &str) -> Result<u32, String> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|err| format!("expected a positive integer: {err}"))?;
+    if parsed == 0 {
+        return Err("expected a positive integer".to_owned());
+    }
+    Ok(parsed)
 }
 
 async fn fetch_one_attempt(
@@ -314,11 +501,16 @@ fn resource_failure(message: String) -> FetchOneFailure {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use clap::Parser;
+    use emojistats_backfill::ledger::{RepoLedgerEntry, RepoLedgerStatus, SqliteLedger};
 
-    use super::{Cli, Command};
+    use super::{Cli, Command, SeedSummary, seed_ledger_from_file};
 
     #[test]
     fn parses_fetch_one_did() {
@@ -329,7 +521,10 @@ mod tests {
             spool_dir,
             max_bytes,
             archive_dir,
-        } = cli.command;
+        } = cli.command
+        else {
+            unreachable!("expected fetch-one command");
+        };
         assert_eq!(did, "did:plc:abc123");
         assert_eq!(spool_dir, PathBuf::from("data/spool"));
         assert_eq!(max_bytes, 2_147_483_648);
@@ -339,5 +534,93 @@ mod tests {
     #[test]
     fn requires_a_subcommand() {
         assert!(Cli::try_parse_from(["emojistats-backfill"]).is_err());
+    }
+
+    #[test]
+    fn parses_run_fleet_defaults() {
+        let cli = Cli::try_parse_from(["emojistats-backfill", "run-fleet", "dids.txt"]).unwrap();
+        let Command::RunFleet {
+            dids_file,
+            ledger_path,
+            run_id,
+            claim_limit,
+            spool_dir,
+            max_bytes,
+            archive_dir,
+        } = cli.command
+        else {
+            unreachable!("expected run-fleet command");
+        };
+        assert_eq!(dids_file, PathBuf::from("dids.txt"));
+        assert_eq!(ledger_path, PathBuf::from("data/ledger/backfill.sqlite"));
+        assert_eq!(run_id, "fleet-local");
+        assert_eq!(claim_limit, 1);
+        assert_eq!(spool_dir, PathBuf::from("data/spool"));
+        assert_eq!(max_bytes, 2_147_483_648);
+        assert_eq!(archive_dir, PathBuf::from("data/archive"));
+    }
+
+    #[test]
+    fn run_fleet_rejects_zero_claim_limit() {
+        assert!(
+            Cli::try_parse_from([
+                "emojistats-backfill",
+                "run-fleet",
+                "dids.txt",
+                "--claim-limit",
+                "0",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn seed_ledger_from_file_inserts_only_missing_dids() {
+        let store = SqliteLedger::open_in_memory().unwrap();
+        let existing = RepoLedgerEntry {
+            did: "did:plc:existing".to_owned(),
+            status: RepoLedgerStatus::Succeeded,
+            attempts: 1,
+            next_attempt_after: None,
+            last_attempt: None,
+            last_error: None,
+        };
+        store.upsert_entry(&existing).unwrap();
+        let dids_file = temp_file_path("seed-ledger");
+        fs::write(
+            &dids_file,
+            "\ndid:plc:existing\ndid:plc:newrepo\ndid:plc:newrepo\n",
+        )
+        .unwrap();
+
+        let summary = seed_ledger_from_file(&store, &dids_file).unwrap();
+
+        assert_eq!(
+            summary,
+            SeedSummary {
+                inserted: 1,
+                existing: 2,
+                blank: 1
+            }
+        );
+        assert_eq!(
+            store.load_entry("did:plc:existing").unwrap(),
+            Some(existing)
+        );
+        assert_eq!(
+            store.load_entry("did:plc:newrepo").unwrap().unwrap().status,
+            RepoLedgerStatus::Pending
+        );
+
+        fs::remove_file(dids_file).unwrap();
+    }
+
+    fn temp_file_path(name: &str) -> PathBuf {
+        let since_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        std::env::temp_dir().join(format!(
+            "emojistats-backfill-{name}-{}-{}.txt",
+            std::process::id(),
+            since_epoch.as_nanos()
+        ))
     }
 }
