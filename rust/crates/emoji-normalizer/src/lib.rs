@@ -128,6 +128,39 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_non_qualified_keycaps_to_qualified_keycaps() {
+        assert_eq!(normalize_emoji_glyph("#\u{20e3}"), Some("#️⃣".to_owned()));
+        assert_eq!(normalize_emoji_glyph("*\u{20e3}"), Some("*️⃣".to_owned()));
+        assert_eq!(normalize_emoji_glyph("1\u{20e3}"), Some("1️⃣".to_owned()));
+    }
+
+    #[test]
+    fn normalizes_heart_zwj_sequences_to_emoji_style() {
+        assert_eq!(normalize_emoji_glyph("❤‍🔥"), Some("❤️‍🔥".to_owned()));
+        assert_eq!(normalize_emoji_glyph("❤‍🩹"), Some("❤️‍🩹".to_owned()));
+    }
+
+    #[test]
+    fn normalizes_zwj_sequences_with_missing_variation_selectors() {
+        assert_eq!(normalize_emoji_glyph("⛹‍♀"), Some("⛹️‍♀️".to_owned()));
+        assert_eq!(normalize_emoji_glyph("⛹🏽‍♀"), Some("⛹🏽‍♀️".to_owned()));
+    }
+
+    #[test]
+    fn keeps_regional_indicator_flags_as_one_glyph() {
+        assert_eq!(extract_emoji_sequence("flags 🇺🇸🇯🇵"), vec!["🇺🇸", "🇯🇵"]);
+    }
+
+    #[test]
+    fn preserves_ts_batch_order_and_duplicates_after_normalization() {
+        let text = "mix ❤ 1⃣ 🇺🇸 ❤‍🔥 👍🏽 1⃣";
+        assert_eq!(
+            extract_emoji_sequence(text),
+            vec!["❤️", "1️⃣", "🇺🇸", "❤️‍🔥", "👍🏽", "1️⃣"]
+        );
+    }
+
+    #[test]
     fn exposes_version_metadata() {
         let metadata = version();
         assert_eq!(metadata.name, "emoji-normalizer");
