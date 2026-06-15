@@ -35,8 +35,14 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   `--claim-limit` or idle, filters persisted shard buckets via `--shard-bucket`, runs
   bounded concurrent attempts via `--concurrency`, applies host retry-after cooldowns,
   loads persisted host overrides by resolved PDS host, and persists claimed/completed
-  transitions. `force_mode = list_records` currently stops loudly because the
-  `listRecords` fetch lane is not implemented yet.
+  transitions. It emits `smoke_telemetry` JSONL lines with per-repo fetch/parse/archive
+  timings, bytes, rows, decode errors, emoji rows, host, stage, and outcome. `force_mode =
+  list_records` currently stops loudly because the `listRecords` fetch lane is not
+  implemented yet.
+- `derive-manifest <manifest.jsonl>` verifies committed raw archive manifest entries,
+  reloads local `Parquet` archive rows, builds `ClickHouseDeriveBatch` values, formats
+  `JSONEachRow` payloads, and inserts them into `ClickHouse` with existing dedupe tokens.
+  `--dry-run` validates and counts payloads without sending inserts.
 - `emoji-normalizer` is a new shared Rust crate. Current parity scope is ordered/repeated
   extraction, heart variation normalization, non-qualified keycaps, regional flags,
   skin-tone sequences, ZWJ sequences, and version metadata. Broad TS
@@ -75,8 +81,9 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   and the `listRecords` fallback lane for hosts forced away from `getRepo`.
 - Wire remaining archive artifacts through the committed-artifact protocol, then configure
   the `storage_box.rs` `ssh` transport for the real Storage Box.
-- Finish derive-from-committed-manifest by wiring verified `ClickHouseDeriveBatch` values
-  into ordered inserts with retry/idempotency around dedupe tokens.
+- Add the operational smoke harness around `run-fleet` + `derive-manifest`: seed a mixed
+  DID file, ramp concurrency (`4 -> 16 -> 32` locally), capture `smoke_telemetry`, and
+  compare committed manifest/receipt counts against `ClickHouse` projection rows.
 - Finish emoji normalization parity with the TypeScript data tables, then add WASM bindings
   before the browser/server serving path depends on it.
 - Wire derive/ClickHouse ingest from committed manifest entries, then run the stratified

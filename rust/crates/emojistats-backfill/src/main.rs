@@ -6,9 +6,10 @@
 //! ("First implementation milestone").
 
 use std::{
-    fs,
+    fs::{self, File},
+    io::BufReader,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use clap::{Parser, Subcommand};
@@ -17,10 +18,12 @@ use emojistats_backfill::{
         ArchiveError, RepoReceiptInput, archive_rows_from_parsed_repo, build_repo_receipt,
         current_normalizer, hash_profile_record, write_archive_artifacts,
     },
+    clickhouse::{ClickHouseClientConfig, derive_insert_payloads, execute_insert_payloads},
     ledger::{
         AttemptId, AttemptOutcome, ForcedFetchMode, HostOverride, RepoLedgerEntry,
         RepoLedgerStatus, RetryPolicy, ShardFilter, SqliteLedger, claim_repo, complete_attempt,
     },
+    manifest_derive::{load_verified_clickhouse_batch, read_committed_jsonl},
     parse::{ParseError, parse_repo_for_did},
     scheduler::{ClaimScope, HostPacer, SchedulerError, SharedHostPacer, checked_concurrency},
     transport::{FetchConfig, FetchError, fetch_repo},
@@ -28,6 +31,7 @@ use emojistats_backfill::{
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use jacquard_common::{deps::fluent_uri::Uri, types::did::Did};
 use jacquard_identity::{PublicResolver, resolver::IdentityResolver};
+use serde::Serialize;
 
 /// emojistats v2 backfill tool.
 #[derive(Parser, Debug)]
@@ -82,6 +86,29 @@ enum Command {
         #[arg(long, default_value = "data/archive")]
         archive_dir: PathBuf,
     },
+    /// Verify a committed archive manifest and load derived rows into `ClickHouse`.
+    DeriveManifest {
+        /// Committed JSONL manifest path.
+        manifest_path: PathBuf,
+        /// Archive root used to resolve manifest object paths.
+        #[arg(long, default_value = "data/archive")]
+        archive_root: PathBuf,
+        /// `ClickHouse` HTTP endpoint.
+        #[arg(long, default_value = "http://localhost:8123")]
+        clickhouse_url: String,
+        /// `ClickHouse` database.
+        #[arg(long, default_value = "emojistats")]
+        clickhouse_database: String,
+        /// `ClickHouse` username.
+        #[arg(long, default_value = "default")]
+        clickhouse_user: String,
+        /// `ClickHouse` password.
+        #[arg(long, default_value = "")]
+        clickhouse_password: String,
+        /// Validate and format payloads without sending inserts.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -120,7 +147,96 @@ async fn main() -> anyhow::Result<()> {
             })
             .await
         }
+        Command::DeriveManifest {
+            manifest_path,
+            archive_root,
+            clickhouse_url,
+            clickhouse_database,
+            clickhouse_user,
+            clickhouse_password,
+            dry_run,
+        } => {
+            derive_manifest(DeriveManifestConfig {
+                manifest_path,
+                archive_root,
+                clickhouse_url,
+                clickhouse_database,
+                clickhouse_user,
+                clickhouse_password,
+                dry_run,
+            })
+            .await
+        }
     }
+}
+
+#[derive(Debug)]
+struct DeriveManifestConfig {
+    manifest_path: PathBuf,
+    archive_root: PathBuf,
+    clickhouse_url: String,
+    clickhouse_database: String,
+    clickhouse_user: String,
+    clickhouse_password: String,
+    dry_run: bool,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct DeriveManifestSummary {
+    manifest_entries: u64,
+    skipped_entries: u64,
+    batches: u64,
+    payloads: u64,
+    rows: u64,
+    inserted_payloads: u64,
+}
+
+async fn derive_manifest(config: DeriveManifestConfig) -> anyhow::Result<()> {
+    let file = File::open(&config.manifest_path)?;
+    let plan = read_committed_jsonl(BufReader::new(file))?;
+    let clickhouse = ClickHouseClientConfig::new(
+        &config.clickhouse_url,
+        &config.clickhouse_database,
+        config.clickhouse_user,
+        config.clickhouse_password,
+        "emojistats-backfill-derive",
+    )?;
+    let http = reqwest::Client::new();
+    let mut summary = DeriveManifestSummary {
+        manifest_entries: count_len(plan.inputs.len(), "manifest_entries")?,
+        skipped_entries: count_len(plan.skipped_entries.len(), "skipped_entries")?,
+        ..DeriveManifestSummary::default()
+    };
+
+    for input in &plan.inputs {
+        let batch = load_verified_clickhouse_batch(&config.archive_root, input)?;
+        let payloads = derive_insert_payloads(&batch)?;
+        increment(&mut summary.batches, "derive batch count")?;
+        add_count(
+            &mut summary.payloads,
+            count_len(payloads.len(), "derive payload count")?,
+            "derive payload total",
+        )?;
+        add_count(
+            &mut summary.rows,
+            payload_row_count(&payloads)?,
+            "derive row total",
+        )?;
+        if !config.dry_run {
+            let receipts = execute_insert_payloads(&http, &clickhouse, &payloads).await?;
+            add_count(
+                &mut summary.inserted_payloads,
+                count_len(receipts.len(), "insert receipt count")?,
+                "inserted payload total",
+            )?;
+        }
+    }
+
+    println!(
+        "derive_manifest_summary {}",
+        serde_json::to_string(&summary)?
+    );
+    Ok(())
 }
 
 /// Resolve a DID to its PDS endpoint.
@@ -433,6 +549,28 @@ fn increment(value: &mut u64, context: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn add_count(value: &mut u64, addend: u64, context: &str) -> anyhow::Result<()> {
+    *value = value
+        .checked_add(addend)
+        .ok_or_else(|| anyhow::anyhow!("{context} overflow"))?;
+    Ok(())
+}
+
+fn count_len(value: usize, context: &str) -> anyhow::Result<u64> {
+    u64::try_from(value).map_err(|_error| anyhow::anyhow!("{context} overflow"))
+}
+
+fn payload_row_count(
+    payloads: &[emojistats_backfill::clickhouse::ClickHouseInsertPayload],
+) -> anyhow::Result<u64> {
+    payloads.iter().try_fold(0_u64, |total, payload| {
+        let rows = count_len(payload.row_count, "payload row count")?;
+        total
+            .checked_add(rows)
+            .ok_or_else(|| anyhow::anyhow!("payload row total overflow"))
+    })
+}
+
 fn parse_positive_u32(value: &str) -> Result<u32, String> {
     let parsed = value
         .parse::<u32>()
@@ -488,6 +626,7 @@ async fn fetch_one_attempt_with_pacer(
     claim_scope: &ClaimScope,
     host_override_ledger_path: Option<&Path>,
 ) -> Result<(), FetchOneFailure> {
+    let attempt_started = Instant::now();
     let did: Did = Did::new_owned(did_str)
         .map_err(|err| permanent_failure(format!("invalid DID {did_str:?}: {err}")))?;
 
@@ -510,28 +649,184 @@ async fn fetch_one_attempt_with_pacer(
     let mut config = FetchConfig::new(spool_dir);
     config.max_bytes = max_bytes;
 
-    let spooled = match fetch_repo(&http, &pds, &did, &config).await {
-        Ok(spooled) => spooled,
-        Err(err) => {
-            let failure = classify_fetch_error(did_str, &err);
-            if let AttemptOutcome::RateLimited { retry_after } = &failure.outcome
-                && let Some(pacer) = &host_pacer
-                && let Err(pacer_error) = HostPacer::record_retry_after(pacer, &host, *retry_after)
-            {
-                eprintln!("failed to record host cooldown for {host}: {pacer_error}");
-            }
-            return Err(failure);
-        }
-    };
+    let fetched = fetch_spooled_repo(FetchStep {
+        http: &http,
+        pds: &pds,
+        did: &did,
+        did_str,
+        host: host.as_str(),
+        config: &config,
+        host_pacer: host_pacer.as_ref(),
+        attempt_started,
+    })
+    .await?;
     println!(
         "spooled {} bytes from HTTP {} to {}",
-        spooled.bytes,
-        spooled.http_status,
-        spooled.car_path.display()
+        fetched.spooled.bytes,
+        fetched.spooled.http_status,
+        fetched.spooled.car_path.display()
     );
 
-    let parsed = parse_repo_for_did(&spooled.car_path, did_str)
-        .map_err(|err| classify_parse_error(did_str, &err))?;
+    let processed = parse_archive_or_emit_failure(
+        did_str,
+        host.as_str(),
+        &fetched,
+        &archive_dir,
+        attempt_started,
+    )?;
+    println!(
+        "parsed {} records, {} posts, {} decode errors, {} emoji rows, receipt {}",
+        processed.records,
+        processed.archived_posts,
+        processed.decode_errors,
+        processed.emoji_rows,
+        processed.receipt_hash
+    );
+    println!(
+        "wrote archive {}, receipt {}, manifest {}, emoji projection {}",
+        processed.parquet_path.display(),
+        processed.receipt_path.display(),
+        processed.manifest_path.display(),
+        processed.emoji_projection_path.display()
+    );
+    emit_smoke_telemetry(&SmokeTelemetry {
+        event: "smoke_repo_attempt",
+        did: did_str,
+        host: Some(host.as_str()),
+        outcome: "succeeded",
+        stage: "complete",
+        elapsed_ms: elapsed_ms(attempt_started),
+        fetch_ms: Some(fetched.fetch_ms),
+        parse_ms: Some(processed.parse_ms),
+        archive_ms: Some(processed.archive_ms),
+        bytes: Some(fetched.spooled.bytes),
+        records: Some(processed.records),
+        archived_posts: Some(processed.archived_posts),
+        decode_errors: Some(processed.decode_errors),
+        emoji_rows: Some(processed.emoji_rows),
+        error: None,
+    });
+    Ok(())
+}
+
+struct FetchStep<'a> {
+    http: &'a reqwest::Client,
+    pds: &'a Uri<String>,
+    did: &'a Did,
+    did_str: &'a str,
+    host: &'a str,
+    config: &'a FetchConfig,
+    host_pacer: Option<&'a SharedHostPacer>,
+    attempt_started: Instant,
+}
+
+struct FetchedRepo {
+    spooled: emojistats_backfill::transport::SpooledRepo,
+    fetch_ms: u64,
+}
+
+async fn fetch_spooled_repo(step: FetchStep<'_>) -> Result<FetchedRepo, FetchOneFailure> {
+    let fetch_started = Instant::now();
+    match fetch_repo(step.http, step.pds, step.did, step.config).await {
+        Ok(spooled) => Ok(FetchedRepo {
+            spooled,
+            fetch_ms: elapsed_ms(fetch_started),
+        }),
+        Err(err) => {
+            let failure = classify_fetch_error(step.did_str, &err);
+            emit_smoke_telemetry(&SmokeTelemetry {
+                event: "smoke_repo_attempt",
+                did: step.did_str,
+                host: Some(step.host),
+                outcome: outcome_name(&failure.outcome),
+                stage: "fetch",
+                elapsed_ms: elapsed_ms(step.attempt_started),
+                fetch_ms: Some(elapsed_ms(fetch_started)),
+                parse_ms: None,
+                archive_ms: None,
+                bytes: None,
+                records: None,
+                archived_posts: None,
+                decode_errors: None,
+                emoji_rows: None,
+                error: Some(failure.error.to_string()),
+            });
+            record_rate_limit_cooldown(step.host_pacer, step.host, &failure);
+            Err(failure)
+        }
+    }
+}
+
+fn record_rate_limit_cooldown(
+    host_pacer: Option<&SharedHostPacer>,
+    host: &str,
+    failure: &FetchOneFailure,
+) {
+    if let AttemptOutcome::RateLimited { retry_after } = &failure.outcome
+        && let Some(pacer) = host_pacer
+        && let Err(pacer_error) = HostPacer::record_retry_after(pacer, host, *retry_after)
+    {
+        eprintln!("failed to record host cooldown for {host}: {pacer_error}");
+    }
+}
+
+fn parse_archive_or_emit_failure(
+    did_str: &str,
+    host: &str,
+    fetched: &FetchedRepo,
+    archive_dir: &Path,
+    attempt_started: Instant,
+) -> Result<ProcessedRepo, FetchOneFailure> {
+    match parse_and_archive_spooled_repo(did_str, &fetched.spooled.car_path, archive_dir) {
+        Ok(processed) => Ok(processed),
+        Err(failure) => {
+            emit_smoke_telemetry(&SmokeTelemetry {
+                event: "smoke_repo_attempt",
+                did: did_str,
+                host: Some(host),
+                outcome: outcome_name(&failure.outcome),
+                stage: "parse_archive",
+                elapsed_ms: elapsed_ms(attempt_started),
+                fetch_ms: Some(fetched.fetch_ms),
+                parse_ms: None,
+                archive_ms: None,
+                bytes: Some(fetched.spooled.bytes),
+                records: None,
+                archived_posts: None,
+                decode_errors: None,
+                emoji_rows: None,
+                error: Some(failure.error.to_string()),
+            });
+            Err(failure)
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ProcessedRepo {
+    records: u64,
+    archived_posts: u64,
+    decode_errors: u64,
+    emoji_rows: u64,
+    receipt_hash: String,
+    parquet_path: PathBuf,
+    receipt_path: PathBuf,
+    manifest_path: PathBuf,
+    emoji_projection_path: PathBuf,
+    parse_ms: u64,
+    archive_ms: u64,
+}
+
+fn parse_and_archive_spooled_repo(
+    did_str: &str,
+    car_path: &Path,
+    archive_dir: &Path,
+) -> Result<ProcessedRepo, FetchOneFailure> {
+    let parse_started = Instant::now();
+    let parsed =
+        parse_repo_for_did(car_path, did_str).map_err(|err| classify_parse_error(did_str, &err))?;
+    let parse_ms = elapsed_ms(parse_started);
+    let archive_started = Instant::now();
     let rows = archive_rows_from_parsed_repo(&parsed).map_err(|err| {
         classify_archive_error(&format!("build archive rows for {did_str}"), &err)
     })?;
@@ -558,7 +853,7 @@ async fn fetch_one_attempt_with_pacer(
     })
     .map_err(|err| classify_archive_error(&format!("build receipt for {did_str}"), &err))?;
     let artifacts = write_archive_artifacts(
-        &archive_dir,
+        archive_dir,
         did_str,
         &rows,
         parsed.profile.as_ref(),
@@ -567,22 +862,63 @@ async fn fetch_one_attempt_with_pacer(
     .map_err(|err| {
         classify_archive_error(&format!("write archive artifacts for {did_str}"), &err)
     })?;
-    println!(
-        "parsed {} records, {} posts, {} decode errors, {} emoji rows, receipt {}",
-        parsed.rkey_digest.all_records_count,
-        receipt.archived_post_rows_count,
-        parsed.record_decode_errors.len(),
-        artifacts.emoji_rows,
-        receipt.post_rows_hash
-    );
-    println!(
-        "wrote archive {}, receipt {}, manifest {}, emoji projection {}",
-        artifacts.parquet_path.display(),
-        artifacts.receipt_path.display(),
-        artifacts.manifest_path.display(),
-        artifacts.emoji_projection_path.display()
-    );
-    Ok(())
+    let decode_errors = count_len(parsed.record_decode_errors.len(), "record decode errors")
+        .map_err(|err| resource_failure(err.to_string()))?;
+
+    Ok(ProcessedRepo {
+        records: parsed.rkey_digest.all_records_count,
+        archived_posts: receipt.archived_post_rows_count,
+        decode_errors,
+        emoji_rows: artifacts.emoji_rows,
+        receipt_hash: receipt.post_rows_hash,
+        parquet_path: artifacts.parquet_path,
+        receipt_path: artifacts.receipt_path,
+        manifest_path: artifacts.manifest_path,
+        emoji_projection_path: artifacts.emoji_projection_path,
+        parse_ms,
+        archive_ms: elapsed_ms(archive_started),
+    })
+}
+
+#[derive(Serialize)]
+struct SmokeTelemetry<'a> {
+    event: &'static str,
+    did: &'a str,
+    host: Option<&'a str>,
+    outcome: &'static str,
+    stage: &'static str,
+    elapsed_ms: u64,
+    fetch_ms: Option<u64>,
+    parse_ms: Option<u64>,
+    archive_ms: Option<u64>,
+    bytes: Option<u64>,
+    records: Option<u64>,
+    archived_posts: Option<u64>,
+    decode_errors: Option<u64>,
+    emoji_rows: Option<u64>,
+    error: Option<String>,
+}
+
+fn emit_smoke_telemetry(telemetry: &SmokeTelemetry<'_>) {
+    match serde_json::to_string(telemetry) {
+        Ok(line) => println!("smoke_telemetry {line}"),
+        Err(error) => eprintln!("failed to serialize smoke telemetry: {error}"),
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+const fn outcome_name(outcome: &AttemptOutcome) -> &'static str {
+    match outcome {
+        AttemptOutcome::Succeeded => "succeeded",
+        AttemptOutcome::AccountState(_) => "account_state",
+        AttemptOutcome::RateLimited { .. } => "rate_limited",
+        AttemptOutcome::RetryableFailure { .. } => "retryable_failure",
+        AttemptOutcome::ResourceLimitExceeded { .. } => "resource_limit_exceeded",
+        AttemptOutcome::PermanentFailure { .. } => "permanent_failure",
+    }
 }
 
 async fn prepare_fetch_host(
@@ -889,6 +1225,72 @@ mod tests {
         };
 
         assert_eq!(shard_bucket, Some(ShardFilter::new(3).unwrap()));
+    }
+
+    #[test]
+    fn parses_derive_manifest_defaults() {
+        let cli = Cli::try_parse_from(["emojistats-backfill", "derive-manifest", "manifest.jsonl"])
+            .unwrap();
+        let Command::DeriveManifest {
+            manifest_path,
+            archive_root,
+            clickhouse_url,
+            clickhouse_database,
+            clickhouse_user,
+            clickhouse_password,
+            dry_run,
+        } = cli.command
+        else {
+            unreachable!("expected derive-manifest command");
+        };
+
+        assert_eq!(manifest_path, PathBuf::from("manifest.jsonl"));
+        assert_eq!(archive_root, PathBuf::from("data/archive"));
+        assert_eq!(clickhouse_url, "http://localhost:8123");
+        assert_eq!(clickhouse_database, "emojistats");
+        assert_eq!(clickhouse_user, "default");
+        assert_eq!(clickhouse_password, "");
+        assert!(!dry_run);
+    }
+
+    #[test]
+    fn parses_derive_manifest_clickhouse_options() {
+        let cli = Cli::try_parse_from([
+            "emojistats-backfill",
+            "derive-manifest",
+            "manifest.jsonl",
+            "--archive-root",
+            "archive",
+            "--clickhouse-url",
+            "http://127.0.0.1:8123",
+            "--clickhouse-database",
+            "analytics",
+            "--clickhouse-user",
+            "writer",
+            "--clickhouse-password",
+            "secret",
+            "--dry-run",
+        ])
+        .unwrap();
+        let Command::DeriveManifest {
+            archive_root,
+            clickhouse_url,
+            clickhouse_database,
+            clickhouse_user,
+            clickhouse_password,
+            dry_run,
+            ..
+        } = cli.command
+        else {
+            unreachable!("expected derive-manifest command");
+        };
+
+        assert_eq!(archive_root, PathBuf::from("archive"));
+        assert_eq!(clickhouse_url, "http://127.0.0.1:8123");
+        assert_eq!(clickhouse_database, "analytics");
+        assert_eq!(clickhouse_user, "writer");
+        assert_eq!(clickhouse_password, "secret");
+        assert!(dry_run);
     }
 
     #[test]
