@@ -10,31 +10,52 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
 - **Checkpoint A done:** `fetch-one <did>` resolves DID→PDS over the live network
   (`did:plc:z72i7hdynmk6r22z27h6tvur` → `puffball.us-east.host.bsky.network`); invalid DIDs
   error cleanly. Full muster green.
+- **Checkpoint B/C/D done locally:** `fetch-one <did>` now resolves DID→PDS, streams
+  `getRepo` to a spooled `CAR`, parses from the `CAR` path with block `CID` verification
+  and `MST` completeness, writes `Parquet` posts, writes receipt + local manifest JSON, and
+  derives compact emoji JSONL rows.
+- Real stress DID verified:
+  `did:plc:vwzwgnygau7ed7b7wt5ux7y2` from `shiitake.us-east.host.bsky.network` spooled
+  41,051,855 bytes, produced 6,407 post rows, 228 emoji rows, and carried 23,656 typed
+  record decode failures as non-fatal parse diagnostics.
 - Jacquard 0.12.0 via **fork-mirror git deps**: `github.com/aliceisjustplaying/jacquard`
   @ `39648622522fa62c4c0b12ac22b8a5f6893c845a` (== tag 0.12.0). reqwest pulls **rustls**
   (no openssl). Full 0.12.0 source also at `/tmp/jacquard` for reading (ephemeral).
 - Build/gate: `./check.sh` (cc is on PATH now). All tools installed.
 
-## fetch-one roadmap (the rest of the vertical slice)
+## fetch-one vertical slice
 
-- **B — transport:** hand-roll `HttpClient` + `HttpClientExt` over reqwest → `download()`
-  getRepo; read `ratelimit-*` headers off the response; stream the CAR to a spool file with
-  a per-chunk inactivity timeout + Loud Resource Caps (disk/size/blocks/records/MST-depth/
-  wall-clock/idle — each emits an explicit status, never a silent drop).
-- **C — parse:** on-disk `BlockStore` over the spooled CAR; `compute_cid` per block at
-  ingest (the missing verify); `Mst::load` + `get_pointer() == commit.data` root-equality =
-  Snapshot Completeness; walk leaves → extract `app.bsky.feed.post`; profile sidecar.
-- **D — archive/derive:** canonical row-content receipt (counts + ordered content hash +
-  normalizer/unicode/emoji versions); write Parquet (Data-Model Lossless: flat columns +
-  `extras_json`); local manifest entry; derive compact emoji serving rows.
+- **A — identity:** `src/main.rs` resolves DID→PDS using `PublicResolver`.
+- **B — transport:** `src/transport.rs` streams `com.atproto.sync.getRepo` with Jacquard's
+  `download()` path, captures standard and legacy rate-limit headers, writes the response
+  body to a deterministic spool path, enforces idle timeout + byte cap, and classifies
+  account-state, HTTP, timeout, cap, transport, and I/O errors.
+- **C — parse:** `src/parse.rs` reads only a `CAR` path, indexes blocks by `CID`, verifies
+  bytes hash back to the advertised `CID`, stores block offsets over the spooled file,
+  parses the commit, proves `MST` root equality, walks records, and extracts typed
+  `app.bsky.feed.post` plus optional profile data. Typed record decode failures are
+  diagnostics; malformed records do not abort a complete snapshot.
+- **D — archive/derive:** `src/archive.rs` converts parsed posts to archive rows, computes
+  row-content receipt hashes and counts, writes `Parquet` with flat lossless columns plus
+  `extras_json`, writes a local manifest entry, and derives local compact emoji JSONL rows.
+
+## Next roadmap
+
+- Add crawler ledger state and retry/account-state transitions around `fetch-one`.
+- Implement the Storage Box committed-manifest protocol: temp upload, verify, final rename,
+  receipt sidecar, manifest append only after the final object exists.
+- Move emoji normalization into the shared WASM-able crate from the design before the
+  browser/server serving path depends on it.
+- Add derive/ClickHouse ingest from committed manifest entries, then run the stratified
+  canary and fleet scheduler work.
 
 ### Defaulted design choices (revisit if needed)
 
 - **BlockStore** = index the spooled CAR file (`CID → (offset,len)`, seek to read) rather
   than a second on-disk copy; spill the index if a whale's is too large for RAM.
 - **Parquet** = `arrow` + `parquet` crates.
-- **Emoji** = its own shared crate (`emoji-normalizer`, the WASM-able one from the design),
-  added at step D — not inline.
+- **Emoji** = currently minimal local Rust extraction in `archive.rs`; still promote it to
+  the shared `emoji-normalizer` crate before this becomes a serving contract.
 
 ## Jacquard 0.12.0 API map (load-bearing; from recon — verify against `/tmp/jacquard`)
 

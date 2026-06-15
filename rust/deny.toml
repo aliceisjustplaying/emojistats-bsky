@@ -10,7 +10,8 @@ version = 2
 yanked = "deny"
 # atomic-polyfill (transitive via the crypto/embedded stack) is unmaintained — superseded by
 # portable-atomic upstream; not a direct dep and not easily removable from the tree.
-ignore = ["RUSTSEC-2023-0089"]
+# paste is transitive via parquet/arrow. Parquet has no safe upgrade path that removes it yet.
+ignore = ["RUSTSEC-2023-0089", "RUSTSEC-2024-0436"]
 
 [licenses]
 version = 2
