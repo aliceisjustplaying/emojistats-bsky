@@ -164,6 +164,8 @@ pub struct ArchiveArtifacts {
     pub manifest_path: PathBuf,
     pub emoji_projection_path: PathBuf,
     pub profile_sidecar_path: Option<PathBuf>,
+    pub profile_sidecar_receipt_path: Option<PathBuf>,
+    pub profile_sidecar_manifest_path: Option<PathBuf>,
     pub manifest: LocalManifestEntry,
     pub emoji_rows: u64,
 }
@@ -251,10 +253,14 @@ pub fn write_archive_artifacts(
     let object_receipt_object_path = PathBuf::from(format!("{safe_did}.object-receipt.json"));
     let manifest_object_path = PathBuf::from(format!("{safe_did}.manifest.jsonl"));
     let emoji_projection_path = output_dir.join(format!("{safe_did}.emoji.jsonl"));
-    let profile_sidecar_path =
-        profile.map(|_profile| output_dir.join(format!("{safe_did}.profile.json")));
+    let profile_sidecar_object_path = PathBuf::from(format!("{safe_did}.profile.json"));
+    let profile_sidecar_receipt_object_path =
+        PathBuf::from(format!("{safe_did}.profile.object-receipt.json"));
+    let profile_sidecar_manifest_object_path =
+        PathBuf::from(format!("{safe_did}.profile.manifest.jsonl"));
 
     write_temp_rename(&receipt_path, |path| write_json_pretty(path, receipt))?;
+    let store = LocalStore::new(output_dir);
     let commit_request = Request {
         object_path: parquet_object_path,
         receipt_path: object_receipt_object_path,
@@ -262,7 +268,7 @@ pub fn write_archive_artifacts(
         manifest_mode: ManifestMode::AppendJsonl,
         metadata: build_commit_metadata(rows, receipt)?,
     };
-    let committed = LocalStore::new(output_dir).commit(&commit_request, |file| {
+    let committed = store.commit(&commit_request, |file| {
         write_posts_parquet_to_writer(file, rows)
             .map_err(|error| crate::commit::Error::writer(format!("write posts parquet: {error}")))
     })?;
@@ -275,9 +281,18 @@ pub fn write_archive_artifacts(
     write_temp_rename(&emoji_projection_path, |path| {
         write_emoji_projection_jsonl(path, &emoji_projection_rows)
     })?;
-    if let (Some(path), Some(profile)) = (&profile_sidecar_path, profile) {
-        write_temp_rename(path, |path| write_profile_sidecar_json(path, profile))?;
-    }
+    let committed_profile = profile
+        .map(|profile| {
+            commit_profile_sidecar(
+                &store,
+                profile_sidecar_object_path,
+                profile_sidecar_receipt_object_path,
+                profile_sidecar_manifest_object_path,
+                profile,
+                receipt,
+            )
+        })
+        .transpose()?;
 
     let manifest = local_manifest_from_committed(&committed, receipt);
 
@@ -287,7 +302,13 @@ pub fn write_archive_artifacts(
         object_receipt_path: committed.receipt_path,
         manifest_path: committed.manifest_path,
         emoji_projection_path,
-        profile_sidecar_path,
+        profile_sidecar_path: committed_profile
+            .as_ref()
+            .map(|artifact| artifact.object_path.clone()),
+        profile_sidecar_receipt_path: committed_profile
+            .as_ref()
+            .map(|artifact| artifact.receipt_path.clone()),
+        profile_sidecar_manifest_path: committed_profile.map(|artifact| artifact.manifest_path),
         manifest,
         emoji_rows,
     })
@@ -477,6 +498,43 @@ fn build_commit_metadata(
     })
 }
 
+fn build_profile_sidecar_metadata(receipt: &RepoReceipt) -> Result<Metadata, ArchiveError> {
+    Ok(Metadata {
+        run_id: "fetch-one-local".to_owned(),
+        shard: "single".to_owned(),
+        file_sequence: 1,
+        dataset: "raw_profile_sidecar".to_owned(),
+        row_count: 1,
+        min_created_at_normalized: None,
+        max_created_at_normalized: None,
+        receipt_hash: hash_serialized(receipt)?,
+        normalizer: receipt.normalizer.clone(),
+        schema_version: ARCHIVE_SCHEMA_VERSION,
+    })
+}
+
+fn commit_profile_sidecar(
+    store: &LocalStore,
+    object_path: PathBuf,
+    receipt_path: PathBuf,
+    manifest_path: PathBuf,
+    profile: &ProfileRecord,
+    receipt: &RepoReceipt,
+) -> Result<crate::commit::Artifact, ArchiveError> {
+    let request = Request {
+        object_path,
+        receipt_path,
+        manifest_path,
+        manifest_mode: ManifestMode::AppendJsonl,
+        metadata: build_profile_sidecar_metadata(receipt)?,
+    };
+    Ok(store.commit(&request, |file| {
+        write_profile_sidecar_json_to_writer(file, profile).map_err(|error| {
+            crate::commit::Error::writer(format!("write profile sidecar JSON: {error}"))
+        })
+    })?)
+}
+
 fn local_manifest_from_committed(
     committed: &crate::commit::Artifact,
     receipt: &RepoReceipt,
@@ -511,8 +569,16 @@ fn write_emoji_projection_jsonl(
     Ok(())
 }
 
-fn write_profile_sidecar_json(path: &Path, profile: &ProfileRecord) -> Result<(), ArchiveError> {
-    write_json_pretty(path, &profile_sidecar_row(profile))
+fn write_profile_sidecar_json_to_writer<W>(
+    mut writer: W,
+    profile: &ProfileRecord,
+) -> Result<(), ArchiveError>
+where
+    W: Write,
+{
+    serde_json::to_writer_pretty(&mut writer, &profile_sidecar_row(profile))?;
+    writer.write_all(b"\n")?;
+    Ok(())
 }
 
 fn profile_sidecar_row(profile: &ProfileRecord) -> ProfileSidecarRow<'_> {
