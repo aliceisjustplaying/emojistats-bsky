@@ -1,6 +1,6 @@
 # Rust Backfill Review Bundle
 
-_Generated 2026-06-15 from branch `v2-rust-backfill` at `7d1aa0f`._
+_Generated 2026-06-15 from branch `v2-rust-backfill` at `7d76e64`._
 
 This file concatenates context, decisions/docs, implementation notes, and Rust source/config for review.
 
@@ -882,10 +882,10 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use emojistats_backfill::{
     archive::{
-        archive_rows_from_parsed_repo, build_repo_receipt, current_normalizer,
-        write_archive_artifacts,
+        RepoReceiptInput, archive_rows_from_parsed_repo, build_repo_receipt, current_normalizer,
+        hash_profile_record, write_archive_artifacts,
     },
-    parse::parse_repo,
+    parse::parse_repo_for_did,
     transport::{FetchConfig, fetch_repo},
 };
 use jacquard_common::types::did::Did;
@@ -967,22 +967,36 @@ async fn fetch_one(
         spooled.car_path.display()
     );
 
-    let parsed = parse_repo(&spooled.car_path)
+    let parsed = parse_repo_for_did(&spooled.car_path, did_str)
         .map_err(|err| anyhow::anyhow!("parse CAR for {did_str}: {err}"))?;
-    let rows = archive_rows_from_parsed_repo(&parsed);
-    let receipt = build_repo_receipt(
-        &rows,
-        parsed.rkey_digest.all_records_count,
-        Some(parsed.commit.data.clone()),
-        Some(parsed.commit.cid.clone()),
-        current_normalizer(),
-    );
+    let rows = archive_rows_from_parsed_repo(&parsed)
+        .map_err(|err| anyhow::anyhow!("build archive rows for {did_str}: {err}"))?;
+    let profile_row_hash = hash_profile_record(parsed.profile.as_ref())
+        .map_err(|err| anyhow::anyhow!("hash profile row for {did_str}: {err}"))?;
+    let post_decode_error_count = parsed
+        .record_decode_errors
+        .iter()
+        .filter(|error| error.collection == "app.bsky.feed.post")
+        .count()
+        .try_into()
+        .map_err(|_err| anyhow::anyhow!("post decode error count overflow for {did_str}"))?;
+    let receipt = build_repo_receipt(RepoReceiptInput {
+        rows: &rows,
+        reachable_records_count: parsed.rkey_digest.all_records_count,
+        reachable_post_records_count: parsed.rkey_digest.post_records_count,
+        post_decode_error_count,
+        profile_row_hash,
+        mst_root_cid: Some(parsed.commit.data.clone()),
+        commit_cid: Some(parsed.commit.cid.clone()),
+        normalizer: current_normalizer(),
+    })
+    .map_err(|err| anyhow::anyhow!("build receipt for {did_str}: {err}"))?;
     let artifacts = write_archive_artifacts(&archive_dir, did_str, &rows, &receipt)
         .map_err(|err| anyhow::anyhow!("write archive artifacts for {did_str}: {err}"))?;
     println!(
         "parsed {} records, {} posts, {} decode errors, {} emoji rows, receipt {}",
         parsed.rkey_digest.all_records_count,
-        receipt.all_posts_count,
+        receipt.archived_post_rows_count,
         parsed.record_decode_errors.len(),
         artifacts.emoji_rows,
         receipt.post_rows_hash
@@ -1039,10 +1053,10 @@ mod tests {
 use std::{
     error::Error,
     fmt,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use futures_util::StreamExt as _;
@@ -1337,10 +1351,30 @@ async fn stream_to_file(
     chunk_idle_timeout: Duration,
     max_bytes: u64,
 ) -> Result<u64, FetchError> {
+    let temp_path = temp_spool_path(car_path)?;
+    match stream_to_temp_file(body, &temp_path, chunk_idle_timeout, max_bytes).await {
+        Ok(bytes) => {
+            fs::rename(&temp_path, car_path)?;
+            sync_parent_dir(car_path)?;
+            Ok(bytes)
+        }
+        Err(error) => {
+            let _ignored = fs::remove_file(&temp_path);
+            Err(error)
+        }
+    }
+}
+
+async fn stream_to_temp_file(
+    body: ByteStream,
+    temp_path: &Path,
+    chunk_idle_timeout: Duration,
+    max_bytes: u64,
+) -> Result<u64, FetchError> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(car_path)?;
+        .open(temp_path)?;
     let mut bytes = 0_u64;
     let mut stream = body.into_inner();
 
@@ -1376,6 +1410,32 @@ async fn stream_to_file(
 
     file.sync_all()?;
     Ok(bytes)
+}
+
+fn temp_spool_path(car_path: &Path) -> Result<PathBuf, FetchError> {
+    let file_name = car_path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "spool path has no file name")
+        })?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| io::Error::other(format!("system clock before UNIX epoch: {error}")))?;
+    let temp_name = format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        timestamp.as_nanos()
+    );
+    Ok(car_path.with_file_name(temp_name))
+}
+
+fn sync_parent_dir(path: &Path) -> Result<(), FetchError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 async fn collect_body_with_cap(
@@ -1632,6 +1692,7 @@ use std::{
     io::{Cursor, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -1666,6 +1727,36 @@ pub struct ParsedRepo {
     pub profile_decode_error: Option<String>,
     /// Typed record decode failures observed while walking reachable records.
     pub record_decode_errors: Vec<RecordDecodeFailure>,
+}
+
+/// Resource caps for Stage C parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseConfig {
+    /// Maximum number of `CAR` blocks accepted while verifying or indexing.
+    pub max_car_blocks: u64,
+    /// Maximum encoded `CAR` block section size accepted before allocation.
+    pub max_block_bytes: u64,
+    /// Maximum number of reachable repo records accepted while walking the `MST`.
+    pub max_records: u64,
+    /// Maximum `MST` cursor layer accepted while walking records.
+    pub max_mst_depth: u64,
+    /// Maximum number of non-fatal typed record decode errors accepted.
+    pub max_decode_errors: u64,
+    /// Maximum best-effort parser wall-clock time.
+    pub max_parse_wall_clock: Duration,
+}
+
+impl Default for ParseConfig {
+    fn default() -> Self {
+        Self {
+            max_car_blocks: 10_000_000,
+            max_block_bytes: 67_108_864,
+            max_records: 10_000_000,
+            max_mst_depth: 256,
+            max_decode_errors: 1_000_000,
+            max_parse_wall_clock: Duration::from_mins(15),
+        }
+    }
 }
 
 /// Commit metadata needed by downstream archive and receipt code.
@@ -1799,6 +1890,22 @@ pub enum ParseError {
         /// Root `CID` declared by the `CAR`.
         root: String,
     },
+    /// The single `CAR` root did not decode as a repo commit.
+    #[error("CAR root {root} did not decode as a repo commit: {message}")]
+    RootCommitDecode {
+        /// Root `CID` declared by the `CAR`.
+        root: String,
+        /// Decode error message.
+        message: String,
+    },
+    /// The repo commit claimed a different `DID` than the caller requested.
+    #[error("commit DID mismatch: requested={requested}, actual={actual}")]
+    CommitDidMismatch {
+        /// Requested repo `DID`.
+        requested: String,
+        /// Commit repo `DID`.
+        actual: String,
+    },
     /// A reachable block was missing from the `CAR`.
     #[error("reachable block missing from CAR: {cid}")]
     MissingBlock {
@@ -1831,6 +1938,16 @@ pub enum ParseError {
     ResourceCountOverflow {
         /// Counter name.
         field: &'static str,
+    },
+    /// Configured parser resource cap was exceeded.
+    #[error("parser resource limit exceeded: {limit} observed={observed}; recovery={recovery}")]
+    ResourceLimitExceeded {
+        /// Limit name.
+        limit: &'static str,
+        /// Observed value.
+        observed: u64,
+        /// Operator recovery hint.
+        recovery: &'static str,
     },
     /// Unsupported parse case with an explicit status.
     #[error("unsupported Stage C parse case: {feature}")]
@@ -1877,6 +1994,52 @@ pub enum ParseError {
 /// Returns [`ParseError`] for malformed `CAR`s, `CID` mismatches, missing reachable blocks,
 /// invalid commits, `MST` traversal failures, typed record decode failures, and local I/O errors.
 pub fn parse_repo(car_path: &Path) -> Result<ParsedRepo, ParseError> {
+    parse_repo_with_config(car_path, ParseConfig::default())
+}
+
+/// Parse a spooled repo `CAR` from disk with explicit resource caps.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] for malformed `CAR`s, `CID` mismatches, missing reachable blocks,
+/// invalid commits, `MST` traversal failures, typed record decode failures, configured resource
+/// limits, and local I/O errors.
+pub fn parse_repo_with_config(
+    car_path: &Path,
+    config: ParseConfig,
+) -> Result<ParsedRepo, ParseError> {
+    parse_repo_thread(car_path, None, config)
+}
+
+/// Parse a spooled repo `CAR` and assert that the commit `DID` matches the requested repo.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] for the same cases as [`parse_repo`], plus a loud commit `DID`
+/// mismatch when the root commit does not claim `requested_did`.
+pub fn parse_repo_for_did(car_path: &Path, requested_did: &str) -> Result<ParsedRepo, ParseError> {
+    parse_repo_for_did_with_config(car_path, requested_did, ParseConfig::default())
+}
+
+/// Parse a spooled repo `CAR` with explicit resource caps and a requested `DID` assertion.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] for malformed input, configured resource limits, traversal failures,
+/// local I/O errors, and commit `DID` mismatch.
+pub fn parse_repo_for_did_with_config(
+    car_path: &Path,
+    requested_did: &str,
+    config: ParseConfig,
+) -> Result<ParsedRepo, ParseError> {
+    parse_repo_thread(car_path, Some(requested_did.to_owned()), config)
+}
+
+fn parse_repo_thread(
+    car_path: &Path,
+    requested_did: Option<String>,
+    config: ParseConfig,
+) -> Result<ParsedRepo, ParseError> {
     let car_path = car_path.to_path_buf();
     std::thread::Builder::new()
         .name("emojistats-stage-c-parse".to_owned())
@@ -1885,20 +2048,33 @@ pub fn parse_repo(car_path: &Path) -> Result<ParsedRepo, ParseError> {
                 .enable_all()
                 .build()
                 .map_err(ParseError::Runtime)?;
-            runtime.block_on(parse_repo_async(&car_path))
+            runtime.block_on(parse_repo_async(
+                &car_path,
+                requested_did.as_deref(),
+                config,
+            ))
         })
         .map_err(ParseError::ThreadSpawn)?
         .join()
         .map_err(|_err| ParseError::RuntimeThreadTerminated)?
 }
 
-async fn parse_repo_async(car_path: &Path) -> Result<ParsedRepo, ParseError> {
-    let stream_summary = verify_streamed_car(car_path).await?;
-    let store = IndexedCarBlockStore::load(car_path)?;
+async fn parse_repo_async(
+    car_path: &Path,
+    requested_did: Option<&str>,
+    config: ParseConfig,
+) -> Result<ParsedRepo, ParseError> {
+    let deadline = ParseDeadline::start(config.max_parse_wall_clock);
+    let stream_summary = verify_streamed_car(car_path, config, deadline).await?;
+    deadline.ensure_not_exceeded()?;
+    let store = IndexedCarBlockStore::load(car_path, config)?;
+    deadline.ensure_not_exceeded()?;
     let commit_root = single_car_root(&stream_summary.roots)?;
     let (commit_cid, commit) = load_commit(commit_root, &store).await?;
+    deadline.ensure_not_exceeded()?;
+    assert_requested_did(requested_did, commit.did().as_str())?;
     let (posts, profile, profile_decode_error, record_decode_errors, rkey_digest) =
-        walk_mst_records(commit.data, &store).await?;
+        walk_mst_records(commit.data, &store, config, deadline).await?;
 
     let proof = CompletenessProof {
         class: CompletenessClass::SnapshotComplete,
@@ -1932,14 +2108,31 @@ async fn parse_repo_async(car_path: &Path) -> Result<ParsedRepo, ParseError> {
     })
 }
 
-async fn verify_streamed_car(car_path: &Path) -> Result<CarStreamSummary, ParseError> {
+async fn verify_streamed_car(
+    car_path: &Path,
+    config: ParseConfig,
+    deadline: ParseDeadline,
+) -> Result<CarStreamSummary, ParseError> {
     let mut stream = car::stream_car(car_path).await?;
     let roots = stream.roots().to_vec();
     let mut verified_block_count = 0_u64;
 
     while let Some((cid, bytes)) = stream.next().await? {
+        ensure_usize_at_most(
+            bytes.len(),
+            config.max_block_bytes,
+            "max_block_bytes",
+            "raise parser max_block_bytes only for a known-good repo",
+        )?;
         verify_block_cid(cid, bytes.as_ref())?;
         verified_block_count = checked_increment(verified_block_count, "verified_block_count")?;
+        deadline.ensure_not_exceeded()?;
+        ensure_u64_at_most(
+            verified_block_count,
+            config.max_car_blocks,
+            "max_car_blocks",
+            "raise parser max_car_blocks only for a known-good repo",
+        )?;
     }
 
     Ok(CarStreamSummary {
@@ -1964,29 +2157,40 @@ async fn load_commit(
     root: IpldCid,
     store: &IndexedCarBlockStore,
 ) -> Result<(IpldCid, Commit<SmolStr>), ParseError> {
-    if let Some(bytes) = store.get(&root).await?
-        && let Ok(commit) = Commit::<SmolStr>::from_cbor(bytes.as_ref())
-    {
-        return Ok((root, commit));
-    }
+    let Some(bytes) = store.get(&root).await? else {
+        return Err(ParseError::CommitNotFound {
+            root: root.to_string(),
+        });
+    };
 
-    for cid in store.cids() {
-        let Some(bytes) = store.get(&cid).await? else {
-            continue;
-        };
-        if let Ok(commit) = Commit::<SmolStr>::from_cbor(bytes.as_ref()) {
-            return Ok((cid, commit));
+    let commit = Commit::<SmolStr>::from_cbor(bytes.as_ref()).map_err(|source| {
+        ParseError::RootCommitDecode {
+            root: root.to_string(),
+            message: source.to_string(),
         }
+    })?;
+    Ok((root, commit))
+}
+
+fn assert_requested_did(requested_did: Option<&str>, actual_did: &str) -> Result<(), ParseError> {
+    let Some(requested) = requested_did else {
+        return Ok(());
+    };
+    if requested == actual_did {
+        return Ok(());
     }
 
-    Err(ParseError::CommitNotFound {
-        root: root.to_string(),
+    Err(ParseError::CommitDidMismatch {
+        requested: requested.to_owned(),
+        actual: actual_did.to_owned(),
     })
 }
 
 async fn walk_mst_records(
     root: IpldCid,
     store: &IndexedCarBlockStore,
+    config: ParseConfig,
+    deadline: ParseDeadline,
 ) -> Result<
     (
         Vec<PostRecord>,
@@ -2015,6 +2219,13 @@ async fn walk_mst_records(
 
     cursor.advance().await?;
     while !cursor.is_end() {
+        ensure_usize_at_most(
+            cursor.layer().await?,
+            config.max_mst_depth,
+            "max_mst_depth",
+            "raise parser max_mst_depth only after inspecting the repo MST",
+        )?;
+        deadline.ensure_not_exceeded()?;
         match cursor.current().clone() {
             CursorPosition::Leaf { key, cid } => {
                 let key_text = key.to_string();
@@ -2025,16 +2236,14 @@ async fn walk_mst_records(
                         .ok_or_else(|| ParseError::MissingBlock {
                             cid: cid.to_string(),
                         })?;
-                update_digest(&mut digest, &key_text)?;
-                extract_known_record(
-                    &key_text,
-                    cid,
-                    record_bytes.as_ref(),
-                    &mut posts,
-                    &mut profile,
-                    &mut profile_decode_error,
-                    &mut record_decode_errors,
-                );
+                update_digest(&mut digest, &key_text, config)?;
+                let mut sinks = RecordSinks {
+                    posts: &mut posts,
+                    profile: &mut profile,
+                    profile_decode_error: &mut profile_decode_error,
+                    record_decode_errors: &mut record_decode_errors,
+                };
+                extract_known_record(&key_text, cid, record_bytes.as_ref(), &mut sinks, config)?;
                 cursor.advance().await?;
             }
             CursorPosition::Tree { .. } => {
@@ -2057,33 +2266,37 @@ fn extract_known_record(
     key: &str,
     cid: IpldCid,
     record_bytes: &[u8],
-    posts: &mut Vec<PostRecord>,
-    profile: &mut Option<ProfileRecord>,
-    profile_decode_error: &mut Option<String>,
-    record_decode_errors: &mut Vec<RecordDecodeFailure>,
-) {
+    sinks: &mut RecordSinks<'_>,
+    config: ParseConfig,
+) -> Result<(), ParseError> {
     let Some((collection, rkey)) = split_repo_key(key) else {
-        return;
+        return Ok(());
     };
 
     match collection {
         POST_COLLECTION => match serde_ipld_dagcbor::from_slice::<Post<SmolStr>>(record_bytes) {
-            Ok(record) => posts.push(PostRecord {
+            Ok(record) => sinks.posts.push(PostRecord {
                 rkey: rkey.to_owned(),
                 cid: cid.to_string(),
                 record,
             }),
-            Err(error) => record_decode_errors.push(RecordDecodeFailure {
-                key: key.to_owned(),
-                collection: POST_COLLECTION,
-                cid: cid.to_string(),
-                message: error.to_string(),
-            }),
+            Err(error) => {
+                sinks.record_decode_errors.push(RecordDecodeFailure {
+                    key: key.to_owned(),
+                    collection: POST_COLLECTION,
+                    cid: cid.to_string(),
+                    message: error.to_string(),
+                });
+                enforce_decode_error_limit(
+                    sinks.record_decode_errors.len(),
+                    config.max_decode_errors,
+                )?;
+            }
         },
         PROFILE_COLLECTION if rkey == PROFILE_RKEY => {
             match serde_ipld_dagcbor::from_slice::<Profile<SmolStr>>(record_bytes) {
                 Ok(record) => {
-                    *profile = Some(ProfileRecord {
+                    *sinks.profile = Some(ProfileRecord {
                         rkey: rkey.to_owned(),
                         cid: cid.to_string(),
                         record,
@@ -2091,23 +2304,46 @@ fn extract_known_record(
                 }
                 Err(error) => {
                     let message = error.to_string();
-                    *profile_decode_error =
+                    *sinks.profile_decode_error =
                         Some(format!("{PROFILE_COLLECTION}/{rkey} at {cid}: {message}"));
-                    record_decode_errors.push(RecordDecodeFailure {
+                    sinks.record_decode_errors.push(RecordDecodeFailure {
                         key: key.to_owned(),
                         collection: PROFILE_COLLECTION,
                         cid: cid.to_string(),
                         message,
                     });
+                    enforce_decode_error_limit(
+                        sinks.record_decode_errors.len(),
+                        config.max_decode_errors,
+                    )?;
                 }
             }
         }
         _other => {}
     }
+
+    Ok(())
 }
 
-fn update_digest(digest: &mut RkeyDigest, key: &str) -> Result<(), ParseError> {
+struct RecordSinks<'a> {
+    posts: &'a mut Vec<PostRecord>,
+    profile: &'a mut Option<ProfileRecord>,
+    profile_decode_error: &'a mut Option<String>,
+    record_decode_errors: &'a mut Vec<RecordDecodeFailure>,
+}
+
+fn update_digest(
+    digest: &mut RkeyDigest,
+    key: &str,
+    config: ParseConfig,
+) -> Result<(), ParseError> {
     digest.all_records_count = checked_increment(digest.all_records_count, "all_records_count")?;
+    ensure_u64_at_most(
+        digest.all_records_count,
+        config.max_records,
+        "max_records",
+        "raise parser max_records only for a known-good repo",
+    )?;
     if digest.first_key.is_none() {
         digest.first_key = Some(key.to_owned());
     }
@@ -2152,16 +2388,12 @@ struct IndexedCarBlockStore {
 }
 
 impl IndexedCarBlockStore {
-    fn load(path: &Path) -> Result<Self, ParseError> {
-        let index = index_car_blocks(path)?;
+    fn load(path: &Path, config: ParseConfig) -> Result<Self, ParseError> {
+        let index = index_car_blocks(path, config)?;
         Ok(Self {
             path: Arc::new(path.to_path_buf()),
             index: Arc::new(index),
         })
-    }
-
-    fn cids(&self) -> Vec<IpldCid> {
-        self.index.keys().copied().collect()
     }
 }
 
@@ -2205,7 +2437,10 @@ impl BlockStore for IndexedCarBlockStore {
     }
 }
 
-fn index_car_blocks(path: &Path) -> Result<BTreeMap<IpldCid, BlockLocation>, ParseError> {
+fn index_car_blocks(
+    path: &Path,
+    config: ParseConfig,
+) -> Result<BTreeMap<IpldCid, BlockLocation>, ParseError> {
     let mut file = open_file(path)?;
     let Some(header_len) = read_varint(&mut file)? else {
         return Err(ParseError::InvalidRoots("CAR file is empty".to_owned()));
@@ -2218,9 +2453,16 @@ fn index_car_blocks(path: &Path) -> Result<BTreeMap<IpldCid, BlockLocation>, Par
         })?;
 
     let mut index = BTreeMap::new();
+    let mut indexed_block_count = 0_u64;
     while let Some(section_len) = read_varint(&mut file)? {
         offset = checked_add_u64(offset, section_len.bytes_read, "section varint")?;
         let section_start = offset;
+        ensure_u64_at_most(
+            section_len.value,
+            config.max_block_bytes,
+            "max_block_bytes",
+            "raise parser max_block_bytes only for a known-good repo",
+        )?;
         let section_len_usize =
             usize::try_from(section_len.value).map_err(|_err| ParseError::CarLengthOverflow {
                 field: "section length",
@@ -2265,6 +2507,13 @@ fn index_car_blocks(path: &Path) -> Result<BTreeMap<IpldCid, BlockLocation>, Par
             Entry::Occupied(_entry) => {}
         }
 
+        indexed_block_count = checked_increment(indexed_block_count, "indexed_block_count")?;
+        ensure_u64_at_most(
+            indexed_block_count,
+            config.max_car_blocks,
+            "max_car_blocks",
+            "raise parser max_car_blocks only for a known-good repo",
+        )?;
         offset = checked_add_u64(section_start, section_len.value, "section end")?;
     }
 
@@ -2341,6 +2590,71 @@ fn checked_add_u64(lhs: u64, rhs: u64, field: &'static str) -> Result<u64, Parse
         .ok_or(ParseError::CarLengthOverflow { field })
 }
 
+const fn ensure_u64_at_most(
+    observed: u64,
+    limit: u64,
+    limit_name: &'static str,
+    recovery: &'static str,
+) -> Result<(), ParseError> {
+    if observed <= limit {
+        return Ok(());
+    }
+
+    Err(ParseError::ResourceLimitExceeded {
+        limit: limit_name,
+        observed,
+        recovery,
+    })
+}
+
+fn ensure_usize_at_most(
+    observed: usize,
+    limit: u64,
+    limit_name: &'static str,
+    recovery: &'static str,
+) -> Result<(), ParseError> {
+    let observed_u64 = u64::try_from(observed).map_err(|_err| ParseError::CarLengthOverflow {
+        field: "usize observed length",
+    })?;
+    ensure_u64_at_most(observed_u64, limit, limit_name, recovery)
+}
+
+fn enforce_decode_error_limit(observed: usize, limit: u64) -> Result<(), ParseError> {
+    ensure_usize_at_most(
+        observed,
+        limit,
+        "max_decode_errors",
+        "raise parser max_decode_errors only after inspecting malformed records",
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ParseDeadline {
+    started_at: Instant,
+    max_wall_clock: Duration,
+}
+
+impl ParseDeadline {
+    fn start(max_wall_clock: Duration) -> Self {
+        Self {
+            started_at: Instant::now(),
+            max_wall_clock,
+        }
+    }
+
+    fn ensure_not_exceeded(self) -> Result<(), ParseError> {
+        let elapsed = self.started_at.elapsed();
+        if elapsed <= self.max_wall_clock {
+            return Ok(());
+        }
+        Err(ParseError::ResourceLimitExceeded {
+            limit: "max_parse_wall_clock",
+            observed: elapsed.as_secs(),
+            recovery: "raise parser max_parse_wall_clock only for a known-good repo",
+        })
+    }
+}
+
 fn read_only_store_error() -> RepoError {
     RepoError::storage(std::io::Error::other(
         "indexed CAR block store is read-only",
@@ -2372,7 +2686,10 @@ const PROFILE_RKEY: &str = "self";
 
 #[cfg(test)]
 mod tests {
-    use super::{RkeyDigest, Varint, read_varint, split_repo_key, update_digest};
+    use super::{
+        ParseConfig, ParseError, RkeyDigest, Varint, assert_requested_did,
+        enforce_decode_error_limit, read_varint, split_repo_key, update_digest,
+    };
 
     #[test]
     fn splits_repo_key_into_collection_and_rkey() {
@@ -2398,9 +2715,10 @@ mod tests {
     #[test]
     fn digest_tracks_first_last_and_post_counts() {
         let mut digest = RkeyDigest::default();
+        let config = ParseConfig::default();
 
-        update_digest(&mut digest, "app.bsky.actor.profile/self").unwrap();
-        update_digest(&mut digest, "app.bsky.feed.post/3kabc").unwrap();
+        update_digest(&mut digest, "app.bsky.actor.profile/self", config).unwrap();
+        update_digest(&mut digest, "app.bsky.feed.post/3kabc", config).unwrap();
 
         assert_eq!(digest.all_records_count, 2);
         assert_eq!(digest.post_records_count, 1);
@@ -2409,6 +2727,56 @@ mod tests {
             Some("app.bsky.actor.profile/self")
         );
         assert_eq!(digest.last_key.as_deref(), Some("app.bsky.feed.post/3kabc"));
+    }
+
+    #[test]
+    fn requested_did_mismatch_is_loud() {
+        let error = assert_requested_did(Some("did:plc:requested"), "did:plc:actual")
+            .expect_err("mismatch should fail");
+
+        assert!(matches!(
+            error,
+            ParseError::CommitDidMismatch {
+                requested,
+                actual
+            } if requested == "did:plc:requested" && actual == "did:plc:actual"
+        ));
+    }
+
+    #[test]
+    fn record_limit_is_loud() {
+        let mut digest = RkeyDigest::default();
+        let config = ParseConfig {
+            max_records: 1,
+            ..ParseConfig::default()
+        };
+
+        update_digest(&mut digest, "app.bsky.feed.post/3kabc", config).unwrap();
+        let error = update_digest(&mut digest, "app.bsky.feed.post/3kdef", config)
+            .expect_err("second record should exceed cap");
+
+        assert!(matches!(
+            error,
+            ParseError::ResourceLimitExceeded {
+                limit: "max_records",
+                observed: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_error_limit_is_loud() {
+        let error = enforce_decode_error_limit(2, 1).expect_err("decode cap should fail");
+
+        assert!(matches!(
+            error,
+            ParseError::ResourceLimitExceeded {
+                limit: "max_decode_errors",
+                observed: 2,
+                ..
+            }
+        ));
     }
 }
 
@@ -2425,9 +2793,10 @@ use std::{
     error::Error,
     fmt, fs,
     fs::File,
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
@@ -2441,10 +2810,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::parse::{ParsedRepo, PostRecord};
+use crate::parse::{ParsedRepo, PostRecord, ProfileRecord};
 
 const POST_COLLECTION: &str = "app.bsky.feed.post";
 const ARCHIVE_SCHEMA_VERSION: u16 = 1;
+const PARQUET_BATCH_ROWS: usize = 1_024;
+const HASH_BUFFER_BYTES: usize = 65_536;
 
 /// Version identity for emoji normalization outputs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2462,6 +2833,10 @@ pub struct ArchivePostRow {
     pub did: String,
     pub rkey: String,
     pub cid: String,
+    pub normalizer: NormalizerVersion,
+    pub account_status: Option<String>,
+    pub record_status: Option<String>,
+    pub public_content_label: Option<String>,
     pub created_at_raw: Option<String>,
     pub created_at_normalized: Option<String>,
     pub created_at_parse_status: CreatedAtParseStatus,
@@ -2497,8 +2872,10 @@ pub enum CreatedAtParseStatus {
 pub struct RepoReceipt {
     pub fetch_method: FetchMethod,
     pub completeness_class: CompletenessClass,
-    pub all_records_count: u64,
-    pub all_posts_count: u64,
+    pub reachable_records_count: u64,
+    pub reachable_post_records_count: u64,
+    pub archived_post_rows_count: u64,
+    pub post_decode_error_count: u64,
     pub emoji_posts_count: u64,
     pub emoji_occurrences_count: u64,
     pub mst_root_cid: Option<String>,
@@ -2510,6 +2887,19 @@ pub struct RepoReceipt {
     pub normalizer: NormalizerVersion,
     pub repo_commit_signature_verified: bool,
     pub identity_verified: bool,
+}
+
+/// Inputs required to build one repo receipt.
+#[derive(Debug, Clone)]
+pub struct RepoReceiptInput<'a> {
+    pub rows: &'a [ArchivePostRow],
+    pub reachable_records_count: u64,
+    pub reachable_post_records_count: u64,
+    pub post_decode_error_count: u64,
+    pub profile_row_hash: Option<String>,
+    pub mst_root_cid: Option<String>,
+    pub commit_cid: Option<String>,
+    pub normalizer: NormalizerVersion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2541,6 +2931,7 @@ pub struct LocalManifestEntry {
     pub max_created_at_normalized: Option<String>,
     pub receipt_hash: String,
     pub schema_version: u16,
+    pub normalizer: NormalizerVersion,
 }
 
 /// Files produced by Stage D for one `fetch-one` run.
@@ -2563,30 +2954,43 @@ pub enum ArchiveError {
     Json(serde_json::Error),
     CountOverflow { field: &'static str },
     InvalidCompression(String),
+    InvalidPath { path: PathBuf },
+    InvalidRecordJson,
 }
 
 /// Convert parsed post records into the first archive-row shape.
-#[must_use]
-pub fn archive_rows_from_parsed_repo(parsed: &ParsedRepo) -> Vec<ArchivePostRow> {
+///
+/// # Errors
+///
+/// Returns [`ArchiveError`] if record extras cannot be serialized without loss.
+pub fn archive_rows_from_parsed_repo(
+    parsed: &ParsedRepo,
+) -> Result<Vec<ArchivePostRow>, ArchiveError> {
+    let normalizer = current_normalizer();
     parsed
         .posts
         .iter()
         .map(|post| {
-            let created_at = post.record.created_at.as_str().to_owned();
-            ArchivePostRow {
+            let created_at = post.record.created_at.as_str();
+            let classified = classify_created_at(Some(created_at));
+            Ok(ArchivePostRow {
                 did: parsed.commit.did.clone(),
                 rkey: post.rkey.clone(),
                 cid: post.cid.clone(),
-                created_at_raw: Some(created_at.clone()),
-                created_at_normalized: Some(created_at),
-                created_at_parse_status: CreatedAtParseStatus::Valid,
+                normalizer: normalizer.clone(),
+                account_status: None,
+                record_status: None,
+                public_content_label: None,
+                created_at_raw: classified.raw,
+                created_at_normalized: classified.normalized,
+                created_at_parse_status: classified.status,
                 text: post.record.text.to_string(),
                 langs: post.record.langs.as_ref().map_or_else(Vec::new, |langs| {
                     langs.iter().map(ToString::to_string).collect()
                 }),
                 emoji_sequence: extract_emojis(post.record.text.as_str()),
-                extras_json: record_json(post),
-            }
+                extras_json: record_extras_json(post)?,
+            })
         })
         .collect()
 }
@@ -2622,12 +3026,20 @@ pub fn write_archive_artifacts(
     let manifest_path = output_dir.join(format!("{safe_did}.manifest.json"));
     let emoji_projection_path = output_dir.join(format!("{safe_did}.emoji.jsonl"));
 
-    write_posts_parquet(&parquet_path, rows)?;
-    write_json_pretty(&receipt_path, receipt)?;
-    let emoji_rows = write_emoji_projection_jsonl(&emoji_projection_path, rows)?;
+    write_temp_rename(&parquet_path, |path| write_posts_parquet(path, rows))?;
+    write_temp_rename(&receipt_path, |path| write_json_pretty(path, receipt))?;
+    let emoji_projection_rows = derive_emoji_projection_rows(rows)?;
+    let emoji_rows = u64::try_from(emoji_projection_rows.len()).map_err(|_error| {
+        ArchiveError::CountOverflow {
+            field: "emoji_rows",
+        }
+    })?;
+    write_temp_rename(&emoji_projection_path, |path| {
+        write_emoji_projection_jsonl(path, &emoji_projection_rows)
+    })?;
 
     let manifest = build_manifest(&parquet_path, rows, receipt)?;
-    write_json_pretty(&manifest_path, &manifest)?;
+    write_temp_rename(&manifest_path, |path| write_json_pretty(path, &manifest))?;
 
     Ok(ArchiveArtifacts {
         parquet_path,
@@ -2640,65 +3052,92 @@ pub fn write_archive_artifacts(
 }
 
 /// Build a content receipt from already-normalized post rows.
-#[must_use]
-pub fn build_repo_receipt(
-    rows: &[ArchivePostRow],
-    all_records_count: u64,
-    mst_root_cid: Option<String>,
-    commit_cid: Option<String>,
-    normalizer: NormalizerVersion,
-) -> RepoReceipt {
-    let post_rows_hash = hash_post_rows(rows);
-    let emoji_projection_hash = hash_emoji_projection(rows);
-    RepoReceipt {
+///
+/// # Errors
+///
+/// Returns [`ArchiveError`] if any counter or hash length overflows the receipt schema.
+pub fn build_repo_receipt(input: RepoReceiptInput<'_>) -> Result<RepoReceipt, ArchiveError> {
+    let rows = input.rows;
+    let post_rows_hash = hash_post_rows(rows)?;
+    let emoji_projection_rows = derive_emoji_projection_rows(rows)?;
+    let emoji_projection_hash = hash_emoji_projection_rows(&emoji_projection_rows)?;
+    Ok(RepoReceipt {
         fetch_method: FetchMethod::GetRepo,
         completeness_class: CompletenessClass::SnapshotComplete,
-        all_records_count,
-        all_posts_count: u64::try_from(rows.len()).unwrap_or(u64::MAX),
-        emoji_posts_count: count_emoji_posts(rows),
-        emoji_occurrences_count: count_emoji_occurrences(rows),
-        mst_root_cid,
-        commit_cid,
+        reachable_records_count: input.reachable_records_count,
+        reachable_post_records_count: input.reachable_post_records_count,
+        archived_post_rows_count: u64::try_from(rows.len()).map_err(|_error| {
+            ArchiveError::CountOverflow {
+                field: "archived_post_rows_count",
+            }
+        })?,
+        post_decode_error_count: input.post_decode_error_count,
+        emoji_posts_count: count_emoji_posts(rows)?,
+        emoji_occurrences_count: count_emoji_occurrences(rows)?,
+        mst_root_cid: input.mst_root_cid,
+        commit_cid: input.commit_cid,
         archive_rows_hash: post_rows_hash.clone(),
         post_rows_hash,
         emoji_projection_hash,
-        profile_row_hash: None,
-        normalizer,
+        profile_row_hash: input.profile_row_hash,
+        normalizer: input.normalizer,
         repo_commit_signature_verified: false,
         identity_verified: false,
-    }
+    })
 }
 
 /// Hash the canonical row content named in `docs/backfill-v2-design.md`.
-#[must_use]
-pub fn hash_post_rows(rows: &[ArchivePostRow]) -> String {
+///
+/// # Errors
+///
+/// Returns [`ArchiveError`] if any hashed string length cannot fit the stable hash framing.
+pub fn hash_post_rows(rows: &[ArchivePostRow]) -> Result<String, ArchiveError> {
     let mut hasher = Sha256::new();
     for row in rows {
-        hash_field(&mut hasher, POST_COLLECTION);
-        hash_field(&mut hasher, &row.did);
-        hash_field(&mut hasher, &row.rkey);
-        hash_field(&mut hasher, &row.cid);
-        hash_optional_field(&mut hasher, row.created_at_raw.as_deref());
-        hash_optional_field(&mut hasher, row.created_at_normalized.as_deref());
-        hash_field(&mut hasher, row.created_at_parse_status.as_str());
-        hash_field(&mut hasher, &row.text);
-        hash_string_slice(&mut hasher, &row.langs);
-        hash_string_slice(&mut hasher, &row.emoji_sequence);
-        hash_field(&mut hasher, &canonical_json(&row.extras_json));
+        hash_field(&mut hasher, POST_COLLECTION)?;
+        hash_field(&mut hasher, &row.did)?;
+        hash_field(&mut hasher, &row.rkey)?;
+        hash_field(&mut hasher, &row.cid)?;
+        hash_normalizer(&mut hasher, &row.normalizer)?;
+        hash_optional_field(&mut hasher, row.account_status.as_deref())?;
+        hash_optional_field(&mut hasher, row.record_status.as_deref())?;
+        hash_optional_field(&mut hasher, row.public_content_label.as_deref())?;
+        hash_optional_field(&mut hasher, row.created_at_raw.as_deref())?;
+        hash_optional_field(&mut hasher, row.created_at_normalized.as_deref())?;
+        hash_field(&mut hasher, row.created_at_parse_status.as_str())?;
+        hash_field(&mut hasher, &row.text)?;
+        hash_string_slice(&mut hasher, &row.langs)?;
+        hash_string_slice(&mut hasher, &row.emoji_sequence)?;
+        hash_field(&mut hasher, &canonical_json(&row.extras_json)?)?;
     }
-    hex::encode(hasher.finalize())
+    Ok(hex::encode(hasher.finalize()))
 }
 
-fn hash_emoji_projection(rows: &[ArchivePostRow]) -> String {
+/// Hash a profile sidecar row when Stage C extracted one.
+///
+/// # Errors
+///
+/// Returns [`ArchiveError`] if the profile row cannot be serialized without loss.
+pub fn hash_profile_record(
+    profile: Option<&ProfileRecord>,
+) -> Result<Option<String>, ArchiveError> {
+    profile.map(hash_one_profile_record).transpose()
+}
+
+fn hash_one_profile_record(profile: &ProfileRecord) -> Result<String, ArchiveError> {
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, &profile.rkey)?;
+    hash_field(&mut hasher, &profile.cid)?;
+    hash_field(&mut hasher, &json_string(&profile.record)?)?;
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn hash_emoji_projection_rows(rows: &[EmojiProjectionRow]) -> Result<String, ArchiveError> {
     let mut hasher = Sha256::new();
     for row in rows {
-        for emoji in &row.emoji_sequence {
-            hash_field(&mut hasher, &row.did);
-            hash_field(&mut hasher, &row.rkey);
-            hash_field(&mut hasher, emoji);
-        }
+        hash_field(&mut hasher, &json_string(row)?)?;
     }
-    hex::encode(hasher.finalize())
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn write_posts_parquet(path: &Path, rows: &[ArchivePostRow]) -> Result<(), ArchiveError> {
@@ -2706,6 +3145,14 @@ fn write_posts_parquet(path: &Path, rows: &[ArchivePostRow]) -> Result<(), Archi
         Field::new("did", DataType::Utf8, false),
         Field::new("rkey", DataType::Utf8, false),
         Field::new("cid", DataType::Utf8, false),
+        Field::new("normalizer_name", DataType::Utf8, false),
+        Field::new("normalizer_semver", DataType::Utf8, false),
+        Field::new("normalizer_git_rev", DataType::Utf8, false),
+        Field::new("normalizer_unicode_version", DataType::Utf8, false),
+        Field::new("normalizer_emoji_data_version", DataType::Utf8, false),
+        Field::new("account_status", DataType::Utf8, true),
+        Field::new("record_status", DataType::Utf8, true),
+        Field::new("public_content_label", DataType::Utf8, true),
         Field::new("created_at_raw", DataType::Utf8, true),
         Field::new("created_at_normalized", DataType::Utf8, true),
         Field::new("created_at_parse_status", DataType::Utf8, false),
@@ -2715,25 +3162,6 @@ fn write_posts_parquet(path: &Path, rows: &[ArchivePostRow]) -> Result<(), Archi
         Field::new("extras_json", DataType::Utf8, false),
     ]));
 
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            string_array(rows.iter().map(|row| Some(row.did.as_str()))),
-            string_array(rows.iter().map(|row| Some(row.rkey.as_str()))),
-            string_array(rows.iter().map(|row| Some(row.cid.as_str()))),
-            string_array(rows.iter().map(|row| row.created_at_raw.as_deref())),
-            string_array(rows.iter().map(|row| row.created_at_normalized.as_deref())),
-            string_array(
-                rows.iter()
-                    .map(|row| Some(row.created_at_parse_status.as_str())),
-            ),
-            string_array(rows.iter().map(|row| Some(row.text.as_str()))),
-            owned_string_array(rows.iter().map(|row| json_string(&row.langs))),
-            owned_string_array(rows.iter().map(|row| json_string(&row.emoji_sequence))),
-            owned_string_array(rows.iter().map(|row| canonical_json(&row.extras_json))),
-        ],
-    )?;
-
     let file = File::create(path)?;
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(
@@ -2741,10 +3169,52 @@ fn write_posts_parquet(path: &Path, rows: &[ArchivePostRow]) -> Result<(), Archi
                 .map_err(|error| ArchiveError::InvalidCompression(error.to_string()))?,
         ))
         .build();
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-    writer.write(&batch)?;
+    let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), Some(props))?;
+    for chunk in rows.chunks(PARQUET_BATCH_ROWS) {
+        let batch = post_record_batch(&schema, chunk)?;
+        writer.write(&batch)?;
+    }
     writer.close()?;
+    sync_file(path)?;
     Ok(())
+}
+
+fn post_record_batch(
+    schema: &Arc<Schema>,
+    rows: &[ArchivePostRow],
+) -> Result<RecordBatch, ArchiveError> {
+    Ok(RecordBatch::try_new(
+        Arc::clone(schema),
+        vec![
+            string_array(rows.iter().map(|row| Some(row.did.as_str()))),
+            string_array(rows.iter().map(|row| Some(row.rkey.as_str()))),
+            string_array(rows.iter().map(|row| Some(row.cid.as_str()))),
+            string_array(rows.iter().map(|row| Some(row.normalizer.name.as_str()))),
+            string_array(rows.iter().map(|row| Some(row.normalizer.semver.as_str()))),
+            string_array(rows.iter().map(|row| Some(row.normalizer.git_rev.as_str()))),
+            string_array(
+                rows.iter()
+                    .map(|row| Some(row.normalizer.unicode_version.as_str())),
+            ),
+            string_array(
+                rows.iter()
+                    .map(|row| Some(row.normalizer.emoji_data_version.as_str())),
+            ),
+            string_array(rows.iter().map(|row| row.account_status.as_deref())),
+            string_array(rows.iter().map(|row| row.record_status.as_deref())),
+            string_array(rows.iter().map(|row| row.public_content_label.as_deref())),
+            string_array(rows.iter().map(|row| row.created_at_raw.as_deref())),
+            string_array(rows.iter().map(|row| row.created_at_normalized.as_deref())),
+            string_array(
+                rows.iter()
+                    .map(|row| Some(row.created_at_parse_status.as_str())),
+            ),
+            string_array(rows.iter().map(|row| Some(row.text.as_str()))),
+            owned_string_array(rows.iter().map(|row| json_string(&row.langs)))?,
+            owned_string_array(rows.iter().map(|row| json_string(&row.emoji_sequence)))?,
+            owned_string_array(rows.iter().map(|row| canonical_json(&row.extras_json)))?,
+        ],
+    )?)
 }
 
 fn build_manifest(
@@ -2767,33 +3237,47 @@ fn build_manifest(
         max_created_at_normalized: max_created_at(rows),
         receipt_hash: hash_serialized(receipt)?,
         schema_version: ARCHIVE_SCHEMA_VERSION,
+        normalizer: receipt.normalizer.clone(),
     })
 }
 
-fn write_emoji_projection_jsonl(path: &Path, rows: &[ArchivePostRow]) -> Result<u64, ArchiveError> {
+fn write_emoji_projection_jsonl(
+    path: &Path,
+    rows: &[EmojiProjectionRow],
+) -> Result<(), ArchiveError> {
     let mut file = File::create(path)?;
-    let mut count = 0_u64;
     for row in rows {
-        for projection in emoji_projection_rows(row) {
-            serde_json::to_writer(&mut file, &projection)?;
-            file.write_all(b"\n")?;
-            count = count.checked_add(1).ok_or(ArchiveError::CountOverflow {
-                field: "emoji_rows",
-            })?;
-        }
+        serde_json::to_writer(&mut file, row)?;
+        file.write_all(b"\n")?;
     }
     file.sync_all()?;
-    Ok(count)
+    Ok(())
 }
 
-fn emoji_projection_rows(row: &ArchivePostRow) -> Vec<EmojiProjectionRow> {
+fn derive_emoji_projection_rows(
+    rows: &[ArchivePostRow],
+) -> Result<Vec<EmojiProjectionRow>, ArchiveError> {
+    let mut projected = Vec::new();
+    for row in rows {
+        projected.extend(emoji_projection_rows(row)?);
+    }
+    Ok(projected)
+}
+
+fn emoji_projection_rows(row: &ArchivePostRow) -> Result<Vec<EmojiProjectionRow>, ArchiveError> {
     let mut rows = Vec::new();
     for emoji in &row.emoji_sequence {
         if let Some(existing) = rows
             .iter_mut()
             .find(|candidate: &&mut EmojiProjectionRow| candidate.emoji == *emoji)
         {
-            existing.occurrences = existing.occurrences.saturating_add(1);
+            existing.occurrences =
+                existing
+                    .occurrences
+                    .checked_add(1)
+                    .ok_or(ArchiveError::CountOverflow {
+                        field: "emoji_occurrences",
+                    })?;
         } else {
             rows.push(EmojiProjectionRow {
                 did: row.did.clone(),
@@ -2805,7 +3289,7 @@ fn emoji_projection_rows(row: &ArchivePostRow) -> Vec<EmojiProjectionRow> {
             });
         }
     }
-    rows
+    Ok(rows)
 }
 
 fn extract_emojis(text: &str) -> Vec<String> {
@@ -2815,18 +3299,29 @@ fn extract_emojis(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn count_emoji_posts(rows: &[ArchivePostRow]) -> u64 {
-    rows.iter()
-        .filter(|row| !row.emoji_sequence.is_empty())
-        .count()
-        .try_into()
-        .unwrap_or(u64::MAX)
+fn count_emoji_posts(rows: &[ArchivePostRow]) -> Result<u64, ArchiveError> {
+    u64::try_from(
+        rows.iter()
+            .filter(|row| !row.emoji_sequence.is_empty())
+            .count(),
+    )
+    .map_err(|_error| ArchiveError::CountOverflow {
+        field: "emoji_posts_count",
+    })
 }
 
-fn count_emoji_occurrences(rows: &[ArchivePostRow]) -> u64 {
-    rows.iter().fold(0_u64, |accumulator, row| {
-        let row_count = u64::try_from(row.emoji_sequence.len()).unwrap_or(u64::MAX);
-        accumulator.saturating_add(row_count)
+fn count_emoji_occurrences(rows: &[ArchivePostRow]) -> Result<u64, ArchiveError> {
+    rows.iter().try_fold(0_u64, |accumulator, row| {
+        let row_count = u64::try_from(row.emoji_sequence.len()).map_err(|_error| {
+            ArchiveError::CountOverflow {
+                field: "emoji_occurrences_count",
+            }
+        })?;
+        accumulator
+            .checked_add(row_count)
+            .ok_or(ArchiveError::CountOverflow {
+                field: "emoji_occurrences_count",
+            })
     })
 }
 
@@ -2834,17 +3329,16 @@ fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
     Arc::new(StringArray::from(values.collect::<Vec<_>>()))
 }
 
-fn owned_string_array(values: impl Iterator<Item = String>) -> ArrayRef {
-    Arc::new(StringArray::from(values.collect::<Vec<_>>()))
+fn owned_string_array(
+    values: impl Iterator<Item = Result<String, ArchiveError>>,
+) -> Result<ArrayRef, ArchiveError> {
+    Ok(Arc::new(StringArray::from(
+        values.collect::<Result<Vec<_>, _>>()?,
+    )))
 }
 
-fn json_string<T: Serialize>(value: &T) -> String {
-    serde_json::to_string(value).unwrap_or_else(|error| {
-        serde_json::json!({
-            "serialization_error": error.to_string(),
-        })
-        .to_string()
-    })
+fn json_string<T: Serialize>(value: &T) -> Result<String, ArchiveError> {
+    Ok(serde_json::to_string(value)?)
 }
 
 fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), ArchiveError> {
@@ -2856,9 +3350,19 @@ fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), Archive
 }
 
 fn hash_file(path: &Path) -> Result<String, ArchiveError> {
-    let bytes = fs::read(path)?;
+    let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
-    hasher.update(bytes);
+    let mut buffer = vec![0_u8; HASH_BUFFER_BYTES];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let chunk = buffer.get(..read).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "hash read exceeded buffer")
+        })?;
+        hasher.update(chunk);
+    }
     Ok(hex::encode(hasher.finalize()))
 }
 
@@ -2890,45 +3394,315 @@ fn safe_file_component(value: &str) -> String {
         .collect()
 }
 
-fn hash_string_slice(hasher: &mut Sha256, values: &[String]) {
+fn hash_string_slice(hasher: &mut Sha256, values: &[String]) -> Result<(), ArchiveError> {
     for value in values {
-        hash_field(hasher, value);
+        hash_field(hasher, value)?;
     }
-    hash_field(hasher, "");
+    hash_field(hasher, "")
 }
 
-fn hash_optional_field(hasher: &mut Sha256, value: Option<&str>) {
+fn hash_optional_field(hasher: &mut Sha256, value: Option<&str>) -> Result<(), ArchiveError> {
     match value {
         Some(value) => {
-            hash_field(hasher, "some");
-            hash_field(hasher, value);
+            hash_field(hasher, "some")?;
+            hash_field(hasher, value)
         }
         None => hash_field(hasher, "none"),
     }
 }
 
-fn hash_field(hasher: &mut Sha256, value: &str) {
-    let len = u64::try_from(value.len()).unwrap_or(u64::MAX);
+fn hash_normalizer(
+    hasher: &mut Sha256,
+    normalizer: &NormalizerVersion,
+) -> Result<(), ArchiveError> {
+    hash_field(hasher, &normalizer.name)?;
+    hash_field(hasher, &normalizer.semver)?;
+    hash_field(hasher, &normalizer.git_rev)?;
+    hash_field(hasher, &normalizer.unicode_version)?;
+    hash_field(hasher, &normalizer.emoji_data_version)
+}
+
+fn hash_field(hasher: &mut Sha256, value: &str) -> Result<(), ArchiveError> {
+    let len = u64::try_from(value.len()).map_err(|_error| ArchiveError::CountOverflow {
+        field: "hash_field_length",
+    })?;
     hasher.update(len.to_be_bytes());
     hasher.update(value.as_bytes());
+    Ok(())
 }
 
-fn canonical_json(value: &serde_json::Value) -> String {
-    serde_json::to_string(value).unwrap_or_else(|error| {
-        serde_json::json!({
-            "serialization_error": error.to_string(),
-        })
-        .to_string()
-    })
+fn canonical_json(value: &serde_json::Value) -> Result<String, ArchiveError> {
+    Ok(serde_json::to_string(value)?)
 }
 
-fn record_json(post: &PostRecord) -> serde_json::Value {
-    match serde_json::to_value(&post.record) {
-        Ok(value) => value,
-        Err(error) => serde_json::json!({
-            "serialization_error": error.to_string(),
-        }),
+fn record_extras_json(post: &PostRecord) -> Result<serde_json::Value, ArchiveError> {
+    let mut extras = serde_json::Map::new();
+    insert_optional_json(&mut extras, "embed", post.record.embed.as_ref())?;
+    insert_optional_json(&mut extras, "facets", post.record.facets.as_ref())?;
+    insert_optional_json(&mut extras, "labels", post.record.labels.as_ref())?;
+    insert_optional_json(&mut extras, "reply", post.record.reply.as_ref())?;
+    insert_optional_json(&mut extras, "tags", post.record.tags.as_ref())?;
+    insert_optional_json(&mut extras, "extra_data", post.record.extra_data.as_ref())?;
+    Ok(serde_json::Value::Object(extras))
+}
+
+fn insert_optional_json<T: Serialize>(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    key: &'static str,
+    value: Option<&T>,
+) -> Result<(), ArchiveError> {
+    if let Some(value) = value {
+        target.insert(key.to_owned(), serde_json::to_value(value)?);
     }
+    Ok(())
+}
+
+struct ClassifiedCreatedAt {
+    raw: Option<String>,
+    normalized: Option<String>,
+    status: CreatedAtParseStatus,
+}
+
+fn classify_created_at(value: Option<&str>) -> ClassifiedCreatedAt {
+    value.map_or_else(
+        || ClassifiedCreatedAt {
+            raw: None,
+            normalized: None,
+            status: CreatedAtParseStatus::Missing,
+        },
+        classify_present_created_at,
+    )
+}
+
+fn classify_present_created_at(raw: &str) -> ClassifiedCreatedAt {
+    let timestamp = parse_rfc3339_epoch_seconds(raw);
+    let now = current_epoch_seconds();
+    let status = match (timestamp, now) {
+        (Some(timestamp), Some(now)) if timestamp > now => CreatedAtParseStatus::Future,
+        (Some(_timestamp), _now) => CreatedAtParseStatus::Valid,
+        (None, _now) => CreatedAtParseStatus::Invalid,
+    };
+    let normalized = if status == CreatedAtParseStatus::Valid {
+        Some(raw.to_owned())
+    } else {
+        None
+    };
+    ClassifiedCreatedAt {
+        raw: Some(raw.to_owned()),
+        normalized,
+        status,
+    }
+}
+
+fn current_epoch_seconds() -> Option<i64> {
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+    i64::try_from(duration.as_secs()).ok()
+}
+
+fn parse_rfc3339_epoch_seconds(value: &str) -> Option<i64> {
+    let mut chars = value.chars();
+    let year = read_digits(&mut chars, 4)?;
+    expect_char(&mut chars, '-')?;
+    let month = read_digits(&mut chars, 2)?;
+    expect_char(&mut chars, '-')?;
+    let day = read_digits(&mut chars, 2)?;
+    expect_char(&mut chars, 'T')?;
+    let hour = read_digits(&mut chars, 2)?;
+    expect_char(&mut chars, ':')?;
+    let minute = read_digits(&mut chars, 2)?;
+    expect_char(&mut chars, ':')?;
+    let second = read_digits(&mut chars, 2)?;
+    let timezone = read_timezone(&mut chars)?;
+    validate_datetime_parts(year, month, day, hour, minute, second)?;
+    let days = days_from_civil(year, month, day)?;
+    let day_seconds = days.checked_mul(86_400)?;
+    let hour_seconds = hour.checked_mul(3_600)?;
+    let minute_seconds = minute.checked_mul(60)?;
+    day_seconds
+        .checked_add(hour_seconds)?
+        .checked_add(minute_seconds)?
+        .checked_add(second)?
+        .checked_sub(timezone)
+}
+
+fn read_timezone(chars: &mut std::str::Chars<'_>) -> Option<i64> {
+    let next = chars.next()?;
+    match next {
+        '.' => {
+            read_fraction(chars)?;
+            read_timezone(chars)
+        }
+        'Z' => {
+            ensure_finished(chars)?;
+            Some(0)
+        }
+        '+' | '-' => {
+            let sign = if next == '+' { 1_i64 } else { -1_i64 };
+            let hour = read_digits(chars, 2)?;
+            expect_char(chars, ':')?;
+            let minute = read_digits(chars, 2)?;
+            ensure_finished(chars)?;
+            validate_timezone(hour, minute)?;
+            hour.checked_mul(3_600)?
+                .checked_add(minute.checked_mul(60)?)?
+                .checked_mul(sign)
+        }
+        _other => None,
+    }
+}
+
+fn read_fraction(chars: &mut std::str::Chars<'_>) -> Option<()> {
+    let mut saw_digit = false;
+    loop {
+        let mut clone = chars.clone();
+        match clone.next() {
+            Some(ch) if ch.is_ascii_digit() => {
+                saw_digit = true;
+                let _discarded = chars.next();
+            }
+            Some('Z' | '+' | '-') if saw_digit => return Some(()),
+            _other => return None,
+        }
+    }
+}
+
+fn read_digits(chars: &mut std::str::Chars<'_>, count: usize) -> Option<i64> {
+    let mut value = 0_i64;
+    for _ in 0..count {
+        let digit = chars.next()?.to_digit(10)?;
+        value = value.checked_mul(10)?.checked_add(i64::from(digit))?;
+    }
+    Some(value)
+}
+
+fn expect_char(chars: &mut std::str::Chars<'_>, expected: char) -> Option<()> {
+    (chars.next()? == expected).then_some(())
+}
+
+fn ensure_finished(chars: &mut std::str::Chars<'_>) -> Option<()> {
+    chars.next().is_none().then_some(())
+}
+
+fn validate_datetime_parts(
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+) -> Option<()> {
+    if !(1..=9999).contains(&year) {
+        return None;
+    }
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    if !(1..=days_in_month(year, month)?).contains(&day) {
+        return None;
+    }
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0..=60).contains(&second) {
+        return None;
+    }
+    Some(())
+}
+
+fn validate_timezone(hour: i64, minute: i64) -> Option<()> {
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) {
+        return None;
+    }
+    Some(())
+}
+
+fn days_in_month(year: i64, month: i64) -> Option<i64> {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => Some(31),
+        4 | 6 | 9 | 11 => Some(30),
+        2 if is_leap_year(year)? => Some(29),
+        2 => Some(28),
+        _other => None,
+    }
+}
+
+fn is_leap_year(year: i64) -> Option<bool> {
+    let by_four = year.checked_rem(4)? == 0;
+    let by_hundred = year.checked_rem(100)? == 0;
+    let by_four_hundred = year.checked_rem(400)? == 0;
+    Some(by_four && (!by_hundred || by_four_hundred))
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
+    let adjusted_year = if month <= 2 {
+        year.checked_sub(1)?
+    } else {
+        year
+    };
+    let era = adjusted_year.div_euclid(400);
+    let era_years = era.checked_mul(400)?;
+    let year_of_era = adjusted_year.checked_sub(era_years)?;
+    let month_prime = if month > 2 {
+        month.checked_sub(3)?
+    } else {
+        month.checked_add(9)?
+    };
+    let day_of_year = 153_i64
+        .checked_mul(month_prime)?
+        .checked_add(2)?
+        .div_euclid(5)
+        .checked_add(day)?
+        .checked_sub(1)?;
+    let year_days = year_of_era.checked_mul(365)?;
+    let leap_days = year_of_era
+        .div_euclid(4)
+        .checked_sub(year_of_era.div_euclid(100))?;
+    let day_of_era = year_days.checked_add(leap_days)?.checked_add(day_of_year)?;
+    era.checked_mul(146_097)?
+        .checked_add(day_of_era)?
+        .checked_sub(719_468)
+}
+
+fn write_temp_rename<F>(path: &Path, write: F) -> Result<(), ArchiveError>
+where
+    F: FnOnce(&Path) -> Result<(), ArchiveError>,
+{
+    let temp_path = temp_path_for(path)?;
+    if temp_path.try_exists()? {
+        fs::remove_file(&temp_path)?;
+    }
+    match write(&temp_path) {
+        Ok(()) => {
+            sync_file(&temp_path)?;
+            fs::rename(&temp_path, path)?;
+            sync_parent_dir(path)?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ignored = fs::remove_file(&temp_path);
+            Err(error)
+        }
+    }
+}
+
+fn temp_path_for(path: &Path) -> Result<PathBuf, ArchiveError> {
+    let file_name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| ArchiveError::InvalidPath {
+            path: path.to_path_buf(),
+        })?;
+    Ok(path.with_file_name(format!("{file_name}.tmp.{}", std::process::id())))
+}
+
+fn sync_file(path: &Path) -> Result<(), ArchiveError> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+fn sync_parent_dir(path: &Path) -> Result<(), ArchiveError> {
+    let parent = path.parent().ok_or_else(|| ArchiveError::InvalidPath {
+        path: path.to_path_buf(),
+    })?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 impl CreatedAtParseStatus {
@@ -2951,6 +3725,8 @@ impl fmt::Display for ArchiveError {
             Self::Json(error) => write!(f, "JSON error: {error}"),
             Self::CountOverflow { field } => write!(f, "count overflow for {field}"),
             Self::InvalidCompression(error) => write!(f, "invalid compression level: {error}"),
+            Self::InvalidPath { path } => write!(f, "invalid archive path: {}", path.display()),
+            Self::InvalidRecordJson => f.write_str("post record serialized to non-object JSON"),
         }
     }
 }
@@ -2962,7 +3738,10 @@ impl Error for ArchiveError {
             Self::Parquet(error) => Some(error),
             Self::Arrow(error) => Some(error),
             Self::Json(error) => Some(error),
-            Self::CountOverflow { .. } | Self::InvalidCompression(_) => None,
+            Self::CountOverflow { .. }
+            | Self::InvalidCompression(_)
+            | Self::InvalidPath { .. }
+            | Self::InvalidRecordJson => None,
         }
     }
 }
@@ -2994,8 +3773,8 @@ impl From<serde_json::Error> for ArchiveError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArchivePostRow, CreatedAtParseStatus, NormalizerVersion, build_repo_receipt,
-        extract_emojis, hash_post_rows,
+        ArchivePostRow, CreatedAtParseStatus, NormalizerVersion, RepoReceiptInput,
+        build_repo_receipt, classify_created_at, extract_emojis, hash_post_rows,
     };
 
     fn normalizer() -> NormalizerVersion {
@@ -3013,6 +3792,10 @@ mod tests {
             did: "did:plc:test".to_owned(),
             rkey: "abc".to_owned(),
             cid: "bafy-test".to_owned(),
+            normalizer: normalizer(),
+            account_status: None,
+            record_status: None,
+            public_content_label: None,
             created_at_raw: Some("2026-06-15T00:00:00Z".to_owned()),
             created_at_normalized: Some("2026-06-15T00:00:00Z".to_owned()),
             created_at_parse_status: CreatedAtParseStatus::Valid,
@@ -3025,29 +3808,57 @@ mod tests {
 
     #[test]
     fn row_hash_changes_when_content_changes() {
-        let first = hash_post_rows(&[row("hello", &["✅"])]);
-        let second = hash_post_rows(&[row("hello!", &["✅"])]);
+        let first = hash_post_rows(&[row("hello", &["✅"])]).expect("first row hash");
+        let second = hash_post_rows(&[row("hello!", &["✅"])]).expect("second row hash");
         assert_ne!(first, second);
     }
 
     #[test]
     fn receipt_counts_posts_and_emoji_occurrences() {
-        let receipt = build_repo_receipt(
-            &[row("a", &["✅", "✅"]), row("b", &[])],
-            3,
-            Some("root".to_owned()),
-            Some("commit".to_owned()),
-            normalizer(),
-        );
-        assert_eq!(receipt.all_records_count, 3);
-        assert_eq!(receipt.all_posts_count, 2);
+        let rows = [row("a", &["✅", "✅"]), row("b", &[])];
+        let receipt = build_repo_receipt(RepoReceiptInput {
+            rows: &rows,
+            reachable_records_count: 3,
+            reachable_post_records_count: 2,
+            post_decode_error_count: 1,
+            profile_row_hash: Some("profile-hash".to_owned()),
+            mst_root_cid: Some("root".to_owned()),
+            commit_cid: Some("commit".to_owned()),
+            normalizer: normalizer(),
+        });
+        let receipt = receipt.expect("receipt should build");
+        assert_eq!(receipt.reachable_records_count, 3);
+        assert_eq!(receipt.reachable_post_records_count, 2);
+        assert_eq!(receipt.archived_post_rows_count, 2);
+        assert_eq!(receipt.post_decode_error_count, 1);
         assert_eq!(receipt.emoji_posts_count, 1);
         assert_eq!(receipt.emoji_occurrences_count, 2);
+        assert_eq!(receipt.profile_row_hash, Some("profile-hash".to_owned()));
     }
 
     #[test]
     fn extracts_grapheme_emoji_sequences() {
         assert_eq!(extract_emojis("hi ✅ 👩‍💻"), vec!["✅", "👩‍💻"]);
+    }
+
+    #[test]
+    fn classifies_created_at_statuses() {
+        let missing = classify_created_at(None);
+        assert_eq!(missing.status, CreatedAtParseStatus::Missing);
+        assert_eq!(missing.normalized, None);
+
+        let invalid = classify_created_at(Some("not-a-date"));
+        assert_eq!(invalid.status, CreatedAtParseStatus::Invalid);
+        assert_eq!(invalid.raw, Some("not-a-date".to_owned()));
+        assert_eq!(invalid.normalized, None);
+
+        let future = classify_created_at(Some("9999-12-31T23:59:59Z"));
+        assert_eq!(future.status, CreatedAtParseStatus::Future);
+        assert_eq!(future.normalized, None);
+
+        let valid = classify_created_at(Some("2020-01-02T03:04:05Z"));
+        assert_eq!(valid.status, CreatedAtParseStatus::Valid);
+        assert_eq!(valid.normalized, Some("2020-01-02T03:04:05Z".to_owned()));
     }
 }
 
