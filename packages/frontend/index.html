@@ -35,18 +35,24 @@
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
-    <!-- Simple Analytics -->
+    <!-- Privacy-friendly analytics by Plausible -->
     <script
       async
-      defer
-      src="https://scripts.simpleanalyticscdn.com/latest.js"
+      src="https://p.mosphere.at/js/pa-hC-YUACHrkSIxauu3bOp1.js"
     ></script>
-    <noscript
-      ><img
-        src="https://queue.simpleanalyticscdn.com/noscript.gif"
-        alt=""
-        referrerpolicy="no-referrer-when-downgrade"
-    /></noscript>
+    <script>
+      window.plausible =
+        window.plausible ||
+        function () {
+          (plausible.q = plausible.q || []).push(arguments);
+        };
+      plausible.init =
+        plausible.init ||
+        function (i) {
+          plausible.o = i || {};
+        };
+      plausible.init();
+    </script>
     <!-- Cloudflare Web Analytics -->
     <script
       defer
