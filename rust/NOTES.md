@@ -43,6 +43,10 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   reloads local `Parquet` archive rows, builds `ClickHouseDeriveBatch` values, formats
   `JSONEachRow` payloads, and inserts them into `ClickHouse` with existing dedupe tokens.
   `--dry-run` validates and counts payloads without sending inserts.
+- `clickhouse-schema --clickhouse-database <db>` prints the v2 `ClickHouse` schema SQL.
+  Smoke bootstrap on this host created `emojistats_smoke` through `clickhouse-smoke.service`
+  (`HTTP 18123`, native `19000`) and verified `v2_emoji_serving` plus
+  `v2_total_post_counters` exist.
 - `emoji-normalizer` is a new shared Rust crate. Current parity scope is ordered/repeated
   extraction, heart variation normalization, non-qualified keycaps, regional flags,
   skin-tone sequences, ZWJ sequences, and version metadata. Broad TS
@@ -81,9 +85,10 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   and the `listRecords` fallback lane for hosts forced away from `getRepo`.
 - Wire remaining archive artifacts through the committed-artifact protocol, then configure
   the `storage_box.rs` `ssh` transport for the real Storage Box.
-- Add the operational smoke harness around `run-fleet` + `derive-manifest`: seed a mixed
-  DID file, ramp concurrency (`4 -> 16 -> 32` locally), capture `smoke_telemetry`, and
-  compare committed manifest/receipt counts against `ClickHouse` projection rows.
+- Run the operational smoke harness around `run-fleet` + `derive-manifest`: use
+  `rust/fixtures/scale-smoke.dids`, ramp concurrency (`4 -> 16 -> 32` locally), capture
+  `smoke_telemetry`, and compare committed manifest/receipt counts against `ClickHouse`
+  projection rows in `emojistats_smoke`.
 - Finish emoji normalization parity with the TypeScript data tables, then add WASM bindings
   before the browser/server serving path depends on it.
 - Wire derive/ClickHouse ingest from committed manifest entries, then run the stratified

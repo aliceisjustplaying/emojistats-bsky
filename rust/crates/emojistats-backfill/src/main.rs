@@ -18,7 +18,9 @@ use emojistats_backfill::{
         ArchiveError, RepoReceiptInput, archive_rows_from_parsed_repo, build_repo_receipt,
         current_normalizer, hash_profile_record, write_archive_artifacts,
     },
-    clickhouse::{ClickHouseClientConfig, derive_insert_payloads, execute_insert_payloads},
+    clickhouse::{
+        ClickHouseClientConfig, create_schema_sql, derive_insert_payloads, execute_insert_payloads,
+    },
     ledger::{
         AttemptId, AttemptOutcome, ForcedFetchMode, HostOverride, RepoLedgerEntry,
         RepoLedgerStatus, RetryPolicy, ShardFilter, SqliteLedger, claim_repo, complete_attempt,
@@ -109,6 +111,12 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Print the v2 `ClickHouse` schema SQL.
+    ClickhouseSchema {
+        /// `ClickHouse` database.
+        #[arg(long, default_value = "emojistats")]
+        clickhouse_database: String,
+    },
 }
 
 #[tokio::main]
@@ -166,6 +174,12 @@ async fn main() -> anyhow::Result<()> {
                 dry_run,
             })
             .await
+        }
+        Command::ClickhouseSchema {
+            clickhouse_database,
+        } => {
+            println!("{}", create_schema_sql(&clickhouse_database)?);
+            Ok(())
         }
     }
 }
@@ -1291,6 +1305,38 @@ mod tests {
         assert_eq!(clickhouse_user, "writer");
         assert_eq!(clickhouse_password, "secret");
         assert!(dry_run);
+    }
+
+    #[test]
+    fn parses_clickhouse_schema_defaults() {
+        let cli = Cli::try_parse_from(["emojistats-backfill", "clickhouse-schema"]).unwrap();
+        let Command::ClickhouseSchema {
+            clickhouse_database,
+        } = cli.command
+        else {
+            unreachable!("expected clickhouse-schema command");
+        };
+
+        assert_eq!(clickhouse_database, "emojistats");
+    }
+
+    #[test]
+    fn parses_clickhouse_schema_database() {
+        let cli = Cli::try_parse_from([
+            "emojistats-backfill",
+            "clickhouse-schema",
+            "--clickhouse-database",
+            "analytics",
+        ])
+        .unwrap();
+        let Command::ClickhouseSchema {
+            clickhouse_database,
+        } = cli.command
+        else {
+            unreachable!("expected clickhouse-schema command");
+        };
+
+        assert_eq!(clickhouse_database, "analytics");
     }
 
     #[test]
