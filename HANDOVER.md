@@ -15,7 +15,7 @@ owned by a separate agent — **do not edit retro.md**).
   `CRAWL_SHARD_INDEX` with `CRAWL_SHARDS=6`. `crawl1`/`crawl2` were retired + **deleted**
   earlier today (their shards 1/2 are paused — bridge-tail only, see §2.5).
 - **Serving box:** `emoji` (CX33, **8 cores**) — ClickHouse (`posts` ≈ 2.09B rows) + the
-  public web/api (emojistats.mosphere.at) + live Jetstream ingest.
+  public web/api (`emojistats.at`; legacy `emojistats.mosphere.at` redirects there) + live Jetstream ingest.
 - **Deployed rev:** `48de289` on all 4 boxes == `origin/main`. Git is clean everywhere.
 - **Remaining work:** ~2.8M repos across the 4 live shards (s0 ~635k / s3 ~740k /
   s4 ~610k / s5 ~690k as of ~20:30), draining slowly (end-game tail — slow/rate-limited
