@@ -10,11 +10,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use arrow_array::{ArrayRef, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 pub use emoji_normalizer::NormalizerVersion;
 use parquet::{
-    arrow::ArrowWriter,
+    arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
     basic::{Compression, ZstdLevel},
     file::properties::WriterProperties,
 };
@@ -172,6 +172,9 @@ pub enum ArchiveError {
     InvalidCompression(String),
     InvalidPath { path: PathBuf },
     InvalidRecordJson,
+    InvalidParquetColumn { column: &'static str },
+    InvalidParquetValue { column: &'static str, value: String },
+    UnexpectedParquetNull { column: &'static str },
 }
 
 /// Convert parsed post records into the first archive-row shape.
@@ -296,6 +299,22 @@ pub fn write_archive_artifacts(
         manifest,
         emoji_rows,
     })
+}
+
+/// Read raw archive post rows from the Stage D Parquet shape.
+///
+/// # Errors
+///
+/// Returns [`ArchiveError`] when the file cannot be read as the expected archive schema,
+/// or when JSON-encoded row fields fail to decode.
+pub fn read_archive_post_rows(path: &Path) -> Result<Vec<ArchivePostRow>, ArchiveError> {
+    let file = File::open(path)?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    let mut rows = Vec::new();
+    for batch in reader {
+        append_archive_rows_from_batch(&mut rows, &batch?)?;
+    }
+    Ok(rows)
 }
 
 /// Build a content receipt from already-normalized post rows.
@@ -461,6 +480,129 @@ fn post_record_batch(
             owned_string_array(rows.iter().map(|row| canonical_json(&row.extras_json)))?,
         ],
     )?)
+}
+
+fn append_archive_rows_from_batch(
+    rows: &mut Vec<ArchivePostRow>,
+    batch: &RecordBatch,
+) -> Result<(), ArchiveError> {
+    let did = string_column(batch, "did")?;
+    let rkey = string_column(batch, "rkey")?;
+    let cid = string_column(batch, "cid")?;
+    let normalizer_name = string_column(batch, "normalizer_name")?;
+    let normalizer_semver = string_column(batch, "normalizer_semver")?;
+    let normalizer_git_rev = string_column(batch, "normalizer_git_rev")?;
+    let normalizer_unicode_version = string_column(batch, "normalizer_unicode_version")?;
+    let normalizer_emoji_data_version = string_column(batch, "normalizer_emoji_data_version")?;
+    let account_status = string_column(batch, "account_status")?;
+    let record_status = string_column(batch, "record_status")?;
+    let public_content_label = string_column(batch, "public_content_label")?;
+    let created_at_raw = string_column(batch, "created_at_raw")?;
+    let created_at_normalized = string_column(batch, "created_at_normalized")?;
+    let created_at_parse_status = string_column(batch, "created_at_parse_status")?;
+    let text = string_column(batch, "text")?;
+    let langs_json = string_column(batch, "langs_json")?;
+    let emoji_sequence_json = string_column(batch, "emoji_sequence_json")?;
+    let extras_json = string_column(batch, "extras_json")?;
+
+    for row_index in 0..batch.num_rows() {
+        rows.push(ArchivePostRow {
+            did: required_string(did, row_index, "did")?.to_owned(),
+            rkey: required_string(rkey, row_index, "rkey")?.to_owned(),
+            cid: required_string(cid, row_index, "cid")?.to_owned(),
+            normalizer: NormalizerVersion {
+                name: required_string(normalizer_name, row_index, "normalizer_name")?.to_owned(),
+                semver: required_string(normalizer_semver, row_index, "normalizer_semver")?
+                    .to_owned(),
+                git_rev: required_string(normalizer_git_rev, row_index, "normalizer_git_rev")?
+                    .to_owned(),
+                unicode_version: required_string(
+                    normalizer_unicode_version,
+                    row_index,
+                    "normalizer_unicode_version",
+                )?
+                .to_owned(),
+                emoji_data_version: required_string(
+                    normalizer_emoji_data_version,
+                    row_index,
+                    "normalizer_emoji_data_version",
+                )?
+                .to_owned(),
+            },
+            account_status: optional_string(account_status, row_index),
+            record_status: optional_string(record_status, row_index),
+            public_content_label: optional_string(public_content_label, row_index),
+            created_at_raw: optional_string(created_at_raw, row_index),
+            created_at_normalized: optional_string(created_at_normalized, row_index),
+            created_at_parse_status: parse_created_at_parse_status(required_string(
+                created_at_parse_status,
+                row_index,
+                "created_at_parse_status",
+            )?)?,
+            text: required_string(text, row_index, "text")?.to_owned(),
+            langs: serde_json::from_str(required_string(langs_json, row_index, "langs_json")?)?,
+            emoji_sequence: serde_json::from_str(required_string(
+                emoji_sequence_json,
+                row_index,
+                "emoji_sequence_json",
+            )?)?,
+            extras_json: serde_json::from_str(required_string(
+                extras_json,
+                row_index,
+                "extras_json",
+            )?)?,
+        });
+    }
+
+    Ok(())
+}
+
+fn string_column<'a>(
+    batch: &'a RecordBatch,
+    column: &'static str,
+) -> Result<&'a StringArray, ArchiveError> {
+    let index = batch
+        .schema()
+        .index_of(column)
+        .map_err(|_error| ArchiveError::InvalidParquetColumn { column })?;
+    batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or(ArchiveError::InvalidParquetColumn { column })
+}
+
+fn required_string<'a>(
+    array: &'a StringArray,
+    row_index: usize,
+    column: &'static str,
+) -> Result<&'a str, ArchiveError> {
+    if array.is_null(row_index) {
+        Err(ArchiveError::UnexpectedParquetNull { column })
+    } else {
+        Ok(array.value(row_index))
+    }
+}
+
+fn optional_string(array: &StringArray, row_index: usize) -> Option<String> {
+    if array.is_null(row_index) {
+        None
+    } else {
+        Some(array.value(row_index).to_owned())
+    }
+}
+
+fn parse_created_at_parse_status(value: &str) -> Result<CreatedAtParseStatus, ArchiveError> {
+    match value {
+        "valid" => Ok(CreatedAtParseStatus::Valid),
+        "missing" => Ok(CreatedAtParseStatus::Missing),
+        "invalid" => Ok(CreatedAtParseStatus::Invalid),
+        "future" => Ok(CreatedAtParseStatus::Future),
+        _ => Err(ArchiveError::InvalidParquetValue {
+            column: "created_at_parse_status",
+            value: value.to_owned(),
+        }),
+    }
 }
 
 fn build_commit_metadata(
@@ -1031,6 +1173,15 @@ impl fmt::Display for ArchiveError {
             Self::InvalidCompression(error) => write!(f, "invalid compression level: {error}"),
             Self::InvalidPath { path } => write!(f, "invalid archive path: {}", path.display()),
             Self::InvalidRecordJson => f.write_str("post record serialized to non-object JSON"),
+            Self::InvalidParquetColumn { column } => {
+                write!(f, "invalid archive Parquet column: {column}")
+            }
+            Self::InvalidParquetValue { column, value } => {
+                write!(f, "invalid archive Parquet value for {column}: {value}")
+            }
+            Self::UnexpectedParquetNull { column } => {
+                write!(f, "unexpected null in archive Parquet column: {column}")
+            }
         }
     }
 }
@@ -1046,7 +1197,10 @@ impl Error for ArchiveError {
             Self::CountOverflow { .. }
             | Self::InvalidCompression(_)
             | Self::InvalidPath { .. }
-            | Self::InvalidRecordJson => None,
+            | Self::InvalidRecordJson
+            | Self::InvalidParquetColumn { .. }
+            | Self::InvalidParquetValue { .. }
+            | Self::UnexpectedParquetNull { .. } => None,
         }
     }
 }
