@@ -12,6 +12,7 @@ use std::{
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+pub use emoji_normalizer::NormalizerVersion;
 use parquet::{
     arrow::ArrowWriter,
     basic::{Compression, ZstdLevel},
@@ -19,7 +20,6 @@ use parquet::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     commit::{LocalStore, ManifestMode, Metadata, Request},
@@ -29,16 +29,6 @@ use crate::{
 const POST_COLLECTION: &str = "app.bsky.feed.post";
 const ARCHIVE_SCHEMA_VERSION: u16 = 1;
 const PARQUET_BATCH_ROWS: usize = 1_024;
-
-/// Version identity for emoji normalization outputs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NormalizerVersion {
-    pub name: String,
-    pub semver: String,
-    pub git_rev: String,
-    pub unicode_version: String,
-    pub emoji_data_version: String,
-}
 
 /// Data-model-lossless post row before `Parquet` encoding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,13 +214,7 @@ pub fn archive_rows_from_parsed_repo(
 /// Current vertical-slice normalizer identity.
 #[must_use]
 pub fn current_normalizer() -> NormalizerVersion {
-    NormalizerVersion {
-        name: "emoji-normalizer-rust-minimal".to_owned(),
-        semver: "0.1.0".to_owned(),
-        git_rev: option_env!("GIT_REV").unwrap_or("unknown").to_owned(),
-        unicode_version: "emoji-rs".to_owned(),
-        emoji_data_version: "emoji-rs".to_owned(),
-    }
+    emoji_normalizer::version()
 }
 
 /// Write local archive artifacts for one parsed repo.
@@ -628,10 +612,7 @@ fn emoji_projection_rows(row: &ArchivePostRow) -> Result<Vec<EmojiProjectionRow>
 }
 
 fn extract_emojis(text: &str) -> Vec<String> {
-    text.graphemes(true)
-        .filter(|grapheme| emojis::get(grapheme).is_some())
-        .map(ToOwned::to_owned)
-        .collect()
+    emoji_normalizer::extract_emoji_sequence(text)
 }
 
 fn count_emoji_posts(rows: &[ArchivePostRow]) -> Result<u64, ArchiveError> {

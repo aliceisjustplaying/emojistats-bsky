@@ -26,9 +26,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 arrow-array = "57"
 arrow-schema = "57"
-emojis = "0.7"
+emoji-normalizer = { version = "0.1.0", path = "../emoji-normalizer" }
 parquet = { version = "57", default-features = false, features = ["arrow", "snap", "zstd"] }
-unicode-segmentation = "1"
 jacquard-common = { version = "0.12.0", git = "https://github.com/aliceisjustplaying/jacquard", rev = "39648622522fa62c4c0b12ac22b8a5f6893c845a", default-features = false, features = ["std", "service-auth", "crypto", "reqwest-client", "streaming"] }
 jacquard-api = { version = "0.12.0", git = "https://github.com/aliceisjustplaying/jacquard", rev = "39648622522fa62c4c0b12ac22b8a5f6893c845a", features = ["app_bsky"] }
 jacquard-identity = { version = "0.12.0", git = "https://github.com/aliceisjustplaying/jacquard", rev = "39648622522fa62c4c0b12ac22b8a5f6893c845a" }

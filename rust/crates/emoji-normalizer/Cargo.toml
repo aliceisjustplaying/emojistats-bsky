@@ -1,0 +1,19 @@
+[package]
+name = "emoji-normalizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Shared emoji extraction and normalization for emojistats."
+readme = "README.md"
+keywords = ["emoji", "normalization", "unicode", "text"]
+categories = ["text-processing"]
+
+[dependencies]
+emojis = "0.7"
+serde = { version = "1", features = ["derive"] }
+unicode-segmentation = "1"
+
+[lints]
+workspace = true

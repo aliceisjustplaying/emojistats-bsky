@@ -937,6 +937,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
+name = "emoji-normalizer"
+version = "0.1.0"
+dependencies = [
+ "emojis",
+ "serde",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "emojis"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -955,7 +964,7 @@ dependencies = [
  "bytes",
  "cid",
  "clap",
- "emojis",
+ "emoji-normalizer",
  "futures-util",
  "hex",
  "http",
@@ -973,7 +982,6 @@ dependencies = [
  "smol_str",
  "thiserror 2.0.18",
  "tokio",
- "unicode-segmentation",
 ]
 
 [[package]]
