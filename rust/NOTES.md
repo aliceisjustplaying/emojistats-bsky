@@ -17,16 +17,19 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
 - **Next-lane foundations started:** `ledger.rs` has retry/account-state transition types
   plus a SQLite store, `commit.rs` has a local Storage Box-shaped committed-artifact
   protocol, `derive.rs` has manifest-to-ClickHouse DTOs and dedupe tokening, `clickhouse.rs`
-  has schema and `JSONEachRow` request builders, and `canary.rs` encodes the stratified
-  canary policy/gate model. These are library foundations, not a wired fleet runner yet.
+  has schema, `JSONEachRow` request builders, and ordered insert execution, and `canary.rs`
+  encodes the stratified canary policy/gate model.
 - **Committed-object path partially wired:** `write_archive_artifacts` now writes the
-  Parquet object through the local committed-artifact protocol, producing object receipt
-  and append-only manifest entries after final object promotion. `storage_box.rs` adds the
-  remote backend skeleton plus `ssh` command binding with temp upload, size/hash/readback
-  verification, rename, and manifest append ordering behind a command trait.
-- `fetch-one` now wraps the vertical slice in a local ledger attempt and maps transport,
+  Parquet object and profile sidecar through the local committed-artifact protocol,
+  producing object receipts and append-only manifest entries after final object promotion.
+  `storage_box.rs` adds the remote backend skeleton plus `ssh` command binding with temp
+  upload, size/hash/readback verification, rename, and manifest append ordering behind a
+  command trait.
+- `fetch-one` wraps the vertical slice in a local ledger attempt and maps transport,
   parse, archive, account-state, resource-cap, retryable, and permanent failures into
-  explicit attempt outcomes.
+  explicit attempt outcomes. `run-fleet <dids_file>` now seeds missing DIDs into
+  `SqliteLedger`, claims up to `--claim-limit`, runs the same attempt path, and persists
+  claimed/completed transitions.
 - Fixture coverage now checks malformed `CAR` headers, empty/missing/non-commit roots,
   requested-DID mismatch, `createdAt` classification, and archive row-hash sensitivity.
 - Real stress DID verified:
@@ -56,12 +59,13 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
 
 ## Next roadmap
 
-- Wire SQLite ledger persistence into the CLI/fleet runner and seed/claim repos from the
-  actual crawl queue.
-- Wire profile sidecar and remaining archive artifacts through the committed-artifact
-  protocol; then configure the `storage_box.rs` `ssh` transport for the real Storage Box.
-- Build the ClickHouse loader that sends `clickhouse.rs` insert requests from committed
-  manifest entries, including retry/idempotency around dedupe tokens.
+- Replace the minimal `run-fleet` loop with the real scheduler: host pacing, bounded
+  concurrency, stale-claim recovery, shard buckets, and host overrides.
+- Wire remaining archive artifacts through the committed-artifact protocol, then configure
+  the `storage_box.rs` `ssh` transport for the real Storage Box.
+- Build derive-from-committed-manifest: read manifest entries, recompute Parquet/receipt
+  hashes, build `ClickHouseDeriveBatch`, and send inserts with retry/idempotency around
+  dedupe tokens.
 - Move emoji normalization into the shared WASM-able crate from the design before the
   browser/server serving path depends on it.
 - Wire derive/ClickHouse ingest from committed manifest entries, then run the stratified
@@ -73,7 +77,10 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   than a second on-disk copy; spill the index if a whale's is too large for RAM.
 - **Parquet** = `arrow` + `parquet` crates.
 - **Emoji** = currently minimal local Rust extraction in `archive.rs`; still promote it to
-  the shared `emoji-normalizer` crate before this becomes a serving contract.
+  the shared `emoji-normalizer` crate before this becomes a serving contract. Parity target:
+  TypeScript `emoji-regex@10.6.0` extraction plus `packages/emoji-normalization`
+  normalization (`non_qualified` -> `unified`, variation selectors -> emoji style),
+  preserving order/repeats and keeping ZWJ/skin-tone sequences as one occurrence.
 
 ## Jacquard 0.12.0 API map (load-bearing; from recon — verify against `/tmp/jacquard`)
 
