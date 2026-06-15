@@ -14,11 +14,12 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   `getRepo` to a spooled `CAR`, parses from the `CAR` path with block `CID` verification
   and `MST` completeness, writes `Parquet` posts, writes receipt + local manifest JSON, and
   derives compact emoji JSONL rows.
-- **Next-lane foundations started:** `ledger.rs` has retry/account-state transition types
-  plus a SQLite store, `commit.rs` has a local Storage Box-shaped committed-artifact
-  protocol, `derive.rs` has manifest-to-ClickHouse DTOs and dedupe tokening, `clickhouse.rs`
-  has schema, `JSONEachRow` request builders, and ordered insert execution, and `canary.rs`
-  encodes the stratified canary policy/gate model.
+- **Next-lane foundations started:** `ledger.rs` has retry/account-state transition types,
+  shard buckets, host overrides, and a SQLite store; `commit.rs` has a local Storage
+  Box-shaped committed-artifact protocol; `derive.rs` has manifest-to-ClickHouse DTOs and
+  dedupe tokening; `manifest_derive.rs` reads committed raw-archive manifests into derive
+  inputs; `clickhouse.rs` has schema, `JSONEachRow` request builders, and ordered insert
+  execution; and `canary.rs` encodes the stratified canary policy/gate model.
 - **Committed-object path partially wired:** `write_archive_artifacts` now writes the
   Parquet object and profile sidecar through the local committed-artifact protocol,
   producing object receipts and append-only manifest entries after final object promotion.
@@ -28,8 +29,12 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
 - `fetch-one` wraps the vertical slice in a local ledger attempt and maps transport,
   parse, archive, account-state, resource-cap, retryable, and permanent failures into
   explicit attempt outcomes. `run-fleet <dids_file>` now seeds missing DIDs into
-  `SqliteLedger`, claims up to `--claim-limit`, runs the same attempt path, and persists
-  claimed/completed transitions.
+  `SqliteLedger`, requeues stale claimed rows from the seed file, claims repeatedly until
+  `--claim-limit` or idle, runs bounded concurrent attempts via `--concurrency`, applies
+  host retry-after cooldowns, and persists claimed/completed transitions.
+- `emoji-normalizer` is a new shared Rust crate. Current parity scope is ordered/repeated
+  extraction, heart variation normalization, skin-tone sequences, ZWJ sequences, and
+  version metadata. Broad TS `non_qualified`/variation-table parity is still pending.
 - Fixture coverage now checks malformed `CAR` headers, empty/missing/non-commit roots,
   requested-DID mismatch, `createdAt` classification, and archive row-hash sensitivity.
 - Real stress DID verified:
@@ -59,15 +64,16 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
 
 ## Next roadmap
 
-- Replace the minimal `run-fleet` loop with the real scheduler: host pacing, bounded
-  concurrency, stale-claim recovery, shard buckets, and host overrides.
+- Wire `run-fleet` to use persisted shard filters and host overrides in the claim path,
+  then add the remaining real scheduler controls: per-host concurrency, advertised
+  rate-limit pacing, host deadness, and durable fleet telemetry.
 - Wire remaining archive artifacts through the committed-artifact protocol, then configure
   the `storage_box.rs` `ssh` transport for the real Storage Box.
-- Build derive-from-committed-manifest: read manifest entries, recompute Parquet/receipt
+- Finish derive-from-committed-manifest: read Parquet rows, recompute Parquet/receipt
   hashes, build `ClickHouseDeriveBatch`, and send inserts with retry/idempotency around
   dedupe tokens.
-- Move emoji normalization into the shared WASM-able crate from the design before the
-  browser/server serving path depends on it.
+- Finish emoji normalization parity with the TypeScript data tables, then add WASM bindings
+  before the browser/server serving path depends on it.
 - Wire derive/ClickHouse ingest from committed manifest entries, then run the stratified
   canary and fleet scheduler work.
 
@@ -76,11 +82,11 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
 - **BlockStore** = index the spooled CAR file (`CID → (offset,len)`, seek to read) rather
   than a second on-disk copy; spill the index if a whale's is too large for RAM.
 - **Parquet** = `arrow` + `parquet` crates.
-- **Emoji** = currently minimal local Rust extraction in `archive.rs`; still promote it to
-  the shared `emoji-normalizer` crate before this becomes a serving contract. Parity target:
-  TypeScript `emoji-regex@10.6.0` extraction plus `packages/emoji-normalization`
-  normalization (`non_qualified` -> `unified`, variation selectors -> emoji style),
-  preserving order/repeats and keeping ZWJ/skin-tone sequences as one occurrence.
+- **Emoji** = shared Rust `emoji-normalizer` crate. Implemented: basic extraction,
+  order/repeats, heart presentation normalization, ZWJ and skin-tone sequence preservation,
+  version metadata. Remaining parity target: TypeScript `emoji-regex@10.6.0` extraction plus
+  full `packages/emoji-normalization` data-table normalization (`non_qualified` ->
+  `unified`, variation selectors -> emoji style).
 
 ## Jacquard 0.12.0 API map (load-bearing; from recon — verify against `/tmp/jacquard`)
 
