@@ -9,6 +9,7 @@ use std::{
     fs::{self, File},
     io::BufReader,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -28,12 +29,16 @@ use emojistats_backfill::{
     manifest_derive::{load_verified_clickhouse_batch, read_committed_jsonl},
     parse::{ParseError, parse_repo_for_did},
     scheduler::{ClaimScope, HostPacer, SchedulerError, SharedHostPacer, checked_concurrency},
-    transport::{FetchConfig, FetchError, fetch_repo},
+    transport::{FetchByteBudget, FetchConfig, FetchError, fetch_repo},
 };
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use jacquard_common::{deps::fluent_uri::Uri, types::did::Did};
 use jacquard_identity::{PublicResolver, resolver::IdentityResolver};
 use serde::Serialize;
+use tokio::sync::Semaphore;
+
+const DEFAULT_PARSE_CONCURRENCY: usize = 1;
+const DEFAULT_MAX_INFLIGHT_SPOOL_BYTES: u64 = 536_870_912;
 
 /// emojistats v2 backfill tool.
 #[derive(Parser, Debug)]
@@ -75,6 +80,12 @@ enum Command {
         /// Maximum concurrent repo attempts.
         #[arg(long, default_value_t = 4, value_parser = parse_positive_usize)]
         concurrency: usize,
+        /// Maximum concurrent parse/archive stages.
+        #[arg(long, default_value_t = DEFAULT_PARSE_CONCURRENCY, value_parser = parse_positive_usize)]
+        parse_concurrency: usize,
+        /// Maximum bytes held by in-flight streamed `CAR` files.
+        #[arg(long, default_value_t = DEFAULT_MAX_INFLIGHT_SPOOL_BYTES, value_parser = parse_positive_u64)]
+        max_inflight_spool_bytes: u64,
         /// Restrict claims to one persisted DID shard bucket.
         #[arg(long, value_name = "BUCKET", value_parser = parse_shard_filter)]
         shard_bucket: Option<ShardFilter>,
@@ -135,6 +146,8 @@ async fn main() -> anyhow::Result<()> {
             run_id,
             claim_limit,
             concurrency,
+            parse_concurrency,
+            max_inflight_spool_bytes,
             shard_bucket,
             spool_dir,
             max_bytes,
@@ -146,6 +159,8 @@ async fn main() -> anyhow::Result<()> {
                 run_id,
                 claim_limit,
                 concurrency,
+                parse_concurrency,
+                max_inflight_spool_bytes,
                 spool_dir,
                 max_bytes,
                 archive_dir,
@@ -293,6 +308,8 @@ struct FleetConfig {
     run_id: String,
     claim_limit: u32,
     concurrency: usize,
+    parse_concurrency: usize,
+    max_inflight_spool_bytes: u64,
     spool_dir: PathBuf,
     max_bytes: u64,
     archive_dir: PathBuf,
@@ -317,6 +334,7 @@ struct FleetSummary {
 
 async fn run_fleet(config: FleetConfig) -> anyhow::Result<()> {
     checked_concurrency(config.concurrency)?;
+    checked_concurrency(config.parse_concurrency)?;
     if let Some(parent) = config
         .ledger_path
         .parent()
@@ -332,6 +350,8 @@ async fn run_fleet(config: FleetConfig) -> anyhow::Result<()> {
     summary.stale_recovered =
         recover_stale_claimed_entries(&ledger, &config.dids_file, SystemTime::now())?;
     let host_pacer = HostPacer::shared();
+    let parse_permits = Arc::new(Semaphore::new(config.parse_concurrency));
+    let byte_budget = FetchByteBudget::new(config.max_inflight_spool_bytes);
     let mut active = FuturesUnordered::new();
     let claim_limit = u64::from(config.claim_limit);
 
@@ -365,6 +385,8 @@ async fn run_fleet(config: FleetConfig) -> anyhow::Result<()> {
                     max_bytes: config.max_bytes,
                     archive_dir: config.archive_dir.clone(),
                     host_pacer: host_pacer.clone(),
+                    parse_permits: parse_permits.clone(),
+                    byte_budget: byte_budget.clone(),
                     claim_scope: config.claim_scope.clone(),
                     ledger_path: config.ledger_path.clone(),
                 }));
@@ -398,6 +420,8 @@ struct FleetAttemptConfig {
     max_bytes: u64,
     archive_dir: PathBuf,
     host_pacer: SharedHostPacer,
+    parse_permits: Arc<Semaphore>,
+    byte_budget: FetchByteBudget,
     claim_scope: ClaimScope,
     ledger_path: PathBuf,
 }
@@ -410,15 +434,17 @@ struct FleetAttemptResult {
 }
 
 async fn run_fleet_attempt(config: FleetAttemptConfig) -> FleetAttemptResult {
-    let result = fetch_one_attempt_with_pacer(
-        &config.did,
-        config.spool_dir,
-        config.max_bytes,
-        config.archive_dir,
-        Some(config.host_pacer),
-        &config.claim_scope,
-        Some(&config.ledger_path),
-    )
+    let result = fetch_one_attempt_with_pacer(FetchOneAttemptConfig {
+        did_str: &config.did,
+        spool_dir: config.spool_dir,
+        max_bytes: config.max_bytes,
+        archive_dir: config.archive_dir,
+        host_pacer: Some(config.host_pacer),
+        parse_permits: Some(config.parse_permits),
+        byte_budget: Some(config.byte_budget),
+        claim_scope: &config.claim_scope,
+        host_override_ledger_path: Some(&config.ledger_path),
+    })
     .await;
     FleetAttemptResult {
         did: config.did,
@@ -605,6 +631,16 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
     Ok(parsed)
 }
 
+fn parse_positive_u64(value: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|err| format!("expected a positive integer: {err}"))?;
+    if parsed == 0 {
+        return Err("expected a positive integer".to_owned());
+    }
+    Ok(parsed)
+}
+
 fn parse_shard_filter(value: &str) -> Result<ShardFilter, String> {
     let bucket = value
         .parse::<u64>()
@@ -619,28 +655,37 @@ async fn fetch_one_attempt(
     archive_dir: PathBuf,
 ) -> Result<(), FetchOneFailure> {
     let claim_scope = ClaimScope::default();
-    fetch_one_attempt_with_pacer(
+    fetch_one_attempt_with_pacer(FetchOneAttemptConfig {
         did_str,
         spool_dir,
         max_bytes,
         archive_dir,
-        None,
-        &claim_scope,
-        None,
-    )
+        host_pacer: None,
+        parse_permits: None,
+        byte_budget: None,
+        claim_scope: &claim_scope,
+        host_override_ledger_path: None,
+    })
     .await
 }
 
-async fn fetch_one_attempt_with_pacer(
-    did_str: &str,
+struct FetchOneAttemptConfig<'a> {
+    did_str: &'a str,
     spool_dir: PathBuf,
     max_bytes: u64,
     archive_dir: PathBuf,
     host_pacer: Option<SharedHostPacer>,
-    claim_scope: &ClaimScope,
-    host_override_ledger_path: Option<&Path>,
+    parse_permits: Option<Arc<Semaphore>>,
+    byte_budget: Option<FetchByteBudget>,
+    claim_scope: &'a ClaimScope,
+    host_override_ledger_path: Option<&'a Path>,
+}
+
+async fn fetch_one_attempt_with_pacer(
+    config: FetchOneAttemptConfig<'_>,
 ) -> Result<(), FetchOneFailure> {
     let attempt_started = Instant::now();
+    let did_str = config.did_str;
     let did: Did = Did::new_owned(did_str)
         .map_err(|err| permanent_failure(format!("invalid DID {did_str:?}: {err}")))?;
 
@@ -654,14 +699,15 @@ async fn fetch_one_attempt_with_pacer(
     let host = prepare_fetch_host(
         did_str,
         &pds,
-        claim_scope,
-        host_override_ledger_path,
-        host_pacer.as_ref(),
+        config.claim_scope,
+        config.host_override_ledger_path,
+        config.host_pacer.as_ref(),
     )
     .await?;
     let http = reqwest::Client::new();
-    let mut config = FetchConfig::new(spool_dir);
-    config.max_bytes = max_bytes;
+    let mut fetch_config = FetchConfig::new(config.spool_dir);
+    fetch_config.max_bytes = config.max_bytes;
+    fetch_config.byte_budget = config.byte_budget;
 
     let fetched = fetch_spooled_repo(FetchStep {
         http: &http,
@@ -669,8 +715,8 @@ async fn fetch_one_attempt_with_pacer(
         did: &did,
         did_str,
         host: host.as_str(),
-        config: &config,
-        host_pacer: host_pacer.as_ref(),
+        config: &fetch_config,
+        host_pacer: config.host_pacer.as_ref(),
         attempt_started,
     })
     .await?;
@@ -685,9 +731,11 @@ async fn fetch_one_attempt_with_pacer(
         did_str,
         host.as_str(),
         &fetched,
-        &archive_dir,
+        &config.archive_dir,
+        config.parse_permits.as_ref(),
         attempt_started,
-    )?;
+    )
+    .await?;
     println!(
         "parsed {} records, {} posts, {} decode errors, {} emoji rows, receipt {}",
         processed.records,
@@ -718,6 +766,7 @@ async fn fetch_one_attempt_with_pacer(
         archived_posts: Some(processed.archived_posts),
         decode_errors: Some(processed.decode_errors),
         emoji_rows: Some(processed.emoji_rows),
+        rss_kb: current_rss_kb(),
         error: None,
     });
     Ok(())
@@ -763,6 +812,7 @@ async fn fetch_spooled_repo(step: FetchStep<'_>) -> Result<FetchedRepo, FetchOne
                 archived_posts: None,
                 decode_errors: None,
                 emoji_rows: None,
+                rss_kb: current_rss_kb(),
                 error: Some(failure.error.to_string()),
             });
             record_rate_limit_cooldown(step.host_pacer, step.host, &failure);
@@ -784,15 +834,79 @@ fn record_rate_limit_cooldown(
     }
 }
 
-fn parse_archive_or_emit_failure(
+async fn parse_archive_or_emit_failure(
     did_str: &str,
     host: &str,
     fetched: &FetchedRepo,
     archive_dir: &Path,
+    parse_permits: Option<&Arc<Semaphore>>,
     attempt_started: Instant,
 ) -> Result<ProcessedRepo, FetchOneFailure> {
+    emit_smoke_telemetry(&SmokeTelemetry {
+        event: "smoke_repo_attempt",
+        did: did_str,
+        host: Some(host),
+        outcome: "running",
+        stage: "parse_wait",
+        elapsed_ms: elapsed_ms(attempt_started),
+        fetch_ms: Some(fetched.fetch_ms),
+        parse_ms: None,
+        archive_ms: None,
+        bytes: Some(fetched.spooled.bytes),
+        records: None,
+        archived_posts: None,
+        decode_errors: None,
+        emoji_rows: None,
+        rss_kb: current_rss_kb(),
+        error: None,
+    });
+    let _permit =
+        match parse_permits {
+            Some(permits) => Some(permits.clone().acquire_owned().await.map_err(|_error| {
+                retryable_failure("parse/archive semaphore closed".to_owned())
+            })?),
+            None => None,
+        };
+    emit_smoke_telemetry(&SmokeTelemetry {
+        event: "smoke_repo_attempt",
+        did: did_str,
+        host: Some(host),
+        outcome: "running",
+        stage: "parse_start",
+        elapsed_ms: elapsed_ms(attempt_started),
+        fetch_ms: Some(fetched.fetch_ms),
+        parse_ms: None,
+        archive_ms: None,
+        bytes: Some(fetched.spooled.bytes),
+        records: None,
+        archived_posts: None,
+        decode_errors: None,
+        emoji_rows: None,
+        rss_kb: current_rss_kb(),
+        error: None,
+    });
     match parse_and_archive_spooled_repo(did_str, &fetched.spooled.car_path, archive_dir) {
-        Ok(processed) => Ok(processed),
+        Ok(processed) => {
+            emit_smoke_telemetry(&SmokeTelemetry {
+                event: "smoke_repo_attempt",
+                did: did_str,
+                host: Some(host),
+                outcome: "running",
+                stage: "parse_archive_done",
+                elapsed_ms: elapsed_ms(attempt_started),
+                fetch_ms: Some(fetched.fetch_ms),
+                parse_ms: Some(processed.parse_ms),
+                archive_ms: Some(processed.archive_ms),
+                bytes: Some(fetched.spooled.bytes),
+                records: Some(processed.records),
+                archived_posts: Some(processed.archived_posts),
+                decode_errors: Some(processed.decode_errors),
+                emoji_rows: Some(processed.emoji_rows),
+                rss_kb: current_rss_kb(),
+                error: None,
+            });
+            Ok(processed)
+        }
         Err(failure) => {
             emit_smoke_telemetry(&SmokeTelemetry {
                 event: "smoke_repo_attempt",
@@ -809,6 +923,7 @@ fn parse_archive_or_emit_failure(
                 archived_posts: None,
                 decode_errors: None,
                 emoji_rows: None,
+                rss_kb: current_rss_kb(),
                 error: Some(failure.error.to_string()),
             });
             Err(failure)
@@ -910,6 +1025,7 @@ struct SmokeTelemetry<'a> {
     archived_posts: Option<u64>,
     decode_errors: Option<u64>,
     emoji_rows: Option<u64>,
+    rss_kb: Option<u64>,
     error: Option<String>,
 }
 
@@ -922,6 +1038,15 @@ fn emit_smoke_telemetry(telemetry: &SmokeTelemetry<'_>) {
 
 fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn current_rss_kb() -> Option<u64> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|line| {
+        let value = line.strip_prefix("VmRSS:")?.trim();
+        let kb = value.split_whitespace().next()?;
+        kb.parse::<u64>().ok()
+    })
 }
 
 const fn outcome_name(outcome: &AttemptOutcome) -> &'static str {
@@ -1035,14 +1160,15 @@ fn classify_fetch_error(did: &str, error: &FetchError) -> FetchOneFailure {
         }
         FetchError::InactivityTimeout { .. }
         | FetchError::Transport { .. }
-        | FetchError::Io { .. } => AttemptOutcome::RetryableFailure {
+        | FetchError::Io { .. }
+        | FetchError::ByteBudgetPoisoned => AttemptOutcome::RetryableFailure {
             message: message.clone(),
         },
-        FetchError::MaxBytesExceeded { .. } | FetchError::ErrorBodyTooLarge { .. } => {
-            AttemptOutcome::ResourceLimitExceeded {
-                message: message.clone(),
-            }
-        }
+        FetchError::MaxBytesExceeded { .. }
+        | FetchError::ErrorBodyTooLarge { .. }
+        | FetchError::InFlightBytesExceeded { .. } => AttemptOutcome::ResourceLimitExceeded {
+            message: message.clone(),
+        },
         FetchError::HttpStatus { .. } => AttemptOutcome::PermanentFailure {
             message: message.clone(),
         },
@@ -1205,6 +1331,8 @@ mod tests {
             run_id,
             claim_limit,
             concurrency,
+            parse_concurrency,
+            max_inflight_spool_bytes,
             shard_bucket,
             spool_dir,
             max_bytes,
@@ -1218,10 +1346,37 @@ mod tests {
         assert_eq!(run_id, "fleet-local");
         assert_eq!(claim_limit, 1);
         assert_eq!(concurrency, 4);
+        assert_eq!(parse_concurrency, 1);
+        assert_eq!(max_inflight_spool_bytes, 536_870_912);
         assert_eq!(shard_bucket, None);
         assert_eq!(spool_dir, PathBuf::from("data/spool"));
         assert_eq!(max_bytes, 2_147_483_648);
         assert_eq!(archive_dir, PathBuf::from("data/archive"));
+    }
+
+    #[test]
+    fn parses_run_fleet_resource_options() {
+        let cli = Cli::try_parse_from([
+            "emojistats-backfill",
+            "run-fleet",
+            "dids.txt",
+            "--parse-concurrency",
+            "2",
+            "--max-inflight-spool-bytes",
+            "123456",
+        ])
+        .unwrap();
+        let Command::RunFleet {
+            parse_concurrency,
+            max_inflight_spool_bytes,
+            ..
+        } = cli.command
+        else {
+            unreachable!("expected run-fleet command");
+        };
+
+        assert_eq!(parse_concurrency, 2);
+        assert_eq!(max_inflight_spool_bytes, 123_456);
     }
 
     #[test]
@@ -1375,6 +1530,34 @@ mod tests {
                 "run-fleet",
                 "dids.txt",
                 "--concurrency",
+                "0",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn run_fleet_rejects_zero_parse_concurrency() {
+        assert!(
+            Cli::try_parse_from([
+                "emojistats-backfill",
+                "run-fleet",
+                "dids.txt",
+                "--parse-concurrency",
+                "0",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn run_fleet_rejects_zero_inflight_spool_bytes() {
+        assert!(
+            Cli::try_parse_from([
+                "emojistats-backfill",
+                "run-fleet",
+                "dids.txt",
+                "--max-inflight-spool-bytes",
                 "0",
             ])
             .is_err()

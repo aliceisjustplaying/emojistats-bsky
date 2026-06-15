@@ -6,6 +6,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -20,7 +21,7 @@ use jacquard_common::{
     xrpc::XrpcExt as _,
 };
 use serde::{Deserialize, Serialize};
-use tokio::time;
+use tokio::{sync::Notify, time};
 
 const DEFAULT_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_BYTES: u64 = 2_147_483_648;
@@ -35,6 +36,8 @@ pub struct FetchConfig {
     pub chunk_idle_timeout: Duration,
     /// Loud single-repo byte cap for the spooled `CAR`.
     pub max_bytes: u64,
+    /// Optional fleet-wide byte budget for in-flight spooled `CAR` bytes.
+    pub byte_budget: Option<FetchByteBudget>,
 }
 
 impl FetchConfig {
@@ -45,12 +48,113 @@ impl FetchConfig {
             spool_dir: spool_dir.into(),
             chunk_idle_timeout: DEFAULT_CHUNK_IDLE_TIMEOUT,
             max_bytes: DEFAULT_MAX_BYTES,
+            byte_budget: None,
         }
     }
 }
 
+/// Shared cap for bytes currently held by in-flight streamed `CAR` files.
+#[derive(Debug, Clone)]
+pub struct FetchByteBudget {
+    inner: Arc<FetchByteBudgetInner>,
+}
+
+#[derive(Debug)]
+struct FetchByteBudgetInner {
+    max_bytes: u64,
+    charged_bytes: Mutex<u64>,
+    notify: Notify,
+}
+
+impl FetchByteBudget {
+    /// Build a shared in-flight byte budget.
+    #[must_use]
+    pub fn new(max_bytes: u64) -> Self {
+        Self {
+            inner: Arc::new(FetchByteBudgetInner {
+                max_bytes,
+                charged_bytes: Mutex::new(0),
+                notify: Notify::new(),
+            }),
+        }
+    }
+
+    fn reservation(&self) -> FetchByteBudgetReservation {
+        FetchByteBudgetReservation {
+            budget: self.clone(),
+            charged_bytes: 0,
+        }
+    }
+
+    async fn reserve_charged_delta(&self, delta: u64) -> Result<(), FetchError> {
+        if delta == 0 || self.inner.max_bytes == 0 {
+            return Ok(());
+        }
+        loop {
+            let notified = self.inner.notify.notified();
+            {
+                let mut charged = self
+                    .inner
+                    .charged_bytes
+                    .lock()
+                    .map_err(|_error| FetchError::ByteBudgetPoisoned)?;
+                let next = charged
+                    .checked_add(delta)
+                    .ok_or(FetchError::InFlightBytesExceeded {
+                        max_bytes: self.inner.max_bytes,
+                        observed_bytes: u64::MAX,
+                    })?;
+                if next <= self.inner.max_bytes {
+                    *charged = next;
+                    drop(charged);
+                    return Ok(());
+                }
+            }
+            notified.await;
+        }
+    }
+
+    fn release_charged(&self, bytes: u64) {
+        if bytes == 0 || self.inner.max_bytes == 0 {
+            return;
+        }
+        if let Ok(mut charged) = self.inner.charged_bytes.lock() {
+            *charged = charged.saturating_sub(bytes);
+        }
+        self.inner.notify.notify_waiters();
+    }
+}
+
+/// Held with a spooled repo until parse/archive no longer needs the local `CAR`.
+#[derive(Debug)]
+pub struct FetchByteBudgetReservation {
+    budget: FetchByteBudget,
+    charged_bytes: u64,
+}
+
+impl FetchByteBudgetReservation {
+    async fn reserve_observed(&mut self, observed_bytes: u64) -> Result<(), FetchError> {
+        let charged_target = observed_bytes.min(self.budget.inner.max_bytes);
+        let delta = charged_target.checked_sub(self.charged_bytes).ok_or(
+            FetchError::InFlightBytesExceeded {
+                max_bytes: self.budget.inner.max_bytes,
+                observed_bytes,
+            },
+        )?;
+        self.budget.reserve_charged_delta(delta).await?;
+        self.charged_bytes = charged_target;
+        Ok(())
+    }
+}
+
+impl Drop for FetchByteBudgetReservation {
+    fn drop(&mut self) {
+        self.budget.release_charged(self.charged_bytes);
+    }
+}
+
 /// A successfully spooled repo `CAR`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct SpooledRepo {
     /// Path to the local spooled `CAR`.
     pub car_path: PathBuf,
@@ -60,6 +164,7 @@ pub struct SpooledRepo {
     pub rate_limit: RateLimitSnapshot,
     /// Bytes written to `car_path`.
     pub bytes: u64,
+    _byte_budget_reservation: Option<FetchByteBudgetReservation>,
 }
 
 /// Parsed `ratelimit-*`, `x-ratelimit-*`, and `retry-after` headers.
@@ -164,6 +269,15 @@ pub enum FetchError {
         /// Bytes observed after accepting the chunk that crossed the cap.
         observed_bytes: u64,
     },
+    /// The fleet-wide in-flight spool byte budget was exceeded.
+    InFlightBytesExceeded {
+        /// Configured cap.
+        max_bytes: u64,
+        /// Bytes observed after accepting the chunk that crossed the cap.
+        observed_bytes: u64,
+    },
+    /// The in-flight byte budget lock was poisoned.
+    ByteBudgetPoisoned,
     /// A streaming transport error occurred before or during body download.
     Transport {
         /// Transport error message.
@@ -221,6 +335,14 @@ impl fmt::Display for FetchError {
                 f,
                 "error response body exceeded max bytes: observed {observed_bytes}, max {max_bytes}"
             ),
+            Self::InFlightBytesExceeded {
+                max_bytes,
+                observed_bytes,
+            } => write!(
+                f,
+                "in-flight spooled CAR bytes exceeded max bytes: observed {observed_bytes}, max {max_bytes}"
+            ),
+            Self::ByteBudgetPoisoned => f.write_str("in-flight spool byte budget lock poisoned"),
             Self::Transport { message } => write!(f, "transport error: {message}"),
             Self::Io { source } => write!(f, "I/O error: {source}"),
         }
@@ -236,6 +358,8 @@ impl Error for FetchError {
             | Self::InactivityTimeout { .. }
             | Self::MaxBytesExceeded { .. }
             | Self::ErrorBodyTooLarge { .. }
+            | Self::InFlightBytesExceeded { .. }
+            | Self::ByteBudgetPoisoned
             | Self::Transport { .. } => None,
         }
     }
@@ -286,14 +410,21 @@ where
     }
 
     let car_path = spool_path(&config.spool_dir, did);
-    let bytes =
-        stream_to_file(body, &car_path, config.chunk_idle_timeout, config.max_bytes).await?;
+    let (bytes, byte_budget_reservation) = stream_to_file(
+        body,
+        &car_path,
+        config.chunk_idle_timeout,
+        config.max_bytes,
+        config.byte_budget.as_ref(),
+    )
+    .await?;
 
     Ok(SpooledRepo {
         car_path,
         http_status: status.as_u16(),
         rate_limit,
         bytes,
+        _byte_budget_reservation: byte_budget_reservation,
     })
 }
 
@@ -302,13 +433,14 @@ async fn stream_to_file(
     car_path: &Path,
     chunk_idle_timeout: Duration,
     max_bytes: u64,
-) -> Result<u64, FetchError> {
+    byte_budget: Option<&FetchByteBudget>,
+) -> Result<(u64, Option<FetchByteBudgetReservation>), FetchError> {
     let temp_path = temp_spool_path(car_path)?;
-    match stream_to_temp_file(body, &temp_path, chunk_idle_timeout, max_bytes).await {
-        Ok(bytes) => {
+    match stream_to_temp_file(body, &temp_path, chunk_idle_timeout, max_bytes, byte_budget).await {
+        Ok((bytes, reservation)) => {
             fs::rename(&temp_path, car_path)?;
             sync_parent_dir(car_path)?;
-            Ok(bytes)
+            Ok((bytes, reservation))
         }
         Err(error) => {
             let _ignored = fs::remove_file(&temp_path);
@@ -322,13 +454,15 @@ async fn stream_to_temp_file(
     temp_path: &Path,
     chunk_idle_timeout: Duration,
     max_bytes: u64,
-) -> Result<u64, FetchError> {
+    byte_budget: Option<&FetchByteBudget>,
+) -> Result<(u64, Option<FetchByteBudgetReservation>), FetchError> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(temp_path)?;
     let mut bytes = 0_u64;
     let mut stream = body.into_inner();
+    let mut reservation = byte_budget.map(FetchByteBudget::reservation);
 
     while let Some(next_chunk) = time::timeout(chunk_idle_timeout, stream.next())
         .await
@@ -356,12 +490,15 @@ async fn stream_to_temp_file(
                 observed_bytes,
             });
         }
+        if let Some(reservation) = &mut reservation {
+            reservation.reserve_observed(observed_bytes).await?;
+        }
         file.write_all(chunk.as_ref())?;
         bytes = observed_bytes;
     }
 
     file.sync_all()?;
-    Ok(bytes)
+    Ok((bytes, reservation))
 }
 
 fn temp_spool_path(car_path: &Path) -> Result<PathBuf, FetchError> {
@@ -529,7 +666,8 @@ mod tests {
     use jacquard_common::types::did::Did;
 
     use super::{
-        AccountState, FetchConfig, FetchError, RateLimitSnapshot, classify_http_error, spool_path,
+        AccountState, FetchByteBudget, FetchConfig, FetchError, RateLimitSnapshot,
+        classify_http_error, spool_path,
     };
 
     #[test]
@@ -617,6 +755,25 @@ mod tests {
         assert_eq!(config.spool_dir, PathBuf::from("/tmp/spool"));
         assert_eq!(config.chunk_idle_timeout, Duration::from_secs(30));
         assert_eq!(config.max_bytes, 2_147_483_648);
+        assert!(config.byte_budget.is_none());
+    }
+
+    #[tokio::test]
+    async fn byte_budget_blocks_until_prior_reservation_is_dropped() {
+        let budget = FetchByteBudget::new(10);
+        let mut first = budget.reservation();
+        first.reserve_observed(10).await.unwrap();
+        let mut second = budget.reservation();
+
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(10), second.reserve_observed(1)).await;
+
+        assert!(blocked.is_err());
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), second.reserve_observed(1))
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

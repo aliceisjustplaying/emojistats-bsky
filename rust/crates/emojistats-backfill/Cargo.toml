@@ -23,7 +23,7 @@ serde_json = "1"
 sha2 = "0.10"
 rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 arrow-array = "57"
 arrow-schema = "57"
 emoji-normalizer = { version = "0.1.0", path = "../emoji-normalizer" }
