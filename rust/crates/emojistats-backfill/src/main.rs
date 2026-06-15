@@ -16,8 +16,8 @@ use std::{
 use clap::{Parser, Subcommand};
 use emojistats_backfill::{
     archive::{
-        ArchiveError, RepoReceiptInput, archive_rows_from_parsed_repo, build_repo_receipt,
-        current_normalizer, hash_profile_record, write_archive_artifacts,
+        ArchiveError, StreamingArchiveSink, StreamingReceiptInput, archive_row_from_post,
+        hash_profile_record,
     },
     clickhouse::{
         ClickHouseClientConfig, create_schema_sql, derive_insert_payloads, execute_insert_payloads,
@@ -27,7 +27,7 @@ use emojistats_backfill::{
         RepoLedgerStatus, RetryPolicy, ShardFilter, SqliteLedger, claim_repo, complete_attempt,
     },
     manifest_derive::{load_verified_clickhouse_batch, read_committed_jsonl},
-    parse::{ParseError, parse_repo_for_did},
+    parse::{ParseConfig, ParseError, ParseVisitError, parse_repo_for_did_with_state},
     scheduler::{ClaimScope, HostPacer, SchedulerError, SharedHostPacer, checked_concurrency},
     transport::{FetchByteBudget, FetchConfig, FetchError, fetch_repo},
 };
@@ -952,52 +952,50 @@ fn parse_and_archive_spooled_repo(
     archive_dir: &Path,
 ) -> Result<ProcessedRepo, FetchOneFailure> {
     let parse_started = Instant::now();
-    let parsed =
-        parse_repo_for_did(car_path, did_str).map_err(|err| classify_parse_error(did_str, &err))?;
+    let sink = StreamingArchiveSink::new(archive_dir, did_str).map_err(|err| {
+        classify_archive_error(&format!("open streaming archive sink for {did_str}"), &err)
+    })?;
+    let normalizer = sink.normalizer().clone();
+    let did = did_str.to_owned();
+    let (parsed, sink) = parse_repo_for_did_with_state(
+        car_path,
+        did_str,
+        ParseConfig::default(),
+        sink,
+        move |sink, post| {
+            let row = archive_row_from_post(&did, &post, &normalizer)?;
+            sink.push_row(row)
+        },
+    )
+    .map_err(|err| match err {
+        ParseVisitError::Parse(err) => classify_parse_error(did_str, &err),
+        ParseVisitError::Visit(err) => {
+            classify_archive_error(&format!("stream archive row for {did_str}"), &err)
+        }
+    })?;
     let parse_ms = elapsed_ms(parse_started);
     let archive_started = Instant::now();
-    let rows = archive_rows_from_parsed_repo(&parsed).map_err(|err| {
-        classify_archive_error(&format!("build archive rows for {did_str}"), &err)
-    })?;
     let profile_row_hash = hash_profile_record(parsed.profile.as_ref())
         .map_err(|err| classify_archive_error(&format!("hash profile row for {did_str}"), &err))?;
-    let post_decode_error_count = parsed
-        .record_decode_errors
-        .iter()
-        .filter(|error| error.collection == "app.bsky.feed.post")
-        .count()
-        .try_into()
-        .map_err(|_err| {
-            resource_failure(format!("post decode error count overflow for {did_str}"))
+    let (receipt, artifacts) = sink
+        .finish(
+            StreamingReceiptInput {
+                reachable_records_count: parsed.rkey_digest.all_records_count,
+                reachable_post_records_count: parsed.rkey_digest.post_records_count,
+                post_decode_error_count: parsed.post_decode_error_count,
+                profile_row_hash,
+                mst_root_cid: Some(parsed.commit.data.clone()),
+                commit_cid: Some(parsed.commit.cid.clone()),
+            },
+            parsed.profile.as_ref(),
+        )
+        .map_err(|err| {
+            classify_archive_error(&format!("finish archive artifacts for {did_str}"), &err)
         })?;
-    let receipt = build_repo_receipt(RepoReceiptInput {
-        rows: &rows,
-        reachable_records_count: parsed.rkey_digest.all_records_count,
-        reachable_post_records_count: parsed.rkey_digest.post_records_count,
-        post_decode_error_count,
-        profile_row_hash,
-        mst_root_cid: Some(parsed.commit.data.clone()),
-        commit_cid: Some(parsed.commit.cid.clone()),
-        normalizer: current_normalizer(),
-    })
-    .map_err(|err| classify_archive_error(&format!("build receipt for {did_str}"), &err))?;
-    let artifacts = write_archive_artifacts(
-        archive_dir,
-        did_str,
-        &rows,
-        parsed.profile.as_ref(),
-        &receipt,
-    )
-    .map_err(|err| {
-        classify_archive_error(&format!("write archive artifacts for {did_str}"), &err)
-    })?;
-    let decode_errors = count_len(parsed.record_decode_errors.len(), "record decode errors")
-        .map_err(|err| resource_failure(err.to_string()))?;
-
     Ok(ProcessedRepo {
         records: parsed.rkey_digest.all_records_count,
         archived_posts: receipt.archived_post_rows_count,
-        decode_errors,
+        decode_errors: parsed.record_decode_error_count,
         emoji_rows: artifacts.emoji_rows,
         receipt_hash: receipt.post_rows_hash,
         parquet_path: artifacts.parquet_path,
@@ -1257,15 +1255,6 @@ fn retryable_failure(message: String) -> FetchOneFailure {
 fn permanent_failure(message: String) -> FetchOneFailure {
     FetchOneFailure {
         outcome: AttemptOutcome::PermanentFailure {
-            message: message.clone(),
-        },
-        error: anyhow::anyhow!(message),
-    }
-}
-
-fn resource_failure(message: String) -> FetchOneFailure {
-    FetchOneFailure {
-        outcome: AttemptOutcome::ResourceLimitExceeded {
             message: message.clone(),
         },
         error: anyhow::anyhow!(message),

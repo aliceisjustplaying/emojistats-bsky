@@ -13,13 +13,10 @@ use bytes::Bytes;
 use cid::Cid as IpldCid;
 use jacquard_api::app_bsky::{actor::profile::Profile, feed::post::Post};
 use jacquard_repo::{
-    DAG_CBOR_CID_CODEC, Mst,
+    DAG_CBOR_CID_CODEC,
     commit::Commit,
     error::RepoError,
-    mst::{
-        cursor::{CursorPosition, MstCursor},
-        util::compute_cid,
-    },
+    mst::{NodeData, util::compute_cid},
     storage::BlockStore,
 };
 use serde::Deserialize;
@@ -40,8 +37,29 @@ pub struct ParsedRepo {
     pub profile: Option<ProfileRecord>,
     /// Non-fatal profile sidecar decode error, when the post snapshot can still be parsed.
     pub profile_decode_error: Option<String>,
-    /// Typed record decode failures observed while walking reachable records.
-    pub record_decode_errors: Vec<RecordDecodeFailure>,
+    /// Number of typed record decode failures observed while walking reachable records.
+    pub record_decode_error_count: u64,
+    /// Number of typed post record decode failures observed while walking reachable records.
+    pub post_decode_error_count: u64,
+}
+
+/// Parsed one-repo summary for streaming callers that do not retain post rows.
+#[derive(Debug, Clone)]
+pub struct ParsedRepoSummary {
+    /// Commit metadata from the repo root block.
+    pub commit: CommitMeta,
+    /// Snapshot completeness proof details.
+    pub completeness: CompletenessProof,
+    /// Deterministic key summary for the traversed `MST`.
+    pub rkey_digest: RkeyDigest,
+    /// Extracted `app.bsky.actor.profile/self`, when present.
+    pub profile: Option<ProfileRecord>,
+    /// Non-fatal profile sidecar decode error, when the post snapshot can still be parsed.
+    pub profile_decode_error: Option<String>,
+    /// Number of typed record decode failures observed while walking reachable records.
+    pub record_decode_error_count: u64,
+    /// Number of typed post record decode failures observed while walking reachable records.
+    pub post_decode_error_count: u64,
 }
 
 /// Resource caps for Stage C parsing.
@@ -137,19 +155,6 @@ pub struct ProfileRecord {
     pub cid: String,
     /// Typed Bluesky profile record.
     pub record: Profile<SmolStr>,
-}
-
-/// Reachable record that failed typed decoding.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecordDecodeFailure {
-    /// Full repo key.
-    pub key: String,
-    /// Collection being decoded.
-    pub collection: &'static str,
-    /// Record block `CID`.
-    pub cid: String,
-    /// Decode error message.
-    pub message: String,
 }
 
 /// Deterministic key summary for archive receipt wiring.
@@ -302,6 +307,17 @@ pub enum ParseError {
     CidRead(#[source] Box<cid::Error>),
 }
 
+/// Error returned by streaming parse visitors.
+#[derive(Debug, thiserror::Error)]
+pub enum ParseVisitError<E> {
+    /// Stage C parser failed.
+    #[error(transparent)]
+    Parse(#[from] ParseError),
+    /// Caller-provided visitor failed.
+    #[error("record visitor failed: {0}")]
+    Visit(E),
+}
+
 /// Parse a spooled repo `CAR` from disk.
 ///
 /// # Errors
@@ -350,6 +366,35 @@ pub fn parse_repo_for_did_with_config(
     parse_repo_thread(car_path, Some(requested_did.to_owned()), config)
 }
 
+/// Parse a spooled repo `CAR`, visiting each decoded post without retaining all posts.
+///
+/// The caller-owned `state` is moved into the parser thread and returned with the summary.
+///
+/// # Errors
+///
+/// Returns [`ParseVisitError::Parse`] for parser failures, or [`ParseVisitError::Visit`] when
+/// `visit_post` fails.
+pub fn parse_repo_for_did_with_state<S, E, F>(
+    car_path: &Path,
+    requested_did: &str,
+    config: ParseConfig,
+    state: S,
+    visit_post: F,
+) -> Result<(ParsedRepoSummary, S), ParseVisitError<E>>
+where
+    S: Send + 'static,
+    E: Send + 'static,
+    F: FnMut(&mut S, PostRecord) -> Result<(), E> + Send + 'static,
+{
+    parse_repo_visit_thread(
+        car_path,
+        Some(requested_did.to_owned()),
+        config,
+        state,
+        visit_post,
+    )
+}
+
 fn parse_repo_thread(
     car_path: &Path,
     requested_did: Option<String>,
@@ -374,11 +419,83 @@ fn parse_repo_thread(
         .map_err(|_err| ParseError::RuntimeThreadTerminated)?
 }
 
+fn parse_repo_visit_thread<S, E, F>(
+    car_path: &Path,
+    requested_did: Option<String>,
+    config: ParseConfig,
+    state: S,
+    mut visit_post: F,
+) -> Result<(ParsedRepoSummary, S), ParseVisitError<E>>
+where
+    S: Send + 'static,
+    E: Send + 'static,
+    F: FnMut(&mut S, PostRecord) -> Result<(), E> + Send + 'static,
+{
+    let car_path = car_path.to_path_buf();
+    std::thread::Builder::new()
+        .name("emojistats-stage-c-parse".to_owned())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(ParseError::Runtime)?;
+            runtime.block_on(parse_repo_async_visit(
+                &car_path,
+                requested_did.as_deref(),
+                config,
+                state,
+                &mut visit_post,
+            ))
+        })
+        .map_err(ParseError::ThreadSpawn)?
+        .join()
+        .map_err(|_err| ParseError::RuntimeThreadTerminated)?
+}
+
 async fn parse_repo_async(
     car_path: &Path,
     requested_did: Option<&str>,
     config: ParseConfig,
 ) -> Result<ParsedRepo, ParseError> {
+    let mut posts = Vec::new();
+    let (summary, ()) = parse_repo_async_visit(
+        car_path,
+        requested_did,
+        config,
+        (),
+        &mut |_state: &mut (), post| {
+            posts.push(post);
+            Ok::<(), std::convert::Infallible>(())
+        },
+    )
+    .await
+    .map_err(|error| match error {
+        ParseVisitError::Parse(error) => error,
+        ParseVisitError::Visit(error) => match error {},
+    })?;
+
+    Ok(ParsedRepo {
+        commit: summary.commit,
+        completeness: summary.completeness,
+        posts,
+        rkey_digest: summary.rkey_digest,
+        profile: summary.profile,
+        profile_decode_error: summary.profile_decode_error,
+        record_decode_error_count: summary.record_decode_error_count,
+        post_decode_error_count: summary.post_decode_error_count,
+    })
+}
+
+async fn parse_repo_async_visit<S, E, F>(
+    car_path: &Path,
+    requested_did: Option<&str>,
+    config: ParseConfig,
+    mut state: S,
+    visit_post: &mut F,
+) -> Result<(ParsedRepoSummary, S), ParseVisitError<E>>
+where
+    F: FnMut(&mut S, PostRecord) -> Result<(), E>,
+{
     let deadline = ParseDeadline::start(config.max_parse_wall_clock);
     let (stream_summary, store) = IndexedCarBlockStore::load(car_path, config, deadline)?;
     deadline.ensure_not_exceeded()?;
@@ -386,8 +503,15 @@ async fn parse_repo_async(
     let (commit_cid, commit) = load_commit(commit_root, &store).await?;
     deadline.ensure_not_exceeded()?;
     assert_requested_did(requested_did, commit.did().as_str())?;
-    let (posts, profile, profile_decode_error, record_decode_errors, rkey_digest) =
-        walk_mst_records(commit.data, &store, config, deadline).await?;
+    let (profile, profile_decode_error, decode_digest, rkey_digest) = walk_mst_records_visit(
+        commit.data,
+        &store,
+        config,
+        deadline,
+        &mut state,
+        visit_post,
+    )
+    .await?;
 
     let proof = CompletenessProof {
         class: CompletenessClass::SnapshotComplete,
@@ -403,22 +527,25 @@ async fn parse_repo_async(
         identity_verified: false,
     };
 
-    Ok(ParsedRepo {
-        commit: CommitMeta {
-            cid: commit_cid.to_string(),
-            did: commit.did().as_str().to_owned(),
-            version: commit.version,
-            rev: commit.rev().as_str().to_owned(),
-            data: commit.data().to_string(),
-            prev: commit.prev().map(ToString::to_string),
+    Ok((
+        ParsedRepoSummary {
+            commit: CommitMeta {
+                cid: commit_cid.to_string(),
+                did: commit.did().as_str().to_owned(),
+                version: commit.version,
+                rev: commit.rev().as_str().to_owned(),
+                data: commit.data().to_string(),
+                prev: commit.prev().map(ToString::to_string),
+            },
+            completeness: proof,
+            rkey_digest,
+            profile,
+            profile_decode_error,
+            record_decode_error_count: decode_digest.all_decode_errors_count,
+            post_decode_error_count: decode_digest.post_decode_errors_count,
         },
-        completeness: proof,
-        posts,
-        rkey_digest,
-        profile,
-        profile_decode_error,
-        record_decode_errors,
-    })
+        state,
+    ))
 }
 
 fn single_car_root(roots: &[IpldCid]) -> Result<IpldCid, ParseError> {
@@ -466,113 +593,210 @@ fn assert_requested_did(requested_did: Option<&str>, actual_did: &str) -> Result
     })
 }
 
-async fn walk_mst_records(
+async fn walk_mst_records_visit<S, E, F>(
     root: IpldCid,
     store: &IndexedCarBlockStore,
     config: ParseConfig,
     deadline: ParseDeadline,
+    state: &mut S,
+    visit_post: &mut F,
 ) -> Result<
     (
-        Vec<PostRecord>,
         Option<ProfileRecord>,
         Option<String>,
-        Vec<RecordDecodeFailure>,
+        DecodeDigest,
         RkeyDigest,
     ),
-    ParseError,
-> {
-    let mst = Mst::load(Arc::new(store.clone()), root, None);
-    let traversed_root = mst.root().await?;
-    if traversed_root != root {
-        return Err(ParseError::MstRootMismatch {
-            commit_data: root.to_string(),
-            traversed_root: traversed_root.to_string(),
-        });
-    }
-
-    let mut cursor = MstCursor::new(mst);
-    let mut posts = Vec::new();
+    ParseVisitError<E>,
+>
+where
+    F: FnMut(&mut S, PostRecord) -> Result<(), E>,
+{
+    let mut cursor = StreamingMstCursor::new(root, store);
     let mut profile = None;
     let mut profile_decode_error = None;
-    let mut record_decode_errors = Vec::new();
+    let mut decode_digest = DecodeDigest::default();
     let mut digest = RkeyDigest::default();
 
-    cursor.advance().await?;
-    while !cursor.is_end() {
-        let cursor_layer = cursor.layer().await?;
-        ensure_usize_at_most(
-            cursor_layer,
+    while let Some(leaf) = cursor.next_leaf(config).await? {
+        deadline.ensure_not_exceeded()?;
+        let record_bytes = store
+            .get(&leaf.cid)
+            .await
+            .map_err(ParseError::Repo)?
+            .ok_or_else(|| ParseError::MissingBlock {
+                cid: leaf.cid.to_string(),
+            })?;
+        update_digest(&mut digest, &leaf.key, config)?;
+        let mut sinks = RecordSinks {
+            state,
+            visit_post,
+            profile: &mut profile,
+            profile_decode_error: &mut profile_decode_error,
+            decode_digest: &mut decode_digest,
+        };
+        extract_known_record(
+            &leaf.key,
+            leaf.cid,
+            record_bytes.as_ref(),
+            &mut sinks,
+            config,
+        )?;
+    }
+
+    Ok((profile, profile_decode_error, decode_digest, digest))
+}
+
+struct StreamingMstCursor<'a> {
+    root: Option<IpldCid>,
+    store: &'a IndexedCarBlockStore,
+    stack: Vec<StreamingMstFrame>,
+}
+
+impl<'a> StreamingMstCursor<'a> {
+    const fn new(root: IpldCid, store: &'a IndexedCarBlockStore) -> Self {
+        Self {
+            root: Some(root),
+            store,
+            stack: Vec::new(),
+        }
+    }
+
+    async fn next_leaf(
+        &mut self,
+        config: ParseConfig,
+    ) -> Result<Option<StreamingMstLeaf>, ParseError> {
+        loop {
+            if let Some(root) = self.root.take() {
+                self.push_node(root, config).await?;
+                continue;
+            }
+
+            let Some(frame) = self.stack.last_mut() else {
+                return Ok(None);
+            };
+            let Some(item) = frame.next() else {
+                self.stack.pop();
+                continue;
+            };
+            match item {
+                StreamingMstItem::Tree(cid) => {
+                    self.push_node(cid, config).await?;
+                }
+                StreamingMstItem::Leaf { key, cid } => {
+                    return Ok(Some(StreamingMstLeaf { key, cid }));
+                }
+            }
+        }
+    }
+
+    async fn push_node(&mut self, cid: IpldCid, config: ParseConfig) -> Result<(), ParseError> {
+        let depth = checked_increment(
+            u64::try_from(self.stack.len()).map_err(|_err| ParseError::CarLengthOverflow {
+                field: "MST stack depth",
+            })?,
+            "mst_depth",
+        )?;
+        ensure_u64_at_most(
+            depth,
             config.max_mst_depth,
             "max_mst_depth",
             "raise parser max_mst_depth only after inspecting the repo MST",
         )?;
-        deadline.ensure_not_exceeded()?;
-        match cursor.current().clone() {
-            CursorPosition::Leaf { key, cid } => {
-                let key_text = key.to_string();
-                let record_bytes =
-                    store
-                        .get(&cid)
-                        .await?
-                        .ok_or_else(|| ParseError::MissingBlock {
-                            cid: cid.to_string(),
-                        })?;
-                update_digest(&mut digest, &key_text, config)?;
-                let mut sinks = RecordSinks {
-                    posts: &mut posts,
-                    profile: &mut profile,
-                    profile_decode_error: &mut profile_decode_error,
-                    record_decode_errors: &mut record_decode_errors,
-                };
-                extract_known_record(&key_text, cid, record_bytes.as_ref(), &mut sinks, config)?;
-                cursor.advance().await?;
-            }
-            CursorPosition::Tree { .. } => {
-                cursor.advance().await?;
-            }
-            CursorPosition::End => {}
-        }
+        let bytes = self
+            .store
+            .get(&cid)
+            .await?
+            .ok_or_else(|| ParseError::MissingBlock {
+                cid: cid.to_string(),
+            })?;
+        self.stack.push(StreamingMstFrame::decode(bytes.as_ref())?);
+        Ok(())
     }
-
-    Ok((
-        posts,
-        profile,
-        profile_decode_error,
-        record_decode_errors,
-        digest,
-    ))
 }
 
-fn extract_known_record(
+struct StreamingMstFrame {
+    items: Vec<StreamingMstItem>,
+    index: usize,
+}
+
+impl StreamingMstFrame {
+    fn decode(bytes: &[u8]) -> Result<Self, ParseError> {
+        let node: NodeData = serde_ipld_dagcbor::from_slice(bytes).map_err(|source| {
+            ParseError::MalformedCar(format!("failed to decode MST node: {source}"))
+        })?;
+        let mut items = Vec::new();
+        if let Some(left) = node.left {
+            items.push(StreamingMstItem::Tree(left));
+        }
+        let mut last_key = String::new();
+        for entry in node.entries {
+            let prefix_len = usize::from(entry.prefix_len);
+            if !last_key.is_char_boundary(prefix_len) || prefix_len > last_key.len() {
+                return Err(ParseError::MalformedCar(
+                    "MST entry prefix exceeds previous key".to_owned(),
+                ));
+            }
+            let suffix = std::str::from_utf8(&entry.key_suffix).map_err(|source| {
+                ParseError::MalformedCar(format!("invalid UTF-8 in MST key suffix: {source}"))
+            })?;
+            let key = format!("{}{}", &last_key[..prefix_len], suffix);
+            items.push(StreamingMstItem::Leaf {
+                key: key.clone(),
+                cid: entry.value,
+            });
+            if let Some(tree) = entry.tree {
+                items.push(StreamingMstItem::Tree(tree));
+            }
+            last_key = key;
+        }
+        Ok(Self { items, index: 0 })
+    }
+
+    fn next(&mut self) -> Option<StreamingMstItem> {
+        let item = self.items.get(self.index)?.clone();
+        self.index = self.index.checked_add(1)?;
+        Some(item)
+    }
+}
+
+#[derive(Clone)]
+enum StreamingMstItem {
+    Tree(IpldCid),
+    Leaf { key: String, cid: IpldCid },
+}
+
+struct StreamingMstLeaf {
+    key: String,
+    cid: IpldCid,
+}
+
+fn extract_known_record<S, E, F>(
     key: &str,
     cid: IpldCid,
     record_bytes: &[u8],
-    sinks: &mut RecordSinks<'_>,
+    sinks: &mut RecordSinks<'_, S, F>,
     config: ParseConfig,
-) -> Result<(), ParseError> {
+) -> Result<(), ParseVisitError<E>>
+where
+    F: FnMut(&mut S, PostRecord) -> Result<(), E>,
+{
     let Some((collection, rkey)) = split_repo_key(key) else {
         return Ok(());
     };
 
     match collection {
         POST_COLLECTION => match serde_ipld_dagcbor::from_slice::<Post<SmolStr>>(record_bytes) {
-            Ok(record) => sinks.posts.push(PostRecord {
-                rkey: rkey.to_owned(),
-                cid: cid.to_string(),
-                record,
-            }),
-            Err(error) => {
-                sinks.record_decode_errors.push(RecordDecodeFailure {
-                    key: key.to_owned(),
-                    collection: POST_COLLECTION,
+            Ok(record) => (sinks.visit_post)(
+                sinks.state,
+                PostRecord {
+                    rkey: rkey.to_owned(),
                     cid: cid.to_string(),
-                    message: error.to_string(),
-                });
-                enforce_decode_error_limit(
-                    sinks.record_decode_errors.len(),
-                    config.max_decode_errors,
-                )?;
-            }
+                    record,
+                },
+            )
+            .map_err(ParseVisitError::Visit)?,
+            Err(_error) => record_decode_failed(sinks.decode_digest, POST_COLLECTION, config)?,
         },
         PROFILE_COLLECTION if rkey == PROFILE_RKEY => {
             match serde_ipld_dagcbor::from_slice::<Profile<SmolStr>>(record_bytes) {
@@ -587,16 +811,7 @@ fn extract_known_record(
                     let message = error.to_string();
                     *sinks.profile_decode_error =
                         Some(format!("{PROFILE_COLLECTION}/{rkey} at {cid}: {message}"));
-                    sinks.record_decode_errors.push(RecordDecodeFailure {
-                        key: key.to_owned(),
-                        collection: PROFILE_COLLECTION,
-                        cid: cid.to_string(),
-                        message,
-                    });
-                    enforce_decode_error_limit(
-                        sinks.record_decode_errors.len(),
-                        config.max_decode_errors,
-                    )?;
+                    record_decode_failed(sinks.decode_digest, PROFILE_COLLECTION, config)?;
                 }
             }
         }
@@ -606,11 +821,32 @@ fn extract_known_record(
     Ok(())
 }
 
-struct RecordSinks<'a> {
-    posts: &'a mut Vec<PostRecord>,
+struct RecordSinks<'a, S, F> {
+    state: &'a mut S,
+    visit_post: &'a mut F,
     profile: &'a mut Option<ProfileRecord>,
     profile_decode_error: &'a mut Option<String>,
-    record_decode_errors: &'a mut Vec<RecordDecodeFailure>,
+    decode_digest: &'a mut DecodeDigest,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DecodeDigest {
+    all_decode_errors_count: u64,
+    post_decode_errors_count: u64,
+}
+
+fn record_decode_failed(
+    digest: &mut DecodeDigest,
+    collection: &'static str,
+    config: ParseConfig,
+) -> Result<(), ParseError> {
+    digest.all_decode_errors_count =
+        checked_increment(digest.all_decode_errors_count, "all_decode_errors_count")?;
+    if collection == POST_COLLECTION {
+        digest.post_decode_errors_count =
+            checked_increment(digest.post_decode_errors_count, "post_decode_errors_count")?;
+    }
+    enforce_decode_error_limit(digest.all_decode_errors_count, config.max_decode_errors)
 }
 
 fn update_digest(
@@ -932,20 +1168,8 @@ const fn ensure_u64_at_most(
     })
 }
 
-fn ensure_usize_at_most(
-    observed: usize,
-    limit: u64,
-    limit_name: &'static str,
-    recovery: &'static str,
-) -> Result<(), ParseError> {
-    let observed_u64 = u64::try_from(observed).map_err(|_err| ParseError::CarLengthOverflow {
-        field: "usize observed length",
-    })?;
-    ensure_u64_at_most(observed_u64, limit, limit_name, recovery)
-}
-
-fn enforce_decode_error_limit(observed: usize, limit: u64) -> Result<(), ParseError> {
-    ensure_usize_at_most(
+const fn enforce_decode_error_limit(observed: u64, limit: u64) -> Result<(), ParseError> {
+    ensure_u64_at_most(
         observed,
         limit,
         "max_decode_errors",

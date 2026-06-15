@@ -6,7 +6,7 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
 
 ## Status (2026-06-15)
 
-- Branch `v2-rust-backfill` (not pushed). Greenfield; no v1 reuse.
+- Branch `v2-rust-backfill`. Greenfield; no v1 reuse.
 - **Checkpoint A done:** `fetch-one <did>` resolves DID→PDS over the live network
   (`did:plc:z72i7hdynmk6r22z27h6tvur` → `puffball.us-east.host.bsky.network`); invalid DIDs
   error cleanly. Full muster green.
@@ -45,7 +45,9 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
 - `derive-manifest <manifest.jsonl>` verifies committed raw archive manifest entries,
   reloads local `Parquet` archive rows, builds `ClickHouseDeriveBatch` values, formats
   `JSONEachRow` payloads, and inserts them into `ClickHouse` with existing dedupe tokens.
-  `--dry-run` validates and counts payloads without sending inserts.
+  `--dry-run` validates and counts payloads without sending inserts. It is still not
+  whale-safe: the scale smoke had to stop `lb7` derive at 7.99 GiB max RSS, so the next
+  required fix is streaming `Parquet` derive + bounded `ClickHouse` insert chunks.
 - `clickhouse-schema --clickhouse-database <db>` prints the v2 `ClickHouse` schema SQL.
   Smoke bootstrap on this host created `emojistats_smoke` through `clickhouse-smoke.service`
   (`HTTP 18123`, native `19000`) and verified `v2_emoji_serving` plus
@@ -60,6 +62,16 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   `did:plc:vwzwgnygau7ed7b7wt5ux7y2` from `shiitake.us-east.host.bsky.network` spooled
   41,051,855 bytes, produced 6,407 post rows, 228 emoji rows, and carried 23,656 typed
   record decode failures as non-fatal parse diagnostics.
+- Scale smoke, release binary, `rust/fixtures/scale-smoke.dids`,
+  `--concurrency 4 --parse-concurrency 1 --max-inflight-spool-bytes 536870912`, output under
+  `rust/data/scale-smoke-streamed-full-fixed/`: 24 claimed, 16 succeeded, 8 loud failures
+  (3 account-state, 3 retryable fetch transport/decode, 1 malformed CAR permanent, 1 2 GiB
+  resource cap). Archive wrote 5,349,107 reachable records, 5,125,748 post rows, and 464,166
+  emoji projection rows. Wall time 7:10.67; process max RSS 878,272 KiB. Largest successful
+  repo was `did:plc:4hm6gb7dzobynqrpypif3dck`: 1,424,463,806-byte CAR, 2,598,565 archived
+  posts, 463,413 emoji rows, 135.7s parse, 629 MiB telemetry RSS. `lb7` parsed 2,523,977
+  posts in 79.4s at 237 MiB telemetry RSS. No stale `*.tmp.*` artifacts remained after the
+  fixed run.
 - Jacquard 0.12.0 via **fork-mirror git deps**: `github.com/aliceisjustplaying/jacquard`
   @ `39648622522fa62c4c0b12ac22b8a5f6893c845a` (== tag 0.12.0). reqwest pulls **rustls**
   (no openssl). Full 0.12.0 source also at `/tmp/jacquard` for reading (ephemeral).
@@ -88,11 +100,9 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   and the `listRecords` fallback lane for hosts forced away from `getRepo`.
 - Wire remaining archive artifacts through the committed-artifact protocol, then configure
   the `storage_box.rs` `ssh` transport for the real Storage Box.
-- Run the operational smoke harness around `run-fleet` + `derive-manifest`: use
-  `rust/fixtures/scale-smoke.dids`, start with `--concurrency 4 --parse-concurrency 1`
-  after the OOM at four concurrent whale parses, capture `smoke_telemetry`, and compare
-  committed manifest/receipt counts against `ClickHouse` projection rows in
-  `emojistats_smoke`.
+- Make `derive-manifest` whale-safe: stream `Parquet` batches, validate row hashes
+  incrementally, and insert bounded `ClickHouse` chunks. The current archive/fleet path scales
+  on the smoke set; the derive path does not.
 - Finish emoji normalization parity with the TypeScript data tables, then add WASM bindings
   before the browser/server serving path depends on it.
 - Wire derive/ClickHouse ingest from committed manifest entries, then run the stratified

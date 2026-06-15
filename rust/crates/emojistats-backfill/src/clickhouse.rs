@@ -16,6 +16,7 @@ pub const JSON_EACH_ROW_FORMAT: &str = "JSONEachRow";
 
 const INSERT_DEDUPLICATE_SETTING: &str = "insert_deduplicate";
 const INSERT_DEDUPLICATION_TOKEN_SETTING: &str = "insert_deduplication_token";
+const DATE_TIME_INPUT_FORMAT_SETTING: &str = "date_time_input_format";
 const CLICKHOUSE_RESPONSE_SNIPPET_MAX_CHARS: usize = 4_096;
 const CLICKHOUSE_USER_HEADER: HeaderName = HeaderName::from_static("x-clickhouse-user");
 const CLICKHOUSE_KEY_HEADER: HeaderName = HeaderName::from_static("x-clickhouse-key");
@@ -152,6 +153,7 @@ impl ClickHouseClientConfig {
                     INSERT_DEDUPLICATION_TOKEN_SETTING,
                     payload.dedupe_token.as_str(),
                 ),
+                (DATE_TIME_INPUT_FORMAT_SETTING, "best_effort"),
             ])
             .body(payload.body.clone())
             .build()
@@ -843,6 +845,7 @@ mod tests {
         assert!(url.contains("query=INSERT"));
         assert!(url.contains("insert_deduplicate=1"));
         assert!(url.contains("insert_deduplication_token=derive%3Atest-token"));
+        assert!(url.contains("date_time_input_format=best_effort"));
         assert_eq!(
             request.headers().get(&CLICKHOUSE_USER_HEADER),
             Some(&"alice".parse().expect("header value"))

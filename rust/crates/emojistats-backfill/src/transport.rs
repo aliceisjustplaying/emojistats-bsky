@@ -133,7 +133,7 @@ pub struct FetchByteBudgetReservation {
 }
 
 impl FetchByteBudgetReservation {
-    async fn reserve_observed(&mut self, observed_bytes: u64) -> Result<(), FetchError> {
+    async fn reserve_completed(&mut self, observed_bytes: u64) -> Result<(), FetchError> {
         let charged_target = observed_bytes.min(self.budget.inner.max_bytes);
         let delta = charged_target.checked_sub(self.charged_bytes).ok_or(
             FetchError::InFlightBytesExceeded {
@@ -436,8 +436,15 @@ async fn stream_to_file(
     byte_budget: Option<&FetchByteBudget>,
 ) -> Result<(u64, Option<FetchByteBudgetReservation>), FetchError> {
     let temp_path = temp_spool_path(car_path)?;
-    match stream_to_temp_file(body, &temp_path, chunk_idle_timeout, max_bytes, byte_budget).await {
-        Ok((bytes, reservation)) => {
+    match stream_to_temp_file(body, &temp_path, chunk_idle_timeout, max_bytes).await {
+        Ok(bytes) => {
+            let mut reservation = byte_budget.map(FetchByteBudget::reservation);
+            if let Some(reservation) = &mut reservation
+                && let Err(error) = reservation.reserve_completed(bytes).await
+            {
+                let _ignored = fs::remove_file(&temp_path);
+                return Err(error);
+            }
             fs::rename(&temp_path, car_path)?;
             sync_parent_dir(car_path)?;
             Ok((bytes, reservation))
@@ -454,15 +461,13 @@ async fn stream_to_temp_file(
     temp_path: &Path,
     chunk_idle_timeout: Duration,
     max_bytes: u64,
-    byte_budget: Option<&FetchByteBudget>,
-) -> Result<(u64, Option<FetchByteBudgetReservation>), FetchError> {
+) -> Result<u64, FetchError> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(temp_path)?;
     let mut bytes = 0_u64;
     let mut stream = body.into_inner();
-    let mut reservation = byte_budget.map(FetchByteBudget::reservation);
 
     while let Some(next_chunk) = time::timeout(chunk_idle_timeout, stream.next())
         .await
@@ -490,15 +495,12 @@ async fn stream_to_temp_file(
                 observed_bytes,
             });
         }
-        if let Some(reservation) = &mut reservation {
-            reservation.reserve_observed(observed_bytes).await?;
-        }
         file.write_all(chunk.as_ref())?;
         bytes = observed_bytes;
     }
 
     file.sync_all()?;
-    Ok((bytes, reservation))
+    Ok(bytes)
 }
 
 fn temp_spool_path(car_path: &Path) -> Result<PathBuf, FetchError> {
@@ -762,15 +764,15 @@ mod tests {
     async fn byte_budget_blocks_until_prior_reservation_is_dropped() {
         let budget = FetchByteBudget::new(10);
         let mut first = budget.reservation();
-        first.reserve_observed(10).await.unwrap();
+        first.reserve_completed(10).await.unwrap();
         let mut second = budget.reservation();
 
         let blocked =
-            tokio::time::timeout(Duration::from_millis(10), second.reserve_observed(1)).await;
+            tokio::time::timeout(Duration::from_millis(10), second.reserve_completed(1)).await;
 
         assert!(blocked.is_err());
         drop(first);
-        tokio::time::timeout(Duration::from_secs(1), second.reserve_observed(1))
+        tokio::time::timeout(Duration::from_secs(1), second.reserve_completed(1))
             .await
             .unwrap()
             .unwrap();

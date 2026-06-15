@@ -189,29 +189,40 @@ pub fn archive_rows_from_parsed_repo(
     parsed
         .posts
         .iter()
-        .map(|post| {
-            let created_at = post.record.created_at.as_str();
-            let classified = classify_created_at(Some(created_at));
-            Ok(ArchivePostRow {
-                did: parsed.commit.did.clone(),
-                rkey: post.rkey.clone(),
-                cid: post.cid.clone(),
-                normalizer: normalizer.clone(),
-                account_status: None,
-                record_status: None,
-                public_content_label: None,
-                created_at_raw: classified.raw,
-                created_at_normalized: classified.normalized,
-                created_at_parse_status: classified.status,
-                text: post.record.text.to_string(),
-                langs: post.record.langs.as_ref().map_or_else(Vec::new, |langs| {
-                    langs.iter().map(ToString::to_string).collect()
-                }),
-                emoji_sequence: extract_emojis(post.record.text.as_str()),
-                extras_json: record_extras_json(post)?,
-            })
-        })
+        .map(|post| archive_row_from_post(&parsed.commit.did, post, &normalizer))
         .collect()
+}
+
+/// Convert one parsed post into an archive row without retaining the whole repo.
+///
+/// # Errors
+///
+/// Returns [`ArchiveError`] if record extras cannot be serialized without loss.
+pub fn archive_row_from_post(
+    did: &str,
+    post: &PostRecord,
+    normalizer: &NormalizerVersion,
+) -> Result<ArchivePostRow, ArchiveError> {
+    let created_at = post.record.created_at.as_str();
+    let classified = classify_created_at(Some(created_at));
+    Ok(ArchivePostRow {
+        did: did.to_owned(),
+        rkey: post.rkey.clone(),
+        cid: post.cid.clone(),
+        normalizer: normalizer.clone(),
+        account_status: None,
+        record_status: None,
+        public_content_label: None,
+        created_at_raw: classified.raw,
+        created_at_normalized: classified.normalized,
+        created_at_parse_status: classified.status,
+        text: post.record.text.to_string(),
+        langs: post.record.langs.as_ref().map_or_else(Vec::new, |langs| {
+            langs.iter().map(ToString::to_string).collect()
+        }),
+        emoji_sequence: extract_emojis(post.record.text.as_str()),
+        extras_json: record_extras_json(post)?,
+    })
 }
 
 /// Current vertical-slice normalizer identity.
@@ -301,6 +312,364 @@ pub fn write_archive_artifacts(
     })
 }
 
+/// Streaming writer for one repo's archive artifacts.
+pub struct StreamingArchiveSink {
+    output_dir: PathBuf,
+    safe_did: String,
+    parquet_path: PathBuf,
+    parquet_temp_path: PathBuf,
+    receipt_path: PathBuf,
+    object_receipt_path: PathBuf,
+    manifest_path: PathBuf,
+    emoji_projection_path: PathBuf,
+    emoji_projection_temp_path: PathBuf,
+    writer: Option<ArrowWriter<File>>,
+    schema: Arc<Schema>,
+    batch: Vec<ArchivePostRow>,
+    rows_hash: Sha256,
+    emoji_projection_hash: Sha256,
+    archived_post_rows_count: u64,
+    emoji_posts_count: u64,
+    emoji_occurrences_count: u64,
+    emoji_rows: u64,
+    min_created_at_normalized: Option<String>,
+    max_created_at_normalized: Option<String>,
+    normalizer: NormalizerVersion,
+    emoji_file: File,
+}
+
+/// Summary fields needed to finish a streaming repo receipt.
+#[derive(Debug, Clone)]
+pub struct StreamingReceiptInput {
+    pub reachable_records_count: u64,
+    pub reachable_post_records_count: u64,
+    pub post_decode_error_count: u64,
+    pub profile_row_hash: Option<String>,
+    pub mst_root_cid: Option<String>,
+    pub commit_cid: Option<String>,
+}
+
+impl StreamingArchiveSink {
+    /// Create a streaming sink for one repo.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArchiveError`] if local files or the `Parquet` writer cannot be opened.
+    pub fn new(output_dir: &Path, did: &str) -> Result<Self, ArchiveError> {
+        fs::create_dir_all(output_dir)?;
+        let safe_did = safe_file_component(did);
+        let parquet_path = output_dir.join(format!("{safe_did}.posts.parquet"));
+        let parquet_temp_path = temp_path_for(&parquet_path)?;
+        let receipt_path = output_dir.join(format!("{safe_did}.receipt.json"));
+        let object_receipt_path = output_dir.join(format!("{safe_did}.object-receipt.json"));
+        let manifest_path = output_dir.join(format!("{safe_did}.manifest.jsonl"));
+        let emoji_projection_path = output_dir.join(format!("{safe_did}.emoji.jsonl"));
+        let emoji_projection_temp_path = temp_path_for(&emoji_projection_path)?;
+        remove_if_exists(&parquet_temp_path)?;
+        remove_if_exists(&emoji_projection_temp_path)?;
+        let parquet_file = File::create(&parquet_temp_path)?;
+        let emoji_file = File::create(&emoji_projection_temp_path)?;
+        let schema = archive_schema();
+        let writer = ArrowWriter::try_new(
+            parquet_file,
+            Arc::clone(&schema),
+            Some(parquet_writer_properties()?),
+        )?;
+        Ok(Self {
+            output_dir: output_dir.to_path_buf(),
+            safe_did,
+            parquet_path,
+            parquet_temp_path,
+            receipt_path,
+            object_receipt_path,
+            manifest_path,
+            emoji_projection_path,
+            emoji_projection_temp_path,
+            writer: Some(writer),
+            schema,
+            batch: Vec::with_capacity(PARQUET_BATCH_ROWS),
+            rows_hash: Sha256::new(),
+            emoji_projection_hash: Sha256::new(),
+            archived_post_rows_count: 0,
+            emoji_posts_count: 0,
+            emoji_occurrences_count: 0,
+            emoji_rows: 0,
+            min_created_at_normalized: None,
+            max_created_at_normalized: None,
+            normalizer: current_normalizer(),
+            emoji_file,
+        })
+    }
+
+    /// Normalizer version used by this sink.
+    #[must_use]
+    pub const fn normalizer(&self) -> &NormalizerVersion {
+        &self.normalizer
+    }
+
+    /// Write one archive row into the streaming artifacts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArchiveError`] if hashing, JSONL writing, or `Parquet` batch writing fails.
+    pub fn push_row(&mut self, row: ArchivePostRow) -> Result<(), ArchiveError> {
+        hash_post_row_into(&mut self.rows_hash, &row)?;
+        self.archived_post_rows_count =
+            self.archived_post_rows_count
+                .checked_add(1)
+                .ok_or(ArchiveError::CountOverflow {
+                    field: "archived_post_rows_count",
+                })?;
+        if !row.emoji_sequence.is_empty() {
+            self.emoji_posts_count =
+                self.emoji_posts_count
+                    .checked_add(1)
+                    .ok_or(ArchiveError::CountOverflow {
+                        field: "emoji_posts_count",
+                    })?;
+        }
+        let row_occurrences = u64::try_from(row.emoji_sequence.len()).map_err(|_error| {
+            ArchiveError::CountOverflow {
+                field: "emoji_occurrences_count",
+            }
+        })?;
+        self.emoji_occurrences_count = self
+            .emoji_occurrences_count
+            .checked_add(row_occurrences)
+            .ok_or(ArchiveError::CountOverflow {
+                field: "emoji_occurrences_count",
+            })?;
+        update_min_max_created_at(
+            &mut self.min_created_at_normalized,
+            &mut self.max_created_at_normalized,
+            row.created_at_normalized.as_deref(),
+        );
+        for projection_row in emoji_projection_rows(&row)? {
+            hash_field(
+                &mut self.emoji_projection_hash,
+                &json_string(&projection_row)?,
+            )?;
+            serde_json::to_writer(&mut self.emoji_file, &projection_row)?;
+            self.emoji_file.write_all(b"\n")?;
+            self.emoji_rows =
+                self.emoji_rows
+                    .checked_add(1)
+                    .ok_or(ArchiveError::CountOverflow {
+                        field: "emoji_rows",
+                    })?;
+        }
+        self.batch.push(row);
+        if self.batch.len() >= PARQUET_BATCH_ROWS {
+            self.flush_batch()?;
+        }
+        Ok(())
+    }
+
+    /// Finish all artifacts and return the receipt plus artifact paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArchiveError`] for filesystem, hash, JSON, or `Parquet` failures.
+    pub fn finish(
+        mut self,
+        input: StreamingReceiptInput,
+        profile: Option<&ProfileRecord>,
+    ) -> Result<(RepoReceipt, ArchiveArtifacts), ArchiveError> {
+        self.finish_stream_files()?;
+        let receipt = self.build_streaming_receipt(input);
+        write_temp_rename(&self.receipt_path, |path| write_json_pretty(path, &receipt))?;
+        let receipt_hash = hash_serialized(&receipt)?;
+        let manifest = self.write_object_receipt_and_manifest(&receipt_hash)?;
+        let committed_profile = self.commit_profile(profile, &receipt)?;
+        let artifacts = self.into_artifacts(manifest, committed_profile);
+        Ok((receipt, artifacts))
+    }
+
+    fn finish_stream_files(&mut self) -> Result<(), ArchiveError> {
+        self.flush_batch()?;
+        self.writer
+            .take()
+            .ok_or(ArchiveError::CountOverflow {
+                field: "streaming_parquet_writer_missing",
+            })?
+            .close()?;
+        sync_file(&self.parquet_temp_path)?;
+        fs::rename(&self.parquet_temp_path, &self.parquet_path)?;
+        sync_parent_dir(&self.parquet_path)?;
+        self.emoji_file.sync_all()?;
+        fs::rename(
+            &self.emoji_projection_temp_path,
+            &self.emoji_projection_path,
+        )?;
+        sync_parent_dir(&self.emoji_projection_path)
+    }
+
+    fn build_streaming_receipt(&self, input: StreamingReceiptInput) -> RepoReceipt {
+        let post_rows_hash = hex::encode(self.rows_hash.clone().finalize());
+        RepoReceipt {
+            fetch_method: FetchMethod::GetRepo,
+            completeness_class: CompletenessClass::SnapshotComplete,
+            reachable_records_count: input.reachable_records_count,
+            reachable_post_records_count: input.reachable_post_records_count,
+            archived_post_rows_count: self.archived_post_rows_count,
+            post_decode_error_count: input.post_decode_error_count,
+            emoji_posts_count: self.emoji_posts_count,
+            emoji_occurrences_count: self.emoji_occurrences_count,
+            mst_root_cid: input.mst_root_cid,
+            commit_cid: input.commit_cid,
+            archive_rows_hash: post_rows_hash.clone(),
+            post_rows_hash,
+            emoji_projection_hash: hex::encode(self.emoji_projection_hash.clone().finalize()),
+            profile_row_hash: input.profile_row_hash,
+            normalizer: self.normalizer.clone(),
+            repo_commit_signature_verified: false,
+            identity_verified: false,
+        }
+    }
+
+    fn write_object_receipt_and_manifest(
+        &self,
+        receipt_hash: &str,
+    ) -> Result<LocalManifestEntry, ArchiveError> {
+        let parquet_digest = hash_file_for_archive(&self.parquet_path)?;
+        let manifest = self.local_streaming_manifest(parquet_digest, receipt_hash);
+        let object_receipt = self.streaming_object_receipt(&manifest, receipt_hash);
+        write_temp_rename(&self.object_receipt_path, |path| {
+            write_json_pretty(path, &object_receipt)
+        })?;
+        write_temp_rename(&self.manifest_path, |path| {
+            let mut file = File::create(path)?;
+            let entry = crate::commit::ManifestEntry {
+                run_id: manifest.run_id.clone(),
+                shard: manifest.shard.clone(),
+                file_sequence: manifest.file_sequence,
+                dataset: manifest.dataset.clone(),
+                object_path: format!("{}.posts.parquet", self.safe_did),
+                row_count: manifest.row_count,
+                bytes: manifest.bytes,
+                content_hash: manifest.content_hash.clone(),
+                min_created_at_normalized: manifest.min_created_at_normalized.clone(),
+                max_created_at_normalized: manifest.max_created_at_normalized.clone(),
+                receipt_hash: manifest.receipt_hash.clone(),
+                normalizer: manifest.normalizer.clone(),
+                schema_version: manifest.schema_version,
+            };
+            serde_json::to_writer(&mut file, &entry)?;
+            file.write_all(b"\n")?;
+            Ok(())
+        })?;
+        Ok(manifest)
+    }
+
+    fn local_streaming_manifest(
+        &self,
+        parquet_digest: ArchiveFileDigest,
+        receipt_hash: &str,
+    ) -> LocalManifestEntry {
+        LocalManifestEntry {
+            run_id: "fetch-one-local".to_owned(),
+            shard: "single".to_owned(),
+            file_sequence: 1,
+            dataset: "raw_archive_posts".to_owned(),
+            local_path: self.parquet_path.clone(),
+            row_count: self.archived_post_rows_count,
+            bytes: parquet_digest.bytes,
+            content_hash: parquet_digest.sha256,
+            min_created_at_normalized: self.min_created_at_normalized.clone(),
+            max_created_at_normalized: self.max_created_at_normalized.clone(),
+            receipt_hash: receipt_hash.to_owned(),
+            schema_version: ARCHIVE_SCHEMA_VERSION,
+            normalizer: self.normalizer.clone(),
+        }
+    }
+
+    fn streaming_object_receipt(
+        &self,
+        manifest: &LocalManifestEntry,
+        receipt_hash: &str,
+    ) -> crate::commit::Receipt {
+        crate::commit::Receipt {
+            protocol_version: 1,
+            run_id: manifest.run_id.clone(),
+            shard: manifest.shard.clone(),
+            file_sequence: manifest.file_sequence,
+            dataset: manifest.dataset.clone(),
+            object_path: format!("{}.posts.parquet", self.safe_did),
+            row_count: manifest.row_count,
+            bytes: manifest.bytes,
+            content_hash: manifest.content_hash.clone(),
+            receipt_hash: receipt_hash.to_owned(),
+            schema_version: manifest.schema_version,
+        }
+    }
+
+    fn commit_profile(
+        &self,
+        profile: Option<&ProfileRecord>,
+        receipt: &RepoReceipt,
+    ) -> Result<Option<crate::commit::Artifact>, ArchiveError> {
+        let store = LocalStore::new(&self.output_dir);
+        profile
+            .map(|profile| {
+                commit_profile_sidecar(
+                    &store,
+                    PathBuf::from(format!("{}.profile.json", self.safe_did)),
+                    PathBuf::from(format!("{}.profile.object-receipt.json", self.safe_did)),
+                    PathBuf::from(format!("{}.profile.manifest.jsonl", self.safe_did)),
+                    profile,
+                    receipt,
+                )
+            })
+            .transpose()
+    }
+
+    fn into_artifacts(
+        self,
+        manifest: LocalManifestEntry,
+        committed_profile: Option<crate::commit::Artifact>,
+    ) -> ArchiveArtifacts {
+        ArchiveArtifacts {
+            parquet_path: self.parquet_path.clone(),
+            receipt_path: self.receipt_path.clone(),
+            object_receipt_path: self.object_receipt_path.clone(),
+            manifest_path: self.manifest_path.clone(),
+            emoji_projection_path: self.emoji_projection_path.clone(),
+            profile_sidecar_path: committed_profile
+                .as_ref()
+                .map(|artifact| artifact.object_path.clone()),
+            profile_sidecar_receipt_path: committed_profile
+                .as_ref()
+                .map(|artifact| artifact.receipt_path.clone()),
+            profile_sidecar_manifest_path: committed_profile.map(|artifact| artifact.manifest_path),
+            manifest,
+            emoji_rows: self.emoji_rows,
+        }
+    }
+
+    fn flush_batch(&mut self) -> Result<(), ArchiveError> {
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+        let batch = post_record_batch(&self.schema, &self.batch)?;
+        self.writer
+            .as_mut()
+            .ok_or(ArchiveError::CountOverflow {
+                field: "streaming_parquet_writer_missing",
+            })?
+            .write(&batch)?;
+        self.batch.clear();
+        Ok(())
+    }
+}
+
+impl Drop for StreamingArchiveSink {
+    fn drop(&mut self) {
+        self.writer.take();
+        let _ignored = fs::remove_file(&self.parquet_temp_path);
+        let _ignored = fs::remove_file(&self.emoji_projection_temp_path);
+    }
+}
+
 /// Read raw archive post rows from the Stage D Parquet shape.
 ///
 /// # Errors
@@ -360,23 +729,27 @@ pub fn build_repo_receipt(input: RepoReceiptInput<'_>) -> Result<RepoReceipt, Ar
 pub fn hash_post_rows(rows: &[ArchivePostRow]) -> Result<String, ArchiveError> {
     let mut hasher = Sha256::new();
     for row in rows {
-        hash_field(&mut hasher, POST_COLLECTION)?;
-        hash_field(&mut hasher, &row.did)?;
-        hash_field(&mut hasher, &row.rkey)?;
-        hash_field(&mut hasher, &row.cid)?;
-        hash_normalizer(&mut hasher, &row.normalizer)?;
-        hash_optional_field(&mut hasher, row.account_status.as_deref())?;
-        hash_optional_field(&mut hasher, row.record_status.as_deref())?;
-        hash_optional_field(&mut hasher, row.public_content_label.as_deref())?;
-        hash_optional_field(&mut hasher, row.created_at_raw.as_deref())?;
-        hash_optional_field(&mut hasher, row.created_at_normalized.as_deref())?;
-        hash_field(&mut hasher, row.created_at_parse_status.as_str())?;
-        hash_field(&mut hasher, &row.text)?;
-        hash_string_slice(&mut hasher, &row.langs)?;
-        hash_string_slice(&mut hasher, &row.emoji_sequence)?;
-        hash_field(&mut hasher, &canonical_json(&row.extras_json)?)?;
+        hash_post_row_into(&mut hasher, row)?;
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn hash_post_row_into(hasher: &mut Sha256, row: &ArchivePostRow) -> Result<(), ArchiveError> {
+    hash_field(hasher, POST_COLLECTION)?;
+    hash_field(hasher, &row.did)?;
+    hash_field(hasher, &row.rkey)?;
+    hash_field(hasher, &row.cid)?;
+    hash_normalizer(hasher, &row.normalizer)?;
+    hash_optional_field(hasher, row.account_status.as_deref())?;
+    hash_optional_field(hasher, row.record_status.as_deref())?;
+    hash_optional_field(hasher, row.public_content_label.as_deref())?;
+    hash_optional_field(hasher, row.created_at_raw.as_deref())?;
+    hash_optional_field(hasher, row.created_at_normalized.as_deref())?;
+    hash_field(hasher, row.created_at_parse_status.as_str())?;
+    hash_field(hasher, &row.text)?;
+    hash_string_slice(hasher, &row.langs)?;
+    hash_string_slice(hasher, &row.emoji_sequence)?;
+    hash_field(hasher, &canonical_json(&row.extras_json)?)
 }
 
 /// Hash a profile sidecar row when Stage C extracted one.
@@ -408,7 +781,22 @@ fn write_posts_parquet_to_writer<W>(writer: W, rows: &[ArchivePostRow]) -> Resul
 where
     W: Write + Send,
 {
-    let schema = Arc::new(Schema::new(vec![
+    let schema = archive_schema();
+    let mut writer = ArrowWriter::try_new(
+        writer,
+        Arc::clone(&schema),
+        Some(parquet_writer_properties()?),
+    )?;
+    for chunk in rows.chunks(PARQUET_BATCH_ROWS) {
+        let batch = post_record_batch(&schema, chunk)?;
+        writer.write(&batch)?;
+    }
+    writer.close()?;
+    Ok(())
+}
+
+fn archive_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
         Field::new("did", DataType::Utf8, false),
         Field::new("rkey", DataType::Utf8, false),
         Field::new("cid", DataType::Utf8, false),
@@ -427,21 +815,16 @@ where
         Field::new("langs_json", DataType::Utf8, false),
         Field::new("emoji_sequence_json", DataType::Utf8, false),
         Field::new("extras_json", DataType::Utf8, false),
-    ]));
+    ]))
+}
 
-    let props = WriterProperties::builder()
+fn parquet_writer_properties() -> Result<WriterProperties, ArchiveError> {
+    Ok(WriterProperties::builder()
         .set_compression(Compression::ZSTD(
             ZstdLevel::try_new(3)
                 .map_err(|error| ArchiveError::InvalidCompression(error.to_string()))?,
         ))
-        .build();
-    let mut writer = ArrowWriter::try_new(writer, Arc::clone(&schema), Some(props))?;
-    for chunk in rows.chunks(PARQUET_BATCH_ROWS) {
-        let batch = post_record_batch(&schema, chunk)?;
-        writer.write(&batch)?;
-    }
-    writer.close()?;
-    Ok(())
+        .build())
 }
 
 fn post_record_batch(
@@ -807,6 +1190,48 @@ fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), Archive
     Ok(())
 }
 
+fn remove_if_exists(path: &Path) -> Result<(), ArchiveError> {
+    if path.try_exists()? {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArchiveFileDigest {
+    bytes: u64,
+    sha256: String,
+}
+
+fn hash_file_for_archive(path: &Path) -> Result<ArchiveFileDigest, ArchiveError> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = vec![0_u8; 65_536].into_boxed_slice();
+    loop {
+        let read = std::io::Read::read(&mut file, &mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let chunk = buffer.get(..read).ok_or(ArchiveError::CountOverflow {
+            field: "archive_file_hash_chunk",
+        })?;
+        hasher.update(chunk);
+        let read_u64 = u64::try_from(read).map_err(|_error| ArchiveError::CountOverflow {
+            field: "archive_file_hash_bytes",
+        })?;
+        bytes = bytes
+            .checked_add(read_u64)
+            .ok_or(ArchiveError::CountOverflow {
+                field: "archive_file_hash_bytes",
+            })?;
+    }
+    Ok(ArchiveFileDigest {
+        bytes,
+        sha256: hex::encode(hasher.finalize()),
+    })
+}
+
 fn hash_serialized<T: Serialize>(value: &T) -> Result<String, ArchiveError> {
     let bytes = serde_json::to_vec(value)?;
     let mut hasher = Sha256::new();
@@ -819,6 +1244,22 @@ fn min_created_at(rows: &[ArchivePostRow]) -> Option<String> {
         .filter_map(|row| row.created_at_normalized.as_deref())
         .min()
         .map(ToOwned::to_owned)
+}
+
+fn update_min_max_created_at(
+    min_value: &mut Option<String>,
+    max_value: &mut Option<String>,
+    value: Option<&str>,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    if min_value.as_deref().is_none_or(|current| value < current) {
+        *min_value = Some(value.to_owned());
+    }
+    if max_value.as_deref().is_none_or(|current| value > current) {
+        *max_value = Some(value.to_owned());
+    }
 }
 
 fn max_created_at(rows: &[ArchivePostRow]) -> Option<String> {
@@ -1237,9 +1678,16 @@ impl From<crate::commit::Error> for ArchiveError {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use super::{
         ArchivePostRow, CreatedAtParseStatus, NormalizerVersion, RepoReceiptInput,
-        build_repo_receipt, classify_created_at, extract_emojis, hash_post_rows,
+        StreamingArchiveSink, StreamingReceiptInput, build_repo_receipt, classify_created_at,
+        extract_emojis, hash_post_rows, temp_path_for,
     };
 
     fn normalizer() -> NormalizerVersion {
@@ -1324,5 +1772,66 @@ mod tests {
         let valid = classify_created_at(Some("2020-01-02T03:04:05Z"));
         assert_eq!(valid.status, CreatedAtParseStatus::Valid);
         assert_eq!(valid.normalized, Some("2020-01-02T03:04:05Z".to_owned()));
+    }
+
+    #[test]
+    fn unfinished_streaming_sink_removes_temp_files_on_drop() {
+        let output_dir = unique_test_dir("streaming-sink-drop");
+        fs::create_dir_all(&output_dir).expect("create test archive dir");
+        let parquet_temp =
+            temp_path_for(&output_dir.join("did_plc_cleanup.posts.parquet")).expect("temp path");
+        let emoji_temp =
+            temp_path_for(&output_dir.join("did_plc_cleanup.emoji.jsonl")).expect("temp path");
+
+        let sink = StreamingArchiveSink::new(&output_dir, "did:plc:cleanup").expect("create sink");
+        assert!(parquet_temp.exists());
+        assert!(emoji_temp.exists());
+        drop(sink);
+
+        assert!(!parquet_temp.exists());
+        assert!(!emoji_temp.exists());
+        fs::remove_dir_all(output_dir).expect("remove test archive dir");
+    }
+
+    #[test]
+    fn streaming_sink_writes_committed_manifest_entry() {
+        let output_dir = unique_test_dir("streaming-sink-manifest");
+        fs::create_dir_all(&output_dir).expect("create test archive dir");
+        let mut sink =
+            StreamingArchiveSink::new(&output_dir, "did:plc:manifest").expect("create sink");
+        sink.push_row(row("hello ✅", &["✅"])).expect("push row");
+        let (_receipt, artifacts) = sink
+            .finish(
+                StreamingReceiptInput {
+                    reachable_records_count: 1,
+                    reachable_post_records_count: 1,
+                    post_decode_error_count: 0,
+                    profile_row_hash: None,
+                    mst_root_cid: Some("root".to_owned()),
+                    commit_cid: Some("commit".to_owned()),
+                },
+                None,
+            )
+            .expect("finish sink");
+
+        let manifest_json = fs::read_to_string(&artifacts.manifest_path).expect("read manifest");
+        let entry: crate::commit::ManifestEntry =
+            serde_json::from_str(&manifest_json).expect("parse committed manifest");
+
+        assert_eq!(entry.object_path, "did_plc_manifest.posts.parquet");
+        assert_eq!(entry.dataset, "raw_archive_posts");
+        assert_eq!(entry.row_count, 1);
+        fs::remove_dir_all(output_dir).expect("remove test archive dir");
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "emojistats-backfill-{name}-{}-{nanos}",
+            std::process::id()
+        ))
     }
 }
