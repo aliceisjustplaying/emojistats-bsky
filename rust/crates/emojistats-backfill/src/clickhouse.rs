@@ -1,7 +1,7 @@
 //! `ClickHouse` schema and insert-format skeleton for the v2 derive lane.
 
 use reqwest::{
-    Method, Request, Url,
+    Client, Method, Request, Response, StatusCode, Url,
     header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT},
 };
 use serde::Serialize;
@@ -16,6 +16,7 @@ pub const JSON_EACH_ROW_FORMAT: &str = "JSONEachRow";
 
 const INSERT_DEDUPLICATE_SETTING: &str = "insert_deduplicate";
 const INSERT_DEDUPLICATION_TOKEN_SETTING: &str = "insert_deduplication_token";
+const CLICKHOUSE_RESPONSE_SNIPPET_MAX_CHARS: usize = 4_096;
 const CLICKHOUSE_USER_HEADER: HeaderName = HeaderName::from_static("x-clickhouse-user");
 const CLICKHOUSE_KEY_HEADER: HeaderName = HeaderName::from_static("x-clickhouse-key");
 const CLICKHOUSE_DATABASE_HEADER: HeaderName = HeaderName::from_static("x-clickhouse-database");
@@ -120,12 +121,26 @@ impl ClickHouseClientConfig {
         &self,
         payload: &ClickHouseInsertPayload,
     ) -> Result<Request, ClickHouseSchemaError> {
+        let client = reqwest::Client::new();
+        self.insert_request_with_client(&client, payload)
+    }
+
+    /// Build a `reqwest` request for an insert payload using the caller's client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClickHouseSchemaError`] if a header value cannot be represented or request
+    /// construction fails.
+    pub fn insert_request_with_client(
+        &self,
+        client: &Client,
+        payload: &ClickHouseInsertPayload,
+    ) -> Result<Request, ClickHouseSchemaError> {
         let query = format!(
             "INSERT INTO {} FORMAT {}",
             payload.table.name(),
             payload.format
         );
-        let client = reqwest::Client::new();
         let mut request = client
             .request(Method::POST, self.url.clone())
             .headers(self.headers()?)
@@ -146,6 +161,20 @@ impl ClickHouseClientConfig {
             HeaderValue::from_static("application/x-ndjson; charset=utf-8"),
         );
         Ok(request)
+    }
+
+    /// Execute a batch of insert payloads in the order they were built.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClickHouseInsertError`] when a request cannot be built, the HTTP transport fails,
+    /// or `ClickHouse` returns a non-2xx status.
+    pub async fn execute_insert_payloads(
+        &self,
+        client: &Client,
+        payloads: &[ClickHouseInsertPayload],
+    ) -> Result<Vec<ClickHouseInsertReceipt>, ClickHouseInsertError> {
+        execute_insert_payloads(client, self, payloads).await
     }
 
     fn headers(&self) -> Result<HeaderMap, ClickHouseSchemaError> {
@@ -191,6 +220,176 @@ pub enum ClickHouseSchemaError {
     /// Request construction failed.
     #[error("failed to build ClickHouse HTTP request")]
     Request(reqwest::Error),
+}
+
+/// Insert metadata retained on success and failure so retries stay idempotent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClickHouseInsertContext {
+    /// Target table for the attempted insert.
+    pub table: ClickHouseTable,
+    /// Number of rows attempted.
+    pub row_count: usize,
+    /// Idempotent batch token sent as `insert_deduplication_token`.
+    pub dedupe_token: String,
+    /// Whether the request enabled `insert_deduplicate`.
+    pub insert_deduplicate: bool,
+}
+
+impl ClickHouseInsertContext {
+    fn from_payload(payload: &ClickHouseInsertPayload) -> Self {
+        Self {
+            table: payload.table,
+            row_count: payload.row_count,
+            dedupe_token: payload.dedupe_token.clone(),
+            insert_deduplicate: true,
+        }
+    }
+}
+
+/// Successful `ClickHouse` insert receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClickHouseInsertReceipt {
+    /// Insert metadata needed for replay/debugging.
+    pub context: ClickHouseInsertContext,
+    /// HTTP status returned by `ClickHouse`.
+    pub status: u16,
+    /// Capped response body snippet, if `ClickHouse` returned one.
+    pub response_snippet: Option<String>,
+}
+
+/// Runtime failures from executing `ClickHouse` insert payloads.
+#[derive(Debug, thiserror::Error)]
+pub enum ClickHouseInsertError {
+    /// Request construction failed before the HTTP call.
+    #[error("failed to build ClickHouse insert request for {context:?}")]
+    RequestBuild {
+        /// Insert metadata needed for replay/debugging.
+        context: ClickHouseInsertContext,
+        /// Underlying request-build failure.
+        #[source]
+        source: ClickHouseSchemaError,
+    },
+    /// Transport failed while sending a request or reading a response body.
+    #[error("ClickHouse insert transport failed for {context:?}")]
+    Transport {
+        /// Insert metadata needed for replay/debugging.
+        context: ClickHouseInsertContext,
+        /// Underlying transport failure.
+        #[source]
+        source: reqwest::Error,
+    },
+    /// `ClickHouse` returned a retryable non-2xx status.
+    #[error("retryable ClickHouse insert status {status} for {context:?}: {response_snippet:?}")]
+    RetryableStatus {
+        /// Insert metadata needed for replay/debugging.
+        context: ClickHouseInsertContext,
+        /// HTTP status returned by `ClickHouse`.
+        status: u16,
+        /// Capped response body snippet.
+        response_snippet: Option<String>,
+    },
+    /// `ClickHouse` returned a permanent non-2xx status.
+    #[error("permanent ClickHouse insert status {status} for {context:?}: {response_snippet:?}")]
+    PermanentStatus {
+        /// Insert metadata needed for replay/debugging.
+        context: ClickHouseInsertContext,
+        /// HTTP status returned by `ClickHouse`.
+        status: u16,
+        /// Capped response body snippet.
+        response_snippet: Option<String>,
+    },
+}
+
+/// Execute insert payloads in order through the provided HTTP client.
+///
+/// # Errors
+///
+/// Returns [`ClickHouseInsertError`] when a request cannot be built, the HTTP transport fails, or
+/// `ClickHouse` returns a non-2xx status.
+pub async fn execute_insert_payloads(
+    client: &Client,
+    config: &ClickHouseClientConfig,
+    payloads: &[ClickHouseInsertPayload],
+) -> Result<Vec<ClickHouseInsertReceipt>, ClickHouseInsertError> {
+    let mut receipts = Vec::with_capacity(payloads.len());
+
+    for payload in payloads {
+        let context = ClickHouseInsertContext::from_payload(payload);
+        let request = config
+            .insert_request_with_client(client, payload)
+            .map_err(|source| ClickHouseInsertError::RequestBuild {
+                context: context.clone(),
+                source,
+            })?;
+        let response =
+            client
+                .execute(request)
+                .await
+                .map_err(|source| ClickHouseInsertError::Transport {
+                    context: context.clone(),
+                    source,
+                })?;
+        let status = response.status();
+        let response_snippet = response_snippet(response).await.map_err(|source| {
+            ClickHouseInsertError::Transport {
+                context: context.clone(),
+                source,
+            }
+        })?;
+
+        if !status.is_success() {
+            return Err(classify_insert_status(context, status, response_snippet));
+        }
+
+        receipts.push(ClickHouseInsertReceipt {
+            context,
+            status: status.as_u16(),
+            response_snippet,
+        });
+    }
+
+    Ok(receipts)
+}
+
+async fn response_snippet(response: Response) -> Result<Option<String>, reqwest::Error> {
+    let body = response.text().await?;
+    let snippet = body
+        .chars()
+        .take(CLICKHOUSE_RESPONSE_SNIPPET_MAX_CHARS)
+        .collect::<String>();
+    if snippet.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(snippet))
+    }
+}
+
+fn classify_insert_status(
+    context: ClickHouseInsertContext,
+    status: StatusCode,
+    response_snippet: Option<String>,
+) -> ClickHouseInsertError {
+    if is_retryable_insert_status(status) {
+        ClickHouseInsertError::RetryableStatus {
+            context,
+            status: status.as_u16(),
+            response_snippet,
+        }
+    } else {
+        ClickHouseInsertError::PermanentStatus {
+            context,
+            status: status.as_u16(),
+            response_snippet,
+        }
+    }
+}
+
+fn is_retryable_insert_status(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::CONFLICT
+        || status == StatusCode::TOO_EARLY
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
 }
 
 /// Return all v2 derive `ClickHouse` table definitions as executable SQL statements.
@@ -414,12 +613,22 @@ impl<'a> TotalPostCounterInsertRow<'a> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::arithmetic_side_effects)]
+
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        thread,
+    };
+
+    use reqwest::{Client, StatusCode};
     use serde_json::Value;
 
     use super::{
-        CLICKHOUSE_DATABASE_HEADER, CLICKHOUSE_KEY_HEADER, CLICKHOUSE_USER_HEADER,
-        ClickHouseClientConfig, ClickHouseSchemaError, ClickHouseTable, JSON_EACH_ROW_FORMAT,
-        create_schema_sql, derive_insert_payloads,
+        CLICKHOUSE_DATABASE_HEADER, CLICKHOUSE_KEY_HEADER, CLICKHOUSE_RESPONSE_SNIPPET_MAX_CHARS,
+        CLICKHOUSE_USER_HEADER, ClickHouseClientConfig, ClickHouseInsertContext,
+        ClickHouseInsertError, ClickHouseSchemaError, ClickHouseTable, JSON_EACH_ROW_FORMAT,
+        classify_insert_status, create_schema_sql, derive_insert_payloads, execute_insert_payloads,
     };
     use crate::{
         archive::EmojiProjectionRow,
@@ -473,6 +682,85 @@ mod tests {
 
     fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
         value.get(name).expect("field should exist")
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RecordedRequest {
+        target: String,
+        body: String,
+    }
+
+    fn spawn_http_server(
+        responses: Vec<(u16, String)>,
+    ) -> (String, thread::JoinHandle<Vec<RecordedRequest>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
+        let addr = listener.local_addr().expect("server addr");
+        let handle = thread::spawn(move || {
+            responses
+                .into_iter()
+                .map(|(status, body)| {
+                    let (mut stream, _addr) = listener.accept().expect("accept request");
+                    let request = read_http_request(&mut stream);
+                    write_http_response(&mut stream, status, &body);
+                    request
+                })
+                .collect::<Vec<_>>()
+        });
+
+        (format!("http://{addr}"), handle)
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> RecordedRequest {
+        let mut headers = Vec::new();
+        let mut byte = [0_u8; 1];
+        loop {
+            let read = stream.read(&mut byte).expect("read request headers");
+            if read == 0 {
+                break;
+            }
+            headers.push(byte[0]);
+            if headers.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let header_text = String::from_utf8(headers).expect("utf8 headers");
+        let content_length = header_text
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().expect("content length"))
+            })
+            .unwrap_or(0);
+        let mut body = vec![0_u8; content_length];
+        stream.read_exact(&mut body).expect("read request body");
+        let request_line = header_text.lines().next().expect("request line").to_owned();
+        let target = request_line
+            .split_whitespace()
+            .nth(1)
+            .expect("request target")
+            .to_owned();
+
+        RecordedRequest {
+            target,
+            body: String::from_utf8(body).expect("utf8 body"),
+        }
+    }
+
+    fn write_http_response(stream: &mut TcpStream, status: u16, body: &str) {
+        let reason = match status {
+            200 => "OK",
+            400 => "Bad Request",
+            503 => "Service Unavailable",
+            _ => "Status",
+        };
+        write!(
+            stream,
+            "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("write response");
     }
 
     #[test]
@@ -567,6 +855,140 @@ mod tests {
             request.headers().get(&CLICKHOUSE_DATABASE_HEADER),
             Some(&"emojistats".parse().expect("header value"))
         );
+    }
+
+    #[tokio::test]
+    async fn execute_insert_payloads_sends_payloads_in_order() {
+        let payloads = derive_insert_payloads(&batch()).expect("payloads");
+        let (url, handle) = spawn_http_server(vec![
+            (200, "emoji-ok".to_owned()),
+            (200, "counter-ok".to_owned()),
+        ]);
+        let config = ClickHouseClientConfig::new(
+            &url,
+            "emojistats",
+            "alice",
+            "secret",
+            "emojistats-backfill-test",
+        )
+        .expect("client config");
+        let client = Client::new();
+
+        let receipts = execute_insert_payloads(&client, &config, &payloads)
+            .await
+            .expect("insert payloads");
+        let requests = handle.join().expect("server thread");
+
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(
+            receipts.first().expect("first receipt").context.table,
+            ClickHouseTable::EmojiServing
+        );
+        assert_eq!(
+            receipts.get(1).expect("second receipt").context.table,
+            ClickHouseTable::TotalPostCounter
+        );
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .first()
+                .expect("first request")
+                .target
+                .contains("v2_emoji_serving")
+        );
+        assert!(
+            requests
+                .get(1)
+                .expect("second request")
+                .target
+                .contains("v2_total_post_counters")
+        );
+        assert!(
+            requests
+                .first()
+                .expect("first request")
+                .target
+                .contains("insert_deduplication_token=derive%3Atest-token")
+        );
+        assert_eq!(
+            requests.first().expect("first request").body,
+            payloads.first().expect("first payload").body
+        );
+        assert_eq!(
+            requests.get(1).expect("second request").body,
+            payloads.get(1).expect("second payload").body
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_insert_payloads_classifies_retryable_status_with_snippet() {
+        let payload = derive_insert_payloads(&batch())
+            .expect("payloads")
+            .remove(0);
+        let response_body = format!(
+            "too many parts {}",
+            "x".repeat(CLICKHOUSE_RESPONSE_SNIPPET_MAX_CHARS + 20)
+        );
+        let (url, handle) = spawn_http_server(vec![(503, response_body)]);
+        let config = ClickHouseClientConfig::new(
+            &url,
+            "emojistats",
+            "alice",
+            "secret",
+            "emojistats-backfill-test",
+        )
+        .expect("client config");
+        let client = Client::new();
+
+        let error = execute_insert_payloads(&client, &config, &[payload])
+            .await
+            .expect_err("retryable status");
+        let requests = handle.join().expect("server thread");
+
+        assert_eq!(requests.len(), 1);
+        match error {
+            ClickHouseInsertError::RetryableStatus {
+                context,
+                status,
+                response_snippet,
+            } => {
+                assert_eq!(status, 503);
+                assert_eq!(context.table, ClickHouseTable::EmojiServing);
+                assert_eq!(context.dedupe_token, "derive:test-token");
+                assert!(context.insert_deduplicate);
+                assert_eq!(
+                    response_snippet.expect("response snippet").chars().count(),
+                    CLICKHOUSE_RESPONSE_SNIPPET_MAX_CHARS
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_insert_status_marks_client_errors_permanent() {
+        let context = ClickHouseInsertContext {
+            table: ClickHouseTable::TotalPostCounter,
+            row_count: 1,
+            dedupe_token: "derive:test-token".to_owned(),
+            insert_deduplicate: true,
+        };
+
+        let error =
+            classify_insert_status(context, StatusCode::BAD_REQUEST, Some("syntax".to_owned()));
+
+        match error {
+            ClickHouseInsertError::PermanentStatus {
+                context,
+                status,
+                response_snippet,
+            } => {
+                assert_eq!(status, 400);
+                assert_eq!(context.table, ClickHouseTable::TotalPostCounter);
+                assert_eq!(response_snippet.as_deref(), Some("syntax"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
