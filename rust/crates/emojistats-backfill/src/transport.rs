@@ -19,6 +19,7 @@ use jacquard_common::{
     types::did::Did,
     xrpc::XrpcExt as _,
 };
+use serde::{Deserialize, Serialize};
 use tokio::time;
 
 const DEFAULT_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -94,7 +95,8 @@ impl RateLimitSnapshot {
 }
 
 /// Terminal account states returned by `com.atproto.sync.getRepo`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
 pub enum AccountState {
     /// The repo does not exist on this host.
     RepoNotFound,

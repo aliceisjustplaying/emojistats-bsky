@@ -14,6 +14,10 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   `getRepo` to a spooled `CAR`, parses from the `CAR` path with block `CID` verification
   and `MST` completeness, writes `Parquet` posts, writes receipt + local manifest JSON, and
   derives compact emoji JSONL rows.
+- **Next-lane foundations started:** `ledger.rs` has retry/account-state transition types,
+  `commit.rs` has a local Storage Box-shaped committed-artifact protocol, `derive.rs` has
+  manifest-to-ClickHouse DTOs and dedupe tokening, and `canary.rs` encodes the stratified
+  canary policy/gate model. These are library foundations, not a wired fleet runner yet.
 - Real stress DID verified:
   `did:plc:vwzwgnygau7ed7b7wt5ux7y2` from `shiitake.us-east.host.bsky.network` spooled
   41,051,855 bytes, produced 6,407 post rows, 228 emoji rows, and carried 23,656 typed
@@ -41,12 +45,13 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
 
 ## Next roadmap
 
-- Add crawler ledger state and retry/account-state transitions around `fetch-one`.
-- Implement the Storage Box committed-manifest protocol: temp upload, verify, final rename,
-  receipt sidecar, manifest append only after the final object exists.
+- Persist crawler ledger state and wire retry/account-state transitions around `fetch-one`.
+- Wire archive artifact writes through the committed-artifact protocol and add the remote
+  Storage Box backend: temp upload, verify, final rename, receipt sidecar, manifest append
+  only after the final object exists.
 - Move emoji normalization into the shared WASM-able crate from the design before the
   browser/server serving path depends on it.
-- Add derive/ClickHouse ingest from committed manifest entries, then run the stratified
+- Wire derive/ClickHouse ingest from committed manifest entries, then run the stratified
   canary and fleet scheduler work.
 
 ### Defaulted design choices (revisit if needed)
