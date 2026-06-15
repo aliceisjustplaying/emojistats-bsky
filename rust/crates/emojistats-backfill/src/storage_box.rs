@@ -1,7 +1,9 @@
 //! Storage Box-shaped remote commit protocol skeleton.
 
 use std::{
+    io::Write,
     path::{Component, Path, PathBuf},
+    process::{Command as ProcessCommand, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -78,6 +80,23 @@ pub trait StorageBoxCommands {
 pub struct StorageBoxBackend<C> {
     config: StorageBoxConfig,
     commands: C,
+}
+
+/// SSH-based command configuration for a Hetzner Storage Box-compatible POSIX endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageBoxSshConfig {
+    /// SSH binary to execute locally.
+    pub ssh_program: PathBuf,
+    /// SSH destination, for example `u123456@u123456.your-storagebox.de`.
+    pub remote: String,
+    /// Extra SSH arguments, such as `-p`, `23`, or `-i`, `/path/to/key`.
+    pub ssh_args: Vec<String>,
+}
+
+/// Storage Box command executor backed by local `ssh` processes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshStorageBoxCommands {
+    config: StorageBoxSshConfig,
 }
 
 /// Completed remote commit result.
@@ -181,6 +200,160 @@ impl StorageBoxConfig {
     }
 }
 
+impl StorageBoxSshConfig {
+    /// Build an SSH command config for a remote Storage Box account.
+    #[must_use]
+    pub fn new(remote: impl Into<String>) -> Self {
+        Self {
+            ssh_program: PathBuf::from("ssh"),
+            remote: remote.into(),
+            ssh_args: Vec::new(),
+        }
+    }
+
+    /// Set the SSH binary path.
+    #[must_use]
+    pub fn with_ssh_program(mut self, ssh_program: impl Into<PathBuf>) -> Self {
+        self.ssh_program = ssh_program.into();
+        self
+    }
+
+    /// Add one SSH argument.
+    #[must_use]
+    pub fn with_ssh_arg(mut self, arg: impl Into<String>) -> Self {
+        self.ssh_args.push(arg.into());
+        self
+    }
+}
+
+impl SshStorageBoxCommands {
+    /// Build an SSH-backed Storage Box command executor.
+    #[must_use]
+    pub const fn new(config: StorageBoxSshConfig) -> Self {
+        Self { config }
+    }
+
+    fn upload_command(&self, remote_path: &str, bytes: &[u8]) -> Result<CommandSpec, CommandError> {
+        let parent = remote_parent(remote_path)?;
+        let script = format!(
+            "umask 077; mkdir -p -- {}; cat > {}",
+            shell_quote(&parent),
+            shell_quote(remote_path)
+        );
+        self.config
+            .ssh_command("upload", script, Some(bytes.to_vec()))
+    }
+
+    fn stat_len_command(&self, remote_path: &str) -> Result<CommandSpec, CommandError> {
+        validate_remote_path(remote_path)?;
+        let path = shell_quote(remote_path);
+        let script = format!("if [ -e {path} ]; then wc -c < {path}; fi");
+        self.config.ssh_command("stat", script, None)
+    }
+
+    fn sha256_command(&self, remote_path: &str) -> Result<CommandSpec, CommandError> {
+        validate_remote_path(remote_path)?;
+        let path = shell_quote(remote_path);
+        let script = format!("if [ -e {path} ]; then sha256sum -- {path} | awk '{{print $1}}'; fi");
+        self.config.ssh_command("sha256", script, None)
+    }
+
+    fn read_prefix_command(
+        &self,
+        remote_path: &str,
+        max_bytes: usize,
+    ) -> Result<CommandSpec, CommandError> {
+        validate_remote_path(remote_path)?;
+        let path = shell_quote(remote_path);
+        let script = format!(
+            "if [ -e {path} ]; then printf 'present\\n'; head -c {max_bytes} -- {path}; else printf 'absent\\n'; fi"
+        );
+        self.config.ssh_command("read_prefix", script, None)
+    }
+
+    fn rename_command(&self, from: &str, to: &str) -> Result<CommandSpec, CommandError> {
+        validate_remote_path(from)?;
+        let parent = remote_parent(to)?;
+        let script = format!(
+            "mkdir -p -- {}; mv -f -- {} {}",
+            shell_quote(&parent),
+            shell_quote(from),
+            shell_quote(to)
+        );
+        self.config.ssh_command("rename", script, None)
+    }
+
+    fn append_command(&self, remote_path: &str, bytes: &[u8]) -> Result<CommandSpec, CommandError> {
+        let parent = remote_parent(remote_path)?;
+        let script = format!(
+            "umask 077; mkdir -p -- {}; cat >> {}",
+            shell_quote(&parent),
+            shell_quote(remote_path)
+        );
+        self.config
+            .ssh_command("append", script, Some(bytes.to_vec()))
+    }
+}
+
+impl StorageBoxCommands for SshStorageBoxCommands {
+    fn upload(&mut self, remote_path: &str, bytes: &[u8]) -> Result<(), CommandError> {
+        run_command(self.upload_command(remote_path, bytes)?).map(|_stdout| ())
+    }
+
+    fn stat_len(&mut self, remote_path: &str) -> Result<Option<u64>, CommandError> {
+        let stdout = run_command(self.stat_len_command(remote_path)?)?;
+        let text = std::str::from_utf8(&stdout)
+            .map_err(|error| CommandError::new(format!("stat output was not UTF-8: {error}")))?;
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        trimmed.parse::<u64>().map(Some).map_err(|error| {
+            CommandError::new(format!("stat output was not a byte count: {error}"))
+        })
+    }
+
+    fn sha256(&mut self, remote_path: &str) -> Result<Option<String>, CommandError> {
+        let stdout = run_command(self.sha256_command(remote_path)?)?;
+        let text = std::str::from_utf8(&stdout)
+            .map_err(|error| CommandError::new(format!("sha256 output was not UTF-8: {error}")))?;
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(trimmed.to_owned()))
+        }
+    }
+
+    fn read_prefix(
+        &mut self,
+        remote_path: &str,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, CommandError> {
+        let stdout = run_command(self.read_prefix_command(remote_path, max_bytes)?)?;
+        stdout.strip_prefix(b"present\n").map_or_else(
+            || {
+                if stdout == b"absent\n" {
+                    Ok(None)
+                } else {
+                    Err(CommandError::new(
+                        "read prefix output had no presence marker",
+                    ))
+                }
+            },
+            |prefix| Ok(Some(prefix.to_vec())),
+        )
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), CommandError> {
+        run_command(self.rename_command(from, to)?).map(|_stdout| ())
+    }
+
+    fn append(&mut self, remote_path: &str, bytes: &[u8]) -> Result<(), CommandError> {
+        run_command(self.append_command(remote_path, bytes)?).map(|_stdout| ())
+    }
+}
+
 impl CommandError {
     /// Build a command error from a message.
     #[must_use]
@@ -198,6 +371,123 @@ impl std::fmt::Display for CommandError {
 }
 
 impl std::error::Error for CommandError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommandSpec {
+    operation: &'static str,
+    program: PathBuf,
+    args: Vec<String>,
+    stdin: Option<Vec<u8>>,
+}
+
+impl StorageBoxSshConfig {
+    fn ssh_command(
+        &self,
+        operation: &'static str,
+        script: String,
+        stdin: Option<Vec<u8>>,
+    ) -> Result<CommandSpec, CommandError> {
+        validate_remote(&self.remote)?;
+        let mut args = self.ssh_args.clone();
+        args.push(self.remote.clone());
+        args.push(script);
+        Ok(CommandSpec {
+            operation,
+            program: self.ssh_program.clone(),
+            args,
+            stdin,
+        })
+    }
+}
+
+fn run_command(spec: CommandSpec) -> Result<Vec<u8>, CommandError> {
+    let mut command = ProcessCommand::new(&spec.program);
+    command.args(&spec.args);
+    if spec.stdin.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| CommandError::new(format!("{} spawn failed: {error}", spec.operation)))?;
+    if let Some(stdin_bytes) = spec.stdin {
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            CommandError::new(format!("{} stdin was not available", spec.operation))
+        })?;
+        stdin.write_all(&stdin_bytes).map_err(|error| {
+            CommandError::new(format!("{} stdin write failed: {error}", spec.operation))
+        })?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| CommandError::new(format!("{} wait failed: {error}", spec.operation)))?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(CommandError::new(format!(
+            "{} exited with {}: {}",
+            spec.operation,
+            output.status,
+            stderr.trim()
+        )))
+    }
+}
+
+fn validate_remote(remote: &str) -> Result<(), CommandError> {
+    if remote.is_empty() {
+        return Err(CommandError::new("ssh remote must not be empty"));
+    }
+    if remote.starts_with('-') {
+        return Err(CommandError::new("ssh remote must not start with '-'"));
+    }
+    if remote.chars().any(char::is_control) {
+        return Err(CommandError::new("ssh remote contains a control character"));
+    }
+    Ok(())
+}
+
+fn validate_remote_path(path: &str) -> Result<(), CommandError> {
+    if !path.starts_with('/') {
+        return Err(CommandError::new(format!(
+            "remote path must be absolute: {path}"
+        )));
+    }
+    if path.chars().any(char::is_control) {
+        return Err(CommandError::new(format!(
+            "remote path contains a control character: {path}"
+        )));
+    }
+    if path
+        .split('/')
+        .any(|component| component == "." || component == "..")
+    {
+        return Err(CommandError::new(format!(
+            "remote path contains an unsafe component: {path}"
+        )));
+    }
+    Ok(())
+}
+
+fn remote_parent(path: &str) -> Result<String, CommandError> {
+    validate_remote_path(path)?;
+    let Some((parent, file_name)) = path.rsplit_once('/') else {
+        return Err(CommandError::new(format!(
+            "remote path has no parent: {path}"
+        )));
+    };
+    if parent.is_empty() || file_name.is_empty() {
+        return Err(CommandError::new(format!(
+            "remote path has no file name: {path}"
+        )));
+    }
+    Ok(parent.to_owned())
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
 
 impl<C> StorageBoxBackend<C> {
     /// Create a backend around a typed config and command executor.
@@ -640,7 +930,10 @@ mod tests {
 
     use sha2::{Digest, Sha256};
 
-    use super::{CommandError, Error, StorageBoxBackend, StorageBoxCommands, StorageBoxConfig};
+    use super::{
+        CommandError, Error, SshStorageBoxCommands, StorageBoxBackend, StorageBoxCommands,
+        StorageBoxConfig, StorageBoxSshConfig,
+    };
     use crate::{
         archive::NormalizerVersion,
         commit::{ManifestEntry, ManifestMode, Metadata, Request},
@@ -786,6 +1079,15 @@ mod tests {
         StorageBoxBackend::new(config, commands)
     }
 
+    fn ssh_commands() -> SshStorageBoxCommands {
+        SshStorageBoxCommands::new(
+            StorageBoxSshConfig::new("u123456@u123456.your-storagebox.de")
+                .with_ssh_program("/usr/bin/ssh")
+                .with_ssh_arg("-p")
+                .with_ssh_arg("23"),
+        )
+    }
+
     #[test]
     fn commits_in_verified_remote_order_before_manifest_append() {
         let mut backend = backend(FakeCommands::default());
@@ -903,5 +1205,60 @@ mod tests {
 
         assert!(matches!(result, Err(Error::PathEscapesRoot { .. })));
         assert!(backend.into_commands().operations.is_empty());
+    }
+
+    #[test]
+    fn ssh_upload_command_keeps_remote_path_inside_script_argument() {
+        let command = ssh_commands()
+            .upload_command(
+                "/storage-box/emojistats/objects/run 1/quote'$(touch bad);.parquet",
+                b"parquet bytes",
+            )
+            .expect("upload command should build");
+
+        assert_eq!(command.program, PathBuf::from("/usr/bin/ssh"));
+        assert_eq!(
+            command.args,
+            vec![
+                "-p",
+                "23",
+                "u123456@u123456.your-storagebox.de",
+                "umask 077; mkdir -p -- '/storage-box/emojistats/objects/run 1'; cat > '/storage-box/emojistats/objects/run 1/quote'\\''$(touch bad);.parquet'"
+            ]
+        );
+        assert_eq!(command.stdin.as_deref(), Some(b"parquet bytes".as_slice()));
+    }
+
+    #[test]
+    fn ssh_commands_reject_unsafe_remote_paths() {
+        let commands = ssh_commands();
+
+        assert!(commands.upload_command("relative/path", b"bytes").is_err());
+        assert!(
+            commands
+                .upload_command("/storage/../outside", b"bytes")
+                .is_err()
+        );
+        assert!(
+            commands
+                .upload_command("/storage/newline\nname", b"bytes")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ssh_read_prefix_command_marks_absent_and_present_outputs() {
+        let command = ssh_commands()
+            .read_prefix_command("/storage-box/emojistats/objects/run-1/42.parquet", 8)
+            .expect("read prefix command should build");
+
+        assert_eq!(command.args.len(), 4);
+        assert_eq!(
+            command
+                .args
+                .last()
+                .expect("ssh script should be the final argument"),
+            "if [ -e '/storage-box/emojistats/objects/run-1/42.parquet' ]; then printf 'present\\n'; head -c 8 -- '/storage-box/emojistats/objects/run-1/42.parquet'; else printf 'absent\\n'; fi"
+        );
     }
 }
