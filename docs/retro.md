@@ -1986,6 +1986,64 @@ Three other fixes landed in the same session:
   reliable ETA yet, but the static bottleneck that was causing the >24h estimate is gone. Nothing
   has converged to closure.
 
+### 2026-06-15 afternoon (~11:30–16:07 UTC) — the Rust rewrite is back on, and the retro becomes the spec
+
+Alice reversed the "no Rust rewrite" decision from the previous evening. The catalyst wasn't
+the performance argument — it was a structured adversarial design session using the
+`grill-with-docs` skill against the retro and an initial v2 plan. The grilling surfaced gaps
+the earlier conversation had missed, and the resulting design document
+(`docs/backfill-v2-design.md`, `4e79790`, 361 lines) is a fundamentally different architecture
+from the TypeScript preflight we drafted together.
+
+What changed:
+
+- **Parquet is the single source of truth.** ClickHouse is explicitly a derived, rebuildable
+  projection. The crawler's only output is Parquet files on a Storage Box. This inverts v1's
+  architecture where ClickHouse was the truth and Parquet was an archival sidecar — and it means
+  verification is against the archive, not against a database that's being concurrently written by
+  the firehose.
+- **No live/backfill table overlap.** v1's "overlap collapses structurally" was elegant but
+  created the "loose" verification category and every dashboard lie about it. v2 runs the backfill
+  to completion, *then* starts Jetstream catch-up from a recorded timestamp. No concurrent writes
+  to the same table from two sources, no "is this a backfill row or a firehose row" ambiguity.
+- **MST root verification at crawl time.** Instead of post-hoc digest comparison (which couldn't
+  prove set-subset once the firehose muddied the counts), v2 verifies the MST root against the
+  signed commit at parse time. This is a **completeness proof**, not a statistical check — and it
+  runs as part of the pipeline, not as a separate phase that OOMs ClickHouse.
+- **HuggingFace publication** as an explicit product. The raw post corpus (observed, not
+  cumulative-ever — a term the grill session pinned down) is packaged as a public dataset. This
+  reframes the project from "emoji site with a backfill" to "a complete network snapshot that
+  happens to power an emoji site."
+- **CARs spooled to 512 GB local disk, then discarded.** The earlier "no CAR storage" decision
+  stands for long-term, but CARs live on local NVMe during processing — eliminating the
+  in-memory parse worker materialization problem entirely.
+- **Stratified canary gate.** Not just "1 box first" but a structured canary: random repos, whale
+  repos, old/future/invalid timestamps, emoji-heavy, third-party/Bridgy, malformed/partial cases,
+  plus a short multi-box contention test. Hard-gated before fan-out.
+
+The operational invariants section carries forward every retro lesson verbatim: scriptable
+fleet ops, O(LIMIT) claim path, header-driven pacing, loud resource caps, deploy-via-git, WAL-safe
+ledger backup, dead-host registry with its inverse. The tiebreaker is explicit: **correctness >
+operability > performance > craft.** The design doc's provenance section names this retro as its
+primary source.
+
+The grill session also formalized domain language into a `CONTEXT.md` and an ADR
+(`docs/adr/0001-raw-archive-and-public-corpus-boundary.md`): the distinction between the private
+Raw Archive (operational truth) and the candidate Published Raw Observed Corpus (public, deferred
+publication policy). A second grill round produced a review packet
+(`docs/backfill-v2-final-review-packet.md`, `b99416d`) with 30 resolved decisions and a critique
+checklist to apply back to the design record.
+
+The retro's reason for existing was always "structured source for a future public blogpost." It
+turned out to be something more: the spec for the rewrite. Every architectural decision in v2
+traces to a failure mode the retro documented, and the design document says so explicitly: *"where
+this document and the original plan disagree, this document wins — it incorporates corrections the
+plan did not have."*
+
+Meanwhile, the loose recrawl continues running on the v1 fleet. The parquet archive on the Storage
+Box is 297.8 GiB across 4,958 files. Alice noted only two shards appear to still have active
+recrawlers. The v1 end-game and the v2 design are running concurrently.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
