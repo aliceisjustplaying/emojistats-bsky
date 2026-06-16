@@ -111,9 +111,15 @@ impl Default for ParseConfig {
             max_decode_errors: 1_000_000,
             #[allow(clippy::duration_suboptimal_units)]
             max_parse_wall_clock: Duration::from_secs(15 * 60),
-            cid_verification_threads: 1,
+            cid_verification_threads: default_cid_verification_threads(),
         }
     }
+}
+
+/// Recommended worker count for CAR block CID verification.
+#[must_use]
+pub const fn default_cid_verification_threads() -> usize {
+    1
 }
 
 /// Commit metadata needed by downstream archive and receipt code.
@@ -1065,7 +1071,18 @@ fn verify_block_cid(cid: IpldCid, data: &[u8]) -> Result<(), ParseError> {
 
 struct CidVerifyJob {
     cid: IpldCid,
-    data: Vec<u8>,
+    section: Vec<u8>,
+    data_offset: usize,
+}
+
+impl CidVerifyJob {
+    fn data(&self) -> Result<&[u8], ParseError> {
+        self.section
+            .get(self.data_offset..)
+            .ok_or(ParseError::MalformedCar(
+                "CID verifier data slice outside CAR section".to_owned(),
+            ))
+    }
 }
 
 enum CidVerifier {
@@ -1087,10 +1104,10 @@ impl CidVerifier {
         Self::Parallel(ParallelCidVerifier::start(worker_count))
     }
 
-    fn verify(&mut self, cid: IpldCid, data: &[u8]) -> Result<(), ParseError> {
+    fn verify(&mut self, job: CidVerifyJob) -> Result<(), ParseError> {
         match self {
-            Self::Inline => verify_block_cid(cid, data),
-            Self::Parallel(verifier) => verifier.verify(cid, data),
+            Self::Inline => verify_block_cid(job.cid, job.data()?),
+            Self::Parallel(verifier) => verifier.verify(job),
         }
     }
 
@@ -1119,7 +1136,7 @@ impl ParallelCidVerifier {
         }
     }
 
-    fn verify(&mut self, cid: IpldCid, data: &[u8]) -> Result<(), ParseError> {
+    fn verify(&mut self, job: CidVerifyJob) -> Result<(), ParseError> {
         let sender = self
             .senders
             .get(self.next_sender)
@@ -1127,10 +1144,7 @@ impl ParallelCidVerifier {
                 "CID verifier has no workers".to_owned(),
             ))?;
         sender
-            .send(CidVerifyJob {
-                cid,
-                data: data.to_vec(),
-            })
+            .send(job)
             .map_err(|_error| ParseError::MalformedCar("CID verifier stopped".to_owned()))?;
         let next_sender = self
             .next_sender
@@ -1159,7 +1173,7 @@ impl ParallelCidVerifier {
 
 fn verify_cid_jobs(receiver: mpsc::Receiver<CidVerifyJob>) -> Result<(), ParseError> {
     for job in receiver {
-        verify_block_cid(job.cid, &job.data)?;
+        verify_block_cid(job.cid, job.data()?)?;
     }
     Ok(())
 }
@@ -1303,12 +1317,14 @@ fn index_car_blocks(
             usize::try_from(cid_len).map_err(|_err| ParseError::CarLengthOverflow {
                 field: "CID length",
             })?;
-        let data = section.get(data_start..).ok_or(ParseError::MalformedCar(
-            "block data slice outside CAR section".to_owned(),
-        ))?;
-        verifier.verify(cid, data)?;
+        let index_cid = cid;
+        verifier.verify(CidVerifyJob {
+            cid,
+            section,
+            data_offset: data_start,
+        })?;
 
-        match index.entry(cid) {
+        match index.entry(index_cid) {
             Entry::Vacant(entry) => {
                 entry.insert(BlockLocation {
                     offset: checked_add_u64(section_start, cid_len, "block data offset")?,
@@ -1556,8 +1572,14 @@ const PROFILE_RKEY: &str = "self";
 mod tests {
     use super::{
         ParseConfig, ParseError, RkeyDigest, Varint, assert_requested_did,
-        enforce_decode_error_limit, read_varint, split_repo_key, update_digest,
+        default_cid_verification_threads, enforce_decode_error_limit, read_varint, split_repo_key,
+        update_digest,
     };
+
+    #[test]
+    fn cid_verification_threads_default_to_one() {
+        assert_eq!(default_cid_verification_threads(), 1);
+    }
 
     #[test]
     fn splits_repo_key_into_collection_and_rkey() {

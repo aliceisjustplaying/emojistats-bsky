@@ -36,12 +36,52 @@ pub fn version() -> NormalizerVersion {
 /// Extract normalized emoji glyph strings, preserving order and repeated occurrences.
 #[must_use]
 pub fn extract_emoji_sequence(text: &str) -> Vec<String> {
-    if text.is_ascii() {
+    if !has_emoji_candidate(text) {
         return Vec::new();
     }
     text.graphemes(true)
         .filter_map(normalize_emoji_glyph)
         .collect()
+}
+
+fn has_emoji_candidate(text: &str) -> bool {
+    if text.is_ascii() {
+        return false;
+    }
+    text.chars().any(is_emoji_candidate_char)
+}
+
+fn is_emoji_candidate_char(ch: char) -> bool {
+    matches!(
+        u32::from(ch),
+        0xa9
+            | 0xae
+            | 0x203c
+            | 0x2049
+            | 0x20e3
+            | 0x2122
+            | 0x2139
+            | 0x2194..=0x21aa
+            | 0x231a..=0x231b
+            | 0x2328
+            | 0x23cf
+            | 0x23e9..=0x23f3
+            | 0x23f8..=0x23fa
+            | 0x24c2
+            | 0x25aa..=0x25ab
+            | 0x25b6
+            | 0x25c0
+            | 0x25fb..=0x25fe
+            | 0x2600..=0x27bf
+            | 0x2934..=0x2935
+            | 0x2b05..=0x2b55
+            | 0x3030
+            | 0x303d
+            | 0x3297
+            | 0x3299
+            | 0xfe0e..=0xfe0f
+            | 0x1f000..=0x1faff
+    )
 }
 
 /// Normalize one already-segmented emoji glyph.

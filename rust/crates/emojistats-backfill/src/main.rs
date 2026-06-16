@@ -40,7 +40,8 @@ use emojistats_backfill::{
         VerifiedLoaderInput, read_committed_jsonl, verify_loader_input_for_streaming,
     },
     parse::{
-        ParseConfig, ParseError, ParseVisitError, PostRecordBody, parse_repo_for_did_with_state,
+        ParseConfig, ParseError, ParseVisitError, PostRecordBody, default_cid_verification_threads,
+        parse_repo_for_did_with_state,
     },
     scheduler::{ClaimScope, HostPacer, SchedulerError, SharedHostPacer, checked_concurrency},
     transport::{FetchByteBudget, FetchConfig, FetchError, fetch_repo},
@@ -81,6 +82,9 @@ enum Command {
         /// Directory for local archive artifacts.
         #[arg(long, default_value = "data/archive")]
         archive_dir: PathBuf,
+        /// Worker threads used for CAR block CID verification.
+        #[arg(long, default_value_t = default_cid_verification_threads(), value_parser = parse_positive_usize)]
+        cid_verification_threads: usize,
     },
     /// Parse and archive an existing `CAR` without fetching it.
     ProfileCar {
@@ -91,6 +95,9 @@ enum Command {
         /// Directory for local archive artifacts.
         #[arg(long, default_value = "data/profile-archive")]
         archive_dir: PathBuf,
+        /// Worker threads used for CAR block CID verification.
+        #[arg(long, default_value_t = default_cid_verification_threads(), value_parser = parse_positive_usize)]
+        cid_verification_threads: usize,
         /// Parse and count posts without writing archive artifacts.
         #[arg(long)]
         parse_only: bool,
@@ -129,6 +136,9 @@ enum Command {
         /// Directory for local archive artifacts.
         #[arg(long, default_value = "data/archive")]
         archive_dir: PathBuf,
+        /// Worker threads used for CAR block CID verification.
+        #[arg(long, default_value_t = default_cid_verification_threads(), value_parser = parse_positive_usize)]
+        cid_verification_threads: usize,
     },
     /// Verify a committed archive manifest and load derived rows into `ClickHouse`.
     DeriveManifest {
@@ -170,13 +180,30 @@ async fn main() -> anyhow::Result<()> {
             spool_dir,
             max_bytes,
             archive_dir,
-        } => fetch_one(&did, spool_dir, max_bytes, archive_dir).await,
+            cid_verification_threads,
+        } => {
+            fetch_one(
+                &did,
+                spool_dir,
+                max_bytes,
+                archive_dir,
+                cid_verification_threads,
+            )
+            .await
+        }
         Command::ProfileCar {
             did,
             car_path,
             archive_dir,
+            cid_verification_threads,
             parse_only,
-        } => profile_car(&did, &car_path, &archive_dir, parse_only),
+        } => profile_car(
+            &did,
+            &car_path,
+            &archive_dir,
+            parse_only,
+            cid_verification_threads,
+        ),
         Command::RunFleet {
             dids_file,
             ledger_path,
@@ -189,6 +216,7 @@ async fn main() -> anyhow::Result<()> {
             spool_dir,
             max_bytes,
             archive_dir,
+            cid_verification_threads,
         } => {
             let worker_id = default_worker_id(&run_id);
             run_fleet(FleetConfig {
@@ -203,6 +231,7 @@ async fn main() -> anyhow::Result<()> {
                 spool_dir,
                 max_bytes,
                 archive_dir,
+                cid_verification_threads,
                 claim_scope: ClaimScope {
                     shard_filter: shard_bucket,
                 },
@@ -243,19 +272,25 @@ fn profile_car(
     car_path: &Path,
     archive_dir: &Path,
     parse_only: bool,
+    cid_verification_threads: usize,
 ) -> anyhow::Result<()> {
     if parse_only {
-        return profile_car_parse_only(did, car_path);
+        return profile_car_parse_only(did, car_path, cid_verification_threads);
     }
     let started = Instant::now();
-    let processed =
-        parse_and_archive_spooled_repo(did, car_path, archive_dir).map_err(|failure| {
-            anyhow::anyhow!(
-                "profile-car failed with {}: {}",
-                outcome_name(&failure.outcome),
-                failure.error
-            )
-        })?;
+    let processed = parse_and_archive_spooled_repo(
+        did,
+        car_path,
+        archive_dir,
+        parse_config_for_threads(cid_verification_threads),
+    )
+    .map_err(|failure| {
+        anyhow::anyhow!(
+            "profile-car failed with {}: {}",
+            outcome_name(&failure.outcome),
+            failure.error
+        )
+    })?;
     println!(
         "profile-car parsed {} records, {} posts, {} decode errors, {} emoji rows",
         processed.records, processed.archived_posts, processed.decode_errors, processed.emoji_rows
@@ -286,12 +321,16 @@ struct ParseOnlyCounters {
     raw_partial_posts: u64,
 }
 
-fn profile_car_parse_only(did: &str, car_path: &Path) -> anyhow::Result<()> {
+fn profile_car_parse_only(
+    did: &str,
+    car_path: &Path,
+    cid_verification_threads: usize,
+) -> anyhow::Result<()> {
     let started = Instant::now();
     let (summary, counters) = parse_repo_for_did_with_state(
         car_path,
         did,
-        ParseConfig::default(),
+        parse_config_for_threads(cid_verification_threads),
         ParseOnlyCounters::default(),
         |state, post| {
             state.posts = state
@@ -330,6 +369,13 @@ fn profile_car_parse_only(did: &str, car_path: &Path) -> anyhow::Result<()> {
         current_rss_kb().unwrap_or_default()
     );
     Ok(())
+}
+
+fn parse_config_for_threads(cid_verification_threads: usize) -> ParseConfig {
+    ParseConfig {
+        cid_verification_threads,
+        ..ParseConfig::default()
+    }
 }
 
 #[derive(Debug)]
@@ -628,13 +674,21 @@ async fn fetch_one(
     spool_dir: PathBuf,
     max_bytes: u64,
     archive_dir: PathBuf,
+    cid_verification_threads: usize,
 ) -> anyhow::Result<()> {
     let now = SystemTime::now();
     let ledger = RepoLedgerEntry::pending(did_str);
     let claimed = claim_repo(&ledger, AttemptId::new("fetch-one-local", did_str, 1), now)
         .map_err(|err| anyhow::anyhow!("claim fetch-one ledger entry for {did_str}: {err}"))?;
 
-    let result = fetch_one_attempt(did_str, spool_dir, max_bytes, archive_dir).await;
+    let result = fetch_one_attempt(
+        did_str,
+        spool_dir,
+        max_bytes,
+        archive_dir,
+        parse_config_for_threads(cid_verification_threads),
+    )
+    .await;
     let outcome = result.as_ref().map_or_else(
         |failure| failure.outcome.clone(),
         |_success| AttemptOutcome::Succeeded,
@@ -662,6 +716,7 @@ struct FleetConfig {
     spool_dir: PathBuf,
     max_bytes: u64,
     archive_dir: PathBuf,
+    cid_verification_threads: usize,
     claim_scope: ClaimScope,
 }
 
@@ -767,6 +822,7 @@ async fn run_fleet(config: FleetConfig) -> anyhow::Result<()> {
                 spool_dir: config.spool_dir.clone(),
                 max_bytes: config.max_bytes,
                 archive_dir: config.archive_dir.clone(),
+                parse_config: parse_config_for_threads(config.cid_verification_threads),
                 host_pacer: host_pacer.clone(),
                 host_limiter: host_limiter.clone(),
                 parse_permits: parse_permits.clone(),
@@ -802,6 +858,7 @@ struct FleetAttemptConfig {
     spool_dir: PathBuf,
     max_bytes: u64,
     archive_dir: PathBuf,
+    parse_config: ParseConfig,
     host_pacer: SharedHostPacer,
     host_limiter: HostConcurrencyLimiter,
     parse_permits: Arc<Semaphore>,
@@ -829,6 +886,7 @@ async fn run_fleet_attempt(config: FleetAttemptConfig) -> FleetAttemptResult {
         byte_budget: Some(config.byte_budget),
         claim_scope: &config.claim_scope,
         host_override_ledger_path: Some(&config.ledger_path),
+        parse_config: config.parse_config,
     })
     .await;
     FleetAttemptResult {
@@ -1034,6 +1092,7 @@ async fn fetch_one_attempt(
     spool_dir: PathBuf,
     max_bytes: u64,
     archive_dir: PathBuf,
+    parse_config: ParseConfig,
 ) -> Result<(), FetchOneFailure> {
     let claim_scope = ClaimScope::default();
     fetch_one_attempt_with_pacer(FetchOneAttemptConfig {
@@ -1047,6 +1106,7 @@ async fn fetch_one_attempt(
         byte_budget: None,
         claim_scope: &claim_scope,
         host_override_ledger_path: None,
+        parse_config,
     })
     .await
 }
@@ -1062,6 +1122,7 @@ struct FetchOneAttemptConfig<'a> {
     byte_budget: Option<FetchByteBudget>,
     claim_scope: &'a ClaimScope,
     host_override_ledger_path: Option<&'a Path>,
+    parse_config: ParseConfig,
 }
 
 async fn fetch_one_attempt_with_pacer(
@@ -1108,6 +1169,7 @@ async fn fetch_one_attempt_with_pacer(
             archive_dir: &config.archive_dir,
             host_pacer: config.host_pacer.as_ref(),
             parse_permits: config.parse_permits.as_ref(),
+            parse_config: config.parse_config,
             attempt_started,
         },
         prepared_host.fetch_mode,
@@ -1177,6 +1239,7 @@ struct FetchModeStep<'a> {
     archive_dir: &'a Path,
     host_pacer: Option<&'a SharedHostPacer>,
     parse_permits: Option<&'a Arc<Semaphore>>,
+    parse_config: ParseConfig,
     attempt_started: Instant,
 }
 
@@ -1228,6 +1291,7 @@ async fn fetch_get_repo_and_archive(
         &fetched,
         step.archive_dir,
         step.parse_permits,
+        step.parse_config,
         step.attempt_started,
     )
     .await?;
@@ -1354,6 +1418,7 @@ async fn parse_archive_or_emit_failure(
     fetched: &FetchedRepo,
     archive_dir: &Path,
     parse_permits: Option<&Arc<Semaphore>>,
+    parse_config: ParseConfig,
     attempt_started: Instant,
 ) -> Result<ProcessedRepo, FetchOneFailure> {
     emit_smoke_telemetry(&SmokeTelemetry {
@@ -1403,7 +1468,7 @@ async fn parse_archive_or_emit_failure(
     let car_path = fetched.spooled.car_path.clone();
     let archive_dir = archive_dir.to_path_buf();
     let parsed = tokio::task::spawn_blocking(move || {
-        parse_and_archive_spooled_repo(&did, &car_path, &archive_dir)
+        parse_and_archive_spooled_repo(&did, &car_path, &archive_dir, parse_config)
     })
     .await
     .map_err(|err| retryable_failure(format!("parse/archive task failed for {did_str}: {err}")))?;
@@ -1628,6 +1693,7 @@ fn parse_and_archive_spooled_repo(
     did_str: &str,
     car_path: &Path,
     archive_dir: &Path,
+    parse_config: ParseConfig,
 ) -> Result<ProcessedRepo, FetchOneFailure> {
     let parse_started = Instant::now();
     let sink = StreamingArchiveSink::new(archive_dir, did_str).map_err(|err| {
@@ -1646,7 +1712,7 @@ fn parse_and_archive_spooled_repo(
     let (parsed, state) = parse_repo_for_did_with_state(
         car_path,
         did_str,
-        ParseConfig::default(),
+        parse_config,
         state,
         move |state, post| {
             if profile_stages {
@@ -2050,8 +2116,9 @@ mod tests {
 
     use super::{
         Cli, Command, HostConcurrencyLimiter, SeedSummary, claim_batch_limit,
-        claimable_entries_for_scope, fetch_mode_for_host, load_host_override, pds_host_key,
-        prepare_fetch_host, recover_stale_claimed_entries, seed_ledger_from_file,
+        claimable_entries_for_scope, default_cid_verification_threads, fetch_mode_for_host,
+        load_host_override, pds_host_key, prepare_fetch_host, recover_stale_claimed_entries,
+        seed_ledger_from_file,
     };
 
     #[test]
@@ -2063,6 +2130,7 @@ mod tests {
             spool_dir,
             max_bytes,
             archive_dir,
+            cid_verification_threads,
         } = cli.command
         else {
             unreachable!("expected fetch-one command");
@@ -2071,6 +2139,7 @@ mod tests {
         assert_eq!(spool_dir, PathBuf::from("data/spool"));
         assert_eq!(max_bytes, 2_147_483_648);
         assert_eq!(archive_dir, PathBuf::from("data/archive"));
+        assert_eq!(cid_verification_threads, default_cid_verification_threads());
     }
 
     #[tokio::test]
@@ -2121,6 +2190,7 @@ mod tests {
             spool_dir,
             max_bytes,
             archive_dir,
+            cid_verification_threads,
         } = cli.command
         else {
             unreachable!("expected run-fleet command");
@@ -2136,6 +2206,7 @@ mod tests {
         assert_eq!(spool_dir, PathBuf::from("data/spool"));
         assert_eq!(max_bytes, 2_147_483_648);
         assert_eq!(archive_dir, PathBuf::from("data/archive"));
+        assert_eq!(cid_verification_threads, default_cid_verification_threads());
     }
 
     #[test]
@@ -2148,11 +2219,14 @@ mod tests {
             "2",
             "--max-inflight-spool-bytes",
             "123456",
+            "--cid-verification-threads",
+            "7",
         ])
         .unwrap();
         let Command::RunFleet {
             parse_concurrency,
             max_inflight_spool_bytes,
+            cid_verification_threads,
             ..
         } = cli.command
         else {
@@ -2161,6 +2235,7 @@ mod tests {
 
         assert_eq!(parse_concurrency, 2);
         assert_eq!(max_inflight_spool_bytes, 123_456);
+        assert_eq!(cid_verification_threads, 7);
     }
 
     #[test]

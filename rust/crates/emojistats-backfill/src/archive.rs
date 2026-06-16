@@ -1,6 +1,7 @@
 //! Archive receipt, `Parquet`, and manifest primitives for the `fetch-one` vertical slice.
 
 use std::{
+    borrow::Cow,
     error::Error,
     fmt, fs,
     fs::File,
@@ -10,7 +11,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, builder::StringBuilder};
 use arrow_schema::{DataType, Field, Schema};
 pub use emoji_normalizer::NormalizerVersion;
 use parquet::{
@@ -88,6 +89,16 @@ pub struct EmojiProjectionRow {
     pub emoji: String,
     pub occurrences: u64,
     pub langs: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BorrowedEmojiProjectionRow<'a> {
+    did: &'a str,
+    rkey: &'a str,
+    created_at_normalized: Option<&'a str>,
+    emoji: &'a str,
+    occurrences: u64,
+    langs: &'a [String],
 }
 
 /// Local profile sidecar row for one repo, when present.
@@ -605,20 +616,7 @@ impl StreamingArchiveSink {
             row.created_at_normalized.as_deref(),
         );
         if !row.emoji_sequence.is_empty() {
-            for projection_row in emoji_projection_rows(&row)? {
-                hash_field(
-                    &mut self.emoji_projection_hash,
-                    &json_string(&projection_row)?,
-                )?;
-                serde_json::to_writer(&mut self.emoji_file, &projection_row)?;
-                self.emoji_file.write_all(b"\n")?;
-                self.emoji_rows =
-                    self.emoji_rows
-                        .checked_add(1)
-                        .ok_or(ArchiveError::CountOverflow {
-                            field: "emoji_rows",
-                        })?;
-            }
+            self.write_emoji_projection_rows(&row)?;
         }
         self.batch.push(row);
         if self.batch.len() >= PARQUET_BATCH_ROWS {
@@ -648,6 +646,48 @@ impl StreamingArchiveSink {
         hash_string_slice(&mut self.rows_hash, &row.langs)?;
         hash_string_slice(&mut self.rows_hash, &row.emoji_sequence)?;
         hash_extras_json(&mut self.rows_hash, &row.extras_json)
+    }
+
+    fn write_emoji_projection_rows(&mut self, row: &ArchivePostRow) -> Result<(), ArchiveError> {
+        let mut projected: Vec<(&str, u64)> = Vec::new();
+        for emoji in &row.emoji_sequence {
+            let emoji = emoji.as_str();
+            if let Some((_, occurrences)) = projected
+                .iter_mut()
+                .find(|(candidate, _)| *candidate == emoji)
+            {
+                *occurrences = occurrences
+                    .checked_add(1)
+                    .ok_or(ArchiveError::CountOverflow {
+                        field: "emoji_occurrences",
+                    })?;
+            } else {
+                projected.push((emoji, 1_u64));
+            }
+        }
+
+        for (emoji, occurrences) in projected {
+            let projection_row = BorrowedEmojiProjectionRow {
+                did: row.did.as_str(),
+                rkey: row.rkey.as_str(),
+                created_at_normalized: row.created_at_normalized.as_deref(),
+                emoji,
+                occurrences,
+                langs: &row.langs,
+            };
+            let json = json_bytes(&projection_row)?;
+            hash_field_bytes(&mut self.emoji_projection_hash, &json)?;
+            self.emoji_file.write_all(&json)?;
+            self.emoji_file.write_all(b"\n")?;
+            self.emoji_rows =
+                self.emoji_rows
+                    .checked_add(1)
+                    .ok_or(ArchiveError::CountOverflow {
+                        field: "emoji_rows",
+                    })?;
+        }
+
+        Ok(())
     }
 
     /// Finish all artifacts and return the receipt plus artifact paths.
@@ -967,14 +1007,14 @@ pub fn hash_profile_record(
 
 fn hash_one_profile_record(profile: &ProfileRecord) -> Result<String, ArchiveError> {
     let mut hasher = Sha256::new();
-    hash_field(&mut hasher, &json_string(&profile_sidecar_row(profile))?)?;
+    hash_field_bytes(&mut hasher, &json_bytes(&profile_sidecar_row(profile))?)?;
     Ok(hex::encode(hasher.finalize()))
 }
 
 fn hash_emoji_projection_rows(rows: &[EmojiProjectionRow]) -> Result<String, ArchiveError> {
     let mut hasher = Sha256::new();
     for row in rows {
-        hash_field(&mut hasher, &json_string(row)?)?;
+        hash_field_bytes(&mut hasher, &json_bytes(row)?)?;
     }
     Ok(hex::encode(hasher.finalize()))
 }
@@ -1036,36 +1076,59 @@ fn post_record_batch(
     Ok(RecordBatch::try_new(
         Arc::clone(schema),
         vec![
-            string_array(rows.iter().map(|row| Some(row.did.as_str()))),
-            string_array(rows.iter().map(|row| Some(row.rkey.as_str()))),
-            string_array(rows.iter().map(|row| Some(row.cid.as_str()))),
-            string_array(rows.iter().map(|row| Some(row.normalizer.name.as_str()))),
-            string_array(rows.iter().map(|row| Some(row.normalizer.semver.as_str()))),
-            string_array(rows.iter().map(|row| Some(row.normalizer.git_rev.as_str()))),
-            string_array(
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.did.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.rkey.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.cid.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.normalizer.name.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.normalizer.semver.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.normalizer.git_rev.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
                 rows.iter()
-                    .map(|row| Some(row.normalizer.unicode_version.as_str())),
-            ),
-            string_array(
+                    .map(|row| row.normalizer.unicode_version.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
                 rows.iter()
-                    .map(|row| Some(row.normalizer.emoji_data_version.as_str())),
-            ),
-            string_array(rows.iter().map(|row| row.account_status.as_deref())),
-            string_array(rows.iter().map(|row| row.record_status.as_deref())),
-            string_array(rows.iter().map(|row| row.public_content_label.as_deref())),
-            string_array(rows.iter().map(|row| row.created_at_raw.as_deref())),
-            string_array(rows.iter().map(|row| row.created_at_normalized.as_deref())),
-            string_array(
-                rows.iter()
-                    .map(|row| Some(row.created_at_parse_status.as_str())),
-            ),
-            string_array(rows.iter().map(|row| Some(row.text.as_str()))),
-            owned_string_array(rows.iter().map(|row| json_string_slice(&row.langs)))?,
-            owned_string_array(
+                    .map(|row| row.normalizer.emoji_data_version.as_str()),
+            )),
+            Arc::new(StringArray::from_iter(
+                rows.iter().map(|row| row.account_status.as_deref()),
+            )),
+            Arc::new(StringArray::from_iter(
+                rows.iter().map(|row| row.record_status.as_deref()),
+            )),
+            Arc::new(StringArray::from_iter(
+                rows.iter().map(|row| row.public_content_label.as_deref()),
+            )),
+            Arc::new(StringArray::from_iter(
+                rows.iter().map(|row| row.created_at_raw.as_deref()),
+            )),
+            Arc::new(StringArray::from_iter(
+                rows.iter().map(|row| row.created_at_normalized.as_deref()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.created_at_parse_status.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|row| row.text.as_str()),
+            )),
+            json_string_array(rows.iter().map(|row| json_string_slice(&row.langs)))?,
+            json_string_array(
                 rows.iter()
                     .map(|row| json_string_slice(&row.emoji_sequence)),
             )?,
-            owned_string_array(rows.iter().map(|row| extras_json_string(&row.extras_json)))?,
+            json_string_array(rows.iter().map(|row| extras_json_string(&row.extras_json)))?,
         ],
     )?)
 }
@@ -1371,34 +1434,36 @@ fn count_emoji_occurrences(rows: &[ArchivePostRow]) -> Result<u64, ArchiveError>
     })
 }
 
-fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
-    Arc::new(StringArray::from(values.collect::<Vec<_>>()))
+fn json_string_array(
+    values: impl Iterator<Item = Result<Cow<'static, str>, ArchiveError>>,
+) -> Result<ArrayRef, ArchiveError> {
+    let mut builder = StringBuilder::new();
+    for value in values {
+        builder.append_value(value?.as_ref());
+    }
+    Ok(Arc::new(builder.finish()))
 }
 
-fn owned_string_array(
-    values: impl Iterator<Item = Result<String, ArchiveError>>,
-) -> Result<ArrayRef, ArchiveError> {
-    Ok(Arc::new(StringArray::from(
-        values.collect::<Result<Vec<_>, _>>()?,
-    )))
+fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, ArchiveError> {
+    Ok(serde_json::to_vec(value)?)
 }
 
 fn json_string<T: Serialize>(value: &T) -> Result<String, ArchiveError> {
     Ok(serde_json::to_string(value)?)
 }
 
-fn json_string_slice(value: &[String]) -> Result<String, ArchiveError> {
+fn json_string_slice(value: &[String]) -> Result<Cow<'static, str>, ArchiveError> {
     if value.is_empty() {
-        return Ok("[]".to_owned());
+        return Ok(Cow::Borrowed("[]"));
     }
-    json_string(&value)
+    Ok(Cow::Owned(json_string(&value)?))
 }
 
-fn extras_json_string(value: &serde_json::Value) -> Result<String, ArchiveError> {
+fn extras_json_string(value: &serde_json::Value) -> Result<Cow<'static, str>, ArchiveError> {
     if matches!(value, serde_json::Value::Object(fields) if fields.is_empty()) {
-        return Ok("{}".to_owned());
+        return Ok(Cow::Borrowed("{}"));
     }
-    canonical_json(value)
+    Ok(Cow::Owned(canonical_json(value)?))
 }
 
 fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), ArchiveError> {
@@ -1574,11 +1639,15 @@ fn append_hash_field_frame(target: &mut Vec<u8>, value: &str) -> Result<(), Arch
 }
 
 fn hash_field(hasher: &mut Sha256, value: &str) -> Result<(), ArchiveError> {
+    hash_field_bytes(hasher, value.as_bytes())
+}
+
+fn hash_field_bytes(hasher: &mut Sha256, value: &[u8]) -> Result<(), ArchiveError> {
     let len = u64::try_from(value.len()).map_err(|_error| ArchiveError::CountOverflow {
         field: "hash_field_length",
     })?;
     hasher.update(len.to_be_bytes());
-    hasher.update(value.as_bytes());
+    hasher.update(value);
     Ok(())
 }
 
@@ -1586,7 +1655,7 @@ fn hash_extras_json(hasher: &mut Sha256, value: &serde_json::Value) -> Result<()
     if matches!(value, serde_json::Value::Object(fields) if fields.is_empty()) {
         return hash_field(hasher, "{}");
     }
-    hash_field(hasher, &canonical_json(value)?)
+    hash_field_bytes(hasher, &json_bytes(value)?)
 }
 
 fn canonical_json(value: &serde_json::Value) -> Result<String, ArchiveError> {
@@ -1655,6 +1724,9 @@ pub fn classify_created_at(value: Option<&str>) -> ClassifiedCreatedAt {
 }
 
 fn classify_present_created_at(raw: &str) -> ClassifiedCreatedAt {
+    if let Some(classified) = classify_canonical_utc_second_created_at(raw) {
+        return classified;
+    }
     let timestamp = parse_rfc3339_epoch_seconds(raw);
     let now = current_epoch_seconds();
     let status = match (timestamp, now) {
@@ -1672,6 +1744,85 @@ fn classify_present_created_at(raw: &str) -> ClassifiedCreatedAt {
         normalized,
         status,
     }
+}
+
+fn classify_canonical_utc_second_created_at(raw: &str) -> Option<ClassifiedCreatedAt> {
+    let parts = parse_canonical_utc_second_parts(raw)?;
+    validate_datetime_parts(
+        parts.year,
+        parts.month,
+        parts.day,
+        parts.hour,
+        parts.minute,
+        parts.second,
+    )?;
+    if current_epoch_utc_second_string()
+        .as_deref()
+        .is_some_and(|now| raw > now)
+    {
+        return Some(ClassifiedCreatedAt {
+            raw: Some(raw.to_owned()),
+            normalized: None,
+            status: CreatedAtParseStatus::Future,
+        });
+    }
+    Some(ClassifiedCreatedAt {
+        raw: Some(raw.to_owned()),
+        normalized: Some(raw.to_owned()),
+        status: CreatedAtParseStatus::Valid,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CanonicalUtcSecondParts {
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+}
+
+fn parse_canonical_utc_second_parts(value: &str) -> Option<CanonicalUtcSecondParts> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 20
+        || *bytes.get(4)? != b'-'
+        || *bytes.get(7)? != b'-'
+        || *bytes.get(10)? != b'T'
+        || *bytes.get(13)? != b':'
+        || *bytes.get(16)? != b':'
+        || *bytes.get(19)? != b'Z'
+    {
+        return None;
+    }
+    Some(CanonicalUtcSecondParts {
+        year: parse_ascii_digits(bytes.get(0..4)?)?,
+        month: parse_ascii_digits(bytes.get(5..7)?)?,
+        day: parse_ascii_digits(bytes.get(8..10)?)?,
+        hour: parse_ascii_digits(bytes.get(11..13)?)?,
+        minute: parse_ascii_digits(bytes.get(14..16)?)?,
+        second: parse_ascii_digits(bytes.get(17..19)?)?,
+    })
+}
+
+fn parse_ascii_digits(bytes: &[u8]) -> Option<i64> {
+    let mut value = 0_i64;
+    for byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value
+            .checked_mul(10)?
+            .checked_add(i64::from(byte.checked_sub(b'0')?))?;
+    }
+    Some(value)
+}
+
+fn current_epoch_utc_second_string() -> Option<String> {
+    static CURRENT_EPOCH_UTC_SECOND_STRING: OnceLock<Option<String>> = OnceLock::new();
+    CURRENT_EPOCH_UTC_SECOND_STRING
+        .get_or_init(|| current_epoch_seconds().and_then(format_epoch_seconds))
+        .clone()
 }
 
 fn current_epoch_seconds() -> Option<i64> {
