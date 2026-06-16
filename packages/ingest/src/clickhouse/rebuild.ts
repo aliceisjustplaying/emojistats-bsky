@@ -30,9 +30,16 @@ import logger from '../logger.js';
 
 import { AGGREGATES, type AggregateSpec } from './aggregates.js';
 
-// Spill GROUP BY state to disk past 2 GiB so a full rebuild survives an 8 GB box.
+// Spill much earlier than the server cap: the first full emoji_hourly rebuild
+// OOMed at ~12 GiB before the old 2 GiB threshold was sufficient to keep the
+// aggregation state bounded, and the rebuild client then swapped an empty
+// shadow into place. Earlier externalization keeps the query under the box
+// limit; wait_end_of_query below makes any failure fail closed before EXCHANGE.
 const HEAVY_GROUP_BY: ClickHouseSettings = {
-  max_bytes_before_external_group_by: String(2 * 1024 ** 3),
+  max_bytes_before_external_group_by: String(512 * 1024 ** 2),
+  max_bytes_before_external_sort: String(512 * 1024 ** 2),
+  max_memory_usage: String(10 * 1024 ** 3),
+  max_threads: 2,
 };
 
 // Wait for the DELETE to materialize before re-inserting, so a reader after
@@ -63,14 +70,19 @@ async function exec(
 }
 
 type Summary = Record<string, number>;
+interface TimeWindow {
+  start: string;
+  end: string;
+}
 
 async function summarize(
   client: ClickHouseClient,
   spec: AggregateSpec,
+  table: string = spec.table,
 ): Promise<Summary> {
   const sums = spec.measures.map((m) => `sum(${m}) AS ${m}`).join(', ');
   const result = await client.query({
-    query: `SELECT toUInt64(count()) AS rows, ${sums} FROM ${spec.table}`,
+    query: `SELECT toUInt64(count()) AS rows, ${sums} FROM ${table}`,
     format: 'JSONEachRow',
   });
   const [row] = await result.json<Record<string, string>>();
@@ -83,6 +95,47 @@ function diff(before: Summary, after: Summary): Summary {
   return Object.fromEntries(
     Object.keys(after).map((key) => [key, after[key] - (before[key] ?? 0)]),
   );
+}
+
+function sqlUtc(date: Date): string {
+  return date.toISOString().slice(0, 19).replace('T', ' ');
+}
+
+function monthStartUtc(date: Date): Date {
+  return new Date(
+    Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1, 0, 0, 0),
+  );
+}
+
+function nextMonthUtc(date: Date): Date {
+  return new Date(
+    Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1, 0, 0, 0),
+  );
+}
+
+async function fullRebuildWindows(
+  client: ClickHouseClient,
+): Promise<TimeWindow[]> {
+  const result = await client.query({
+    query:
+      'SELECT min(created_at) AS min_created_at, max(created_at) AS max_created_at FROM posts',
+    format: 'JSONEachRow',
+  });
+  const [row] = await result.json<{
+    min_created_at: string | null;
+    max_created_at: string | null;
+  }>();
+  if (row?.min_created_at === null || row?.max_created_at === null) return [];
+
+  const windows: TimeWindow[] = [];
+  let cursor = monthStartUtc(new Date(row.min_created_at));
+  const end = nextMonthUtc(monthStartUtc(new Date(row.max_created_at)));
+  while (cursor < end) {
+    const next = nextMonthUtc(cursor);
+    windows.push({ start: sqlUtc(cursor), end: sqlUtc(next) });
+    cursor = next;
+  }
+  return windows;
 }
 
 async function showCreate(
@@ -120,11 +173,30 @@ async function rebuildFull(ctx: Ctx, spec: AggregateSpec): Promise<void> {
   const before = ctx.dryRun ? undefined : await summarize(ctx.client, spec);
   await exec(ctx, `DROP TABLE IF EXISTS ${shadow}`);
   await exec(ctx, shadowDdl);
-  await exec(
-    ctx,
-    `INSERT INTO ${shadow}\n${spec.select(undefined, FINAL).trim()}`,
-    HEAVY_GROUP_BY,
-  );
+  // Full-history month chunks are safe for every Summing aggregate here:
+  // each chunk emits additive partials for the same keyspace, and the shadow
+  // table merges/sums identical keys across inserts before the final EXCHANGE.
+  for (const window of await fullRebuildWindows(ctx.client)) {
+    logger.info({ table: spec.table, ...window }, 'full rebuild chunk');
+    await exec(
+      ctx,
+      `INSERT INTO ${shadow}\n${spec
+        .select(
+          `created_at >= toDateTime('${window.start}', 'UTC') AND created_at < toDateTime('${window.end}', 'UTC')`,
+          FINAL,
+        )
+        .trim()}`,
+      HEAVY_GROUP_BY,
+    );
+  }
+  if (before !== undefined) {
+    const shadowSummary = await summarize(ctx.client, spec, shadow);
+    if (before.rows > 0 && shadowSummary.rows === 0) {
+      throw new Error(
+        `shadow rebuild ${shadow} stayed empty while ${spec.table} had ${before.rows} rows; refusing to exchange`,
+      );
+    }
+  }
   // Atomic swap. Live posts that arrive during the INSERT scan are missing
   // from the shadow (their MV rows went to the table being replaced) — a gap
   // of one scan's duration, repaired by the next scheduled --recent pass.
@@ -204,6 +276,7 @@ async function main(): Promise<void> {
   const { values } = parseArgs({
     options: {
       full: { type: 'boolean', default: false },
+      from: { type: 'string' },
       recent: { type: 'string' },
       'dry-run': { type: 'boolean', default: false },
     },
@@ -223,6 +296,17 @@ async function main(): Promise<void> {
     );
   }
 
+  const fromIndex =
+    values.from === undefined
+      ? 0
+      : AGGREGATES.findIndex((spec) => spec.table === values.from);
+  if (fromIndex === -1) {
+    throw new Error(
+      `--from expects one of: ${AGGREGATES.map((s) => s.table).join(', ')}`,
+    );
+  }
+  const specs = AGGREGATES.slice(fromIndex);
+
   const ctx: Ctx = {
     // Not the shared ingest client: its 30s request_timeout would abort a
     // full-history INSERT…SELECT mid-flight.
@@ -234,10 +318,12 @@ async function main(): Promise<void> {
       application: 'emojistats-rebuild',
       keep_alive: { eagerly_destroy_stale_sockets: true },
       request_timeout: 4 * 3_600_000,
-      // Keeps the HTTP socket alive across a full-history INSERT…SELECT.
+      // Fail closed: do not return success until ClickHouse has finished the
+      // query body. The prior rebuild swapped in an empty shadow after an OOM
+      // because the HTTP client advanced past a late server-side failure.
       clickhouse_settings: {
-        send_progress_in_http_headers: 1,
-        http_headers_progress_interval_ms: '50000',
+        wait_end_of_query: 1,
+        send_progress_in_http_headers: 0,
       },
     }),
     dryRun: values['dry-run'],
@@ -246,17 +332,22 @@ async function main(): Promise<void> {
   try {
     if (recentDays === undefined) {
       logger.info(
-        { dryRun: ctx.dryRun },
+        { dryRun: ctx.dryRun, from: values.from ?? AGGREGATES[0]?.table },
         'full rebuild of all aggregate tables',
       );
-      for (const spec of AGGREGATES) await rebuildFull(ctx, spec);
+      for (const spec of specs) await rebuildFull(ctx, spec);
     } else {
       const cutoff = hourAlignedCutoff(recentDays);
       logger.info(
-        { cutoff, recentDays, dryRun: ctx.dryRun },
+        {
+          cutoff,
+          recentDays,
+          dryRun: ctx.dryRun,
+          from: values.from ?? AGGREGATES[0]?.table,
+        },
         'self-heal of recent aggregates',
       );
-      for (const spec of AGGREGATES) {
+      for (const spec of specs) {
         // Totals tables cannot be partially rebuilt: a Summing row keyed only
         // by emoji/lang blends contributions from all of history, so no
         // predicate can isolate the recent share for deletion. The full
