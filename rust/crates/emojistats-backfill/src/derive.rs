@@ -50,6 +50,17 @@ pub struct ClickHouseDeriveBatch {
     pub total_post_counter: TotalPostCounterInput,
 }
 
+/// Borrowed projection row derived from one archive post row.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct BorrowedEmojiProjectionRow<'a> {
+    pub did: &'a str,
+    pub rkey: &'a str,
+    pub created_at_normalized: Option<&'a str>,
+    pub emoji: &'a str,
+    pub occurrences: u64,
+    pub langs: &'a [String],
+}
+
 /// Durable key for a derived `ClickHouse` write unit.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeriveCheckpointKey {
@@ -77,7 +88,7 @@ pub struct DeriveCheckpointRecord {
 }
 
 /// Derive-lane failures before any `ClickHouse` network write is attempted.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum DeriveError {
     #[error(
         "manifest row_count {manifest_rows} did not match verified archive row count {archive_rows}"
@@ -233,18 +244,19 @@ fn validate_manifest_row_count(
     }
 }
 
-fn derive_emoji_projection_rows(
+/// Derive compact emoji projection rows for archive post rows.
+///
+/// # Errors
+///
+/// Returns [`DeriveError`] if occurrence counters overflow.
+pub fn derive_emoji_projection_rows(
     rows: &[ArchivePostRow],
 ) -> Result<Vec<EmojiProjectionRow>, DeriveError> {
     let mut projected = Vec::new();
     for row in rows {
-        projected.extend(emoji_projection_rows(row)?);
+        projected.extend(emoji_projection_rows_for_post(row)?);
     }
     Ok(projected)
-}
-
-fn emoji_projection_rows(row: &ArchivePostRow) -> Result<Vec<EmojiProjectionRow>, DeriveError> {
-    emoji_projection_rows_for_post(row)
 }
 
 /// Derive compact emoji projection rows for one archive post row.
@@ -255,11 +267,34 @@ fn emoji_projection_rows(row: &ArchivePostRow) -> Result<Vec<EmojiProjectionRow>
 pub fn emoji_projection_rows_for_post(
     row: &ArchivePostRow,
 ) -> Result<Vec<EmojiProjectionRow>, DeriveError> {
+    Ok(borrowed_emoji_projection_rows_for_post(row)?
+        .into_iter()
+        .map(|row| EmojiProjectionRow {
+            did: row.did.to_owned(),
+            rkey: row.rkey.to_owned(),
+            created_at_normalized: row.created_at_normalized.map(ToOwned::to_owned),
+            emoji: row.emoji.to_owned(),
+            occurrences: row.occurrences,
+            langs: row.langs.to_vec(),
+        })
+        .collect())
+}
+
+/// Derive borrowed compact emoji projection rows for one archive post row.
+///
+/// # Errors
+///
+/// Returns [`DeriveError`] if occurrence counters overflow.
+pub fn borrowed_emoji_projection_rows_for_post(
+    row: &ArchivePostRow,
+) -> Result<Vec<BorrowedEmojiProjectionRow<'_>>, DeriveError> {
     let mut rows = Vec::new();
     for emoji in &row.emoji_sequence {
-        if let Some(existing) = rows
-            .iter_mut()
-            .find(|candidate: &&mut EmojiProjectionRow| candidate.emoji == *emoji)
+        if let Some(existing) =
+            rows.iter_mut()
+                .find(|candidate: &&mut BorrowedEmojiProjectionRow<'_>| {
+                    candidate.emoji == emoji.as_str()
+                })
         {
             existing.occurrences =
                 existing
@@ -269,13 +304,13 @@ pub fn emoji_projection_rows_for_post(
                         field: "emoji_occurrences",
                     })?;
         } else {
-            rows.push(EmojiProjectionRow {
-                did: row.did.clone(),
-                rkey: row.rkey.clone(),
-                created_at_normalized: row.created_at_normalized.clone(),
-                emoji: emoji.clone(),
+            rows.push(BorrowedEmojiProjectionRow {
+                did: row.did.as_str(),
+                rkey: row.rkey.as_str(),
+                created_at_normalized: row.created_at_normalized.as_deref(),
+                emoji: emoji.as_str(),
                 occurrences: 1,
-                langs: row.langs.clone(),
+                langs: &row.langs,
             });
         }
     }

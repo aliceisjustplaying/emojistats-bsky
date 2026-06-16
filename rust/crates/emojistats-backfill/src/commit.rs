@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::archive::NormalizerVersion;
 
 const HASH_BUFFER_BYTES: usize = 65_536;
-const PROTOCOL_VERSION: u16 = 1;
+pub(crate) const PROTOCOL_VERSION: u16 = 1;
 
 /// Local filesystem implementation of the committed artifact protocol.
 #[derive(Debug, Clone)]
@@ -253,7 +253,11 @@ impl Error {
 }
 
 impl ManifestEntry {
-    fn from_parts(metadata: &Metadata, object_path: String, digest: &DigestResult) -> Self {
+    pub(crate) fn from_parts(
+        metadata: &Metadata,
+        object_path: String,
+        digest: &DigestResult,
+    ) -> Self {
         Self {
             run_id: metadata.run_id.clone(),
             shard: metadata.shard.clone(),
@@ -273,7 +277,11 @@ impl ManifestEntry {
 }
 
 impl Receipt {
-    fn from_parts(metadata: &Metadata, object_path: String, digest: &DigestResult) -> Self {
+    pub(crate) fn from_parts(
+        metadata: &Metadata,
+        object_path: String,
+        digest: &DigestResult,
+    ) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
             run_id: metadata.run_id.clone(),
@@ -291,9 +299,9 @@ impl Receipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DigestResult {
-    bytes: u64,
-    sha256: String,
+pub(crate) struct DigestResult {
+    pub(crate) bytes: u64,
+    pub(crate) sha256: String,
 }
 
 fn write_temp_promote_file<F>(

@@ -10,8 +10,8 @@ use smol_str::SmolStr;
 
 use crate::{
     archive::{
-        ArchiveArtifacts, ArchiveError, CompletenessClass, FetchMethod, RepoReceipt,
-        StreamingArchiveSink, StreamingReceiptInput, archive_row_from_post,
+        ArchiveArtifacts, ArchiveCommitContext, ArchiveError, CompletenessClass, FetchMethod,
+        RepoReceipt, StreamingArchiveSink, StreamingReceiptInput, archive_row_from_post,
     },
     parse::{PostRecord, PostRecordBody, RawPartialPostRecord},
     transport::{AccountState, RateLimitSnapshot},
@@ -145,9 +145,10 @@ pub async fn fetch_and_archive_list_records(
     did: &Did,
     did_str: &str,
     archive_dir: &Path,
+    archive_context: ArchiveCommitContext,
     config: ListRecordsConfig,
 ) -> Result<ListRecordsArchiveOutput, ListRecordsError> {
-    let mut archiver = ListRecordsArchiver::new(did_str, archive_dir, config)?;
+    let mut archiver = ListRecordsArchiver::new(did_str, archive_dir, archive_context, config)?;
     let mut rate_limits = Vec::new();
     let mut cursor = None;
 
@@ -186,7 +187,12 @@ pub fn archive_list_records_pages<I>(
 where
     I: IntoIterator<Item = ListRecordsPage>,
 {
-    let mut archiver = ListRecordsArchiver::new(did_str, archive_dir, config)?;
+    let mut archiver = ListRecordsArchiver::new(
+        did_str,
+        archive_dir,
+        ArchiveCommitContext::fetch_one_local(),
+        config,
+    )?;
 
     for page in pages {
         archiver.push_page(page)?;
@@ -208,11 +214,12 @@ impl<'a> ListRecordsArchiver<'a> {
     fn new(
         did_str: &'a str,
         archive_dir: &Path,
+        archive_context: ArchiveCommitContext,
         config: ListRecordsConfig,
     ) -> Result<Self, ListRecordsError> {
         Ok(Self {
             did_str,
-            sink: StreamingArchiveSink::new(archive_dir, did_str)?,
+            sink: StreamingArchiveSink::new(archive_dir, did_str, archive_context)?,
             config,
             records: 0,
             decode_errors: 0,

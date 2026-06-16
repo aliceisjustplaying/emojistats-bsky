@@ -6,7 +6,6 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -18,6 +17,7 @@ use crate::{
         ClickHouseDeriveBatch, DeriveBatchInput, DeriveError, DeriveManifestIdentity,
         derive_clickhouse_batch, manifest_identity,
     },
+    hash::hash_serialized_json,
 };
 
 const RAW_ARCHIVE_POSTS_DATASET: &str = "raw_archive_posts";
@@ -658,7 +658,7 @@ fn validate_repo_receipt(
         &receipt.archive_rows_hash,
     )?;
 
-    let receipt_hash = hash_serialized(receipt).map_err(|source| Error::ReceiptJson {
+    let receipt_hash = hash_serialized_json(receipt).map_err(|source| Error::ReceiptJson {
         path: path.to_path_buf(),
         source,
     })?;
@@ -681,16 +681,6 @@ fn expect_receipt_field(
             actual: actual.to_owned(),
         })
     }
-}
-
-fn hash_serialized<T>(value: &T) -> Result<String, serde_json::Error>
-where
-    T: Serialize,
-{
-    let bytes = serde_json::to_vec(value)?;
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    Ok(hex::encode(hasher.finalize()))
 }
 
 fn first_existing_path(paths: Vec<PathBuf>) -> Option<PathBuf> {
@@ -738,8 +728,9 @@ mod tests {
     };
     use crate::{
         archive::{
-            ArchivePostRow, CreatedAtParseStatus, NormalizerVersion, RepoReceipt, RepoReceiptInput,
-            build_repo_receipt, current_normalizer, write_archive_artifacts,
+            ArchiveCommitContext, ArchivePostRow, CreatedAtParseStatus, NormalizerVersion,
+            RepoReceipt, RepoReceiptInput, build_repo_receipt, current_normalizer,
+            write_archive_artifacts,
         },
         commit::ManifestEntry,
     };
@@ -914,9 +905,15 @@ mod tests {
             archive_row("b", "fire 🔥🔥", &["🔥", "🔥"]),
         ];
         let receipt = repo_receipt(&rows);
-        let artifacts =
-            write_archive_artifacts(&output_dir, "did:plc:fixture123", &rows, None, &receipt)
-                .expect("archive artifacts should write");
+        let artifacts = write_archive_artifacts(
+            &output_dir,
+            "did:plc:fixture123",
+            &ArchiveCommitContext::fetch_one_local(),
+            &rows,
+            None,
+            &receipt,
+        )
+        .expect("archive artifacts should write");
         let plan = read_plan_from_path(&artifacts.manifest_path);
         let input = plan.inputs.first().expect("loader input");
 
@@ -935,9 +932,15 @@ mod tests {
         let output_dir = temp.path.join("archive");
         let rows = vec![archive_row("a", "hello ✅", &["✅"])];
         let receipt = repo_receipt(&rows);
-        let artifacts =
-            write_archive_artifacts(&output_dir, "did:plc:fixture123", &rows, None, &receipt)
-                .expect("archive artifacts should write");
+        let artifacts = write_archive_artifacts(
+            &output_dir,
+            "did:plc:fixture123",
+            &ArchiveCommitContext::fetch_one_local(),
+            &rows,
+            None,
+            &receipt,
+        )
+        .expect("archive artifacts should write");
         let plan = read_plan_from_path(&artifacts.manifest_path);
         fs::remove_file(&artifacts.parquet_path).expect("parquet should be removable");
 
@@ -954,9 +957,15 @@ mod tests {
         let output_dir = temp.path.join("archive");
         let rows = vec![archive_row("a", "hello ✅", &["✅"])];
         let receipt = repo_receipt(&rows);
-        let artifacts =
-            write_archive_artifacts(&output_dir, "did:plc:fixture123", &rows, None, &receipt)
-                .expect("archive artifacts should write");
+        let artifacts = write_archive_artifacts(
+            &output_dir,
+            "did:plc:fixture123",
+            &ArchiveCommitContext::fetch_one_local(),
+            &rows,
+            None,
+            &receipt,
+        )
+        .expect("archive artifacts should write");
         let plan = read_plan_from_path(&artifacts.manifest_path);
         fs::write(&artifacts.parquet_path, b"corrupt").expect("parquet should be mutable");
 
@@ -976,9 +985,15 @@ mod tests {
         let output_dir = temp.path.join("archive");
         let rows = vec![archive_row("a", "hello ✅", &["✅"])];
         let receipt = repo_receipt(&rows);
-        let artifacts =
-            write_archive_artifacts(&output_dir, "did:plc:fixture123", &rows, None, &receipt)
-                .expect("archive artifacts should write");
+        let artifacts = write_archive_artifacts(
+            &output_dir,
+            "did:plc:fixture123",
+            &ArchiveCommitContext::fetch_one_local(),
+            &rows,
+            None,
+            &receipt,
+        )
+        .expect("archive artifacts should write");
         let plan = read_plan_from_path(&artifacts.manifest_path);
         let input = plan.inputs.first().expect("loader input");
 

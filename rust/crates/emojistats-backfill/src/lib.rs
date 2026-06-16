@@ -5,6 +5,7 @@ pub mod canary;
 pub mod clickhouse;
 pub mod commit;
 pub mod derive;
+pub mod hash;
 pub mod ledger;
 pub mod list_records;
 pub mod manifest_derive;

@@ -11,10 +11,9 @@ use std::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::commit::{ManifestEntry, ManifestMode, Metadata, Receipt, Request};
+use crate::commit::{DigestResult, ManifestEntry, ManifestMode, Receipt, Request};
 
 const DEFAULT_READBACK_BYTES: usize = 4_096;
-const PROTOCOL_VERSION: u16 = 1;
 
 /// Typed configuration for a bounded remote Storage Box write scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -611,13 +610,13 @@ where
             "object",
         )?;
 
-        let entry = manifest_entry_from_parts(
+        let entry = ManifestEntry::from_parts(
             &request.metadata,
             paths.object_manifest_path,
             &object_digest,
         );
         let receipt =
-            receipt_from_parts(&request.metadata, entry.object_path.clone(), &object_digest);
+            Receipt::from_parts(&request.metadata, entry.object_path.clone(), &object_digest);
         let receipt_bytes = json_bytes("receipt", &receipt)?;
         let receipt_digest = digest_bytes("receipt", &receipt_bytes)?;
         self.commands
@@ -671,12 +670,6 @@ struct RemotePaths {
     temp_receipt: String,
     manifest: String,
     object_manifest_path: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DigestResult {
-    bytes: u64,
-    sha256: String,
 }
 
 impl RemotePaths {
@@ -1005,44 +998,6 @@ where
             operation: "stat final file",
             path: remote_path.to_owned(),
         }),
-    }
-}
-
-fn manifest_entry_from_parts(
-    metadata: &Metadata,
-    object_path: String,
-    digest: &DigestResult,
-) -> ManifestEntry {
-    ManifestEntry {
-        run_id: metadata.run_id.clone(),
-        shard: metadata.shard.clone(),
-        file_sequence: metadata.file_sequence,
-        dataset: metadata.dataset.clone(),
-        object_path,
-        row_count: metadata.row_count,
-        bytes: digest.bytes,
-        content_hash: digest.sha256.clone(),
-        min_created_at_normalized: metadata.min_created_at_normalized.clone(),
-        max_created_at_normalized: metadata.max_created_at_normalized.clone(),
-        receipt_hash: metadata.receipt_hash.clone(),
-        normalizer: metadata.normalizer.clone(),
-        schema_version: metadata.schema_version,
-    }
-}
-
-fn receipt_from_parts(metadata: &Metadata, object_path: String, digest: &DigestResult) -> Receipt {
-    Receipt {
-        protocol_version: PROTOCOL_VERSION,
-        run_id: metadata.run_id.clone(),
-        shard: metadata.shard.clone(),
-        file_sequence: metadata.file_sequence,
-        dataset: metadata.dataset.clone(),
-        object_path,
-        row_count: metadata.row_count,
-        bytes: digest.bytes,
-        content_hash: digest.sha256.clone(),
-        receipt_hash: metadata.receipt_hash.clone(),
-        schema_version: metadata.schema_version,
     }
 }
 

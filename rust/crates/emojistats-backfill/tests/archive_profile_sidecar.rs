@@ -8,8 +8,8 @@ use std::{
 
 use emojistats_backfill::{
     archive::{
-        ArchivePostRow, CreatedAtParseStatus, RepoReceipt, RepoReceiptInput, build_repo_receipt,
-        current_normalizer, hash_profile_record, write_archive_artifacts,
+        ArchiveCommitContext, ArchivePostRow, CreatedAtParseStatus, RepoReceipt, RepoReceiptInput,
+        build_repo_receipt, current_normalizer, hash_profile_record, write_archive_artifacts,
     },
     commit::{ManifestEntry, Receipt},
     parse::ProfileRecord,
@@ -32,6 +32,7 @@ fn profile_sidecar_is_written_as_committed_artifact() {
     let artifacts = write_archive_artifacts(
         &output_dir,
         "did:plc:fixture123",
+        &ArchiveCommitContext::new("run-test", "shard3", 9),
         &rows,
         Some(&profile),
         &receipt,
@@ -72,11 +73,17 @@ fn profile_sidecar_is_written_as_committed_artifact() {
         ".profile.manifest.jsonl",
     );
     assert_eq!(receipt.dataset, "raw_profile_sidecar");
+    assert_eq!(receipt.run_id, "run-test");
+    assert_eq!(receipt.shard, "shard3");
+    assert_eq!(receipt.file_sequence, 9);
     assert!(receipt.object_path.starts_with("did_plc_fixture123__"));
     assert!(receipt.object_path.ends_with(".profile.json"));
     assert_eq!(receipt.row_count, 1);
     assert_eq!(receipt.content_hash, sha256_file(&profile_path));
     assert_eq!(entry.dataset, receipt.dataset);
+    assert_eq!(entry.run_id, receipt.run_id);
+    assert_eq!(entry.shard, receipt.shard);
+    assert_eq!(entry.file_sequence, receipt.file_sequence);
     assert_eq!(entry.object_path, receipt.object_path);
     assert_eq!(entry.row_count, receipt.row_count);
     assert_eq!(entry.bytes, receipt.bytes);

@@ -13,6 +13,7 @@ use std::{
 
 use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, builder::StringBuilder};
 use arrow_schema::{DataType, Field, Schema};
+use chrono::{DateTime, SecondsFormat, Utc};
 pub use emoji_normalizer::NormalizerVersion;
 use parquet::{
     arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
@@ -24,6 +25,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     commit::{LocalStore, ManifestMode, Metadata, Request},
+    derive::{DeriveError, borrowed_emoji_projection_rows_for_post, derive_emoji_projection_rows},
+    hash::hash_serialized_json,
     parse::{ParsedRepo, PostRecord, PostRecordBody, ProfileRecord, RawPartialPostRecord},
 };
 
@@ -89,16 +92,6 @@ pub struct EmojiProjectionRow {
     pub emoji: String,
     pub occurrences: u64,
     pub langs: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct BorrowedEmojiProjectionRow<'a> {
-    did: &'a str,
-    rkey: &'a str,
-    created_at_normalized: Option<&'a str>,
-    emoji: &'a str,
-    occurrences: u64,
-    langs: &'a [String],
 }
 
 /// Local profile sidecar row for one repo, when present.
@@ -184,6 +177,30 @@ pub struct LocalManifestEntry {
     pub receipt_hash: String,
     pub schema_version: u16,
     pub normalizer: NormalizerVersion,
+}
+
+/// Stable identity for one archive commit attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveCommitContext {
+    pub run_id: String,
+    pub shard: String,
+    pub file_sequence: u64,
+}
+
+impl ArchiveCommitContext {
+    #[must_use]
+    pub fn new(run_id: impl Into<String>, shard: impl Into<String>, file_sequence: u64) -> Self {
+        Self {
+            run_id: run_id.into(),
+            shard: shard.into(),
+            file_sequence,
+        }
+    }
+
+    #[must_use]
+    pub fn fetch_one_local() -> Self {
+        Self::new("fetch-one-local", "single", 1)
+    }
 }
 
 /// Files produced by Stage D for one `fetch-one` run.
@@ -395,6 +412,7 @@ pub fn current_normalizer() -> NormalizerVersion {
 pub fn write_archive_artifacts(
     output_dir: &Path,
     did: &str,
+    commit_context: &ArchiveCommitContext,
     rows: &[ArchivePostRow],
     profile: Option<&ProfileRecord>,
     receipt: &RepoReceipt,
@@ -419,13 +437,14 @@ pub fn write_archive_artifacts(
         receipt_path: object_receipt_object_path,
         manifest_path: manifest_object_path,
         manifest_mode: ManifestMode::AppendJsonl,
-        metadata: build_commit_metadata(rows, receipt)?,
+        metadata: build_commit_metadata(rows, receipt, commit_context)?,
     };
     let committed = store.commit(&commit_request, |file| {
         write_posts_parquet_to_writer(file, rows)
             .map_err(|error| crate::commit::Error::writer(format!("write posts parquet: {error}")))
     })?;
-    let emoji_projection_rows = derive_emoji_projection_rows(rows)?;
+    let emoji_projection_rows =
+        derive_emoji_projection_rows(rows).map_err(archive_error_from_derive)?;
     let emoji_rows = u64::try_from(emoji_projection_rows.len()).map_err(|_error| {
         ArchiveError::CountOverflow {
             field: "emoji_rows",
@@ -443,6 +462,7 @@ pub fn write_archive_artifacts(
                 profile_sidecar_manifest_object_path,
                 profile,
                 receipt,
+                commit_context,
             )
         })
         .transpose()?;
@@ -490,6 +510,7 @@ pub struct StreamingArchiveSink {
     min_created_at_normalized: Option<String>,
     max_created_at_normalized: Option<String>,
     normalizer: NormalizerVersion,
+    commit_context: ArchiveCommitContext,
     did: String,
     hash_prefix: Vec<u8>,
     hash_after_cid: Vec<u8>,
@@ -516,7 +537,11 @@ impl StreamingArchiveSink {
     /// # Errors
     ///
     /// Returns [`ArchiveError`] if local files or the `Parquet` writer cannot be opened.
-    pub fn new(output_dir: &Path, did: &str) -> Result<Self, ArchiveError> {
+    pub fn new(
+        output_dir: &Path,
+        did: &str,
+        commit_context: ArchiveCommitContext,
+    ) -> Result<Self, ArchiveError> {
         fs::create_dir_all(output_dir)?;
         let artifact_stem = artifact_file_stem(did);
         let parquet_path = output_dir.join(format!("{artifact_stem}.posts.parquet"));
@@ -564,6 +589,7 @@ impl StreamingArchiveSink {
             min_created_at_normalized: None,
             max_created_at_normalized: None,
             normalizer,
+            commit_context,
             did: did.to_owned(),
             hash_prefix,
             hash_after_cid,
@@ -649,32 +675,9 @@ impl StreamingArchiveSink {
     }
 
     fn write_emoji_projection_rows(&mut self, row: &ArchivePostRow) -> Result<(), ArchiveError> {
-        let mut projected: Vec<(&str, u64)> = Vec::new();
-        for emoji in &row.emoji_sequence {
-            let emoji = emoji.as_str();
-            if let Some((_, occurrences)) = projected
-                .iter_mut()
-                .find(|(candidate, _)| *candidate == emoji)
-            {
-                *occurrences = occurrences
-                    .checked_add(1)
-                    .ok_or(ArchiveError::CountOverflow {
-                        field: "emoji_occurrences",
-                    })?;
-            } else {
-                projected.push((emoji, 1_u64));
-            }
-        }
-
-        for (emoji, occurrences) in projected {
-            let projection_row = BorrowedEmojiProjectionRow {
-                did: row.did.as_str(),
-                rkey: row.rkey.as_str(),
-                created_at_normalized: row.created_at_normalized.as_deref(),
-                emoji,
-                occurrences,
-                langs: &row.langs,
-            };
+        for projection_row in
+            borrowed_emoji_projection_rows_for_post(row).map_err(archive_error_from_derive)?
+        {
             let json = json_bytes(&projection_row)?;
             hash_field_bytes(&mut self.emoji_projection_hash, &json)?;
             self.emoji_file.write_all(&json)?;
@@ -703,7 +706,7 @@ impl StreamingArchiveSink {
         self.finish_stream_files()?;
         let receipt = self.build_streaming_receipt(input);
         write_temp_rename(&self.receipt_path, |path| write_json_pretty(path, &receipt))?;
-        let receipt_hash = hash_serialized(&receipt)?;
+        let receipt_hash = hash_serialized_json(&receipt)?;
         let manifest = self.write_object_receipt_and_manifest(&receipt_hash)?;
         let committed_profile = self.commit_profile(profile, &receipt)?;
         let artifacts = self.into_artifacts(manifest, committed_profile);
@@ -792,9 +795,9 @@ impl StreamingArchiveSink {
         receipt_hash: &str,
     ) -> LocalManifestEntry {
         LocalManifestEntry {
-            run_id: "fetch-one-local".to_owned(),
-            shard: "single".to_owned(),
-            file_sequence: 1,
+            run_id: self.commit_context.run_id.clone(),
+            shard: self.commit_context.shard.clone(),
+            file_sequence: self.commit_context.file_sequence,
             dataset: "raw_archive_posts".to_owned(),
             local_path: self.parquet_path.clone(),
             row_count: self.archived_post_rows_count,
@@ -846,6 +849,7 @@ impl StreamingArchiveSink {
                     PathBuf::from(format!("{}.profile.manifest.jsonl", self.artifact_stem)),
                     profile,
                     receipt,
+                    &self.commit_context,
                 )
             })
             .transpose()
@@ -936,7 +940,8 @@ pub fn archive_post_rows_from_record_batch(
 pub fn build_repo_receipt(input: RepoReceiptInput<'_>) -> Result<RepoReceipt, ArchiveError> {
     let rows = input.rows;
     let post_rows_hash = hash_post_rows(rows)?;
-    let emoji_projection_rows = derive_emoji_projection_rows(rows)?;
+    let emoji_projection_rows =
+        derive_emoji_projection_rows(rows).map_err(archive_error_from_derive)?;
     let emoji_projection_hash = hash_emoji_projection_rows(&emoji_projection_rows)?;
     Ok(RepoReceipt {
         fetch_method: FetchMethod::GetRepo,
@@ -1259,32 +1264,36 @@ fn parse_created_at_parse_status(value: &str) -> Result<CreatedAtParseStatus, Ar
 fn build_commit_metadata(
     rows: &[ArchivePostRow],
     receipt: &RepoReceipt,
+    commit_context: &ArchiveCommitContext,
 ) -> Result<Metadata, ArchiveError> {
     Ok(Metadata {
-        run_id: "fetch-one-local".to_owned(),
-        shard: "single".to_owned(),
-        file_sequence: 1,
+        run_id: commit_context.run_id.clone(),
+        shard: commit_context.shard.clone(),
+        file_sequence: commit_context.file_sequence,
         dataset: "raw_archive_posts".to_owned(),
         row_count: u64::try_from(rows.len())
             .map_err(|_error| ArchiveError::CountOverflow { field: "row_count" })?,
         min_created_at_normalized: min_created_at(rows),
         max_created_at_normalized: max_created_at(rows),
-        receipt_hash: hash_serialized(receipt)?,
+        receipt_hash: hash_serialized_json(receipt)?,
         normalizer: receipt.normalizer.clone(),
         schema_version: ARCHIVE_SCHEMA_VERSION,
     })
 }
 
-fn build_profile_sidecar_metadata(receipt: &RepoReceipt) -> Result<Metadata, ArchiveError> {
+fn build_profile_sidecar_metadata(
+    receipt: &RepoReceipt,
+    commit_context: &ArchiveCommitContext,
+) -> Result<Metadata, ArchiveError> {
     Ok(Metadata {
-        run_id: "fetch-one-local".to_owned(),
-        shard: "single".to_owned(),
-        file_sequence: 1,
+        run_id: commit_context.run_id.clone(),
+        shard: commit_context.shard.clone(),
+        file_sequence: commit_context.file_sequence,
         dataset: "raw_profile_sidecar".to_owned(),
         row_count: 1,
         min_created_at_normalized: None,
         max_created_at_normalized: None,
-        receipt_hash: hash_serialized(receipt)?,
+        receipt_hash: hash_serialized_json(receipt)?,
         normalizer: receipt.normalizer.clone(),
         schema_version: ARCHIVE_SCHEMA_VERSION,
     })
@@ -1297,13 +1306,14 @@ fn commit_profile_sidecar(
     manifest_path: PathBuf,
     profile: &ProfileRecord,
     receipt: &RepoReceipt,
+    commit_context: &ArchiveCommitContext,
 ) -> Result<crate::commit::Artifact, ArchiveError> {
     let request = Request {
         object_path,
         receipt_path,
         manifest_path,
         manifest_mode: ManifestMode::AppendJsonl,
-        metadata: build_profile_sidecar_metadata(receipt)?,
+        metadata: build_profile_sidecar_metadata(receipt, commit_context)?,
     };
     Ok(store.commit(&request, |file| {
         write_profile_sidecar_json_to_writer(file, profile).map_err(|error| {
@@ -1366,46 +1376,17 @@ fn profile_sidecar_row(profile: &ProfileRecord) -> ProfileSidecarRow<'_> {
     }
 }
 
-fn derive_emoji_projection_rows(
-    rows: &[ArchivePostRow],
-) -> Result<Vec<EmojiProjectionRow>, ArchiveError> {
-    let mut projected = Vec::new();
-    for row in rows {
-        projected.extend(emoji_projection_rows(row)?);
-    }
-    Ok(projected)
-}
-
-fn emoji_projection_rows(row: &ArchivePostRow) -> Result<Vec<EmojiProjectionRow>, ArchiveError> {
-    let mut rows = Vec::new();
-    for emoji in &row.emoji_sequence {
-        if let Some(existing) = rows
-            .iter_mut()
-            .find(|candidate: &&mut EmojiProjectionRow| candidate.emoji == *emoji)
-        {
-            existing.occurrences =
-                existing
-                    .occurrences
-                    .checked_add(1)
-                    .ok_or(ArchiveError::CountOverflow {
-                        field: "emoji_occurrences",
-                    })?;
-        } else {
-            rows.push(EmojiProjectionRow {
-                did: row.did.clone(),
-                rkey: row.rkey.clone(),
-                created_at_normalized: row.created_at_normalized.clone(),
-                emoji: emoji.clone(),
-                occurrences: 1,
-                langs: row.langs.clone(),
-            });
-        }
-    }
-    Ok(rows)
-}
-
 fn extract_emojis(text: &str) -> Vec<String> {
     emoji_normalizer::extract_emoji_sequence(text)
+}
+
+const fn archive_error_from_derive(error: DeriveError) -> ArchiveError {
+    match error {
+        DeriveError::CountOverflow { field } => ArchiveError::CountOverflow { field },
+        DeriveError::RowCountMismatch { .. } => ArchiveError::CountOverflow {
+            field: "derive_row_count_mismatch",
+        },
+    }
 }
 
 fn count_emoji_posts(rows: &[ArchivePostRow]) -> Result<u64, ArchiveError> {
@@ -1514,13 +1495,6 @@ fn hash_file_for_archive(path: &Path) -> Result<ArchiveFileDigest, ArchiveError>
         bytes,
         sha256: hex::encode(hasher.finalize()),
     })
-}
-
-fn hash_serialized<T: Serialize>(value: &T) -> Result<String, ArchiveError> {
-    let bytes = serde_json::to_vec(value)?;
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    Ok(hex::encode(hasher.finalize()))
 }
 
 fn min_created_at(rows: &[ArchivePostRow]) -> Option<String> {
@@ -1724,315 +1698,32 @@ pub fn classify_created_at(value: Option<&str>) -> ClassifiedCreatedAt {
 }
 
 fn classify_present_created_at(raw: &str) -> ClassifiedCreatedAt {
-    if let Some(classified) = classify_canonical_utc_second_created_at(raw) {
-        return classified;
-    }
-    let timestamp = parse_rfc3339_epoch_seconds(raw);
-    let now = current_epoch_seconds();
-    let status = match (timestamp, now) {
-        (Some(timestamp), Some(now)) if timestamp > now => CreatedAtParseStatus::Future,
-        (Some(_timestamp), _now) => CreatedAtParseStatus::Valid,
-        (None, _now) => CreatedAtParseStatus::Invalid,
-    };
-    let normalized = if status == CreatedAtParseStatus::Valid {
-        timestamp.and_then(format_epoch_seconds)
-    } else {
-        None
-    };
-    ClassifiedCreatedAt {
-        raw: Some(raw.to_owned()),
-        normalized,
-        status,
-    }
-}
-
-fn classify_canonical_utc_second_created_at(raw: &str) -> Option<ClassifiedCreatedAt> {
-    let parts = parse_canonical_utc_second_parts(raw)?;
-    validate_datetime_parts(
-        parts.year,
-        parts.month,
-        parts.day,
-        parts.hour,
-        parts.minute,
-        parts.second,
-    )?;
-    if current_epoch_utc_second_string()
-        .as_deref()
-        .is_some_and(|now| raw > now)
-    {
-        return Some(ClassifiedCreatedAt {
+    match DateTime::parse_from_rfc3339(raw) {
+        Ok(timestamp) if timestamp.with_timezone(&Utc) > current_utc() => ClassifiedCreatedAt {
             raw: Some(raw.to_owned()),
             normalized: None,
             status: CreatedAtParseStatus::Future,
-        });
-    }
-    Some(ClassifiedCreatedAt {
-        raw: Some(raw.to_owned()),
-        normalized: Some(raw.to_owned()),
-        status: CreatedAtParseStatus::Valid,
-    })
-}
-
-#[derive(Debug, Clone, Copy)]
-struct CanonicalUtcSecondParts {
-    year: i64,
-    month: i64,
-    day: i64,
-    hour: i64,
-    minute: i64,
-    second: i64,
-}
-
-fn parse_canonical_utc_second_parts(value: &str) -> Option<CanonicalUtcSecondParts> {
-    let bytes = value.as_bytes();
-    if bytes.len() != 20
-        || *bytes.get(4)? != b'-'
-        || *bytes.get(7)? != b'-'
-        || *bytes.get(10)? != b'T'
-        || *bytes.get(13)? != b':'
-        || *bytes.get(16)? != b':'
-        || *bytes.get(19)? != b'Z'
-    {
-        return None;
-    }
-    Some(CanonicalUtcSecondParts {
-        year: parse_ascii_digits(bytes.get(0..4)?)?,
-        month: parse_ascii_digits(bytes.get(5..7)?)?,
-        day: parse_ascii_digits(bytes.get(8..10)?)?,
-        hour: parse_ascii_digits(bytes.get(11..13)?)?,
-        minute: parse_ascii_digits(bytes.get(14..16)?)?,
-        second: parse_ascii_digits(bytes.get(17..19)?)?,
-    })
-}
-
-fn parse_ascii_digits(bytes: &[u8]) -> Option<i64> {
-    let mut value = 0_i64;
-    for byte in bytes {
-        if !byte.is_ascii_digit() {
-            return None;
-        }
-        value = value
-            .checked_mul(10)?
-            .checked_add(i64::from(byte.checked_sub(b'0')?))?;
-    }
-    Some(value)
-}
-
-fn current_epoch_utc_second_string() -> Option<String> {
-    static CURRENT_EPOCH_UTC_SECOND_STRING: OnceLock<Option<String>> = OnceLock::new();
-    CURRENT_EPOCH_UTC_SECOND_STRING
-        .get_or_init(|| current_epoch_seconds().and_then(format_epoch_seconds))
-        .clone()
-}
-
-fn current_epoch_seconds() -> Option<i64> {
-    static CURRENT_EPOCH_SECONDS: OnceLock<Option<i64>> = OnceLock::new();
-    *CURRENT_EPOCH_SECONDS.get_or_init(|| {
-        let duration = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
-        i64::try_from(duration.as_secs()).ok()
-    })
-}
-
-fn parse_rfc3339_epoch_seconds(value: &str) -> Option<i64> {
-    let mut chars = value.chars();
-    let year = read_digits(&mut chars, 4)?;
-    expect_char(&mut chars, '-')?;
-    let month = read_digits(&mut chars, 2)?;
-    expect_char(&mut chars, '-')?;
-    let day = read_digits(&mut chars, 2)?;
-    expect_char(&mut chars, 'T')?;
-    let hour = read_digits(&mut chars, 2)?;
-    expect_char(&mut chars, ':')?;
-    let minute = read_digits(&mut chars, 2)?;
-    expect_char(&mut chars, ':')?;
-    let second = read_digits(&mut chars, 2)?;
-    let timezone = read_timezone(&mut chars)?;
-    validate_datetime_parts(year, month, day, hour, minute, second)?;
-    let days = days_from_civil(year, month, day)?;
-    let day_seconds = days.checked_mul(86_400)?;
-    let hour_seconds = hour.checked_mul(3_600)?;
-    let minute_seconds = minute.checked_mul(60)?;
-    day_seconds
-        .checked_add(hour_seconds)?
-        .checked_add(minute_seconds)?
-        .checked_add(second)?
-        .checked_sub(timezone)
-}
-
-fn read_timezone(chars: &mut std::str::Chars<'_>) -> Option<i64> {
-    let next = chars.next()?;
-    match next {
-        '.' => {
-            read_fraction(chars)?;
-            read_timezone(chars)
-        }
-        'Z' => {
-            ensure_finished(chars)?;
-            Some(0)
-        }
-        '+' | '-' => {
-            let sign = if next == '+' { 1_i64 } else { -1_i64 };
-            let hour = read_digits(chars, 2)?;
-            expect_char(chars, ':')?;
-            let minute = read_digits(chars, 2)?;
-            ensure_finished(chars)?;
-            validate_timezone(hour, minute)?;
-            hour.checked_mul(3_600)?
-                .checked_add(minute.checked_mul(60)?)?
-                .checked_mul(sign)
-        }
-        _other => None,
+        },
+        Ok(timestamp) => ClassifiedCreatedAt {
+            raw: Some(raw.to_owned()),
+            normalized: Some(
+                timestamp
+                    .with_timezone(&Utc)
+                    .to_rfc3339_opts(SecondsFormat::Secs, true),
+            ),
+            status: CreatedAtParseStatus::Valid,
+        },
+        Err(_error) => ClassifiedCreatedAt {
+            raw: Some(raw.to_owned()),
+            normalized: None,
+            status: CreatedAtParseStatus::Invalid,
+        },
     }
 }
 
-fn read_fraction(chars: &mut std::str::Chars<'_>) -> Option<()> {
-    let mut saw_digit = false;
-    loop {
-        let mut clone = chars.clone();
-        match clone.next() {
-            Some(ch) if ch.is_ascii_digit() => {
-                saw_digit = true;
-                let _discarded = chars.next();
-            }
-            Some('Z' | '+' | '-') if saw_digit => return Some(()),
-            _other => return None,
-        }
-    }
-}
-
-fn read_digits(chars: &mut std::str::Chars<'_>, count: usize) -> Option<i64> {
-    let mut value = 0_i64;
-    for _ in 0..count {
-        let digit = chars.next()?.to_digit(10)?;
-        value = value.checked_mul(10)?.checked_add(i64::from(digit))?;
-    }
-    Some(value)
-}
-
-fn expect_char(chars: &mut std::str::Chars<'_>, expected: char) -> Option<()> {
-    (chars.next()? == expected).then_some(())
-}
-
-fn ensure_finished(chars: &mut std::str::Chars<'_>) -> Option<()> {
-    chars.next().is_none().then_some(())
-}
-
-fn validate_datetime_parts(
-    year: i64,
-    month: i64,
-    day: i64,
-    hour: i64,
-    minute: i64,
-    second: i64,
-) -> Option<()> {
-    if !(1..=9999).contains(&year) {
-        return None;
-    }
-    if !(1..=12).contains(&month) {
-        return None;
-    }
-    if !(1..=days_in_month(year, month)?).contains(&day) {
-        return None;
-    }
-    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0..=59).contains(&second) {
-        return None;
-    }
-    Some(())
-}
-
-fn format_epoch_seconds(value: i64) -> Option<String> {
-    let days = value.div_euclid(86_400);
-    let seconds_of_day = value.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days)?;
-    let hour = seconds_of_day.div_euclid(3_600);
-    let minute = seconds_of_day.checked_rem(3_600)?.div_euclid(60);
-    let second = seconds_of_day.checked_rem(60)?;
-    Some(format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
-    ))
-}
-
-fn civil_from_days(days: i64) -> Option<(i64, i64, i64)> {
-    let z = days.checked_add(719_468)?;
-    let era = if z >= 0 {
-        z.div_euclid(146_097)
-    } else {
-        z.checked_sub(146_096)?.div_euclid(146_097)
-    };
-    let doe = z.checked_sub(era.checked_mul(146_097)?)?;
-    let yoe = doe
-        .checked_sub(doe.div_euclid(1_460))?
-        .checked_add(doe.div_euclid(36_524))?
-        .checked_sub(doe.div_euclid(146_096))?
-        .div_euclid(365);
-    let year = yoe.checked_add(era.checked_mul(400)?)?;
-    let doy = doe.checked_sub(
-        365_i64
-            .checked_mul(yoe)?
-            .checked_add(yoe.div_euclid(4))?
-            .checked_sub(yoe.div_euclid(100))?,
-    )?;
-    let mp = 5_i64.checked_mul(doy)?.checked_add(2)?.div_euclid(153);
-    let day = doy
-        .checked_sub(153_i64.checked_mul(mp)?.checked_add(2)?.div_euclid(5))?
-        .checked_add(1)?;
-    let month = mp.checked_add(if mp < 10 { 3 } else { -9 })?;
-    let year = year.checked_add(i64::from(month <= 2))?;
-    Some((year, month, day))
-}
-
-fn validate_timezone(hour: i64, minute: i64) -> Option<()> {
-    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) {
-        return None;
-    }
-    Some(())
-}
-
-fn days_in_month(year: i64, month: i64) -> Option<i64> {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => Some(31),
-        4 | 6 | 9 | 11 => Some(30),
-        2 if is_leap_year(year)? => Some(29),
-        2 => Some(28),
-        _other => None,
-    }
-}
-
-fn is_leap_year(year: i64) -> Option<bool> {
-    let by_four = year.checked_rem(4)? == 0;
-    let by_hundred = year.checked_rem(100)? == 0;
-    let by_four_hundred = year.checked_rem(400)? == 0;
-    Some(by_four && (!by_hundred || by_four_hundred))
-}
-
-fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
-    let adjusted_year = if month <= 2 {
-        year.checked_sub(1)?
-    } else {
-        year
-    };
-    let era = adjusted_year.div_euclid(400);
-    let era_years = era.checked_mul(400)?;
-    let year_of_era = adjusted_year.checked_sub(era_years)?;
-    let month_prime = if month > 2 {
-        month.checked_sub(3)?
-    } else {
-        month.checked_add(9)?
-    };
-    let day_of_year = 153_i64
-        .checked_mul(month_prime)?
-        .checked_add(2)?
-        .div_euclid(5)
-        .checked_add(day)?
-        .checked_sub(1)?;
-    let year_days = year_of_era.checked_mul(365)?;
-    let leap_days = year_of_era
-        .div_euclid(4)
-        .checked_sub(year_of_era.div_euclid(100))?;
-    let day_of_era = year_days.checked_add(leap_days)?.checked_add(day_of_year)?;
-    era.checked_mul(146_097)?
-        .checked_add(day_of_era)?
-        .checked_sub(719_468)
+fn current_utc() -> DateTime<Utc> {
+    static CURRENT_UTC: OnceLock<DateTime<Utc>> = OnceLock::new();
+    *CURRENT_UTC.get_or_init(Utc::now)
 }
 
 fn write_temp_rename<F>(path: &Path, write: F) -> Result<(), ArchiveError>
@@ -2211,9 +1902,9 @@ mod tests {
     };
 
     use super::{
-        ArchivePostRow, CompletenessClass, CreatedAtParseStatus, FetchMethod, NormalizerVersion,
-        RepoReceiptInput, StreamingArchiveSink, StreamingReceiptInput, build_repo_receipt,
-        classify_created_at, extract_emojis, hash_post_rows,
+        ArchiveCommitContext, ArchivePostRow, CompletenessClass, CreatedAtParseStatus, FetchMethod,
+        NormalizerVersion, RepoReceiptInput, StreamingArchiveSink, StreamingReceiptInput,
+        build_repo_receipt, classify_created_at, extract_emojis, hash_post_rows,
     };
 
     fn normalizer() -> NormalizerVersion {
@@ -2305,7 +1996,12 @@ mod tests {
         let output_dir = unique_test_dir("streaming-sink-drop");
         fs::create_dir_all(&output_dir).expect("create test archive dir");
 
-        let sink = StreamingArchiveSink::new(&output_dir, "did:plc:cleanup").expect("create sink");
+        let sink = StreamingArchiveSink::new(
+            &output_dir,
+            "did:plc:cleanup",
+            ArchiveCommitContext::fetch_one_local(),
+        )
+        .expect("create sink");
         let parquet_temp = sink.parquet_temp_path.clone();
         let emoji_temp = sink.emoji_projection_temp_path.clone();
         assert!(parquet_temp.exists(), "{}", parquet_temp.display());
@@ -2321,8 +2017,12 @@ mod tests {
     fn streaming_sink_writes_committed_manifest_entry() {
         let output_dir = unique_test_dir("streaming-sink-manifest");
         fs::create_dir_all(&output_dir).expect("create test archive dir");
-        let mut sink =
-            StreamingArchiveSink::new(&output_dir, "did:plc:manifest").expect("create sink");
+        let mut sink = StreamingArchiveSink::new(
+            &output_dir,
+            "did:plc:manifest",
+            ArchiveCommitContext::new("run-test", "shard7", 42),
+        )
+        .expect("create sink");
         sink.push_row(row("hello ✅", &["✅"])).expect("push row");
         let (_receipt, artifacts) = sink
             .finish(
@@ -2346,6 +2046,9 @@ mod tests {
 
         assert!(entry.object_path.starts_with("did_plc_manifest__"));
         assert!(entry.object_path.ends_with(".posts.parquet"));
+        assert_eq!(entry.run_id, "run-test");
+        assert_eq!(entry.shard, "shard7");
+        assert_eq!(entry.file_sequence, 42);
         assert_eq!(entry.dataset, "raw_archive_posts");
         assert_eq!(entry.row_count, 1);
         fs::remove_dir_all(output_dir).expect("remove test archive dir");

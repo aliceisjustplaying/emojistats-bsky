@@ -145,6 +145,11 @@ impl FetchByteBudgetReservation {
         self.charged_bytes = charged_target;
         Ok(())
     }
+
+    #[cfg(test)]
+    const fn charged_bytes(&self) -> u64 {
+        self.charged_bytes
+    }
 }
 
 impl Drop for FetchByteBudgetReservation {
@@ -463,15 +468,17 @@ async fn stream_to_file(
     byte_budget: Option<&FetchByteBudget>,
 ) -> Result<(u64, Option<FetchByteBudgetReservation>), FetchError> {
     let temp_path = temp_spool_path(car_path)?;
-    match stream_to_temp_file(body, &temp_path, chunk_idle_timeout, max_bytes).await {
+    let mut reservation = byte_budget.map(FetchByteBudget::reservation);
+    match stream_to_temp_file(
+        body,
+        &temp_path,
+        chunk_idle_timeout,
+        max_bytes,
+        reservation.as_mut(),
+    )
+    .await
+    {
         Ok(bytes) => {
-            let mut reservation = byte_budget.map(FetchByteBudget::reservation);
-            if let Some(reservation) = &mut reservation
-                && let Err(error) = reservation.reserve_completed(bytes).await
-            {
-                let _ignored = fs::remove_file(&temp_path);
-                return Err(error);
-            }
             fs::hard_link(&temp_path, car_path)?;
             let _ignored = fs::remove_file(&temp_path);
             sync_parent_dir(car_path)?;
@@ -489,6 +496,7 @@ async fn stream_to_temp_file(
     temp_path: &Path,
     chunk_idle_timeout: Duration,
     max_bytes: u64,
+    mut byte_budget_reservation: Option<&mut FetchByteBudgetReservation>,
 ) -> Result<u64, FetchError> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -523,6 +531,9 @@ async fn stream_to_temp_file(
                 max_bytes,
                 observed_bytes,
             });
+        }
+        if let Some(reservation) = &mut byte_budget_reservation {
+            reservation.reserve_completed(observed_bytes).await?;
         }
         file.write_all(chunk.as_ref())?;
         bytes = observed_bytes;
@@ -686,15 +697,14 @@ fn parse_retry_after_header(headers: &HeaderMap) -> Option<Duration> {
 }
 
 fn parse_http_date_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
-    parse_imf_fixdate_epoch_seconds(value).and_then(|deadline| {
-        let now = epoch_seconds(now)?;
-        let delay = deadline.checked_sub(now)?;
-        u64::try_from(delay).ok().map(Duration::from_secs)
-    })
+    httpdate::parse_http_date(value)
+        .ok()?
+        .duration_since(now)
+        .ok()
 }
 
 fn reset_delay(reset: u64, now: SystemTime) -> Option<Duration> {
-    let now = u64::try_from(epoch_seconds(now)?).ok()?;
+    let now = now.duration_since(UNIX_EPOCH).ok()?.as_secs();
     if reset > now {
         return reset.checked_sub(now).map(Duration::from_secs);
     }
@@ -702,118 +712,6 @@ fn reset_delay(reset: u64, now: SystemTime) -> Option<Duration> {
         return Some(Duration::from_secs(reset));
     }
     None
-}
-
-fn epoch_seconds(now: SystemTime) -> Option<i64> {
-    let duration = now.duration_since(UNIX_EPOCH).ok()?;
-    i64::try_from(duration.as_secs()).ok()
-}
-
-fn parse_imf_fixdate_epoch_seconds(value: &str) -> Option<i64> {
-    let mut parts = value.split_ascii_whitespace();
-    let _weekday = parts.next()?;
-    let day = parts.next()?.parse::<i64>().ok()?;
-    let month = month_number(parts.next()?)?;
-    let year = parts.next()?.parse::<i64>().ok()?;
-    let time = parts.next()?;
-    if parts.next()? != "GMT" || parts.next().is_some() {
-        return None;
-    }
-    let mut time_parts = time.split(':');
-    let hour = time_parts.next()?.parse::<i64>().ok()?;
-    let minute = time_parts.next()?.parse::<i64>().ok()?;
-    let second = time_parts.next()?.parse::<i64>().ok()?;
-    if time_parts.next().is_some() {
-        return None;
-    }
-    validate_http_date_parts(year, month, day, hour, minute, second)?;
-    let days = days_from_civil(year, month, day)?;
-    days.checked_mul(86_400)?
-        .checked_add(hour.checked_mul(3_600)?)?
-        .checked_add(minute.checked_mul(60)?)?
-        .checked_add(second)
-}
-
-fn month_number(value: &str) -> Option<i64> {
-    match value {
-        "Jan" => Some(1),
-        "Feb" => Some(2),
-        "Mar" => Some(3),
-        "Apr" => Some(4),
-        "May" => Some(5),
-        "Jun" => Some(6),
-        "Jul" => Some(7),
-        "Aug" => Some(8),
-        "Sep" => Some(9),
-        "Oct" => Some(10),
-        "Nov" => Some(11),
-        "Dec" => Some(12),
-        _other => None,
-    }
-}
-
-fn validate_http_date_parts(
-    year: i64,
-    month: i64,
-    day: i64,
-    hour: i64,
-    minute: i64,
-    second: i64,
-) -> Option<()> {
-    if !(1970..=9999).contains(&year)
-        || !(1..=12).contains(&month)
-        || !(1..=days_in_month(year, month)?).contains(&day)
-        || !(0..=23).contains(&hour)
-        || !(0..=59).contains(&minute)
-        || !(0..=59).contains(&second)
-    {
-        return None;
-    }
-    Some(())
-}
-
-fn days_in_month(year: i64, month: i64) -> Option<i64> {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => Some(31),
-        4 | 6 | 9 | 11 => Some(30),
-        2 if is_leap_year(year)? => Some(29),
-        2 => Some(28),
-        _other => None,
-    }
-}
-
-fn is_leap_year(year: i64) -> Option<bool> {
-    let by_four = year.checked_rem(4)? == 0;
-    let by_hundred = year.checked_rem(100)? == 0;
-    let by_four_hundred = year.checked_rem(400)? == 0;
-    Some(by_four_hundred || (by_four && !by_hundred))
-}
-
-fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
-    let adjusted_year = if month <= 2 {
-        year.checked_sub(1)?
-    } else {
-        year
-    };
-    let era = adjusted_year.div_euclid(400);
-    let year_of_era = adjusted_year.checked_sub(era.checked_mul(400)?)?;
-    let month_prime = if month > 2 {
-        month.checked_sub(3)?
-    } else {
-        month.checked_add(9)?
-    };
-    let day_of_year = 153_i64
-        .checked_mul(month_prime)?
-        .checked_add(2)?
-        .div_euclid(5)
-        .checked_add(day)?
-        .checked_sub(1)?;
-    era.checked_mul(146_097)?
-        .checked_add(year_of_era.checked_mul(365)?)?
-        .checked_add(year_of_era.div_euclid(4))?
-        .checked_sub(year_of_era.div_euclid(100))?
-        .checked_add(day_of_year)?
-        .checked_sub(719_468)
 }
 
 fn parse_string_header(headers: &HeaderMap, name: &'static str) -> Option<String> {
@@ -844,12 +742,13 @@ mod tests {
         time::{Duration, UNIX_EPOCH},
     };
 
+    use bytes::Bytes;
     use http::{HeaderMap, StatusCode};
-    use jacquard_common::types::did::Did;
+    use jacquard_common::{stream::ByteStream, types::did::Did};
 
     use super::{
         AccountState, FetchByteBudget, FetchConfig, FetchError, RateLimitSnapshot,
-        classify_http_error, parse_http_date_retry_after, spool_path,
+        classify_http_error, parse_http_date_retry_after, spool_path, stream_to_temp_file,
     };
 
     #[test]
@@ -982,6 +881,48 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn byte_budget_blocks_while_streaming_chunk() {
+        let budget = FetchByteBudget::new(10);
+        let mut first = budget.reservation();
+        first.reserve_completed(8).await.unwrap();
+        let mut second = budget.reservation();
+        let path = std::env::temp_dir().join(format!(
+            "emojistats-byte-budget-stream-{}-{}.car",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let body = ByteStream::new(futures_util::stream::iter([Ok(Bytes::from_static(b"abc"))]));
+        let task_path = path.clone();
+        let handle = tokio::spawn(async move {
+            let result = stream_to_temp_file(
+                body,
+                &task_path,
+                Duration::from_secs(1),
+                100,
+                Some(&mut second),
+            )
+            .await;
+            (result, second.charged_bytes())
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!handle.is_finished());
+        assert!(!path.exists() || std::fs::metadata(&path).unwrap().len() == 0);
+
+        drop(first);
+        let (result, charged_bytes) = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap(), 3);
+        assert_eq!(charged_bytes, 3);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
