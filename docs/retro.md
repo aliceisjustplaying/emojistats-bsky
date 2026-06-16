@@ -2122,6 +2122,65 @@ that failed samples stay unpromoted rather than being incorrectly marked verifie
 The five-minute revert is the verification story in miniature: every plausible shortcut through
 the loose band reveals another edge case that makes the shortcut wrong.
 
+### 2026-06-16 (continued) — the memory fix, the performance arc, and three reviews that agree
+
+**The OOM had three root causes, not one.** The first scale smoke test died at 7 GB RSS, and a
+second whale parse (`lb7`, 293 MB CAR, 2.5M posts) hit ~10 GB RSS before Alice stopped it
+manually. She rejected the initial band-aid (an RSS cap) outright: "I don't want a band-aid. I
+want a root cause fixed please." The three causes, each fixed independently:
+
+- Jacquard's cached `MstCursor` kept the full MST in memory during traversal. Replaced with a
+  streaming MST walker that holds only the current stack (`60263ae`).
+- The parser accumulated all decoded posts into a `Vec<PostRecord>` before returning. Replaced
+  with a visitor/streaming pattern that writes 1024-row batches to Parquet during traversal.
+- The ClickHouse derive path read all archive rows into memory before inserting. Replaced with
+  a streaming Parquet batch reader + bounded inserts (`fd94c08`).
+
+The memory numbers before and after tell the story. Whale `lb7` (293 MB CAR): **10 GB RSS →
+261 MB**. ClickHouse derive of the same repo: **7.3 GB → 35.6 MB**. Whale `o6g` (3.96 GB
+CAR, 5.0M posts): **1.50 GB RSS**. The 24-DID final smoke test ran all whales at peak
+**3.58 GB RSS** — down from a kernel OOM. 19 succeeded, 5 failed with expected terminal
+classifications.
+
+There was also an 18× parse speedup earlier in the session. CID verification was 90% of wall
+time on a 41 MB test CAR (22s per repo in release mode). Replacing Jacquard's streaming CAR
+reader with a one-pass verifier + indexer (`9749689`) dropped it to ~1.2s. Alice's reaction to
+seeing 22s: "can we make it faster. that feels like a lot." Her reaction to 1.2s: "okay. yeah.
+fine. commit. push." The `repo-stream` crate was also evaluated as a potential drop-in: it
+benchmarked at 36s total on the o6g whale, but when properly compared against the streaming path
+it was actually slower (87s vs 56s parse-only). Kept as a reference, not a dependency.
+
+**A fourth root cause surfaced before the memory fixes: spool budget deadlock.** Four whale
+fetches simultaneously filled the 512 MiB shared spool budget and all blocked mid-stream waiting
+for budget to free. The fix: charge the budget after the CAR completes, not during active
+download — the budget bounds concurrency, not in-flight bytes.
+
+**Three independent thermo-nuclear code quality reviews converged on the same structural
+blockers.** Alice ran the reviews on the afternoon of June 16 (sessions at 14:18, 14:51, and
+15:11 UTC — potentially parallel agents). All three independently found:
+
+- `main.rs` is a 2.6–3k line orchestration sink
+- Six to seven Rust files over 1,000 lines
+- The in-flight byte budget is charged *after* a full CAR finishes, so it doesn't actually bound
+  what it claims to bound
+- Two parallel committed-artifact systems (local and remote) that should be one engine with
+  pluggable I/O
+- Protocol duplication between `parse.rs` and `list_records.rs`
+
+Verdict from all three: **"tests pass, but shape not approved."** Alice's response was to
+package the Rust source into a zip and SCP it off the box for an independent external review.
+This is the same pattern as v1's thermo-nuclear reviews — write the code fast, then submit it
+to adversarial critique before it touches production. The difference is that v1's reviews came
+after the backfill was already running; v2's come before a single production byte is crawled.
+
+The session also revealed a working pattern for the parallel-subagent approach to the rewrite:
+the main Codex agent orchestrated 6+ concurrent subagent sessions for individual lanes (ledger,
+normalizer, fleet, transport, derive). The tradeoff: high velocity (26k lines in 24 hours) at
+the cost of significant integration cleanup — subagents delivered code with compile issues,
+missing helpers and stale tests that the orchestrating agent had to reconcile manually. The
+concurrent sessions for the ledger lane alone produced atomic claims with CAS, worker leases,
+stale recovery, and deterministic retry jitter — with 16/16 focused tests green.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
