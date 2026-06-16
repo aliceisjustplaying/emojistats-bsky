@@ -7,7 +7,7 @@ use std::{
     fs::File,
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -491,11 +491,8 @@ pub fn write_archive_artifacts(
 pub struct StreamingArchiveSink {
     output_dir: PathBuf,
     artifact_stem: String,
-    parquet_path: PathBuf,
     parquet_temp_path: PathBuf,
     receipt_path: PathBuf,
-    object_receipt_path: PathBuf,
-    manifest_path: PathBuf,
     emoji_projection_path: PathBuf,
     emoji_projection_temp_path: PathBuf,
     writer: Option<ArrowWriter<File>>,
@@ -547,8 +544,6 @@ impl StreamingArchiveSink {
         let parquet_path = output_dir.join(format!("{artifact_stem}.posts.parquet"));
         let parquet_temp_path = temp_path_for(&parquet_path)?;
         let receipt_path = output_dir.join(format!("{artifact_stem}.receipt.json"));
-        let object_receipt_path = output_dir.join(format!("{artifact_stem}.object-receipt.json"));
-        let manifest_path = output_dir.join(format!("{artifact_stem}.manifest.jsonl"));
         let emoji_projection_path = output_dir.join(format!("{artifact_stem}.emoji.jsonl"));
         let emoji_projection_temp_path = temp_path_for(&emoji_projection_path)?;
         remove_if_exists(&parquet_temp_path)?;
@@ -570,11 +565,8 @@ impl StreamingArchiveSink {
         Ok(Self {
             output_dir: output_dir.to_path_buf(),
             artifact_stem,
-            parquet_path,
             parquet_temp_path,
             receipt_path,
-            object_receipt_path,
-            manifest_path,
             emoji_projection_path,
             emoji_projection_temp_path,
             writer: Some(writer),
@@ -707,9 +699,10 @@ impl StreamingArchiveSink {
         let receipt = self.build_streaming_receipt(input);
         write_temp_rename(&self.receipt_path, |path| write_json_pretty(path, &receipt))?;
         let receipt_hash = hash_serialized_json(&receipt)?;
-        let manifest = self.write_object_receipt_and_manifest(&receipt_hash)?;
+        let committed_posts = self.commit_streaming_posts(&receipt_hash)?;
+        let manifest = local_manifest_from_committed(&committed_posts, &receipt);
         let committed_profile = self.commit_profile(profile, &receipt)?;
-        let artifacts = self.into_artifacts(manifest, committed_profile);
+        let artifacts = self.into_artifacts(manifest, committed_posts, committed_profile);
         Ok((receipt, artifacts))
     }
 
@@ -721,11 +714,8 @@ impl StreamingArchiveSink {
                 field: "streaming_parquet_writer_missing",
             })?
             .close()?;
-        sync_file(&self.parquet_temp_path)?;
-        fs::rename(&self.parquet_temp_path, &self.parquet_path)?;
-        sync_parent_dir(&self.parquet_path)?;
         self.emoji_file.sync_all()?;
-        fs::rename(
+        promote_temp_no_overwrite(
             &self.emoji_projection_temp_path,
             &self.emoji_projection_path,
         )?;
@@ -755,79 +745,33 @@ impl StreamingArchiveSink {
         }
     }
 
-    fn write_object_receipt_and_manifest(
+    fn commit_streaming_posts(
         &self,
         receipt_hash: &str,
-    ) -> Result<LocalManifestEntry, ArchiveError> {
-        let parquet_digest = hash_file_for_archive(&self.parquet_path)?;
-        let manifest = self.local_streaming_manifest(parquet_digest, receipt_hash);
-        let object_receipt = self.streaming_object_receipt(&manifest, receipt_hash);
-        write_temp_rename(&self.object_receipt_path, |path| {
-            write_json_pretty(path, &object_receipt)
-        })?;
-        write_temp_rename(&self.manifest_path, |path| {
-            let mut file = File::create(path)?;
-            let entry = crate::commit::ManifestEntry {
-                run_id: manifest.run_id.clone(),
-                shard: manifest.shard.clone(),
-                file_sequence: manifest.file_sequence,
-                dataset: manifest.dataset.clone(),
-                object_path: format!("{}.posts.parquet", self.artifact_stem),
-                row_count: manifest.row_count,
-                bytes: manifest.bytes,
-                content_hash: manifest.content_hash.clone(),
-                min_created_at_normalized: manifest.min_created_at_normalized.clone(),
-                max_created_at_normalized: manifest.max_created_at_normalized.clone(),
-                receipt_hash: manifest.receipt_hash.clone(),
-                normalizer: manifest.normalizer.clone(),
-                schema_version: manifest.schema_version,
-            };
-            serde_json::to_writer(&mut file, &entry)?;
-            file.write_all(b"\n")?;
-            Ok(())
-        })?;
-        Ok(manifest)
+    ) -> Result<crate::commit::Artifact, ArchiveError> {
+        let store = LocalStore::new(&self.output_dir);
+        let request = Request {
+            object_path: PathBuf::from(format!("{}.posts.parquet", self.artifact_stem)),
+            receipt_path: PathBuf::from(format!("{}.object-receipt.json", self.artifact_stem)),
+            manifest_path: PathBuf::from(format!("{}.manifest.jsonl", self.artifact_stem)),
+            manifest_mode: ManifestMode::AppendJsonl,
+            metadata: self.streaming_posts_metadata(receipt_hash),
+        };
+        Ok(store.commit_prepared_temp(&request, &self.parquet_temp_path)?)
     }
 
-    fn local_streaming_manifest(
-        &self,
-        parquet_digest: ArchiveFileDigest,
-        receipt_hash: &str,
-    ) -> LocalManifestEntry {
-        LocalManifestEntry {
+    fn streaming_posts_metadata(&self, receipt_hash: &str) -> Metadata {
+        Metadata {
             run_id: self.commit_context.run_id.clone(),
             shard: self.commit_context.shard.clone(),
             file_sequence: self.commit_context.file_sequence,
             dataset: "raw_archive_posts".to_owned(),
-            local_path: self.parquet_path.clone(),
             row_count: self.archived_post_rows_count,
-            bytes: parquet_digest.bytes,
-            content_hash: parquet_digest.sha256,
             min_created_at_normalized: self.min_created_at_normalized.clone(),
             max_created_at_normalized: self.max_created_at_normalized.clone(),
             receipt_hash: receipt_hash.to_owned(),
-            schema_version: ARCHIVE_SCHEMA_VERSION,
             normalizer: self.normalizer.clone(),
-        }
-    }
-
-    fn streaming_object_receipt(
-        &self,
-        manifest: &LocalManifestEntry,
-        receipt_hash: &str,
-    ) -> crate::commit::Receipt {
-        crate::commit::Receipt {
-            protocol_version: 1,
-            run_id: manifest.run_id.clone(),
-            shard: manifest.shard.clone(),
-            file_sequence: manifest.file_sequence,
-            dataset: manifest.dataset.clone(),
-            object_path: format!("{}.posts.parquet", self.artifact_stem),
-            row_count: manifest.row_count,
-            bytes: manifest.bytes,
-            content_hash: manifest.content_hash.clone(),
-            receipt_hash: receipt_hash.to_owned(),
-            schema_version: manifest.schema_version,
+            schema_version: ARCHIVE_SCHEMA_VERSION,
         }
     }
 
@@ -858,13 +802,14 @@ impl StreamingArchiveSink {
     fn into_artifacts(
         self,
         manifest: LocalManifestEntry,
+        committed_posts: crate::commit::Artifact,
         committed_profile: Option<crate::commit::Artifact>,
     ) -> ArchiveArtifacts {
         ArchiveArtifacts {
-            parquet_path: self.parquet_path.clone(),
+            parquet_path: committed_posts.object_path,
             receipt_path: self.receipt_path.clone(),
-            object_receipt_path: self.object_receipt_path.clone(),
-            manifest_path: self.manifest_path.clone(),
+            object_receipt_path: committed_posts.receipt_path,
+            manifest_path: committed_posts.manifest_path,
             emoji_projection_path: self.emoji_projection_path.clone(),
             profile_sidecar_path: committed_profile
                 .as_ref()
@@ -1722,8 +1667,7 @@ fn classify_present_created_at(raw: &str) -> ClassifiedCreatedAt {
 }
 
 fn current_utc() -> DateTime<Utc> {
-    static CURRENT_UTC: OnceLock<DateTime<Utc>> = OnceLock::new();
-    *CURRENT_UTC.get_or_init(Utc::now)
+    Utc::now()
 }
 
 fn write_temp_rename<F>(path: &Path, write: F) -> Result<(), ArchiveError>
@@ -2043,6 +1987,10 @@ mod tests {
         let manifest_json = fs::read_to_string(&artifacts.manifest_path).expect("read manifest");
         let entry: crate::commit::ManifestEntry =
             serde_json::from_str(&manifest_json).expect("parse committed manifest");
+        let object_receipt: crate::commit::Receipt = serde_json::from_slice(
+            &fs::read(&artifacts.object_receipt_path).expect("read receipt"),
+        )
+        .expect("parse committed receipt");
 
         assert!(entry.object_path.starts_with("did_plc_manifest__"));
         assert!(entry.object_path.ends_with(".posts.parquet"));
@@ -2051,6 +1999,9 @@ mod tests {
         assert_eq!(entry.file_sequence, 42);
         assert_eq!(entry.dataset, "raw_archive_posts");
         assert_eq!(entry.row_count, 1);
+        assert_eq!(object_receipt.object_path, entry.object_path);
+        assert_eq!(object_receipt.content_hash, entry.content_hash);
+        assert_eq!(object_receipt.receipt_hash, entry.receipt_hash);
         fs::remove_dir_all(output_dir).expect("remove test archive dir");
     }
 

@@ -15,6 +15,7 @@ use crate::transport::AccountState;
 pub const DID_SHARD_BUCKET_MODULUS: u64 = 8;
 /// Default amount of time a fleet worker owns a claimed repo before recovery may requeue it.
 pub const DEFAULT_CLAIM_LEASE_DURATION: Duration = Duration::from_hours(6);
+const SHARD_BUCKET_MIGRATION_BATCH_SIZE: i64 = 1_000;
 
 /// Return the stable persisted shard bucket for a DID.
 #[must_use]
@@ -107,6 +108,13 @@ pub struct RepoLedgerEntry {
     pub worker_id: Option<String>,
     pub claimed_at: Option<SystemTime>,
     pub lease_until: Option<SystemTime>,
+}
+
+/// Insert-or-ignore result for a bounded seed batch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LedgerSeedBatchSummary {
+    pub inserted: u64,
+    pub existing: u64,
 }
 
 impl RepoLedgerEntry {
@@ -496,6 +504,53 @@ impl SqliteLedger {
         Ok(())
     }
 
+    /// Insert pending seed rows without loading each DID first.
+    ///
+    /// Existing rows are left unchanged, including terminal and succeeded rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerStoreError`] when a DID cannot be encoded or SQLite rejects the batch.
+    pub fn insert_pending_entries_ignore_existing<'a, I>(
+        &self,
+        dids: I,
+    ) -> Result<LedgerSeedBatchSummary, LedgerStoreError>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let transaction = self.connection.unchecked_transaction()?;
+        let mut summary = LedgerSeedBatchSummary::default();
+        {
+            let mut statement = transaction.prepare(
+                "
+                INSERT OR IGNORE INTO repo_ledger (
+                    did,
+                    shard_bucket,
+                    status,
+                    attempts
+                ) VALUES (?1, ?2, 'pending', 0)
+                ",
+            )?;
+            for did in dids {
+                let changed =
+                    statement.execute(params![did, shard_bucket_to_i64(did_shard_bucket(did))?])?;
+                if changed == 0 {
+                    summary.existing = summary
+                        .existing
+                        .checked_add(1)
+                        .ok_or(LedgerStoreError::IntegerOverflow)?;
+                } else {
+                    summary.inserted = summary
+                        .inserted
+                        .checked_add(1)
+                        .ok_or(LedgerStoreError::IntegerOverflow)?;
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(summary)
+    }
+
     /// Persist an entry returned by a state transition.
     ///
     /// # Errors
@@ -647,6 +702,61 @@ impl SqliteLedger {
             return Ok(None);
         }
         Ok(Some(completed))
+    }
+
+    /// Extend a claimed repo lease only when the stored row still belongs to this worker attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerStoreError`] when SQLite fails or the new lease deadline cannot be encoded.
+    pub fn extend_owned_claim_lease(
+        &self,
+        claimed: &RepoLedgerEntry,
+        now: SystemTime,
+        lease_duration: Duration,
+    ) -> Result<Option<RepoLedgerEntry>, LedgerStoreError> {
+        let Some(worker_id) = claimed.worker_id.as_deref() else {
+            return Ok(None);
+        };
+        let Some(attempt) = claimed.last_attempt.as_ref() else {
+            return Ok(None);
+        };
+        let lease_until = now
+            .checked_add(lease_duration)
+            .ok_or(LedgerStoreError::IntegerOverflow)?;
+        let lease_until_ms = time_to_millis(lease_until)?;
+        let owned_attempt_sequence =
+            i64::try_from(attempt.sequence).map_err(|_err| LedgerStoreError::IntegerOverflow)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "
+            UPDATE repo_ledger
+            SET lease_until_ms = ?2
+            WHERE
+                did = ?1
+                AND status = 'claimed'
+                AND worker_id = ?3
+                AND last_attempt_run_id = ?4
+                AND last_attempt_did = ?5
+                AND last_attempt_sequence = ?6
+            ",
+            params![
+                claimed.did.as_str(),
+                lease_until_ms,
+                worker_id,
+                attempt.run_id.as_str(),
+                attempt.did.as_str(),
+                owned_attempt_sequence,
+            ],
+        )?;
+        if changed == 0 {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let updated = load_entry_in_transaction(&transaction, &claimed.did)?
+            .ok_or(LedgerStoreError::MissingClaimedEntry)?;
+        transaction.commit()?;
+        Ok(Some(updated))
     }
 
     /// Requeue a claimed repo only after its lease has expired.
@@ -890,22 +1000,38 @@ impl SqliteLedger {
     }
 
     fn backfill_missing_shard_buckets(&self) -> Result<(), LedgerStoreError> {
-        let dids = {
-            let mut statement = self
-                .connection
-                .prepare("SELECT did FROM repo_ledger WHERE shard_bucket IS NULL")?;
-            statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        let mut statement = self
-            .connection
-            .prepare("UPDATE repo_ledger SET shard_bucket = ?1 WHERE did = ?2")?;
-        for did in dids {
-            statement.execute(params![
-                shard_bucket_to_i64(did_shard_bucket(&did))?,
-                did.as_str(),
-            ])?;
+        loop {
+            let dids = {
+                let mut statement = self.connection.prepare(
+                    "
+                    SELECT did
+                    FROM repo_ledger
+                    WHERE shard_bucket IS NULL
+                    ORDER BY did
+                    LIMIT ?1
+                    ",
+                )?;
+                statement
+                    .query_map(params![SHARD_BUCKET_MIGRATION_BATCH_SIZE], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            if dids.is_empty() {
+                break;
+            }
+            let transaction = self.connection.unchecked_transaction()?;
+            {
+                let mut statement = transaction
+                    .prepare("UPDATE repo_ledger SET shard_bucket = ?1 WHERE did = ?2")?;
+                for did in &dids {
+                    statement.execute(params![
+                        shard_bucket_to_i64(did_shard_bucket(did))?,
+                        did.as_str(),
+                    ])?;
+                }
+            }
+            transaction.commit()?;
         }
         Ok(())
     }
@@ -1642,6 +1768,42 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_insert_pending_entries_ignore_existing_preserves_existing_rows() {
+        let store = SqliteLedger::open_in_memory().unwrap();
+        let existing = RepoLedgerEntry {
+            did: "did:plc:existing".to_owned(),
+            status: RepoLedgerStatus::Succeeded,
+            attempts: 1,
+            next_attempt_after: None,
+            last_attempt: Some(AttemptId::new("run-1", "did:plc:existing", 1)),
+            last_error: None,
+            worker_id: None,
+            claimed_at: None,
+            lease_until: None,
+        };
+        store.upsert_entry(&existing).unwrap();
+
+        let summary = store
+            .insert_pending_entries_ignore_existing([
+                "did:plc:existing",
+                "did:plc:newrepo",
+                "did:plc:newrepo",
+            ])
+            .unwrap();
+
+        assert_eq!(summary.inserted, 1);
+        assert_eq!(summary.existing, 2);
+        assert_eq!(
+            store.load_entry("did:plc:existing").unwrap(),
+            Some(existing)
+        );
+        assert_eq!(
+            store.load_entry("did:plc:newrepo").unwrap().unwrap().status,
+            RepoLedgerStatus::Pending
+        );
+    }
+
+    #[test]
     fn sqlite_claimable_entries_are_due_at_now() {
         let store = SqliteLedger::open_in_memory().unwrap();
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
@@ -1781,6 +1943,48 @@ mod tests {
 
         assert_eq!(recovered, None);
         assert_eq!(store.load_entry("did:plc:active").unwrap(), Some(claimed));
+    }
+
+    #[test]
+    fn sqlite_owned_claim_lease_extension_requires_current_owner() {
+        let store = SqliteLedger::open_in_memory().unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        store
+            .upsert_entry(&RepoLedgerEntry::pending("did:plc:heartbeat"))
+            .unwrap();
+        let claimed = store
+            .try_claim_next(now, "run-1", "worker-a", Duration::from_secs(60), None)
+            .unwrap()
+            .unwrap();
+
+        let extended = store
+            .extend_owned_claim_lease(
+                &claimed,
+                now + Duration::from_secs(30),
+                Duration::from_secs(120),
+            )
+            .unwrap()
+            .unwrap();
+        let mut wrong_owner = claimed;
+        wrong_owner.worker_id = Some("worker-b".to_owned());
+        let rejected = store
+            .extend_owned_claim_lease(
+                &wrong_owner,
+                now + Duration::from_secs(40),
+                Duration::from_secs(120),
+            )
+            .unwrap();
+
+        assert_eq!(extended.lease_until, Some(now + Duration::from_secs(150)));
+        assert_eq!(rejected, None);
+        assert_eq!(
+            store
+                .load_entry("did:plc:heartbeat")
+                .unwrap()
+                .unwrap()
+                .lease_until,
+            Some(now + Duration::from_secs(150))
+        );
     }
 
     #[test]

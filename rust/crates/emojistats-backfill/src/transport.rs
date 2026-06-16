@@ -134,7 +134,13 @@ pub struct FetchByteBudgetReservation {
 
 impl FetchByteBudgetReservation {
     async fn reserve_completed(&mut self, observed_bytes: u64) -> Result<(), FetchError> {
-        let charged_target = observed_bytes.min(self.budget.inner.max_bytes);
+        if observed_bytes > self.budget.inner.max_bytes {
+            return Err(FetchError::InFlightBytesExceeded {
+                max_bytes: self.budget.inner.max_bytes,
+                observed_bytes,
+            });
+        }
+        let charged_target = observed_bytes;
         let delta = charged_target.checked_sub(self.charged_bytes).ok_or(
             FetchError::InFlightBytesExceeded {
                 max_bytes: self.budget.inner.max_bytes,
@@ -881,6 +887,26 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn byte_budget_rejects_single_repo_larger_than_budget() {
+        let budget = FetchByteBudget::new(10);
+        let mut reservation = budget.reservation();
+
+        let error = reservation.reserve_completed(11).await.unwrap_err();
+
+        match error {
+            FetchError::InFlightBytesExceeded {
+                max_bytes,
+                observed_bytes,
+            } => {
+                assert_eq!(max_bytes, 10);
+                assert_eq!(observed_bytes, 11);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(reservation.charged_bytes(), 0);
     }
 
     #[tokio::test]

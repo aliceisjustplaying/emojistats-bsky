@@ -6,172 +6,52 @@
 //! ("First implementation milestone").
 
 use std::{
-    collections::HashMap,
-    fs::{self, File},
-    io::BufReader,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use emojistats_backfill::{
     archive::{
-        ArchiveCommitContext, ArchiveError, ArchivePostRowsHasher, CompletenessClass,
-        EmojiProjectionRow, FetchMethod, NormalizerVersion, StreamingArchiveSink,
-        StreamingReceiptInput, archive_post_rows_from_record_batch, archive_row_from_owned_post,
+        ArchiveCommitContext, ArchiveError, CompletenessClass, FetchMethod, NormalizerVersion,
+        StreamingArchiveSink, StreamingReceiptInput, archive_row_from_owned_post,
         hash_profile_record,
     },
-    clickhouse::{
-        ClickHouseClientConfig, ClickHouseInsertPayload, create_schema_sql,
-        emoji_serving_rows_insert_payload, execute_insert_payloads,
-        total_post_counter_insert_payload_for_counter,
-    },
-    derive::{
-        BACKFILL_DERIVE_SOURCE, DeriveManifestIdentity, TotalPostCounterInput,
-        emoji_projection_rows_for_post,
-    },
-    hash::hash_serialized_json,
+    clickhouse::create_schema_sql,
     ledger::{
-        AttemptId, AttemptOutcome, DEFAULT_CLAIM_LEASE_DURATION, ForcedFetchMode, HostOverride,
-        RepoLedgerEntry, RepoLedgerStatus, RetryPolicy, ShardFilter, SqliteLedger, claim_repo,
-        complete_attempt,
+        AttemptId, AttemptOutcome, ForcedFetchMode, HostOverride, RepoLedgerEntry, RetryPolicy,
+        SqliteLedger, claim_repo, complete_attempt,
     },
-    list_records::{ListRecordsConfig, ListRecordsError, fetch_and_archive_list_records},
-    manifest_derive::{
-        VerifiedLoaderInput, read_committed_jsonl, verify_loader_input_for_streaming,
-    },
-    parse::{
-        ParseConfig, ParseError, ParseVisitError, ParsedRepoSummary, PostRecordBody,
-        default_cid_verification_threads, parse_repo_for_did_with_state,
-    },
-    scheduler::{ClaimScope, HostPacer, SchedulerError, SharedHostPacer, checked_concurrency},
+    list_records::{ListRecordsConfig, fetch_and_archive_list_records},
+    parse::{ParseConfig, ParseVisitError, ParsedRepoSummary, parse_repo_for_did_with_state},
+    scheduler::{ClaimScope, HostPacer, SharedHostPacer},
     transport::{FetchByteBudget, FetchConfig, FetchError, fetch_repo},
 };
-use futures_util::{StreamExt, stream::FuturesUnordered};
 use jacquard_common::{deps::fluent_uri::Uri, types::did::Did};
 use jacquard_identity::{PublicResolver, resolver::IdentityResolver};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Semaphore;
 
-const DEFAULT_PARSE_CONCURRENCY: usize = 1;
-const DEFAULT_MAX_INFLIGHT_SPOOL_BYTES: u64 = 536_870_912;
-const DERIVE_EMOJI_CHUNK_ROWS: usize = 10_000;
+mod cli;
+mod derive_manifest_cmd;
+mod failure;
+mod fleet;
+mod profile_cmd;
+
+use cli::{Cli, Command};
+use derive_manifest_cmd::DeriveManifestConfig;
+use failure::{
+    FetchOneFailure, SmokeTelemetry, classify_archive_error, classify_fetch_error,
+    classify_list_records_error, classify_parse_error, current_rss_kb, elapsed_ms,
+    emit_smoke_telemetry, outcome_name, permanent_failure, retryable_failure,
+};
+use fleet::{FleetConfig, HostConcurrencyLimiter, HostConcurrencyPermit, default_worker_id};
+
 const FETCH_TRANSPORT_ATTEMPTS: u8 = 3;
-
-/// emojistats v2 backfill tool.
-#[derive(Parser, Debug)]
-#[command(name = "emojistats-backfill", version, about)]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand, Debug)]
-enum Command {
-    /// Fetch and process a single repo by DID (vertical-slice milestone).
-    FetchOne {
-        /// The DID to fetch, e.g. did:plc:....
-        did: String,
-        /// Directory for local `CAR` spooling.
-        #[arg(long, default_value = "data/spool")]
-        spool_dir: PathBuf,
-        /// Loud single-repo byte cap for the spooled `CAR`.
-        #[arg(long, default_value_t = 2_147_483_648)]
-        max_bytes: u64,
-        /// Directory for local archive artifacts.
-        #[arg(long, default_value = "data/archive")]
-        archive_dir: PathBuf,
-        /// Worker threads used for CAR block CID verification.
-        #[arg(long, default_value_t = default_cid_verification_threads(), value_parser = parse_positive_usize)]
-        cid_verification_threads: usize,
-    },
-    /// Parse and archive an existing `CAR` without fetching it.
-    ProfileCar {
-        /// The DID expected in the repo commit.
-        did: String,
-        /// Existing `CAR` path.
-        car_path: PathBuf,
-        /// Directory for local archive artifacts.
-        #[arg(long, default_value = "data/profile-archive")]
-        archive_dir: PathBuf,
-        /// Worker threads used for CAR block CID verification.
-        #[arg(long, default_value_t = default_cid_verification_threads(), value_parser = parse_positive_usize)]
-        cid_verification_threads: usize,
-        /// Parse and count posts without writing archive artifacts.
-        #[arg(long)]
-        parse_only: bool,
-    },
-    /// Seed, claim, and process repos from a newline-delimited DID file.
-    RunFleet {
-        /// Newline-delimited file of DIDs to seed into the SQLite ledger.
-        dids_file: PathBuf,
-        /// SQLite ledger path.
-        #[arg(long, default_value = "data/ledger/backfill.sqlite")]
-        ledger_path: PathBuf,
-        /// Stable run id stored on claimed attempts.
-        #[arg(long, default_value = "fleet-local")]
-        run_id: String,
-        /// Maximum claimable repos to process in this invocation.
-        #[arg(long, default_value_t = 1, value_parser = parse_positive_u32)]
-        claim_limit: u32,
-        /// Maximum concurrent repo attempts.
-        #[arg(long, default_value_t = 4, value_parser = parse_positive_usize)]
-        concurrency: usize,
-        /// Maximum concurrent parse/archive stages.
-        #[arg(long, default_value_t = DEFAULT_PARSE_CONCURRENCY, value_parser = parse_positive_usize)]
-        parse_concurrency: usize,
-        /// Maximum bytes held by in-flight streamed `CAR` files.
-        #[arg(long, default_value_t = DEFAULT_MAX_INFLIGHT_SPOOL_BYTES, value_parser = parse_positive_u64)]
-        max_inflight_spool_bytes: u64,
-        /// Restrict claims to one persisted DID shard bucket.
-        #[arg(long, value_name = "BUCKET", value_parser = parse_shard_filter)]
-        shard_bucket: Option<ShardFilter>,
-        /// Directory for local `CAR` spooling.
-        #[arg(long, default_value = "data/spool")]
-        spool_dir: PathBuf,
-        /// Loud single-repo byte cap for each spooled `CAR`.
-        #[arg(long, default_value_t = 2_147_483_648)]
-        max_bytes: u64,
-        /// Directory for local archive artifacts.
-        #[arg(long, default_value = "data/archive")]
-        archive_dir: PathBuf,
-        /// Worker threads used for CAR block CID verification.
-        #[arg(long, default_value_t = default_cid_verification_threads(), value_parser = parse_positive_usize)]
-        cid_verification_threads: usize,
-    },
-    /// Verify a committed archive manifest and load derived rows into `ClickHouse`.
-    DeriveManifest {
-        /// Committed JSONL manifest path.
-        manifest_path: PathBuf,
-        /// Archive root used to resolve manifest object paths.
-        #[arg(long, default_value = "data/archive")]
-        archive_root: PathBuf,
-        /// `ClickHouse` HTTP endpoint.
-        #[arg(long, default_value = "http://localhost:8123")]
-        clickhouse_url: String,
-        /// `ClickHouse` database.
-        #[arg(long, default_value = "emojistats")]
-        clickhouse_database: String,
-        /// `ClickHouse` username.
-        #[arg(long, default_value = "default")]
-        clickhouse_user: String,
-        /// `ClickHouse` password.
-        #[arg(long, default_value = "")]
-        clickhouse_password: String,
-        /// Validate and format payloads without sending inserts.
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Print the v2 `ClickHouse` schema SQL.
-    ClickhouseSchema {
-        /// `ClickHouse` database.
-        #[arg(long, default_value = "emojistats")]
-        clickhouse_database: String,
-    },
-}
+const FETCH_TRANSPORT_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+const FETCH_TRANSPORT_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+const CRAWLER_USER_AGENT: &str = "emojistats-backfill/0.1 (+https://emojistats.at)";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -199,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
             archive_dir,
             cid_verification_threads,
             parse_only,
-        } => profile_car(
+        } => profile_cmd::run(
             &did,
             &car_path,
             &archive_dir,
@@ -221,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
             cid_verification_threads,
         } => {
             let worker_id = default_worker_id(&run_id);
-            run_fleet(FleetConfig {
+            fleet::run(FleetConfig {
                 dids_file,
                 ledger_path,
                 run_id,
@@ -249,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
             clickhouse_password,
             dry_run,
         } => {
-            derive_manifest(DeriveManifestConfig {
+            derive_manifest_cmd::run(DeriveManifestConfig {
                 manifest_path,
                 archive_root,
                 clickhouse_url,
@@ -269,399 +149,11 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-fn profile_car(
-    did: &str,
-    car_path: &Path,
-    archive_dir: &Path,
-    parse_only: bool,
-    cid_verification_threads: usize,
-) -> anyhow::Result<()> {
-    if parse_only {
-        return profile_car_parse_only(did, car_path, cid_verification_threads);
-    }
-    let started = Instant::now();
-    let processed = parse_and_archive_spooled_repo(
-        did,
-        car_path,
-        archive_dir,
-        ArchiveCommitContext::fetch_one_local(),
-        parse_config_for_threads(cid_verification_threads),
-    )
-    .map_err(|failure| {
-        anyhow::anyhow!(
-            "profile-car failed with {}: {}",
-            outcome_name(&failure.outcome),
-            failure.error
-        )
-    })?;
-    let counts = processed.counts();
-    let artifacts = processed.artifacts();
-    let timings = processed
-        .get_repo_timings()
-        .ok_or_else(|| anyhow::anyhow!("profile-car expected getRepo timings"))?;
-    println!(
-        "profile-car parsed {} records, {} posts, {} decode errors, {} emoji rows",
-        counts.records, counts.archived_posts, counts.decode_errors, counts.emoji_rows
-    );
-    println!(
-        "timings total={}ms parse={}ms index={}ms commit={}ms walk={}ms archive={}ms rss_kb={}",
-        elapsed_ms(started),
-        timings.parse_ms,
-        timings.parse_index_ms,
-        timings.parse_commit_ms,
-        timings.parse_walk_ms,
-        timings.archive_ms,
-        current_rss_kb().unwrap_or_default()
-    );
-    println!(
-        "wrote archive {}, receipt {}, manifest {}, emoji projection {}",
-        artifacts.parquet_path.display(),
-        artifacts.receipt_path.display(),
-        artifacts.manifest_path.display(),
-        artifacts.emoji_projection_path.display()
-    );
-    Ok(())
-}
-
-#[derive(Debug, Default)]
-struct ParseOnlyCounters {
-    posts: u64,
-    raw_partial_posts: u64,
-}
-
-fn profile_car_parse_only(
-    did: &str,
-    car_path: &Path,
-    cid_verification_threads: usize,
-) -> anyhow::Result<()> {
-    let started = Instant::now();
-    let (summary, counters) = parse_repo_for_did_with_state(
-        car_path,
-        did,
-        parse_config_for_threads(cid_verification_threads),
-        ParseOnlyCounters::default(),
-        |state, post| {
-            state.posts = state
-                .posts
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("profile parse-only post counter overflow"))?;
-            if matches!(
-                post.body,
-                PostRecordBody::RawPartial(record) if record.typed_decode_failed
-            ) {
-                state.raw_partial_posts =
-                    state.raw_partial_posts.checked_add(1).ok_or_else(|| {
-                        anyhow::anyhow!("profile parse-only partial post counter overflow")
-                    })?;
-            }
-            Ok::<(), anyhow::Error>(())
-        },
-    )
-    .map_err(|error| match error {
-        ParseVisitError::Parse(error) => anyhow::anyhow!("profile parse-only failed: {error}"),
-        ParseVisitError::Visit(error) => error,
-    })?;
-    println!(
-        "profile-car parse-only parsed {} records, {} posts, {} raw partial posts, {} decode errors",
-        summary.rkey_digest.all_records_count,
-        counters.posts,
-        counters.raw_partial_posts,
-        summary.post_decode_error_count
-    );
-    println!(
-        "timings total={}ms index={}ms commit={}ms walk={}ms rss_kb={}",
-        elapsed_ms(started),
-        summary.timings.index_ms,
-        summary.timings.commit_ms,
-        summary.timings.walk_ms,
-        current_rss_kb().unwrap_or_default()
-    );
-    Ok(())
-}
-
 fn parse_config_for_threads(cid_verification_threads: usize) -> ParseConfig {
     ParseConfig {
         cid_verification_threads,
         ..ParseConfig::default()
     }
-}
-
-#[derive(Debug)]
-struct DeriveManifestConfig {
-    manifest_path: PathBuf,
-    archive_root: PathBuf,
-    clickhouse_url: String,
-    clickhouse_database: String,
-    clickhouse_user: String,
-    clickhouse_password: String,
-    dry_run: bool,
-}
-
-#[derive(Debug, Default, Serialize)]
-struct DeriveManifestSummary {
-    manifest_entries: u64,
-    skipped_entries: u64,
-    batches: u64,
-    payloads: u64,
-    rows: u64,
-    inserted_payloads: u64,
-}
-
-async fn derive_manifest(config: DeriveManifestConfig) -> anyhow::Result<()> {
-    let file = File::open(&config.manifest_path)?;
-    let plan = read_committed_jsonl(BufReader::new(file))?;
-    let clickhouse = ClickHouseClientConfig::new(
-        &config.clickhouse_url,
-        &config.clickhouse_database,
-        config.clickhouse_user,
-        config.clickhouse_password,
-        "emojistats-backfill-derive",
-    )?;
-    let http = reqwest::Client::new();
-    let mut summary = DeriveManifestSummary {
-        manifest_entries: count_len(plan.inputs.len(), "manifest_entries")?,
-        skipped_entries: count_len(plan.skipped_entries.len(), "skipped_entries")?,
-        ..DeriveManifestSummary::default()
-    };
-
-    for input in &plan.inputs {
-        let verified = verify_loader_input_for_streaming(&config.archive_root, input)?;
-        derive_verified_input_streaming(
-            &verified,
-            &http,
-            &clickhouse,
-            config.dry_run,
-            &mut summary,
-        )
-        .await?;
-    }
-
-    println!(
-        "derive_manifest_summary {}",
-        serde_json::to_string(&summary)?
-    );
-    Ok(())
-}
-
-async fn derive_verified_input_streaming(
-    verified: &VerifiedLoaderInput,
-    http: &reqwest::Client,
-    clickhouse: &ClickHouseClientConfig,
-    dry_run: bool,
-    summary: &mut DeriveManifestSummary,
-) -> anyhow::Result<()> {
-    let file = File::open(&verified.object_path)?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
-    let mut state = StreamingDeriveState::new(verified);
-
-    for batch in reader {
-        let rows = archive_post_rows_from_record_batch(&batch?)?;
-        let payloads = state.consume_rows(&rows)?;
-        apply_derive_payloads(http, clickhouse, dry_run, summary, &payloads).await?;
-    }
-
-    let payloads = state.finish()?;
-    apply_derive_payloads(http, clickhouse, dry_run, summary, &payloads).await?;
-    increment(&mut summary.batches, "derive batch count")
-}
-
-async fn apply_derive_payloads(
-    http: &reqwest::Client,
-    clickhouse: &ClickHouseClientConfig,
-    dry_run: bool,
-    summary: &mut DeriveManifestSummary,
-    payloads: &[ClickHouseInsertPayload],
-) -> anyhow::Result<()> {
-    if payloads.is_empty() {
-        return Ok(());
-    }
-    add_count(
-        &mut summary.payloads,
-        count_len(payloads.len(), "derive payload count")?,
-        "derive payload total",
-    )?;
-    add_count(
-        &mut summary.rows,
-        payload_row_count(payloads)?,
-        "derive row total",
-    )?;
-    if !dry_run {
-        let receipts = execute_insert_payloads(http, clickhouse, payloads).await?;
-        add_count(
-            &mut summary.inserted_payloads,
-            count_len(receipts.len(), "insert receipt count")?,
-            "inserted payload total",
-        )?;
-    }
-    Ok(())
-}
-
-struct StreamingDeriveState<'a> {
-    verified: &'a VerifiedLoaderInput,
-    row_hasher: ArchivePostRowsHasher,
-    rows: u64,
-    posts_with_emojis: u64,
-    emoji_occurrences: u64,
-    emoji_chunk_rows: Vec<EmojiProjectionRow>,
-    emoji_chunk_index: u64,
-}
-
-impl<'a> StreamingDeriveState<'a> {
-    fn new(verified: &'a VerifiedLoaderInput) -> Self {
-        Self {
-            verified,
-            row_hasher: ArchivePostRowsHasher::new(),
-            rows: 0,
-            posts_with_emojis: 0,
-            emoji_occurrences: 0,
-            emoji_chunk_rows: Vec::with_capacity(DERIVE_EMOJI_CHUNK_ROWS),
-            emoji_chunk_index: 0,
-        }
-    }
-
-    fn consume_rows(
-        &mut self,
-        rows: &[emojistats_backfill::archive::ArchivePostRow],
-    ) -> anyhow::Result<Vec<ClickHouseInsertPayload>> {
-        let mut payloads = Vec::new();
-        for row in rows {
-            self.row_hasher.push_row(row)?;
-            increment(&mut self.rows, "streaming derive row count")?;
-            if !row.emoji_sequence.is_empty() {
-                increment(
-                    &mut self.posts_with_emojis,
-                    "streaming derive emoji post count",
-                )?;
-            }
-            add_count(
-                &mut self.emoji_occurrences,
-                count_len(
-                    row.emoji_sequence.len(),
-                    "streaming derive emoji occurrence count",
-                )?,
-                "streaming derive emoji occurrence total",
-            )?;
-            let projection_rows = emoji_projection_rows_for_post(row)?;
-            for projection_row in projection_rows {
-                self.emoji_chunk_rows.push(projection_row);
-                if self.emoji_chunk_rows.len() >= DERIVE_EMOJI_CHUNK_ROWS {
-                    payloads.push(self.flush_emoji_chunk()?);
-                }
-            }
-        }
-        Ok(payloads)
-    }
-
-    fn finish(mut self) -> anyhow::Result<Vec<ClickHouseInsertPayload>> {
-        let mut payloads = Vec::new();
-        if !self.emoji_chunk_rows.is_empty() {
-            payloads.push(self.flush_emoji_chunk()?);
-        }
-        let row_hash = std::mem::take(&mut self.row_hasher).finish();
-        self.validate_receipts(&row_hash)?;
-        let counter = TotalPostCounterInput {
-            source: BACKFILL_DERIVE_SOURCE.to_owned(),
-            run_id: self.verified.manifest.run_id.clone(),
-            shard: self.verified.manifest.shard.clone(),
-            file_sequence: self.verified.manifest.file_sequence,
-            receipt_hash: self.verified.manifest.receipt_hash.clone(),
-            posts_processed: self.rows,
-            posts_with_emojis: self.posts_with_emojis,
-            emoji_occurrences: self.emoji_occurrences,
-            min_created_at_normalized: self.verified.manifest.min_created_at_normalized.clone(),
-            max_created_at_normalized: self.verified.manifest.max_created_at_normalized.clone(),
-        };
-        let token = streaming_dedupe_token(&self.verified.identity, "counter", None, &counter)?;
-        payloads.push(total_post_counter_insert_payload_for_counter(
-            &counter, token,
-        )?);
-        Ok(payloads)
-    }
-
-    fn flush_emoji_chunk(&mut self) -> anyhow::Result<ClickHouseInsertPayload> {
-        let rows = std::mem::take(&mut self.emoji_chunk_rows);
-        let token = streaming_dedupe_token(
-            &self.verified.identity,
-            "emoji",
-            Some(self.emoji_chunk_index),
-            &rows,
-        )?;
-        increment(
-            &mut self.emoji_chunk_index,
-            "streaming derive emoji chunk index",
-        )?;
-        self.emoji_chunk_rows = Vec::with_capacity(DERIVE_EMOJI_CHUNK_ROWS);
-        Ok(emoji_serving_rows_insert_payload(
-            &self.verified.identity,
-            &rows,
-            token,
-        )?)
-    }
-
-    fn validate_receipts(&self, row_hash: &str) -> anyhow::Result<()> {
-        if self.verified.manifest.row_count != self.rows {
-            anyhow::bail!(
-                "manifest row_count {} did not match streamed archive row count {} for {}",
-                self.verified.manifest.row_count,
-                self.rows,
-                self.verified.object_path.display()
-            );
-        }
-        let Some(receipt) = &self.verified.repo_receipt else {
-            return Ok(());
-        };
-        if receipt.archived_post_rows_count != self.rows {
-            anyhow::bail!(
-                "repo receipt archived_post_rows_count {} did not match streamed archive row count {} for {}",
-                receipt.archived_post_rows_count,
-                self.rows,
-                self.verified.object_path.display()
-            );
-        }
-        if receipt.normalizer != self.verified.manifest.normalizer {
-            anyhow::bail!(
-                "repo receipt normalizer did not match manifest normalizer for {}",
-                self.verified.object_path.display()
-            );
-        }
-        if receipt.post_rows_hash != row_hash || receipt.archive_rows_hash != row_hash {
-            anyhow::bail!(
-                "repo receipt row hash did not match streamed archive rows for {}",
-                self.verified.object_path.display()
-            );
-        }
-        let receipt_hash = hash_serialized_json(receipt)?;
-        if self.verified.manifest.receipt_hash != receipt_hash {
-            anyhow::bail!(
-                "manifest receipt_hash {} did not match repo receipt hash {} for {}",
-                self.verified.manifest.receipt_hash,
-                receipt_hash,
-                self.verified.object_path.display()
-            );
-        }
-        Ok(())
-    }
-}
-
-fn streaming_dedupe_token<T: Serialize>(
-    identity: &DeriveManifestIdentity,
-    lane: &'static str,
-    chunk_index: Option<u64>,
-    value: &T,
-) -> anyhow::Result<String> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"emojistats-backfill-streaming-derive-v1");
-    hasher.update(serde_json::to_vec(identity)?);
-    hasher.update(lane.as_bytes());
-    if let Some(chunk_index) = chunk_index {
-        hasher.update(chunk_index.to_be_bytes());
-    }
-    hasher.update(serde_json::to_vec(value)?);
-    Ok(format!(
-        "derive:{}:{}",
-        lane,
-        hex::encode(hasher.finalize())
-    ))
 }
 
 /// Resolve a DID to its PDS endpoint.
@@ -706,407 +198,6 @@ async fn fetch_one(
     result.map_err(|failure| failure.error)
 }
 
-#[derive(Debug)]
-struct FleetConfig {
-    dids_file: PathBuf,
-    ledger_path: PathBuf,
-    run_id: String,
-    worker_id: String,
-    claim_limit: u32,
-    concurrency: usize,
-    parse_concurrency: usize,
-    max_inflight_spool_bytes: u64,
-    spool_dir: PathBuf,
-    max_bytes: u64,
-    archive_dir: PathBuf,
-    cid_verification_threads: usize,
-    claim_scope: ClaimScope,
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct SeedSummary {
-    inserted: u64,
-    existing: u64,
-    blank: u64,
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct FleetSummary {
-    seed: SeedSummary,
-    stale_recovered: u64,
-    claimed: u64,
-    succeeded: u64,
-    failed: u64,
-}
-
-#[derive(Debug, Clone, Default)]
-struct HostConcurrencyLimiter {
-    hosts: Arc<Mutex<HashMap<String, Arc<HostConcurrencyState>>>>,
-}
-
-#[derive(Debug)]
-struct HostConcurrencyState {
-    inner: Mutex<HostConcurrencyInner>,
-    notify: Notify,
-}
-
-#[derive(Debug)]
-struct HostConcurrencyInner {
-    cap: usize,
-    in_use: usize,
-}
-
-#[derive(Debug)]
-struct HostConcurrencyPermit {
-    state: Arc<HostConcurrencyState>,
-}
-
-impl HostConcurrencyLimiter {
-    async fn acquire(
-        &self,
-        host: &str,
-        concurrency_cap: Option<u32>,
-    ) -> Result<Option<HostConcurrencyPermit>, FetchOneFailure> {
-        let Some(concurrency_cap) = concurrency_cap else {
-            return Ok(None);
-        };
-        let cap = usize::try_from(concurrency_cap)
-            .map_err(|_err| retryable_failure(format!("host cap overflows usize for {host}")))?;
-        let state = {
-            let mut hosts = self
-                .hosts
-                .lock()
-                .map_err(|_err| retryable_failure("host limiter lock poisoned".to_owned()))?;
-            Arc::clone(hosts.entry(host.to_owned()).or_insert_with(|| {
-                Arc::new(HostConcurrencyState {
-                    inner: Mutex::new(HostConcurrencyInner { cap, in_use: 0 }),
-                    notify: Notify::new(),
-                })
-            }))
-        };
-        state.acquire(host, cap).await.map(Some)
-    }
-}
-
-impl HostConcurrencyState {
-    async fn acquire(
-        self: Arc<Self>,
-        host: &str,
-        cap: usize,
-    ) -> Result<HostConcurrencyPermit, FetchOneFailure> {
-        loop {
-            let notified = self.notify.notified();
-            {
-                let mut inner = self.inner.lock().map_err(|_err| {
-                    retryable_failure(format!("host limiter lock poisoned for {host}"))
-                })?;
-                inner.cap = cap;
-                if inner.in_use < inner.cap {
-                    inner.in_use = inner.in_use.checked_add(1).ok_or_else(|| {
-                        retryable_failure(format!("host limiter in-use count overflow for {host}"))
-                    })?;
-                    let state = Arc::clone(&self);
-                    drop(inner);
-                    return Ok(HostConcurrencyPermit { state });
-                }
-            }
-            notified.await;
-        }
-    }
-}
-
-impl Drop for HostConcurrencyPermit {
-    fn drop(&mut self) {
-        if let Ok(mut inner) = self.state.inner.lock() {
-            inner.in_use = inner.in_use.saturating_sub(1);
-        }
-        self.state.notify.notify_waiters();
-    }
-}
-
-async fn run_fleet(config: FleetConfig) -> anyhow::Result<()> {
-    checked_concurrency(config.concurrency)?;
-    checked_concurrency(config.parse_concurrency)?;
-    if let Some(parent) = config
-        .ledger_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-    let ledger = SqliteLedger::open(&config.ledger_path)?;
-    let mut summary = FleetSummary {
-        seed: seed_ledger_from_file(&ledger, &config.dids_file)?,
-        ..FleetSummary::default()
-    };
-    summary.stale_recovered =
-        recover_stale_claimed_entries(&ledger, &config.dids_file, SystemTime::now())?;
-    let host_pacer = HostPacer::shared();
-    let host_limiter = HostConcurrencyLimiter::default();
-    let parse_permits = Arc::new(Semaphore::new(config.parse_concurrency));
-    let byte_budget = FetchByteBudget::new(config.max_inflight_spool_bytes);
-    let mut active = FuturesUnordered::new();
-    let claim_limit = u64::from(config.claim_limit);
-
-    loop {
-        while active.len() < config.concurrency && summary.claimed < claim_limit {
-            let remaining = claim_limit
-                .checked_sub(summary.claimed)
-                .ok_or(SchedulerError::ClaimLimitOverflow)?;
-            let batch_limit = claim_batch_limit(config.concurrency, active.len(), remaining)?;
-            if batch_limit == 0 {
-                break;
-            }
-            let claimed = ledger.try_claim_next(
-                SystemTime::now(),
-                &config.run_id,
-                &config.worker_id,
-                DEFAULT_CLAIM_LEASE_DURATION,
-                config.claim_scope.shard_filter(),
-            )?;
-            let Some(claimed) = claimed else {
-                break;
-            };
-            let did = claimed.did.clone();
-            increment(&mut summary.claimed, "claimed repo count")?;
-            active.push(run_fleet_attempt(FleetAttemptConfig {
-                did,
-                claimed,
-                spool_dir: config.spool_dir.clone(),
-                max_bytes: config.max_bytes,
-                archive_dir: config.archive_dir.clone(),
-                parse_config: parse_config_for_threads(config.cid_verification_threads),
-                host_pacer: host_pacer.clone(),
-                host_limiter: host_limiter.clone(),
-                parse_permits: parse_permits.clone(),
-                byte_budget: byte_budget.clone(),
-                claim_scope: config.claim_scope.clone(),
-                ledger_path: config.ledger_path.clone(),
-            }));
-        }
-
-        let Some(attempt_result) = active.next().await else {
-            break;
-        };
-        complete_fleet_attempt(&ledger, &mut summary, attempt_result)?;
-    }
-
-    println!(
-        "fleet summary: seeded {}, existing {}, blank {}, stale_recovered {}, claimed {}, succeeded {}, failed {}",
-        summary.seed.inserted,
-        summary.seed.existing,
-        summary.seed.blank,
-        summary.stale_recovered,
-        summary.claimed,
-        summary.succeeded,
-        summary.failed
-    );
-    Ok(())
-}
-
-#[derive(Debug)]
-struct FleetAttemptConfig {
-    did: String,
-    claimed: RepoLedgerEntry,
-    spool_dir: PathBuf,
-    max_bytes: u64,
-    archive_dir: PathBuf,
-    parse_config: ParseConfig,
-    host_pacer: SharedHostPacer,
-    host_limiter: HostConcurrencyLimiter,
-    parse_permits: Arc<Semaphore>,
-    byte_budget: FetchByteBudget,
-    claim_scope: ClaimScope,
-    ledger_path: PathBuf,
-}
-
-#[derive(Debug)]
-struct FleetAttemptResult {
-    did: String,
-    claimed: RepoLedgerEntry,
-    result: Result<(), FetchOneFailure>,
-}
-
-async fn run_fleet_attempt(config: FleetAttemptConfig) -> FleetAttemptResult {
-    let archive_context = archive_context_for_claim(&config.claimed, &config.claim_scope);
-    let result = match archive_context {
-        Ok(archive_context) => {
-            fetch_one_attempt_with_pacer(FetchOneAttemptConfig {
-                did_str: &config.did,
-                spool_dir: config.spool_dir,
-                max_bytes: config.max_bytes,
-                archive_dir: config.archive_dir,
-                archive_context,
-                runtime: AttemptRuntime::Fleet {
-                    host_pacer: config.host_pacer,
-                    host_limiter: config.host_limiter,
-                    parse_permits: config.parse_permits,
-                    byte_budget: config.byte_budget,
-                    claim_scope: &config.claim_scope,
-                    host_override_ledger_path: &config.ledger_path,
-                },
-                parse_config: config.parse_config,
-            })
-            .await
-        }
-        Err(failure) => Err(failure),
-    };
-    FleetAttemptResult {
-        did: config.did,
-        claimed: config.claimed,
-        result,
-    }
-}
-
-fn archive_context_for_claim(
-    claimed: &RepoLedgerEntry,
-    claim_scope: &ClaimScope,
-) -> Result<ArchiveCommitContext, FetchOneFailure> {
-    let attempt = claimed.last_attempt.as_ref().ok_or_else(|| {
-        retryable_failure(format!(
-            "claimed repo {} has no attempt identity",
-            claimed.did
-        ))
-    })?;
-    Ok(ArchiveCommitContext::new(
-        attempt.run_id.clone(),
-        archive_shard_label(claim_scope),
-        attempt.sequence,
-    ))
-}
-
-fn archive_shard_label(claim_scope: &ClaimScope) -> String {
-    claim_scope.shard_filter().map_or_else(
-        || "all".to_owned(),
-        |shard| format!("shard{}", shard.bucket()),
-    )
-}
-
-fn complete_fleet_attempt(
-    ledger: &SqliteLedger,
-    summary: &mut FleetSummary,
-    attempt_result: FleetAttemptResult,
-) -> anyhow::Result<()> {
-    let outcome = attempt_result.result.as_ref().map_or_else(
-        |failure| failure.outcome.clone(),
-        |_success| AttemptOutcome::Succeeded,
-    );
-    let completed = ledger.complete_owned_claim(
-        &attempt_result.claimed,
-        outcome,
-        SystemTime::now(),
-        RetryPolicy::default(),
-    )?;
-    let Some(completed) = completed else {
-        eprintln!(
-            "skipping completion for {} because this worker no longer owns the claim",
-            attempt_result.did
-        );
-        return Ok(());
-    };
-
-    match attempt_result.result {
-        Ok(()) => increment(&mut summary.succeeded, "succeeded repo count")?,
-        Err(failure) => {
-            increment(&mut summary.failed, "failed repo count")?;
-            eprintln!(
-                "attempt failed for {}: {}",
-                attempt_result.did, failure.error
-            );
-        }
-    }
-    println!(
-        "ledger status for {} after {} attempt(s): {:?}",
-        completed.did, completed.attempts, completed.status
-    );
-    Ok(())
-}
-
-fn claim_batch_limit(concurrency: usize, in_flight: usize, remaining: u64) -> anyhow::Result<u32> {
-    let available = concurrency
-        .checked_sub(in_flight)
-        .ok_or(SchedulerError::InvalidConcurrency)?;
-    let available = u64::try_from(available)?;
-    let limit = available.min(remaining).min(u64::from(u32::MAX));
-    u32::try_from(limit).map_err(Into::into)
-}
-
-#[cfg(test)]
-fn claimable_entries_for_scope(
-    ledger: &SqliteLedger,
-    now: SystemTime,
-    limit: u32,
-    claim_scope: &ClaimScope,
-) -> anyhow::Result<Vec<RepoLedgerEntry>> {
-    claim_scope.shard_filter().map_or_else(
-        || ledger.claimable_entries(now, limit).map_err(Into::into),
-        |shard_filter| {
-            ledger
-                .claimable_entries_for_shard(now, limit, shard_filter)
-                .map_err(Into::into)
-        },
-    )
-}
-
-fn recover_stale_claimed_entries(
-    ledger: &SqliteLedger,
-    dids_file: &Path,
-    now: SystemTime,
-) -> anyhow::Result<u64> {
-    let contents = fs::read_to_string(dids_file)?;
-    let mut recovered = 0_u64;
-    for line in contents.lines() {
-        let did = line.trim();
-        if did.is_empty() {
-            continue;
-        }
-        let Some(entry) = ledger.load_entry(did)? else {
-            continue;
-        };
-        if entry.status != RepoLedgerStatus::Claimed {
-            continue;
-        }
-        if ledger
-            .recover_expired_claim(did, now, "expired claimed lease at fleet startup")?
-            .is_some()
-        {
-            increment(&mut recovered, "stale claimed recovery count")?;
-        }
-    }
-    Ok(recovered)
-}
-
-fn seed_ledger_from_file(ledger: &SqliteLedger, dids_file: &Path) -> anyhow::Result<SeedSummary> {
-    let mut summary = SeedSummary::default();
-    let contents = fs::read_to_string(dids_file)?;
-
-    for line in contents.lines() {
-        let did = line.trim();
-        if did.is_empty() {
-            increment(&mut summary.blank, "blank line count")?;
-            continue;
-        }
-        let _parsed: Did = Did::new_owned(did).map_err(|err| {
-            anyhow::anyhow!("invalid DID {did:?} in {}: {err}", dids_file.display())
-        })?;
-
-        if ledger.load_entry(did)?.is_some() {
-            increment(&mut summary.existing, "existing seed count")?;
-            continue;
-        }
-
-        ledger.upsert_entry(&RepoLedgerEntry::pending(did))?;
-        increment(&mut summary.inserted, "inserted seed count")?;
-    }
-
-    Ok(summary)
-}
-
-fn default_worker_id(run_id: &str) -> String {
-    let host = std::env::var("HOSTNAME").unwrap_or_else(|_err| "unknown-host".to_owned());
-    format!("{run_id}:{host}:{}", std::process::id())
-}
-
 fn increment(value: &mut u64, context: &str) -> anyhow::Result<()> {
     *value = value
         .checked_add(1)
@@ -1134,43 +225,6 @@ fn payload_row_count(
             .checked_add(rows)
             .ok_or_else(|| anyhow::anyhow!("payload row total overflow"))
     })
-}
-
-fn parse_positive_u32(value: &str) -> Result<u32, String> {
-    let parsed = value
-        .parse::<u32>()
-        .map_err(|err| format!("expected a positive integer: {err}"))?;
-    if parsed == 0 {
-        return Err("expected a positive integer".to_owned());
-    }
-    Ok(parsed)
-}
-
-fn parse_positive_usize(value: &str) -> Result<usize, String> {
-    let parsed = value
-        .parse::<usize>()
-        .map_err(|err| format!("expected a positive integer: {err}"))?;
-    if parsed == 0 {
-        return Err("expected a positive integer".to_owned());
-    }
-    Ok(parsed)
-}
-
-fn parse_positive_u64(value: &str) -> Result<u64, String> {
-    let parsed = value
-        .parse::<u64>()
-        .map_err(|err| format!("expected a positive integer: {err}"))?;
-    if parsed == 0 {
-        return Err("expected a positive integer".to_owned());
-    }
-    Ok(parsed)
-}
-
-fn parse_shard_filter(value: &str) -> Result<ShardFilter, String> {
-    let bucket = value
-        .parse::<u64>()
-        .map_err(|err| format!("expected a shard bucket integer: {err}"))?;
-    ShardFilter::new(bucket).map_err(|err| err.to_string())
 }
 
 async fn fetch_one_attempt(
@@ -1480,12 +534,15 @@ async fn fetch_spooled_repo(step: FetchStep<'_>) -> Result<FetchedRepo, FetchOne
             Err(err)
                 if is_retryable_stream_fetch_error(&err) && attempt < FETCH_TRANSPORT_ATTEMPTS =>
             {
+                let delay = transport_retry_delay(step.did_str, attempt);
                 eprintln!(
-                    "fetch retry {next_attempt}/{max_attempts} for {did}: {err}",
+                    "fetch retry {next_attempt}/{max_attempts} for {did} after {delay_ms} ms: {err}",
                     next_attempt = attempt.saturating_add(1),
                     max_attempts = FETCH_TRANSPORT_ATTEMPTS,
-                    did = step.did_str
+                    did = step.did_str,
+                    delay_ms = delay.as_millis()
                 );
+                tokio::time::sleep(delay).await;
                 attempt = attempt.saturating_add(1);
             }
             Err(err) => {
@@ -1517,10 +574,41 @@ async fn fetch_spooled_repo(step: FetchStep<'_>) -> Result<FetchedRepo, FetchOne
 
 fn repo_fetch_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
+        .user_agent(CRAWLER_USER_AGENT)
         .http1_only()
         .tcp_keepalive(Duration::from_secs(60))
         .connect_timeout(Duration::from_secs(30))
         .build()
+}
+
+fn transport_retry_delay(did: &str, failed_attempt: u8) -> Duration {
+    let exponent = u32::from(failed_attempt.saturating_sub(1));
+    let multiplier = 1_u32.checked_shl(exponent).unwrap_or(u32::MAX);
+    let base = FETCH_TRANSPORT_RETRY_BASE_DELAY
+        .checked_mul(multiplier)
+        .unwrap_or(FETCH_TRANSPORT_RETRY_MAX_DELAY)
+        .min(FETCH_TRANSPORT_RETRY_MAX_DELAY);
+    base.checked_add(transport_retry_jitter(did, failed_attempt, base))
+        .unwrap_or(FETCH_TRANSPORT_RETRY_MAX_DELAY)
+        .min(FETCH_TRANSPORT_RETRY_MAX_DELAY)
+}
+
+fn transport_retry_jitter(did: &str, failed_attempt: u8, base: Duration) -> Duration {
+    let window_millis = u64::try_from(base.as_millis() / 2).unwrap_or(u64::MAX);
+    if window_millis == 0 {
+        return Duration::ZERO;
+    }
+    let modulus = window_millis.saturating_add(1);
+    let mut hasher = Sha256::new();
+    hasher.update(did.as_bytes());
+    hasher.update([failed_attempt]);
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 8];
+    for (destination, source) in bytes.iter_mut().zip(digest) {
+        *destination = source;
+    }
+    let jitter_millis = u64::from_be_bytes(bytes).checked_rem(modulus).unwrap_or(0);
+    Duration::from_millis(jitter_millis)
 }
 
 const fn is_retryable_stream_fetch_error(error: &FetchError) -> bool {
@@ -2076,57 +1164,6 @@ fn parse_repo_streaming_archive_profiled(
     Ok((summary, state))
 }
 
-#[derive(Serialize)]
-struct SmokeTelemetry<'a> {
-    event: &'static str,
-    did: &'a str,
-    host: Option<&'a str>,
-    outcome: &'static str,
-    stage: &'static str,
-    elapsed_ms: u64,
-    fetch_ms: Option<u64>,
-    parse_ms: Option<u64>,
-    archive_ms: Option<u64>,
-    bytes: Option<u64>,
-    records: Option<u64>,
-    archived_posts: Option<u64>,
-    decode_errors: Option<u64>,
-    emoji_rows: Option<u64>,
-    rss_kb: Option<u64>,
-    error: Option<String>,
-}
-
-fn emit_smoke_telemetry(telemetry: &SmokeTelemetry<'_>) {
-    match serde_json::to_string(telemetry) {
-        Ok(line) => println!("smoke_telemetry {line}"),
-        Err(error) => eprintln!("failed to serialize smoke telemetry: {error}"),
-    }
-}
-
-fn elapsed_ms(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
-}
-
-fn current_rss_kb() -> Option<u64> {
-    let status = fs::read_to_string("/proc/self/status").ok()?;
-    status.lines().find_map(|line| {
-        let value = line.strip_prefix("VmRSS:")?.trim();
-        let kb = value.split_whitespace().next()?;
-        kb.parse::<u64>().ok()
-    })
-}
-
-const fn outcome_name(outcome: &AttemptOutcome) -> &'static str {
-    match outcome {
-        AttemptOutcome::Succeeded => "succeeded",
-        AttemptOutcome::AccountState(_) => "account_state",
-        AttemptOutcome::RateLimited { .. } => "rate_limited",
-        AttemptOutcome::RetryableFailure { .. } => "retryable_failure",
-        AttemptOutcome::ResourceLimitExceeded { .. } => "resource_limit_exceeded",
-        AttemptOutcome::PermanentFailure { .. } => "permanent_failure",
-    }
-}
-
 async fn prepare_fetch_host(
     did_str: &str,
     pds: &Uri<String>,
@@ -2208,178 +1245,6 @@ fn fetch_mode_for_host(
     Ok(host_override.force_mode.unwrap_or(ForcedFetchMode::GetRepo))
 }
 
-#[derive(Debug)]
-struct FetchOneFailure {
-    outcome: AttemptOutcome,
-    error: anyhow::Error,
-}
-
-fn classify_fetch_error(did: &str, error: &FetchError) -> FetchOneFailure {
-    let message = format!("fetch getRepo for {did}: {error}");
-    let outcome = match &error {
-        FetchError::AccountState { state, .. } => AttemptOutcome::AccountState(*state),
-        FetchError::HttpStatus {
-            status, rate_limit, ..
-        } if *status == 429 => rate_limit.retry_after.map_or_else(
-            || AttemptOutcome::RetryableFailure {
-                message: message.clone(),
-            },
-            |retry_after| AttemptOutcome::RateLimited { retry_after },
-        ),
-        FetchError::HttpStatus { status, .. } if *status >= 500 => {
-            AttemptOutcome::RetryableFailure {
-                message: message.clone(),
-            }
-        }
-        FetchError::InactivityTimeout { .. }
-        | FetchError::Transport { .. }
-        | FetchError::Io { .. }
-        | FetchError::ByteBudgetPoisoned => AttemptOutcome::RetryableFailure {
-            message: message.clone(),
-        },
-        FetchError::MaxBytesExceeded { .. }
-        | FetchError::ErrorBodyTooLarge { .. }
-        | FetchError::InFlightBytesExceeded { .. } => AttemptOutcome::ResourceLimitExceeded {
-            message: message.clone(),
-        },
-        FetchError::HttpStatus { .. } => AttemptOutcome::PermanentFailure {
-            message: message.clone(),
-        },
-    };
-    FetchOneFailure {
-        outcome,
-        error: anyhow::anyhow!(message),
-    }
-}
-
-fn classify_list_records_error(did: &str, error: &ListRecordsError) -> FetchOneFailure {
-    let message = format!("fetch listRecords for {did}: {error}");
-    let outcome = match error {
-        ListRecordsError::AccountState { state, .. } => AttemptOutcome::AccountState(*state),
-        ListRecordsError::HttpStatus { status, .. }
-            if *status == 429
-                && error
-                    .rate_limit()
-                    .and_then(|limit| limit.retry_after)
-                    .is_some() =>
-        {
-            AttemptOutcome::RateLimited {
-                retry_after: error
-                    .rate_limit()
-                    .and_then(|limit| limit.retry_after)
-                    .unwrap_or(Duration::ZERO),
-            }
-        }
-        ListRecordsError::HttpStatus { .. } if error.is_retryable() => {
-            AttemptOutcome::RetryableFailure {
-                message: message.clone(),
-            }
-        }
-        ListRecordsError::Transport(_) => AttemptOutcome::RetryableFailure {
-            message: message.clone(),
-        },
-        ListRecordsError::ResourceLimitExceeded { .. } => AttemptOutcome::ResourceLimitExceeded {
-            message: message.clone(),
-        },
-        ListRecordsError::HttpStatus { .. }
-        | ListRecordsError::PageJson(_)
-        | ListRecordsError::Archive(_)
-        | ListRecordsError::Protocol(_) => AttemptOutcome::PermanentFailure {
-            message: message.clone(),
-        },
-    };
-    FetchOneFailure {
-        outcome,
-        error: anyhow::anyhow!(message),
-    }
-}
-
-fn classify_parse_error(did: &str, error: &ParseError) -> FetchOneFailure {
-    let message = format!("parse CAR for {did}: {error}");
-    let outcome = match error {
-        ParseError::ResourceLimitExceeded { .. } | ParseError::ResourceCountOverflow { .. } => {
-            AttemptOutcome::ResourceLimitExceeded {
-                message: message.clone(),
-            }
-        }
-        ParseError::Io { .. } | ParseError::Runtime(_) | ParseError::ThreadSpawn(_) => {
-            AttemptOutcome::RetryableFailure {
-                message: message.clone(),
-            }
-        }
-        ParseError::Repo(_)
-        | ParseError::InvalidRoots(_)
-        | ParseError::CidMismatch { .. }
-        | ParseError::UnsupportedCodec { .. }
-        | ParseError::CommitNotFound { .. }
-        | ParseError::RootCommitDecode { .. }
-        | ParseError::CommitDidMismatch { .. }
-        | ParseError::MissingBlock { .. }
-        | ParseError::RecordDecode { .. }
-        | ParseError::MstRootMismatch { .. }
-        | ParseError::Unsupported { .. }
-        | ParseError::NotYetImplemented { .. }
-        | ParseError::RuntimeThreadTerminated
-        | ParseError::MalformedVarint
-        | ParseError::CarLengthOverflow { .. }
-        | ParseError::MalformedCar(_)
-        | ParseError::CidRead(_) => AttemptOutcome::PermanentFailure {
-            message: message.clone(),
-        },
-    };
-    FetchOneFailure {
-        outcome,
-        error: anyhow::anyhow!(message),
-    }
-}
-
-fn classify_archive_error(context: &str, error: &ArchiveError) -> FetchOneFailure {
-    let message = format!("{context}: {error}");
-    let outcome = match error {
-        ArchiveError::Io(_) | ArchiveError::Commit(_) => AttemptOutcome::RetryableFailure {
-            message: message.clone(),
-        },
-        ArchiveError::CountOverflow { .. } => AttemptOutcome::ResourceLimitExceeded {
-            message: message.clone(),
-        },
-        ArchiveError::Parquet(_)
-        | ArchiveError::Arrow(_)
-        | ArchiveError::Json(_)
-        | ArchiveError::InvalidParquetColumn { .. }
-        | ArchiveError::InvalidParquetValue { .. }
-        | ArchiveError::UnexpectedParquetNull { .. }
-        | ArchiveError::InvalidCompression(_)
-        | ArchiveError::InvalidPath { .. }
-        | ArchiveError::InvalidRecordJson
-        | ArchiveError::FinalPathExists { .. }
-        | ArchiveError::FinalHashMismatch { .. } => AttemptOutcome::PermanentFailure {
-            message: message.clone(),
-        },
-    };
-    FetchOneFailure {
-        outcome,
-        error: anyhow::anyhow!(message),
-    }
-}
-
-fn retryable_failure(message: String) -> FetchOneFailure {
-    FetchOneFailure {
-        outcome: AttemptOutcome::RetryableFailure {
-            message: message.clone(),
-        },
-        error: anyhow::anyhow!(message),
-    }
-}
-
-fn permanent_failure(message: String) -> FetchOneFailure {
-    FetchOneFailure {
-        outcome: AttemptOutcome::PermanentFailure {
-            message: message.clone(),
-        },
-        error: anyhow::anyhow!(message),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::arithmetic_side_effects)]
@@ -2396,15 +1261,17 @@ mod tests {
             AttemptId, AttemptOutcome, ForcedFetchMode, HostOverride, RepoLedgerEntry,
             RepoLedgerStatus, ShardFilter, SqliteLedger, claim_repo_with_lease, did_shard_bucket,
         },
+        parse::default_cid_verification_threads,
         scheduler::ClaimScope,
     };
     use jacquard_common::deps::fluent_uri::Uri;
 
     use super::{
-        Cli, Command, HostConcurrencyLimiter, SeedSummary, claim_batch_limit,
-        claimable_entries_for_scope, default_cid_verification_threads, fetch_mode_for_host,
-        load_host_override, pds_host_key, prepare_fetch_host, recover_stale_claimed_entries,
-        seed_ledger_from_file,
+        Cli, Command, fetch_mode_for_host, load_host_override, pds_host_key, prepare_fetch_host,
+    };
+    use crate::fleet::{
+        HostConcurrencyLimiter, SeedSummary, claim_batch_limit, claimable_entries_for_scope,
+        recover_stale_claimed_entries, seed_ledger_from_file,
     };
 
     #[test]

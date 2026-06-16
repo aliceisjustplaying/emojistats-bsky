@@ -6,7 +6,7 @@ use std::{
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,10 @@ use crate::archive::NormalizerVersion;
 
 const HASH_BUFFER_BYTES: usize = 65_536;
 pub(crate) const PROTOCOL_VERSION: u16 = 1;
+const MANIFEST_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const MANIFEST_LOCK_MAX_WAIT: Duration = Duration::from_secs(60);
+#[allow(clippy::duration_suboptimal_units)]
+const MANIFEST_LOCK_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
 
 /// Local filesystem implementation of the committed artifact protocol.
 #[derive(Debug, Clone)]
@@ -148,6 +152,13 @@ pub enum Error {
         #[source]
         source: serde_json::Error,
     },
+    /// JSON deserialization failed.
+    #[error("JSON read failed for {}: {source}", path.display())]
+    JsonRead {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
     /// Byte count overflowed the manifest schema.
     #[error("byte count overflow while hashing {}", path.display())]
     ByteCountOverflow { path: PathBuf },
@@ -168,6 +179,9 @@ pub enum Error {
         expected: String,
         observed: String,
     },
+    /// A retry found a final receipt, but it did not match the repaired commit request.
+    #[error("existing receipt does not match repaired commit request: {}", path.display())]
+    ExistingReceiptMismatch { path: PathBuf },
 }
 
 impl LocalStore {
@@ -187,6 +201,31 @@ impl LocalStore {
     where
         F: FnOnce(&mut File) -> Result<(), Error>,
     {
+        self.prepare_commit(request, |object| {
+            write_temp_promote_file(object, "object", write_object)
+        })
+    }
+
+    /// Commit an already-written temp object through fsync, rename, digest, sidecar, and manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if path validation, object promotion, digesting, receipt writing, or
+    /// manifest writing fails.
+    pub(crate) fn commit_prepared_temp(
+        &self,
+        request: &Request,
+        temp_object_path: &Path,
+    ) -> Result<Artifact, Error> {
+        self.prepare_commit(request, |object| {
+            promote_prepared_file(temp_object_path, object, "object")
+        })
+    }
+
+    fn prepare_commit<F>(&self, request: &Request, promote_object: F) -> Result<Artifact, Error>
+    where
+        F: FnOnce(&Path) -> Result<ObjectCommitState, Error>,
+    {
         self.prepare_root()?;
         let object = self.resolve_scoped("object", &request.object_path)?;
         let receipt = self.resolve_scoped("receipt", &request.receipt_path)?;
@@ -195,13 +234,22 @@ impl LocalStore {
         prepare_parent(&receipt, "receipt")?;
         prepare_parent(&manifest, "manifest")?;
 
-        let digest = write_temp_promote_file(&object, "object", write_object)?;
+        let object_state = promote_object(&object)?;
+        let digest = object_state.digest();
         let object_path = manifest_path_string("object", &request.object_path)?;
         let entry = ManifestEntry::from_parts(&request.metadata, object_path.clone(), &digest);
         let receipt_doc = Receipt::from_parts(&request.metadata, object_path, &digest);
 
-        write_json_temp_promote(&receipt, "receipt", &receipt_doc)?;
-        write_manifest(&manifest, request.manifest_mode, &entry)?;
+        match object_state {
+            ObjectCommitState::Promoted(_) => {
+                write_json_temp_promote(&receipt, "receipt", &receipt_doc)?;
+                write_manifest(&manifest, request.manifest_mode, &entry)?;
+            }
+            ObjectCommitState::AlreadyCommitted(_) => {
+                validate_existing_receipt(&receipt, &receipt_doc)?;
+                write_manifest_if_missing(&manifest, request.manifest_mode, &entry)?;
+            }
+        }
 
         Ok(Artifact {
             object_path: object,
@@ -304,11 +352,25 @@ pub(crate) struct DigestResult {
     pub(crate) sha256: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ObjectCommitState {
+    Promoted(DigestResult),
+    AlreadyCommitted(DigestResult),
+}
+
+impl ObjectCommitState {
+    fn digest(&self) -> DigestResult {
+        match self {
+            Self::Promoted(digest) | Self::AlreadyCommitted(digest) => digest.clone(),
+        }
+    }
+}
+
 fn write_temp_promote_file<F>(
     path: &Path,
     kind: &'static str,
     write: F,
-) -> Result<DigestResult, Error>
+) -> Result<ObjectCommitState, Error>
 where
     F: FnOnce(&mut File) -> Result<(), Error>,
 {
@@ -321,16 +383,35 @@ where
             source,
         })?;
         write(&mut file)?;
-        file.sync_all().map_err(|source| Error::Io {
+        drop(file);
+        promote_prepared_file(&temp_path, path, kind)
+    })();
+    let _ignored = fs::remove_file(&temp_path);
+    result
+}
+
+fn promote_prepared_file(
+    temp_path: &Path,
+    path: &Path,
+    kind: &'static str,
+) -> Result<ObjectCommitState, Error> {
+    File::open(temp_path)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| Error::Io {
             operation: "fsync temp file",
-            path: temp_path.clone(),
+            path: temp_path.to_path_buf(),
             source,
         })?;
-        drop(file);
-        let temp_digest = hash_file(&temp_path)?;
-        promote_no_overwrite(&temp_path, path, kind)?;
-        let final_digest = hash_file(path)?;
-        if final_digest.sha256 != temp_digest.sha256 || final_digest.bytes != temp_digest.bytes {
+    let temp_digest = hash_file(temp_path)?;
+    match promote_no_overwrite(temp_path, path, kind) {
+        Ok(()) => {}
+        Err(Error::FinalPathExists { .. }) => {
+            let final_digest = hash_file(path)?;
+            if final_digest.sha256 == temp_digest.sha256 && final_digest.bytes == temp_digest.bytes
+            {
+                let _ignored = fs::remove_file(temp_path);
+                return Ok(ObjectCommitState::AlreadyCommitted(final_digest));
+            }
             return Err(Error::FinalHashMismatch {
                 kind,
                 path: path.to_path_buf(),
@@ -338,10 +419,19 @@ where
                 observed: final_digest.sha256,
             });
         }
-        Ok(final_digest)
-    })();
-    let _ignored = fs::remove_file(&temp_path);
-    result
+        Err(error) => return Err(error),
+    }
+    let final_digest = hash_file(path)?;
+    if final_digest.sha256 != temp_digest.sha256 || final_digest.bytes != temp_digest.bytes {
+        return Err(Error::FinalHashMismatch {
+            kind,
+            path: path.to_path_buf(),
+            expected: temp_digest.sha256,
+            observed: final_digest.sha256,
+        });
+    }
+    let _ignored = fs::remove_file(temp_path);
+    Ok(ObjectCommitState::Promoted(final_digest))
 }
 
 fn write_json_temp_promote<T>(path: &Path, kind: &'static str, value: &T) -> Result<(), Error>
@@ -366,6 +456,59 @@ fn write_manifest(path: &Path, mode: ManifestMode, entry: &ManifestEntry) -> Res
     match mode {
         ManifestMode::AppendJsonl => append_manifest_jsonl(path, entry),
         ManifestMode::ReplaceJsonArray => write_json_temp_promote(path, "manifest", &[entry]),
+    }
+}
+
+fn write_manifest_if_missing(
+    path: &Path,
+    mode: ManifestMode,
+    entry: &ManifestEntry,
+) -> Result<(), Error> {
+    if manifest_contains_entry(path, mode, entry)? {
+        return Ok(());
+    }
+    write_manifest(path, mode, entry)
+}
+
+fn manifest_contains_entry(
+    path: &Path,
+    mode: ManifestMode,
+    entry: &ManifestEntry,
+) -> Result<bool, Error> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(Error::Io {
+                operation: "read manifest",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    match mode {
+        ManifestMode::AppendJsonl => {
+            for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+                let candidate: ManifestEntry =
+                    serde_json::from_str(line).map_err(|source| Error::JsonRead {
+                        path: path.to_path_buf(),
+                        source,
+                    })?;
+                if candidate == *entry {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        ManifestMode::ReplaceJsonArray => {
+            let entries: Vec<ManifestEntry> =
+                serde_json::from_str(&contents).map_err(|source| Error::JsonRead {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            Ok(entries.iter().any(|candidate| candidate == entry))
+        }
     }
 }
 
@@ -406,7 +549,7 @@ struct ManifestAppendLock {
 impl ManifestAppendLock {
     fn acquire(path: &Path) -> Result<Self, Error> {
         let lock_path = manifest_lock_path(path)?;
-        let mut attempts = 0_u16;
+        let started = Instant::now();
         loop {
             match OpenOptions::new()
                 .write(true)
@@ -424,11 +567,22 @@ impl ManifestAppendLock {
                         path: lock_path.clone(),
                         source,
                     })?;
+                    drop(file);
+                    sync_parent_dir(&lock_path, "manifest append lock")?;
                     return Ok(Self { path: lock_path });
                 }
-                Err(source) if source.kind() == io::ErrorKind::AlreadyExists && attempts < 200 => {
-                    attempts = attempts.saturating_add(1);
-                    thread::sleep(Duration::from_millis(10));
+                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                    if remove_stale_manifest_lock(&lock_path)? {
+                        continue;
+                    }
+                    if started.elapsed() >= MANIFEST_LOCK_MAX_WAIT {
+                        return Err(Error::Io {
+                            operation: "acquire manifest append lock",
+                            path: lock_path,
+                            source,
+                        });
+                    }
+                    thread::sleep(MANIFEST_LOCK_POLL_INTERVAL);
                 }
                 Err(source) => {
                     return Err(Error::Io {
@@ -457,6 +611,60 @@ fn manifest_lock_path(path: &Path) -> Result<PathBuf, Error> {
                 path: path.to_path_buf(),
             })?;
     Ok(path.with_file_name(format!(".{file_name}.lock")))
+}
+
+fn remove_stale_manifest_lock(path: &Path) -> Result<bool, Error> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(source) => {
+            return Err(Error::Io {
+                operation: "stat manifest append lock",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let Ok(modified) = metadata.modified() else {
+        return Ok(false);
+    };
+    let Ok(age) = modified.elapsed() else {
+        return Ok(false);
+    };
+    if age < MANIFEST_LOCK_STALE_AFTER {
+        return Ok(false);
+    }
+    match fs::remove_file(path) {
+        Ok(()) => {
+            sync_parent_dir(path, "manifest append lock")?;
+            Ok(true)
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(source) => Err(Error::Io {
+            operation: "remove stale manifest append lock",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn validate_existing_receipt(path: &Path, expected: &Receipt) -> Result<(), Error> {
+    let bytes = fs::read(path).map_err(|source| Error::Io {
+        operation: "read existing receipt",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let actual: Receipt = serde_json::from_slice(&bytes).map_err(|source| Error::JsonRead {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if actual == *expected {
+        Ok(())
+    } else {
+        Err(Error::ExistingReceiptMismatch {
+            path: path.to_path_buf(),
+        })
+    }
 }
 
 fn promote_no_overwrite(temp_path: &Path, path: &Path, kind: &'static str) -> Result<(), Error> {
@@ -712,6 +920,108 @@ mod tests {
         let manifest_entry: ManifestEntry =
             serde_json::from_str(first).expect("manifest entry should decode");
         assert_eq!(manifest_entry, artifact.entry);
+
+        fs::remove_dir_all(root).expect("test temp dir should be removed");
+    }
+
+    #[test]
+    fn commits_prepared_temp_object_receipt_and_manifest() {
+        let root = temp_dir("prepared");
+        let store = LocalStore::new(&root);
+        let prepared_path = root.join("prepared-object.tmp");
+        fs::write(&prepared_path, b"prepared").expect("prepared object should be written");
+
+        let artifact = store
+            .commit_prepared_temp(&request(3, ManifestMode::AppendJsonl), &prepared_path)
+            .expect("prepared commit should succeed");
+
+        assert!(!prepared_path.exists());
+        assert_eq!(
+            fs::read(&artifact.object_path).expect("object should be readable"),
+            b"prepared"
+        );
+        assert_eq!(artifact.entry.bytes, 8);
+        assert_eq!(artifact.entry.content_hash, sha256_hex(b"prepared"));
+
+        let receipt: Receipt = read_json(&artifact.receipt_path);
+        assert_eq!(receipt, artifact.receipt);
+        let manifest =
+            fs::read_to_string(&artifact.manifest_path).expect("manifest should be readable");
+        let entry: ManifestEntry =
+            serde_json::from_str(manifest.trim()).expect("manifest entry should decode");
+        assert_eq!(entry, artifact.entry);
+
+        fs::remove_dir_all(root).expect("test temp dir should be removed");
+    }
+
+    #[test]
+    fn retry_repairs_missing_jsonl_manifest_when_object_and_receipt_match() {
+        let root = temp_dir("repair-missing-manifest");
+        let store = LocalStore::new(&root);
+        let request = request(4, ManifestMode::AppendJsonl);
+        let artifact = store
+            .commit(&request, |file| {
+                file.write_all(b"retryable").map_err(|source| Error::Io {
+                    operation: "test write",
+                    path: PathBuf::from("test"),
+                    source,
+                })
+            })
+            .expect("initial commit should succeed");
+        fs::remove_file(&artifact.manifest_path).expect("manifest should be removable");
+
+        let repaired = store
+            .commit(&request, |file| {
+                file.write_all(b"retryable").map_err(|source| Error::Io {
+                    operation: "test write",
+                    path: PathBuf::from("test"),
+                    source,
+                })
+            })
+            .expect("retry should repair missing manifest");
+
+        assert_eq!(repaired.entry, artifact.entry);
+        let manifest =
+            fs::read_to_string(&artifact.manifest_path).expect("manifest should be repaired");
+        let entries = manifest.lines().collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        let first_entry = entries.first().expect("manifest should contain one entry");
+        let manifest_entry: ManifestEntry =
+            serde_json::from_str(first_entry).expect("manifest entry should decode");
+        assert_eq!(manifest_entry, artifact.entry);
+
+        fs::remove_dir_all(root).expect("test temp dir should be removed");
+    }
+
+    #[test]
+    fn retry_with_existing_jsonl_manifest_does_not_duplicate_entry() {
+        let root = temp_dir("repair-existing-manifest");
+        let store = LocalStore::new(&root);
+        let request = request(5, ManifestMode::AppendJsonl);
+        let artifact = store
+            .commit(&request, |file| {
+                file.write_all(b"retryable").map_err(|source| Error::Io {
+                    operation: "test write",
+                    path: PathBuf::from("test"),
+                    source,
+                })
+            })
+            .expect("initial commit should succeed");
+
+        let repaired = store
+            .commit(&request, |file| {
+                file.write_all(b"retryable").map_err(|source| Error::Io {
+                    operation: "test write",
+                    path: PathBuf::from("test"),
+                    source,
+                })
+            })
+            .expect("retry should be idempotent");
+
+        assert_eq!(repaired.entry, artifact.entry);
+        let manifest =
+            fs::read_to_string(&artifact.manifest_path).expect("manifest should be readable");
+        assert_eq!(manifest.lines().count(), 1);
 
         fs::remove_dir_all(root).expect("test temp dir should be removed");
     }

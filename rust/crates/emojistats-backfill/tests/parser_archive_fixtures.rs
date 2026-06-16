@@ -2,6 +2,7 @@
 
 mod fixtures;
 
+use bytes::Bytes;
 use emojistats_backfill::{
     archive::{
         ArchivePostRow, CompletenessClass, CreatedAtParseStatus, FetchMethod, RepoReceiptInput,
@@ -10,11 +11,13 @@ use emojistats_backfill::{
     },
     parse::{ParseError, parse_repo, parse_repo_for_did},
 };
+use jacquard_repo::mst::{NodeData, TreeEntry};
 use serde_json::json;
 
 use crate::fixtures::{
-    TempCar, commit_only_car_bytes, empty_roots_car_bytes, malformed_header_car_bytes,
-    non_commit_root_car_bytes, root_without_block_car_bytes, single_post_car_bytes,
+    TempCar, commit_only_car_bytes, empty_mst_block, empty_roots_car_bytes,
+    malformed_header_car_bytes, non_commit_root_car_bytes, record_block,
+    repo_car_with_root_node_bytes, root_without_block_car_bytes, single_post_car_bytes,
 };
 
 #[test]
@@ -64,6 +67,126 @@ fn rejects_requested_did_mismatch_before_mst_walk() {
         error,
         ParseError::CommitDidMismatch { requested, actual }
             if requested == "did:plc:requested456" && actual == "did:plc:actual123"
+    ));
+}
+
+#[test]
+fn rejects_malformed_repo_keys_from_car_mst() {
+    let did = "did:plc:fixture123";
+    let car = TempCar::from_bytes(
+        "empty-rkey.car",
+        &single_post_car_bytes(did, "", &valid_post_json()),
+    );
+
+    let error = parse_repo_for_did(&car.path, did).expect_err("empty rkey should fail");
+
+    assert!(matches!(
+        error,
+        ParseError::MalformedCar(message)
+            if message == "invalid repo key \"app.bsky.feed.post/\": rkey is empty"
+    ));
+}
+
+#[test]
+fn rejects_duplicate_mst_keys() {
+    let did = "did:plc:fixture123";
+    let key = "app.bsky.feed.post/3kabc";
+    let (record_cid, record_bytes) = record_block(&valid_post_json());
+    let node = NodeData {
+        left: None,
+        entries: vec![
+            TreeEntry {
+                key_suffix: Bytes::from(key.as_bytes().to_vec()),
+                prefix_len: 0,
+                tree: None,
+                value: record_cid,
+            },
+            TreeEntry {
+                key_suffix: Bytes::new(),
+                prefix_len: u8::try_from(key.len()).expect("key length fits u8"),
+                tree: None,
+                value: record_cid,
+            },
+        ],
+    };
+    let car = TempCar::from_bytes(
+        "duplicate-key.car",
+        &repo_car_with_root_node_bytes(did, &node, &[(record_cid, record_bytes)]),
+    );
+
+    let error = parse_repo_for_did(&car.path, did).expect_err("duplicate key should fail");
+
+    assert!(matches!(
+        error,
+        ParseError::MalformedCar(message) if message == format!("duplicate MST key: {key}")
+    ));
+}
+
+#[test]
+fn rejects_out_of_order_mst_keys() {
+    let did = "did:plc:fixture123";
+    let (record_cid, record_bytes) = record_block(&valid_post_json());
+    let node = NodeData {
+        left: None,
+        entries: vec![
+            TreeEntry {
+                key_suffix: Bytes::from_static(b"app.bsky.feed.post/3kdef"),
+                prefix_len: 0,
+                tree: None,
+                value: record_cid,
+            },
+            TreeEntry {
+                key_suffix: Bytes::from_static(b"3kabc"),
+                prefix_len: 19,
+                tree: None,
+                value: record_cid,
+            },
+        ],
+    };
+    let car = TempCar::from_bytes(
+        "out-of-order-key.car",
+        &repo_car_with_root_node_bytes(did, &node, &[(record_cid, record_bytes)]),
+    );
+
+    let error = parse_repo_for_did(&car.path, did).expect_err("out-of-order key should fail");
+
+    assert!(matches!(
+        error,
+        ParseError::MalformedCar(message)
+            if message
+                == "MST keys out of order: previous=app.bsky.feed.post/3kdef, key=app.bsky.feed.post/3kabc"
+    ));
+}
+
+#[test]
+fn rejects_revisited_mst_node_cids() {
+    let did = "did:plc:fixture123";
+    let (record_cid, record_bytes) = record_block(&valid_post_json());
+    let (child_cid, child_bytes) = empty_mst_block();
+    let node = NodeData {
+        left: Some(child_cid),
+        entries: vec![TreeEntry {
+            key_suffix: Bytes::from_static(b"app.bsky.feed.post/3kabc"),
+            prefix_len: 0,
+            tree: Some(child_cid),
+            value: record_cid,
+        }],
+    };
+    let car = TempCar::from_bytes(
+        "revisited-node.car",
+        &repo_car_with_root_node_bytes(
+            did,
+            &node,
+            &[(child_cid, child_bytes), (record_cid, record_bytes)],
+        ),
+    );
+
+    let error = parse_repo_for_did(&car.path, did).expect_err("revisited node CID should fail");
+
+    assert!(matches!(
+        error,
+        ParseError::MalformedCar(message)
+            if message.starts_with("MST node CID visited more than once:")
     ));
 }
 
@@ -216,4 +339,12 @@ fn archive_row(text: &str) -> ArchivePostRow {
         emoji_sequence: Vec::new(),
         extras_json: json!({ "fixture": "original" }),
     }
+}
+
+fn valid_post_json() -> serde_json::Value {
+    json!({
+        "$type": "app.bsky.feed.post",
+        "createdAt": "2024-01-02T03:04:05Z",
+        "text": "hello"
+    })
 }

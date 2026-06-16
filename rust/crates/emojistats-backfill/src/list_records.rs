@@ -1,6 +1,6 @@
 //! `com.atproto.repo.listRecords` fallback fetch and archive path.
 
-use std::{fmt, path::Path};
+use std::{collections::HashSet, fmt, path::Path};
 
 use jacquard_api::app_bsky::feed::post::Post;
 use jacquard_common::{deps::fluent_uri::Uri, types::did::Did};
@@ -13,7 +13,7 @@ use crate::{
         ArchiveArtifacts, ArchiveCommitContext, ArchiveError, CompletenessClass, FetchMethod,
         RepoReceipt, StreamingArchiveSink, StreamingReceiptInput, archive_row_from_post,
     },
-    parse::{PostRecord, PostRecordBody, RawPartialPostRecord},
+    parse::{PostRecord, PostRecordBody, raw_partial_post},
     transport::{AccountState, RateLimitSnapshot},
 };
 
@@ -148,21 +148,57 @@ pub async fn fetch_and_archive_list_records(
     archive_context: ArchiveCommitContext,
     config: ListRecordsConfig,
 ) -> Result<ListRecordsArchiveOutput, ListRecordsError> {
+    fetch_and_archive_list_records_with_rate_limit_observer(
+        http,
+        pds,
+        did,
+        did_str,
+        archive_dir,
+        archive_context,
+        config,
+        |_rate_limit| {},
+    )
+    .await
+}
+
+/// Fetch all `app.bsky.feed.post` records and report each page's rate-limit headers as it arrives.
+///
+/// # Errors
+///
+/// Returns [`ListRecordsError`] for transport, pagination cap, decode, or archive failures.
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_and_archive_list_records_with_rate_limit_observer(
+    http: &Client,
+    pds: &Uri<String>,
+    did: &Did,
+    did_str: &str,
+    archive_dir: &Path,
+    archive_context: ArchiveCommitContext,
+    config: ListRecordsConfig,
+    mut observe_rate_limit: impl FnMut(&RateLimitSnapshot),
+) -> Result<ListRecordsArchiveOutput, ListRecordsError> {
     let mut archiver = ListRecordsArchiver::new(did_str, archive_dir, archive_context, config)?;
     let mut rate_limits = Vec::new();
-    let mut cursor = None;
+    let mut seen_cursors = HashSet::new();
+    let mut cursor: Option<String> = None;
 
     loop {
         let fetched = fetch_list_records_page(http, pds, did, cursor.as_deref(), config).await?;
+        observe_rate_limit(&fetched.rate_limit);
         rate_limits.push(fetched.rate_limit);
         let next_cursor = fetched.page.cursor.clone();
         archiver.push_page(fetched.page)?;
-        if next_cursor.is_none() {
+        let Some(next_cursor_value) = next_cursor.as_deref() else {
             break;
-        }
-        if next_cursor == cursor {
+        };
+        if Some(next_cursor_value) == cursor.as_deref() {
             return Err(ListRecordsError::Protocol(
                 "PDS returned the same listRecords cursor twice".to_owned(),
+            ));
+        }
+        if !seen_cursors.insert(next_cursor_value.to_owned()) {
+            return Err(ListRecordsError::Protocol(
+                "PDS returned a repeated listRecords cursor".to_owned(),
             ));
         }
         cursor = next_cursor;
@@ -312,6 +348,7 @@ impl<'a> ListRecordsArchiver<'a> {
     }
 }
 
+#[derive(Debug)]
 struct FetchedListRecordsPage {
     page: ListRecordsPage,
     rate_limit: RateLimitSnapshot,
@@ -337,18 +374,13 @@ async fn fetch_list_records_page(
         query.push(("cursor", cursor.to_owned()));
     }
 
-    let response = http.get(url).query(&query).send().await?;
+    let mut response = http.get(url).query(&query).send().await?;
     let status = response.status();
     let rate_limit = RateLimitSnapshot::from_headers(response.headers());
     if let Some(content_length) = response.content_length() {
         enforce_cap("max_page_bytes", content_length, config.max_page_bytes)?;
     }
-    let body = response.bytes().await?;
-    enforce_cap(
-        "max_page_bytes",
-        u64::try_from(body.len()).unwrap_or(u64::MAX),
-        config.max_page_bytes,
-    )?;
+    let body = read_response_body_with_cap(&mut response, config.max_page_bytes).await?;
 
     if !status.is_success() {
         return Err(classify_error_status(status, &rate_limit, &body));
@@ -357,6 +389,28 @@ async fn fetch_list_records_page(
     serde_json::from_slice::<ListRecordsPage>(&body)
         .map(|page| FetchedListRecordsPage { page, rate_limit })
         .map_err(ListRecordsError::PageJson)
+}
+
+async fn read_response_body_with_cap(
+    response: &mut reqwest::Response,
+    max_page_bytes: u64,
+) -> Result<Vec<u8>, ListRecordsError> {
+    let mut body = Vec::new();
+    let mut observed = 0_u64;
+    while let Some(chunk) = response.chunk().await? {
+        let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+        observed =
+            observed
+                .checked_add(chunk_len)
+                .ok_or(ListRecordsError::ResourceLimitExceeded {
+                    limit: "max_page_bytes",
+                    observed: u64::MAX,
+                    max: max_page_bytes,
+                })?;
+        enforce_cap("max_page_bytes", observed, max_page_bytes)?;
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn classify_error_status(
@@ -438,8 +492,10 @@ fn post_record_from_list_record(
             },
             typed_decode_failed: false,
         }),
-        Err(_error) => {
-            raw_partial_post_from_json_value(value).map_or(Err(ListRecordDecodeError), |post| {
+        Err(_error) => raw_partial_post::from_json_value(value).map_or(
+            Err(ListRecordDecodeError),
+            |mut post| {
+                post.typed_decode_failed = true;
                 Ok(DecodedListRecord {
                     post: PostRecord {
                         rkey: rkey.to_owned(),
@@ -448,72 +504,9 @@ fn post_record_from_list_record(
                     },
                     typed_decode_failed: true,
                 })
-            })
-        }
+            },
+        ),
     }
-}
-
-fn raw_partial_post_from_json_value(value: serde_json::Value) -> Option<RawPartialPostRecord> {
-    let serde_json::Value::Object(mut fields) = value else {
-        return None;
-    };
-    let created_at_raw = raw_created_at(fields.get("createdAt"));
-    let text = fields
-        .get("text")
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned);
-    let langs = raw_string_array(fields.get("langs"));
-    for key in ["$type", "createdAt", "langs", "text"] {
-        fields.remove(key);
-    }
-    Some(RawPartialPostRecord {
-        typed_decode_failed: raw_post_typed_decode_failed(&fields),
-        created_at_raw,
-        text,
-        langs,
-        extras_json: serde_json::Value::Object(fields),
-    })
-}
-
-fn raw_post_typed_decode_failed(fields: &serde_json::Map<String, serde_json::Value>) -> bool {
-    if !matches!(fields.get("createdAt"), Some(serde_json::Value::String(_))) {
-        return true;
-    }
-    if !matches!(fields.get("text"), Some(serde_json::Value::String(_))) {
-        return true;
-    }
-    raw_langs_decode_failed(fields.get("langs"))
-}
-
-fn raw_langs_decode_failed(value: Option<&serde_json::Value>) -> bool {
-    let Some(value) = value else {
-        return false;
-    };
-    let serde_json::Value::Array(values) = value else {
-        return true;
-    };
-    values
-        .iter()
-        .any(|value| !matches!(value, serde_json::Value::String(_)))
-}
-
-fn raw_created_at(value: Option<&serde_json::Value>) -> Option<String> {
-    match value {
-        None => None,
-        Some(serde_json::Value::String(value)) => Some(value.clone()),
-        Some(value) => Some(value.to_string()),
-    }
-}
-
-fn raw_string_array(value: Option<&serde_json::Value>) -> Vec<String> {
-    let Some(serde_json::Value::Array(values)) = value else {
-        return Vec::new();
-    };
-    values
-        .iter()
-        .filter_map(serde_json::Value::as_str)
-        .map(ToOwned::to_owned)
-        .collect()
 }
 
 fn rkey_from_uri<'a>(did_str: &str, uri: &'a str) -> Option<&'a str> {
@@ -538,8 +531,16 @@ const fn enforce_cap(limit: &'static str, observed: u64, max: u64) -> Result<(),
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf, time::SystemTime};
+    use std::{
+        fs,
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        path::PathBuf,
+        thread,
+        time::SystemTime,
+    };
 
+    use jacquard_common::deps::fluent_uri::Uri;
     use serde_json::json;
 
     use super::*;
@@ -617,6 +618,122 @@ mod tests {
         fs::remove_dir_all(archive_dir).expect("remove archive dir");
     }
 
+    #[tokio::test]
+    async fn fetch_rejects_cursor_cycle_beyond_immediate_repeat() {
+        let archive_dir = temp_dir("list-records-cursor-cycle");
+        let did_str = "did:plc:testrepo";
+        let (base_url, handle) = spawn_list_records_server(vec![
+            TestResponse::json_page(None, Some("cursor-a"), Some(10), true),
+            TestResponse::json_page(None, Some("cursor-b"), Some(9), true),
+            TestResponse::json_page(None, Some("cursor-a"), Some(8), true),
+        ]);
+        let http = Client::new();
+        let pds = Uri::parse(base_url).expect("parse pds").clone();
+        let did = Did::new_owned(did_str).expect("parse did");
+
+        let error = fetch_and_archive_list_records(
+            &http,
+            &pds,
+            &did,
+            did_str,
+            &archive_dir,
+            ArchiveCommitContext::fetch_one_local(),
+            ListRecordsConfig::default(),
+        )
+        .await
+        .expect_err("cursor cycle should fail");
+
+        match error {
+            ListRecordsError::Protocol(message) => {
+                assert_eq!(message, "PDS returned a repeated listRecords cursor");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(handle.join().expect("server thread").len(), 3);
+        fs::remove_dir_all(archive_dir).expect("remove archive dir");
+    }
+
+    #[tokio::test]
+    async fn fetch_enforces_page_byte_cap_without_content_length() {
+        let did_str = "did:plc:testrepo";
+        let body = json!({"records": [], "cursor": null}).to_string();
+        let max_page_bytes = u64::try_from(body.len() - 1).expect("body length fits");
+        let (base_url, handle) =
+            spawn_list_records_server(vec![TestResponse::raw(body, None, false)]);
+        let http = Client::new();
+        let pds = Uri::parse(base_url).expect("parse pds").clone();
+        let did = Did::new_owned(did_str).expect("parse did");
+
+        let error = fetch_list_records_page(
+            &http,
+            &pds,
+            &did,
+            None,
+            ListRecordsConfig {
+                max_page_bytes,
+                ..ListRecordsConfig::default()
+            },
+        )
+        .await
+        .expect_err("oversize page should fail");
+
+        match error {
+            ListRecordsError::ResourceLimitExceeded {
+                limit,
+                observed,
+                max,
+            } => {
+                assert_eq!(limit, "max_page_bytes");
+                assert!(observed > max);
+                assert_eq!(max, max_page_bytes);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(handle.join().expect("server thread").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_observer_runs_after_each_fetched_page() {
+        let archive_dir = temp_dir("list-records-rate-limit-observer");
+        let did_str = "did:plc:testrepo";
+        let first_record = post_record(did_str, "3kabc", "bafyreia", "hello");
+        let second_record = post_record(did_str, "3kabd", "bafyreib", "second");
+        let (base_url, handle) = spawn_list_records_server(vec![
+            TestResponse::json_page(Some(&first_record), Some("next"), Some(4), true),
+            TestResponse::json_page(Some(&second_record), None, Some(3), true),
+        ]);
+        let http = Client::new();
+        let pds = Uri::parse(base_url).expect("parse pds").clone();
+        let did = Did::new_owned(did_str).expect("parse did");
+        let mut observed_remaining = Vec::new();
+
+        let output = fetch_and_archive_list_records_with_rate_limit_observer(
+            &http,
+            &pds,
+            &did,
+            did_str,
+            &archive_dir,
+            ArchiveCommitContext::fetch_one_local(),
+            ListRecordsConfig::default(),
+            |rate_limit| observed_remaining.push(rate_limit.remaining),
+        )
+        .await
+        .expect("fetch and archive listRecords");
+
+        assert_eq!(observed_remaining, vec![Some(4), Some(3)]);
+        assert_eq!(
+            output
+                .rate_limits
+                .iter()
+                .map(|rate_limit| rate_limit.remaining)
+                .collect::<Vec<_>>(),
+            vec![Some(4), Some(3)]
+        );
+        assert_eq!(output.archived_posts, 2);
+        assert_eq!(handle.join().expect("server thread").len(), 2);
+        fs::remove_dir_all(archive_dir).expect("remove archive dir");
+    }
+
     fn post_record(did: &str, rkey: &str, cid: &str, text: &str) -> ListRecordsRecord {
         ListRecordsRecord {
             uri: format!("at://{did}/{POST_COLLECTION}/{rkey}"),
@@ -637,5 +754,107 @@ mod tests {
         let path = std::env::temp_dir().join(format!("{prefix}-{nanos}"));
         fs::create_dir_all(&path).expect("create temp dir");
         path
+    }
+
+    struct TestResponse {
+        body: String,
+        remaining: Option<u64>,
+        content_length: bool,
+    }
+
+    impl TestResponse {
+        fn json_page(
+            record: Option<&ListRecordsRecord>,
+            cursor: Option<&str>,
+            remaining: Option<u64>,
+            content_length: bool,
+        ) -> Self {
+            Self::raw(
+                json!({
+                    "records": record.into_iter().map(record_json).collect::<Vec<_>>(),
+                    "cursor": cursor
+                })
+                .to_string(),
+                remaining,
+                content_length,
+            )
+        }
+
+        fn raw(body: String, remaining: Option<u64>, content_length: bool) -> Self {
+            Self {
+                body,
+                remaining,
+                content_length,
+            }
+        }
+    }
+
+    fn record_json(record: &ListRecordsRecord) -> serde_json::Value {
+        json!({
+            "uri": record.uri,
+            "cid": record.cid,
+            "value": record.value,
+        })
+    }
+
+    fn spawn_list_records_server(
+        responses: Vec<TestResponse>,
+    ) -> (String, thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
+        let addr = listener.local_addr().expect("server addr");
+        let handle = thread::spawn(move || {
+            responses
+                .into_iter()
+                .map(|response| {
+                    let (mut stream, _addr) = listener.accept().expect("accept request");
+                    let target = read_request_target(&mut stream);
+                    write_list_records_response(&mut stream, &response);
+                    target
+                })
+                .collect::<Vec<_>>()
+        });
+
+        (format!("http://{addr}"), handle)
+    }
+
+    fn read_request_target(stream: &mut TcpStream) -> String {
+        let mut headers = Vec::new();
+        let mut byte = [0_u8; 1];
+        loop {
+            let read = stream.read(&mut byte).expect("read request headers");
+            if read == 0 {
+                break;
+            }
+            headers.push(byte[0]);
+            if headers.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let header_text = String::from_utf8(headers).expect("utf8 headers");
+        header_text
+            .lines()
+            .next()
+            .expect("request line")
+            .split_whitespace()
+            .nth(1)
+            .expect("request target")
+            .to_owned()
+    }
+
+    fn write_list_records_response(stream: &mut TcpStream, response: &TestResponse) {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n"
+        )
+        .expect("write status");
+        if let Some(remaining) = response.remaining {
+            write!(stream, "ratelimit-remaining: {remaining}\r\n").expect("write rate limit");
+        }
+        if response.content_length {
+            write!(stream, "Content-Length: {}\r\n", response.body.len())
+                .expect("write content length");
+        }
+        write!(stream, "\r\n{}", response.body).expect("write body");
     }
 }

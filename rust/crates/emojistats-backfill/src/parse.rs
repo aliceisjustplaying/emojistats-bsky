@@ -1,7 +1,7 @@
 //! Stage C `CAR` parser for the v2 backfill pipeline.
 
 use std::{
-    collections::{BTreeMap, HashMap, hash_map::Entry},
+    collections::{HashMap, HashSet, hash_map::Entry},
     fs::File,
     io::{Cursor, Read, Seek, SeekFrom},
     os::unix::fs::FileExt,
@@ -13,8 +13,8 @@ use std::{
 
 use bytes::Bytes;
 use cid::Cid as IpldCid;
-use ipld_core::ipld::Ipld;
 use jacquard_api::app_bsky::{actor::profile::Profile, feed::post::Post};
+use jacquard_common::types::{nsid::validate_nsid, recordkey::Rkey};
 use jacquard_repo::{
     DAG_CBOR_CID_CODEC,
     commit::Commit,
@@ -24,6 +24,9 @@ use jacquard_repo::{
 };
 use serde::Deserialize;
 use smol_str::SmolStr;
+
+#[path = "raw_partial_post.rs"]
+pub(crate) mod raw_partial_post;
 
 /// Parsed one-repo output from Stage C.
 #[derive(Debug, Clone)]
@@ -150,8 +153,8 @@ pub struct CompletenessProof {
     pub verified_block_count: u64,
     /// Number of reachable `MST` leaves whose record block resolved by `CID`.
     pub reachable_record_count: u64,
-    /// Whether the commit's `data` root matched the traversed `MST` root.
-    pub mst_root_matches_commit: bool,
+    /// Whether the commit's `data` root block was present, traversed, and content-address verified.
+    pub mst_root_cid_verified: bool,
     /// Commit signature verification is deliberately out of scope for Stage C.
     pub repo_commit_signature_verified: bool,
     /// Identity verification is deliberately out of scope for Stage C.
@@ -568,7 +571,7 @@ where
             .collect(),
         verified_block_count: stream_summary.verified_block_count,
         reachable_record_count: rkey_digest.all_records_count,
-        mst_root_matches_commit: true,
+        mst_root_cid_verified: true,
         repo_commit_signature_verified: false,
         identity_verified: false,
     };
@@ -704,14 +707,18 @@ struct StreamingMstCursor<'a> {
     root: Option<IpldCid>,
     store: &'a IndexedCarBlockStore,
     stack: Vec<StreamingMstFrame>,
+    visited_nodes: HashSet<IpldCid>,
+    last_leaf_key: Option<String>,
 }
 
 impl<'a> StreamingMstCursor<'a> {
-    const fn new(root: IpldCid, store: &'a IndexedCarBlockStore) -> Self {
+    fn new(root: IpldCid, store: &'a IndexedCarBlockStore) -> Self {
         Self {
             root: Some(root),
             store,
             stack: Vec::new(),
+            visited_nodes: HashSet::new(),
+            last_leaf_key: None,
         }
     }
 
@@ -734,6 +741,8 @@ impl<'a> StreamingMstCursor<'a> {
                     self.push_node(cid, config)?;
                 }
                 StreamingMstItem::Leaf { key, cid } => {
+                    validate_repo_key(&key)?;
+                    self.validate_leaf_order(&key)?;
                     return Ok(Some(StreamingMstLeaf { key, cid }));
                 }
             }
@@ -741,6 +750,11 @@ impl<'a> StreamingMstCursor<'a> {
     }
 
     fn push_node(&mut self, cid: IpldCid, config: ParseConfig) -> Result<(), ParseError> {
+        if !self.visited_nodes.insert(cid) {
+            return Err(ParseError::MalformedCar(format!(
+                "MST node CID visited more than once: {cid}"
+            )));
+        }
         let depth = checked_increment(
             u64::try_from(self.stack.len()).map_err(|_err| ParseError::CarLengthOverflow {
                 field: "MST stack depth",
@@ -761,6 +775,26 @@ impl<'a> StreamingMstCursor<'a> {
                 cid: cid.to_string(),
             })?;
         self.stack.push(StreamingMstFrame::decode(bytes.as_ref())?);
+        Ok(())
+    }
+
+    fn validate_leaf_order(&mut self, key: &str) -> Result<(), ParseError> {
+        if let Some(previous) = self.last_leaf_key.as_deref() {
+            match key.cmp(previous) {
+                std::cmp::Ordering::Less => {
+                    return Err(ParseError::MalformedCar(format!(
+                        "MST keys out of order: previous={previous}, key={key}"
+                    )));
+                }
+                std::cmp::Ordering::Equal => {
+                    return Err(ParseError::MalformedCar(format!(
+                        "duplicate MST key: {key}"
+                    )));
+                }
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+        self.last_leaf_key = Some(key.to_owned());
         Ok(())
     }
 }
@@ -837,7 +871,7 @@ where
 
     match collection {
         POST_COLLECTION => {
-            if let Some(raw_record) = raw_post_from_cbor(record_bytes) {
+            if let Some(raw_record) = raw_partial_post::from_cbor(record_bytes) {
                 if raw_record.typed_decode_failed {
                     record_decode_failed(sinks.decode_digest, POST_COLLECTION, config)?;
                 }
@@ -875,121 +909,6 @@ where
     }
 
     Ok(())
-}
-
-fn raw_post_from_cbor(record_bytes: &[u8]) -> Option<RawPartialPostRecord> {
-    if let Ok(fields) = serde_ipld_dagcbor::from_slice::<FastPostFields>(record_bytes) {
-        return raw_post_from_fast_fields(fields);
-    }
-    let ipld = serde_ipld_dagcbor::from_slice::<Ipld>(record_bytes).ok()?;
-    let Ipld::Map(fields) = ipld else {
-        return None;
-    };
-    raw_post_from_ipld_fields(fields)
-}
-
-#[derive(Debug, Deserialize)]
-struct FastPostFields {
-    #[serde(rename = "$type")]
-    _record_type: Option<String>,
-    #[serde(rename = "createdAt")]
-    created_at: String,
-    text: String,
-    langs: Option<Vec<String>>,
-    #[serde(flatten)]
-    extras: BTreeMap<String, Ipld>,
-}
-
-fn raw_post_from_fast_fields(mut fields: FastPostFields) -> Option<RawPartialPostRecord> {
-    fields.extras.remove("$type");
-    let extras_json = if fields.extras.is_empty() {
-        serde_json::Value::Object(serde_json::Map::new())
-    } else {
-        ipld_to_json(Ipld::Map(fields.extras)).ok()?
-    };
-    Some(RawPartialPostRecord {
-        typed_decode_failed: false,
-        created_at_raw: Some(fields.created_at),
-        text: Some(fields.text),
-        langs: fields.langs.unwrap_or_default(),
-        extras_json,
-    })
-}
-
-fn raw_post_from_ipld_fields(mut fields: BTreeMap<String, Ipld>) -> Option<RawPartialPostRecord> {
-    let typed_decode_failed = raw_post_ipld_typed_decode_failed(&fields);
-    let created_at_raw = raw_ipld_created_at(fields.get("createdAt"));
-    let text = fields
-        .get("text")
-        .and_then(ipld_string)
-        .map(ToOwned::to_owned);
-    let langs = raw_ipld_string_array(fields.get("langs"));
-    for key in ["$type", "createdAt", "langs", "text"] {
-        fields.remove(key);
-    }
-    let extras_json = if fields.is_empty() {
-        serde_json::Value::Object(serde_json::Map::new())
-    } else {
-        ipld_to_json(Ipld::Map(fields)).ok()?
-    };
-    Some(RawPartialPostRecord {
-        typed_decode_failed,
-        created_at_raw,
-        text,
-        langs,
-        extras_json,
-    })
-}
-
-fn raw_post_ipld_typed_decode_failed(fields: &BTreeMap<String, Ipld>) -> bool {
-    if !matches!(fields.get("createdAt"), Some(Ipld::String(_))) {
-        return true;
-    }
-    if !matches!(fields.get("text"), Some(Ipld::String(_))) {
-        return true;
-    }
-    raw_ipld_langs_decode_failed(fields.get("langs"))
-}
-
-fn raw_ipld_langs_decode_failed(value: Option<&Ipld>) -> bool {
-    let Some(value) = value else {
-        return false;
-    };
-    if matches!(value, Ipld::Null) {
-        return false;
-    }
-    let Ipld::List(values) = value else {
-        return true;
-    };
-    values.iter().any(|value| !matches!(value, Ipld::String(_)))
-}
-
-fn raw_ipld_created_at(value: Option<&Ipld>) -> Option<String> {
-    match value {
-        None | Some(Ipld::Null) => None,
-        Some(Ipld::String(value)) => Some(value.clone()),
-        Some(value) => ipld_to_json(value.clone())
-            .ok()
-            .map(|json| json.to_string()),
-    }
-}
-
-fn raw_ipld_string_array(value: Option<&Ipld>) -> Vec<String> {
-    let Some(Ipld::List(values)) = value else {
-        return Vec::new();
-    };
-    values
-        .iter()
-        .filter_map(ipld_string)
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-const fn ipld_string(value: &Ipld) -> Option<&str> {
-    match value {
-        Ipld::String(value) => Some(value.as_str()),
-        _other => None,
-    }
 }
 
 struct RecordSinks<'a, S, F> {
@@ -1046,7 +965,36 @@ fn update_digest(
 }
 
 fn split_repo_key(key: &str) -> Option<(&str, &str)> {
-    key.split_once('/')
+    let (collection, rkey) = key.split_once('/')?;
+    validate_repo_key_parts(collection, rkey).ok()?;
+    Some((collection, rkey))
+}
+
+fn validate_repo_key(key: &str) -> Result<(), ParseError> {
+    let Some((collection, rkey)) = key.split_once('/') else {
+        return Err(invalid_repo_key(key, "missing collection/rkey separator"));
+    };
+    validate_repo_key_parts(collection, rkey).map_err(|message| invalid_repo_key(key, message))
+}
+
+fn validate_repo_key_parts(collection: &str, rkey: &str) -> Result<(), &'static str> {
+    if validate_nsid(collection).is_err() {
+        return Err("collection is not a valid NSID");
+    }
+    if rkey.is_empty() {
+        return Err("rkey is empty");
+    }
+    if rkey.contains('/') {
+        return Err("rkey contains an extra slash");
+    }
+    if Rkey::<&str>::new(rkey).is_err() {
+        return Err("rkey is not a valid record key");
+    }
+    Ok(())
+}
+
+fn invalid_repo_key(key: &str, message: impl Into<String>) -> ParseError {
+    ParseError::MalformedCar(format!("invalid repo key {key:?}: {}", message.into()))
 }
 
 fn verify_block_cid(cid: IpldCid, data: &[u8]) -> Result<(), ParseError> {
@@ -1357,39 +1305,6 @@ fn index_car_blocks(
     })
 }
 
-fn ipld_to_json(ipld: Ipld) -> Result<serde_json::Value, ParseError> {
-    match ipld {
-        Ipld::Null => Ok(serde_json::Value::Null),
-        Ipld::Bool(value) => Ok(serde_json::Value::Bool(value)),
-        Ipld::Integer(value) => {
-            let number = i64::try_from(value)
-                .map(serde_json::Number::from)
-                .map_err(|_error| {
-                    ParseError::MalformedCar("IPLD integer exceeds JSON range".to_owned())
-                })?;
-            Ok(serde_json::Value::Number(number))
-        }
-        Ipld::Float(value) => serde_json::Number::from_f64(value)
-            .map(serde_json::Value::Number)
-            .ok_or_else(|| ParseError::MalformedCar("IPLD float is not finite".to_owned())),
-        Ipld::String(value) => Ok(serde_json::Value::String(value)),
-        Ipld::Bytes(value) => Ok(serde_json::json!({ "$bytes": hex::encode(value) })),
-        Ipld::List(values) => values
-            .into_iter()
-            .map(ipld_to_json)
-            .collect::<Result<Vec<_>, _>>()
-            .map(serde_json::Value::Array),
-        Ipld::Map(fields) => {
-            let mut json_fields = serde_json::Map::new();
-            for (key, value) in fields {
-                json_fields.insert(key, ipld_to_json(value)?);
-            }
-            Ok(serde_json::Value::Object(json_fields))
-        }
-        Ipld::Link(cid) => Ok(serde_json::json!({ "$link": cid.to_string() })),
-    }
-}
-
 fn parse_car_header(bytes: &[u8]) -> Result<CarHeader, ParseError> {
     let header = serde_ipld_dagcbor::from_slice::<CarHeader>(bytes).map_err(|source| {
         ParseError::MalformedCar(format!("failed to decode CAR header: {source}"))
@@ -1573,7 +1488,7 @@ mod tests {
     use super::{
         ParseConfig, ParseError, RkeyDigest, Varint, assert_requested_did,
         default_cid_verification_threads, enforce_decode_error_limit, read_varint, split_repo_key,
-        update_digest,
+        update_digest, validate_repo_key,
     };
 
     #[test]
@@ -1588,6 +1503,32 @@ mod tests {
             Some(("app.bsky.feed.post", "3kabc"))
         );
         assert_eq!(split_repo_key("app.bsky.feed.post"), None);
+        assert_eq!(split_repo_key("app.bsky.feed.post/"), None);
+        assert_eq!(split_repo_key("app.bsky.feed.post/3kabc/extra"), None);
+        assert_eq!(split_repo_key("not a collection/3kabc"), None);
+    }
+
+    #[test]
+    fn validates_repo_key_shape() {
+        validate_repo_key("app.bsky.feed.post/3kabc").unwrap();
+
+        assert!(matches!(
+            validate_repo_key("app.bsky.feed.post/"),
+            Err(ParseError::MalformedCar(message))
+                if message == "invalid repo key \"app.bsky.feed.post/\": rkey is empty"
+        ));
+        assert!(matches!(
+            validate_repo_key("app.bsky.feed.post/3kabc/extra"),
+            Err(ParseError::MalformedCar(message))
+                if message
+                    == "invalid repo key \"app.bsky.feed.post/3kabc/extra\": rkey contains an extra slash"
+        ));
+        assert!(matches!(
+            validate_repo_key("app.bsky.feed.post"),
+            Err(ParseError::MalformedCar(message))
+                if message
+                    == "invalid repo key \"app.bsky.feed.post\": missing collection/rkey separator"
+        ));
     }
 
     #[test]

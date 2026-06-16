@@ -100,8 +100,7 @@ pub fn commit_only_car_bytes(actual_did: &str) -> Vec<u8> {
 }
 
 pub fn single_post_car_bytes(actual_did: &str, rkey: &str, record: &serde_json::Value) -> Vec<u8> {
-    let record_block = dag_cbor_bytes(record);
-    let record_cid = compute_cid(&record_block).expect("fixture record CID should compute");
+    let (record_cid, record_block) = record_block(record);
     let key = format!("app.bsky.feed.post/{rkey}");
     let node = NodeData {
         left: None,
@@ -112,7 +111,15 @@ pub fn single_post_car_bytes(actual_did: &str, rkey: &str, record: &serde_json::
             value: record_cid,
         }],
     };
-    let node_block = dag_cbor_bytes(&node);
+    repo_car_with_root_node_bytes(actual_did, &node, &[(record_cid, record_block)])
+}
+
+pub fn repo_car_with_root_node_bytes(
+    actual_did: &str,
+    node: &NodeData,
+    extra_blocks: &[(IpldCid, Vec<u8>)],
+) -> Vec<u8> {
+    let node_block = dag_cbor_bytes(node);
     let node_cid = compute_cid(&node_block).expect("fixture MST CID should compute");
     let commit = Commit {
         did: Did::<SmolStr>::new_owned(actual_did).expect("fixture DID should be valid"),
@@ -124,14 +131,25 @@ pub fn single_post_car_bytes(actual_did: &str, rkey: &str, record: &serde_json::
     };
     let commit_block = commit.to_cbor().expect("fixture commit should encode");
     let commit_cid = compute_cid(&commit_block).expect("fixture commit CID should compute");
-    car_bytes(
-        &[commit_cid],
-        &[
-            (commit_cid, commit_block),
-            (node_cid, node_block),
-            (record_cid, record_block),
-        ],
-    )
+    let mut blocks = vec![(commit_cid, commit_block), (node_cid, node_block)];
+    blocks.extend_from_slice(extra_blocks);
+    car_bytes(&[commit_cid], &blocks)
+}
+
+pub fn record_block(record: &serde_json::Value) -> (IpldCid, Vec<u8>) {
+    let block = dag_cbor_bytes(record);
+    let cid = compute_cid(&block).expect("fixture record CID should compute");
+    (cid, block)
+}
+
+pub fn empty_mst_block() -> (IpldCid, Vec<u8>) {
+    let node = NodeData {
+        left: None,
+        entries: Vec::new(),
+    };
+    let block = dag_cbor_bytes(&node);
+    let cid = compute_cid(&block).expect("fixture MST CID should compute");
+    (cid, block)
 }
 
 fn dag_cbor_cid<T: Serialize>(value: &T) -> IpldCid {
