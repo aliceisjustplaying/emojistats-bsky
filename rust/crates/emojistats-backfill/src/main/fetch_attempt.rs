@@ -1,3 +1,5 @@
+#![allow(clippy::redundant_pub_crate)]
+
 use jacquard_identity::resolver::IdentityResolver;
 
 use super::{
@@ -15,7 +17,7 @@ use super::{
     archive_host::{PreparedFetchHost, parse_and_archive_spooled_repo, prepare_fetch_host},
 };
 
-pub async fn fetch_one_attempt(
+pub(crate) async fn fetch_one_attempt(
     did_str: &str,
     spool_dir: PathBuf,
     max_bytes: u64,
@@ -36,17 +38,17 @@ pub async fn fetch_one_attempt(
     .await
 }
 
-pub struct FetchOneAttemptConfig<'a> {
-    pub did_str: &'a str,
-    pub spool_dir: PathBuf,
-    pub max_bytes: u64,
-    pub archive_dir: PathBuf,
-    pub archive_context: ArchiveCommitContext,
-    pub runtime: AttemptRuntime<'a>,
-    pub parse_config: ParseConfig,
+pub(crate) struct FetchOneAttemptConfig<'a> {
+    pub(crate) did_str: &'a str,
+    pub(crate) spool_dir: PathBuf,
+    pub(crate) max_bytes: u64,
+    pub(crate) archive_dir: PathBuf,
+    pub(crate) archive_context: ArchiveCommitContext,
+    pub(crate) runtime: AttemptRuntime<'a>,
+    pub(crate) parse_config: ParseConfig,
 }
 
-pub enum AttemptRuntime<'a> {
+pub(crate) enum AttemptRuntime<'a> {
     Local {
         claim_scope: ClaimScope,
     },
@@ -119,17 +121,17 @@ impl AttemptRuntime<'_> {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct HostOverrideCache {
-    pub entries: Arc<Mutex<HashMap<String, HostOverrideCacheEntry>>>,
+pub(crate) struct HostOverrideCache {
+    pub(super) entries: Arc<Mutex<HashMap<String, HostOverrideCacheEntry>>>,
 }
 
 #[derive(Debug, Clone)]
-pub struct HostOverrideCacheEntry {
-    pub loaded_at: Instant,
-    pub value: Option<HostOverride>,
+pub(super) struct HostOverrideCacheEntry {
+    pub(super) loaded_at: Instant,
+    pub(super) value: Option<HostOverride>,
 }
 
-pub async fn fetch_one_attempt_with_pacer(
+pub(crate) async fn fetch_one_attempt_with_pacer(
     config: FetchOneAttemptConfig<'_>,
 ) -> Result<(), FetchOneFailure> {
     let attempt_started = Instant::now();
@@ -428,7 +430,7 @@ fn emit_fetch_failure(step: &FetchModeStep<'_>, failure: &FetchOneFailure, start
     });
 }
 
-pub fn should_fallback_get_repo_to_list_records(error: &FetchError) -> bool {
+pub(crate) fn should_fallback_get_repo_to_list_records(error: &FetchError) -> bool {
     let FetchError::HttpStatus {
         status,
         error_code,
@@ -637,31 +639,31 @@ fn emit_parse_archive_running(step: &ParseArchiveStep<'_>, stage: &'static str) 
 }
 
 #[derive(Debug, Clone)]
-pub struct ProcessedRepoCounts {
-    pub records: u64,
-    pub archived_posts: u64,
-    pub decode_errors: u64,
-    pub emoji_rows: u64,
+pub(crate) struct ProcessedRepoCounts {
+    pub(crate) records: u64,
+    pub(crate) archived_posts: u64,
+    pub(crate) decode_errors: u64,
+    pub(crate) emoji_rows: u64,
 }
 
 #[derive(Debug, Clone)]
-pub struct ProcessedRepoArtifacts {
-    pub receipt_hash: String,
-    pub parquet_path: PathBuf,
-    pub receipt_path: PathBuf,
-    pub manifest_path: PathBuf,
-    pub emoji_projection_path: PathBuf,
+pub(crate) struct ProcessedRepoArtifacts {
+    pub(crate) receipt_hash: String,
+    pub(crate) parquet_path: PathBuf,
+    pub(crate) receipt_path: PathBuf,
+    pub(crate) manifest_path: PathBuf,
+    pub(crate) emoji_projection_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
-pub struct GetRepoTimings {
-    pub fetch_ms: Option<u64>,
-    pub bytes: Option<u64>,
-    pub parse_ms: u64,
-    pub parse_index_ms: u64,
-    pub parse_commit_ms: u64,
-    pub parse_walk_ms: u64,
-    pub archive_ms: u64,
+pub(crate) struct GetRepoTimings {
+    pub(crate) fetch_ms: Option<u64>,
+    pub(crate) bytes: Option<u64>,
+    pub(crate) parse_ms: u64,
+    pub(crate) parse_index_ms: u64,
+    pub(crate) parse_commit_ms: u64,
+    pub(crate) parse_walk_ms: u64,
+    pub(crate) archive_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -671,69 +673,69 @@ struct ListRecordsTimings {
 }
 
 #[derive(Debug, Clone)]
-pub struct GetRepoProcessed {
-    pub counts: ProcessedRepoCounts,
-    pub artifacts: ProcessedRepoArtifacts,
-    pub timings: GetRepoTimings,
+pub(crate) struct GetRepoProcessed {
+    pub(crate) counts: ProcessedRepoCounts,
+    pub(crate) artifacts: ProcessedRepoArtifacts,
+    pub(crate) timings: GetRepoTimings,
 }
 
 #[derive(Debug, Clone)]
-pub struct ListRecordsProcessed {
+pub(crate) struct ListRecordsProcessed {
     counts: ProcessedRepoCounts,
     artifacts: ProcessedRepoArtifacts,
     timings: ListRecordsTimings,
 }
 
 #[derive(Debug, Clone)]
-pub enum ProcessedRepo {
+pub(crate) enum ProcessedRepo {
     GetRepo(GetRepoProcessed),
     ListRecords(ListRecordsProcessed),
 }
 
 impl ProcessedRepo {
-    pub const fn counts(&self) -> &ProcessedRepoCounts {
+    pub(crate) const fn counts(&self) -> &ProcessedRepoCounts {
         match self {
             Self::GetRepo(processed) => &processed.counts,
             Self::ListRecords(processed) => &processed.counts,
         }
     }
 
-    pub const fn artifacts(&self) -> &ProcessedRepoArtifacts {
+    pub(crate) const fn artifacts(&self) -> &ProcessedRepoArtifacts {
         match self {
             Self::GetRepo(processed) => &processed.artifacts,
             Self::ListRecords(processed) => &processed.artifacts,
         }
     }
 
-    pub const fn fetch_ms_opt(&self) -> Option<u64> {
+    pub(crate) const fn fetch_ms_opt(&self) -> Option<u64> {
         match self {
             Self::GetRepo(processed) => processed.timings.fetch_ms,
             Self::ListRecords(processed) => Some(processed.timings.fetch_ms),
         }
     }
 
-    pub const fn bytes(&self) -> Option<u64> {
+    pub(crate) const fn bytes(&self) -> Option<u64> {
         match self {
             Self::GetRepo(processed) => processed.timings.bytes,
             Self::ListRecords(_) => None,
         }
     }
 
-    pub const fn parse_ms(&self) -> Option<u64> {
+    pub(crate) const fn parse_ms(&self) -> Option<u64> {
         match self {
             Self::GetRepo(processed) => Some(processed.timings.parse_ms),
             Self::ListRecords(_) => None,
         }
     }
 
-    pub const fn archive_ms(&self) -> u64 {
+    pub(crate) const fn archive_ms(&self) -> u64 {
         match self {
             Self::GetRepo(processed) => processed.timings.archive_ms,
             Self::ListRecords(processed) => processed.timings.archive_ms,
         }
     }
 
-    pub const fn get_repo_timings(&self) -> Option<&GetRepoTimings> {
+    pub(crate) const fn get_repo_timings(&self) -> Option<&GetRepoTimings> {
         match self {
             Self::GetRepo(processed) => Some(&processed.timings),
             Self::ListRecords(_) => None,

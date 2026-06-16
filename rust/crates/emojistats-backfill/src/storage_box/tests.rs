@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, io::Write, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    io::{Read, Write},
+    path::PathBuf,
+};
 
 use sha2::{Digest, Sha256};
 
@@ -38,6 +42,18 @@ impl StorageBoxCommands for FakeCommands {
         );
         self.files.insert(remote_path.to_owned(), stored);
         Ok(())
+    }
+
+    fn upload_reader(
+        &mut self,
+        remote_path: &str,
+        reader: &mut dyn Read,
+    ) -> Result<(), CommandError> {
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(|error| CommandError::new(format!("upload source read failed: {error}")))?;
+        self.upload(remote_path, &bytes)
     }
 
     fn stat_len(&mut self, remote_path: &str) -> Result<Option<u64>, CommandError> {
@@ -183,7 +199,6 @@ fn commits_in_verified_remote_order_before_manifest_append() {
             "stat",
             "sha256",
             "read_prefix",
-            "stat",
             "rename",
             "stat",
             "sha256",
@@ -191,7 +206,6 @@ fn commits_in_verified_remote_order_before_manifest_append() {
             "stat",
             "sha256",
             "read_prefix",
-            "stat",
             "rename",
             "stat",
             "sha256",
@@ -201,7 +215,7 @@ fn commits_in_verified_remote_order_before_manifest_append() {
     assert_eq!(
         commands
             .operations
-            .get(5)
+            .get(4)
             .expect("object rename operation should exist")
             .target
             .as_deref(),
@@ -210,7 +224,7 @@ fn commits_in_verified_remote_order_before_manifest_append() {
     assert_eq!(
         commands
             .operations
-            .get(16)
+            .get(14)
             .expect("manifest append operation should exist")
             .path,
         "/storage-box/emojistats/manifests/raw.jsonl"
@@ -260,7 +274,7 @@ fn commits_local_file_without_buffering_object_in_backend() {
 }
 
 #[test]
-fn final_object_conflict_fails_before_rename_or_manifest_append() {
+fn final_object_conflict_fails_before_manifest_append() {
     let mut commands = FakeCommands::default();
     commands.files.insert(
         "/storage-box/emojistats/objects/run-1/shard0/42.parquet".to_owned(),
@@ -272,12 +286,6 @@ fn final_object_conflict_fails_before_rename_or_manifest_append() {
 
     assert!(matches!(result, Err(Error::FinalExistsConflict { .. })));
     let commands = backend.into_commands();
-    assert!(
-        !commands
-            .operations
-            .iter()
-            .any(|operation| operation.name == "rename")
-    );
     assert!(
         !commands
             .operations

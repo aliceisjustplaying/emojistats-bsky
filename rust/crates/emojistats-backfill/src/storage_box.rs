@@ -45,13 +45,7 @@ pub trait StorageBoxCommands {
         &mut self,
         remote_path: &str,
         reader: &mut dyn Read,
-    ) -> Result<(), CommandError> {
-        let mut bytes = Vec::new();
-        reader
-            .read_to_end(&mut bytes)
-            .map_err(|error| CommandError::new(format!("upload source read failed: {error}")))?;
-        self.upload(remote_path, &bytes)
-    }
+    ) -> Result<(), CommandError>;
 
     /// Return the remote file length, or `None` when the path is absent.
     ///
@@ -797,11 +791,6 @@ fn promote_temp_to_final<C>(
 where
     C: StorageBoxCommands,
 {
-    match check_final_state(commands, final_path, expected_digest)? {
-        FinalState::Exact => return Ok(()),
-        FinalState::Absent => {}
-    }
-
     let rename_result = commands.rename(temp_path, final_path);
     match rename_result {
         Ok(()) => verify_remote_final(commands, final_path, expected_digest),

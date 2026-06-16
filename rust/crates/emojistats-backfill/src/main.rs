@@ -39,7 +39,7 @@ mod derive_manifest_cmd;
 mod failure;
 mod fleet;
 #[path = "main/mod.rs"]
-mod main;
+pub(crate) mod main;
 mod profile_cmd;
 
 use cli::{Cli, Command};

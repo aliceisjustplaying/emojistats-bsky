@@ -352,6 +352,9 @@ fn hash_manifest_identity(
     hasher: &mut Sha256,
     identity: &DeriveManifestIdentity,
 ) -> Result<(), DeriveError> {
+    hash_field(hasher, &identity.run_id)?;
+    hash_field(hasher, &identity.shard)?;
+    hash_u64(hasher, identity.file_sequence);
     hash_field(hasher, &identity.dataset)?;
     hash_field(hasher, &identity.content_hash)?;
     hash_field(hasher, &identity.receipt_hash)?;
@@ -530,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_token_is_stable_across_replay_manifest_sequence() {
+    fn dedupe_token_changes_across_replay_manifest_sequence() {
         let rows = [row("a", &["✅"])];
         let first = derive_clickhouse_batch(DeriveBatchInput {
             manifest: &manifest(1),
@@ -547,7 +550,7 @@ mod tests {
         })
         .expect("replay derive batch");
 
-        assert_eq!(first.dedupe_token, replay.dedupe_token);
+        assert_ne!(first.dedupe_token, replay.dedupe_token);
     }
 
     #[test]

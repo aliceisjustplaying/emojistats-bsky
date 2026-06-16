@@ -105,19 +105,43 @@ async fn derive_verified_input_streaming(
     dry_run: bool,
     summary: &mut DeriveManifestSummary,
 ) -> anyhow::Result<()> {
+    validate_verified_input_streaming(verified)?;
+    insert_verified_input_streaming(verified, http, clickhouse, dry_run, summary).await?;
+    increment(&mut summary.archive_files, "derive archive file count")
+}
+
+fn validate_verified_input_streaming(verified: &VerifiedLoaderInput) -> anyhow::Result<()> {
     let file = File::open(&verified.object_path)?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
-    let mut state = StreamingPayloadState::new(verified);
-    let mut payloads = Vec::new();
+    let mut state = StreamingValidationState::new(verified);
 
     for batch in reader {
         let rows = archive_post_rows_from_record_batch(&batch?)?;
-        payloads.extend(state.consume_rows(&rows)?);
+        state.consume_rows(&rows)?;
     }
 
-    payloads.extend(state.finish()?);
-    apply_derive_payloads(http, clickhouse, dry_run, summary, &payloads).await?;
-    increment(&mut summary.archive_files, "derive archive file count")
+    state.finish()
+}
+
+async fn insert_verified_input_streaming(
+    verified: &VerifiedLoaderInput,
+    http: &reqwest::Client,
+    clickhouse: &ClickHouseClientConfig,
+    dry_run: bool,
+    summary: &mut DeriveManifestSummary,
+) -> anyhow::Result<()> {
+    let file = File::open(&verified.object_path)?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    let mut state = StreamingPayloadState::new(verified);
+
+    for batch in reader {
+        let rows = archive_post_rows_from_record_batch(&batch?)?;
+        let payloads = state.consume_rows(&rows)?;
+        apply_derive_payloads(http, clickhouse, dry_run, summary, &payloads).await?;
+    }
+
+    let payloads = state.finish()?;
+    apply_derive_payloads(http, clickhouse, dry_run, summary, &payloads).await
 }
 
 async fn apply_derive_payloads(
@@ -165,102 +189,35 @@ async fn apply_derive_payloads(
     Ok(())
 }
 
-struct StreamingPayloadState<'a> {
+struct StreamingValidationState<'a> {
     verified: &'a VerifiedLoaderInput,
     row_hasher: ArchivePostRowsHasher,
     rows: u64,
-    posts_with_emojis: u64,
-    emoji_occurrences: u64,
-    emoji_chunk_rows: Vec<EmojiProjectionRow>,
-    emoji_chunk_index: u64,
 }
 
-impl<'a> StreamingPayloadState<'a> {
+impl<'a> StreamingValidationState<'a> {
     fn new(verified: &'a VerifiedLoaderInput) -> Self {
         Self {
             verified,
             row_hasher: ArchivePostRowsHasher::new(),
             rows: 0,
-            posts_with_emojis: 0,
-            emoji_occurrences: 0,
-            emoji_chunk_rows: Vec::with_capacity(DERIVE_EMOJI_CHUNK_ROWS),
-            emoji_chunk_index: 0,
         }
     }
 
     fn consume_rows(
         &mut self,
         rows: &[emojistats_backfill::archive::ArchivePostRow],
-    ) -> anyhow::Result<Vec<ClickHouseInsertPayload>> {
-        let mut payloads = Vec::new();
+    ) -> anyhow::Result<()> {
         for row in rows {
             self.row_hasher.push_row(row)?;
-            increment(&mut self.rows, "streaming derive row count")?;
-            if !row.emoji_sequence.is_empty() {
-                increment(
-                    &mut self.posts_with_emojis,
-                    "streaming derive emoji post count",
-                )?;
-            }
-            add_count(
-                &mut self.emoji_occurrences,
-                count_len(
-                    row.emoji_sequence.len(),
-                    "streaming derive emoji occurrence count",
-                )?,
-                "streaming derive emoji occurrence total",
-            )?;
-            let projection_rows = emoji_projection_rows_for_post(row)?;
-            for projection_row in projection_rows {
-                self.emoji_chunk_rows.push(projection_row);
-                if self.emoji_chunk_rows.len() >= DERIVE_EMOJI_CHUNK_ROWS {
-                    payloads.push(self.flush_emoji_chunk()?);
-                }
-            }
+            increment(&mut self.rows, "streaming derive validation row count")?;
         }
-        Ok(payloads)
+        Ok(())
     }
 
-    fn finish(mut self) -> anyhow::Result<Vec<ClickHouseInsertPayload>> {
+    fn finish(mut self) -> anyhow::Result<()> {
         let row_hash = std::mem::take(&mut self.row_hasher).finish();
-        self.validate_receipt(&row_hash)?;
-        let mut payloads = Vec::new();
-        if !self.emoji_chunk_rows.is_empty() {
-            payloads.push(self.flush_emoji_chunk()?);
-        }
-        let counter = TotalPostCounterInput {
-            source: BACKFILL_DERIVE_SOURCE.to_owned(),
-            run_id: self.verified.manifest.run_id.clone(),
-            shard: self.verified.manifest.shard.clone(),
-            file_sequence: self.verified.manifest.file_sequence,
-            receipt_hash: self.verified.manifest.receipt_hash.clone(),
-            posts_processed: self.rows,
-            posts_with_emojis: self.posts_with_emojis,
-            emoji_occurrences: self.emoji_occurrences,
-            min_created_at_normalized: self.verified.manifest.min_created_at_normalized.clone(),
-            max_created_at_normalized: self.verified.manifest.max_created_at_normalized.clone(),
-        };
-        let token = streaming_counter_dedupe_token(&self.verified.identity, &counter)?;
-        payloads.push(total_post_counter_insert_payload_for_counter(
-            &counter, token,
-        )?);
-        Ok(payloads)
-    }
-
-    fn flush_emoji_chunk(&mut self) -> anyhow::Result<ClickHouseInsertPayload> {
-        let rows = std::mem::take(&mut self.emoji_chunk_rows);
-        let token =
-            streaming_emoji_dedupe_token(&self.verified.identity, self.emoji_chunk_index, &rows)?;
-        increment(
-            &mut self.emoji_chunk_index,
-            "streaming derive emoji chunk index",
-        )?;
-        self.emoji_chunk_rows = Vec::with_capacity(DERIVE_EMOJI_CHUNK_ROWS);
-        Ok(emoji_serving_rows_insert_payload(
-            &self.verified.identity,
-            &rows,
-            token,
-        )?)
+        self.validate_receipt(&row_hash)
     }
 
     fn validate_receipt(&self, row_hash: &str) -> anyhow::Result<()> {
@@ -303,6 +260,100 @@ impl<'a> StreamingPayloadState<'a> {
             );
         }
         Ok(())
+    }
+}
+
+struct StreamingPayloadState<'a> {
+    verified: &'a VerifiedLoaderInput,
+    rows: u64,
+    posts_with_emojis: u64,
+    emoji_occurrences: u64,
+    emoji_chunk_rows: Vec<EmojiProjectionRow>,
+    emoji_chunk_index: u64,
+}
+
+impl<'a> StreamingPayloadState<'a> {
+    fn new(verified: &'a VerifiedLoaderInput) -> Self {
+        Self {
+            verified,
+            rows: 0,
+            posts_with_emojis: 0,
+            emoji_occurrences: 0,
+            emoji_chunk_rows: Vec::with_capacity(DERIVE_EMOJI_CHUNK_ROWS),
+            emoji_chunk_index: 0,
+        }
+    }
+
+    fn consume_rows(
+        &mut self,
+        rows: &[emojistats_backfill::archive::ArchivePostRow],
+    ) -> anyhow::Result<Vec<ClickHouseInsertPayload>> {
+        let mut payloads = Vec::new();
+        for row in rows {
+            increment(&mut self.rows, "streaming derive row count")?;
+            if !row.emoji_sequence.is_empty() {
+                increment(
+                    &mut self.posts_with_emojis,
+                    "streaming derive emoji post count",
+                )?;
+            }
+            add_count(
+                &mut self.emoji_occurrences,
+                count_len(
+                    row.emoji_sequence.len(),
+                    "streaming derive emoji occurrence count",
+                )?,
+                "streaming derive emoji occurrence total",
+            )?;
+            let projection_rows = emoji_projection_rows_for_post(row)?;
+            for projection_row in projection_rows {
+                self.emoji_chunk_rows.push(projection_row);
+                if self.emoji_chunk_rows.len() >= DERIVE_EMOJI_CHUNK_ROWS {
+                    payloads.push(self.flush_emoji_chunk()?);
+                }
+            }
+        }
+        Ok(payloads)
+    }
+
+    fn finish(mut self) -> anyhow::Result<Vec<ClickHouseInsertPayload>> {
+        let mut payloads = Vec::new();
+        if !self.emoji_chunk_rows.is_empty() {
+            payloads.push(self.flush_emoji_chunk()?);
+        }
+        let counter = TotalPostCounterInput {
+            source: BACKFILL_DERIVE_SOURCE.to_owned(),
+            run_id: self.verified.manifest.run_id.clone(),
+            shard: self.verified.manifest.shard.clone(),
+            file_sequence: self.verified.manifest.file_sequence,
+            receipt_hash: self.verified.manifest.receipt_hash.clone(),
+            posts_processed: self.rows,
+            posts_with_emojis: self.posts_with_emojis,
+            emoji_occurrences: self.emoji_occurrences,
+            min_created_at_normalized: self.verified.manifest.min_created_at_normalized.clone(),
+            max_created_at_normalized: self.verified.manifest.max_created_at_normalized.clone(),
+        };
+        let token = streaming_counter_dedupe_token(&self.verified.identity, &counter)?;
+        payloads.push(total_post_counter_insert_payload_for_counter(
+            &counter, token,
+        )?);
+        Ok(payloads)
+    }
+
+    fn flush_emoji_chunk(&mut self) -> anyhow::Result<ClickHouseInsertPayload> {
+        let rows = std::mem::take(&mut self.emoji_chunk_rows);
+        let token =
+            streaming_emoji_dedupe_token(&self.verified.identity, self.emoji_chunk_index, &rows)?;
+        increment(
+            &mut self.emoji_chunk_index,
+            "streaming derive emoji chunk index",
+        )?;
+        self.emoji_chunk_rows = Vec::with_capacity(DERIVE_EMOJI_CHUNK_ROWS);
+        Ok(emoji_serving_rows_insert_payload(
+            &self.verified.identity,
+            &rows,
+            token,
+        )?)
     }
 }
 
@@ -380,6 +431,9 @@ fn hash_identity_frames(
     hasher: &mut Sha256,
     identity: &DeriveManifestIdentity,
 ) -> anyhow::Result<()> {
+    hash_str_frame(hasher, "identity.run_id", &identity.run_id)?;
+    hash_str_frame(hasher, "identity.shard", &identity.shard)?;
+    hash_u64_frame(hasher, "identity.file_sequence", identity.file_sequence)?;
     hash_str_frame(hasher, "identity.dataset", &identity.dataset)?;
     hash_str_frame(hasher, "identity.content_hash", &identity.content_hash)?;
     hash_str_frame(hasher, "identity.receipt_hash", &identity.receipt_hash)?;
@@ -615,7 +669,7 @@ mod tests {
 
         assert_eq!(
             token,
-            "derive:emoji:0b1692472a132f583f2779c310d61aae6495315bd3311164faff93f898009c0a"
+            "derive:emoji:f4e90a62d6f1b42393614e275168febb6ffa294b16a3a0836d6320b24afff832"
         );
     }
 
@@ -625,7 +679,7 @@ mod tests {
 
         assert_eq!(
             token,
-            "derive:counter:2ae91b8c9f7c11934de926c8caf674a8431a06104b19debc4f6c96f014bb6a06"
+            "derive:counter:331066fff819f9efbeac797970141bb98d5d6b139de16e6c61f4dd2af02e09bb"
         );
     }
 
@@ -642,7 +696,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_dedupe_tokens_are_stable_across_replay_manifest_sequence() {
+    fn streaming_dedupe_tokens_change_across_replay_manifest_sequence() {
         let mut replay_identity = identity();
         replay_identity.run_id = "run-2".to_owned();
         replay_identity.shard = "shard9".to_owned();
@@ -652,11 +706,11 @@ mod tests {
         replay_counter.shard = "shard9".to_owned();
         replay_counter.file_sequence = 99;
 
-        assert_eq!(
+        assert_ne!(
             streaming_emoji_dedupe_token(&identity(), 0, &emoji_rows()).unwrap(),
             streaming_emoji_dedupe_token(&replay_identity, 0, &emoji_rows()).unwrap()
         );
-        assert_eq!(
+        assert_ne!(
             streaming_counter_dedupe_token(&identity(), &counter()).unwrap(),
             streaming_counter_dedupe_token(&replay_identity, &replay_counter).unwrap()
         );
