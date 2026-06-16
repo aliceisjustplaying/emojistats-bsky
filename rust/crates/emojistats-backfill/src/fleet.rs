@@ -25,6 +25,7 @@ use tokio::{
 
 use super::{
     add_count,
+    cli::HttpProtocol,
     failure::{FetchOneFailure, retryable_failure},
     increment,
     main::fetch_attempt::{
@@ -38,6 +39,7 @@ const STALE_RECOVERY_BATCH_SIZE: u32 = 512;
 #[allow(clippy::duration_suboptimal_units)]
 const CLAIM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const STALE_RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
+pub const DEFAULT_HOST_CONCURRENCY_CAP: u32 = 2;
 
 #[derive(Debug)]
 pub struct FleetConfig {
@@ -53,6 +55,7 @@ pub struct FleetConfig {
     pub max_bytes: u64,
     pub archive_dir: PathBuf,
     pub cid_verification_threads: usize,
+    pub http_protocol: HttpProtocol,
     pub claim_scope: ClaimScope,
 }
 
@@ -207,8 +210,7 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
             let remaining = claim_limit
                 .checked_sub(summary.claimed)
                 .ok_or(SchedulerError::ClaimLimitOverflow)?;
-            let batch_limit = claim_batch_limit(config.concurrency, active.len(), remaining)?;
-            if batch_limit == 0 {
+            if remaining == 0 {
                 break;
             }
             let claimed = ledger.try_claim_next(
@@ -230,6 +232,7 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
                 max_bytes: config.max_bytes,
                 archive_dir: config.archive_dir.clone(),
                 parse_config: parse_config_for_threads(config.cid_verification_threads),
+                http_protocol: config.http_protocol,
                 host_pacer: host_pacer.clone(),
                 host_limiter: host_limiter.clone(),
                 host_override_cache: host_override_cache.clone(),
@@ -267,6 +270,7 @@ struct FleetAttemptConfig {
     max_bytes: u64,
     archive_dir: PathBuf,
     parse_config: ParseConfig,
+    http_protocol: HttpProtocol,
     host_pacer: SharedHostPacer,
     host_limiter: HostConcurrencyLimiter,
     host_override_cache: HostOverrideCache,
@@ -294,11 +298,13 @@ async fn run_fleet_attempt(config: FleetAttemptConfig) -> FleetAttemptResult {
                 max_bytes: config.max_bytes,
                 archive_dir: config.archive_dir,
                 archive_context,
+                http_protocol: config.http_protocol,
                 runtime: AttemptRuntime::Fleet {
                     host_pacer: config.host_pacer,
                     host_limiter: config.host_limiter,
                     parse_permits: config.parse_permits,
                     byte_budget: config.byte_budget,
+                    claimed: Box::new(config.claimed.clone()),
                     claim_scope: &config.claim_scope,
                     host_override_ledger_path: &config.ledger_path,
                     host_override_cache: config.host_override_cache,
@@ -336,7 +342,6 @@ fn spawn_claim_heartbeat(ledger_path: PathBuf, claimed: RepoLedgerEntry) -> Join
                 }
                 Err(error) => {
                     eprintln!("claim heartbeat failed for {}: {error}", claimed.did);
-                    break;
                 }
             }
         }
@@ -405,19 +410,6 @@ fn complete_fleet_attempt(
         completed.did, completed.attempts, completed.status
     );
     Ok(())
-}
-
-pub fn claim_batch_limit(
-    concurrency: usize,
-    in_flight: usize,
-    remaining: u64,
-) -> anyhow::Result<u32> {
-    let available = concurrency
-        .checked_sub(in_flight)
-        .ok_or(SchedulerError::InvalidConcurrency)?;
-    let available = u64::try_from(available)?;
-    let limit = available.min(remaining).min(u64::from(u32::MAX));
-    u32::try_from(limit).map_err(Into::into)
 }
 
 #[cfg(test)]

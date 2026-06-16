@@ -126,6 +126,7 @@ pub struct RepoReceipt {
     pub emoji_occurrences_count: u64,
     pub mst_root_cid: Option<String>,
     pub commit_cid: Option<String>,
+    /// Schema v1 contains only post rows, so this intentionally equals `post_rows_hash`.
     pub archive_rows_hash: String,
     pub post_rows_hash: String,
     pub emoji_projection_hash: String,
@@ -158,7 +159,7 @@ pub enum FetchMethod {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompletenessClass {
-    SnapshotComplete,
+    ContentAddressedSnapshot,
     CollectionPaginated,
 }
 
@@ -263,7 +264,7 @@ mod write;
 
 pub use archive_io::{
     archive_post_rows_from_record_batch, build_repo_receipt, hash_post_rows, hash_profile_record,
-    read_archive_post_rows,
+    read_all_archive_post_rows,
 };
 pub use write::{
     StreamingArchiveSink, StreamingReceiptInput, archive_row_from_owned_post,

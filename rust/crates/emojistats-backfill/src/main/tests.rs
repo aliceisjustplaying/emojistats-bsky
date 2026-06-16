@@ -23,7 +23,7 @@ use super::{
     prepare_fetch_host, should_fallback_get_repo_to_list_records,
 };
 use crate::fleet::{
-    HostConcurrencyLimiter, SeedSummary, claim_batch_limit, claimable_entries_for_scope,
+    HostConcurrencyLimiter, SeedSummary, claimable_entries_for_scope,
     recover_stale_claimed_entries, seed_ledger_from_file,
 };
 
@@ -36,6 +36,7 @@ fn parses_fetch_one_did() {
         max_bytes,
         archive_dir,
         cid_verification_threads,
+        ..
     } = cli.command
     else {
         unreachable!("expected fetch-one command");
@@ -132,6 +133,7 @@ fn parses_run_fleet_defaults() {
         max_bytes,
         archive_dir,
         cid_verification_threads,
+        ..
     } = cli.command
     else {
         unreachable!("expected run-fleet command");
@@ -142,7 +144,7 @@ fn parses_run_fleet_defaults() {
     assert_eq!(claim_limit, 1);
     assert_eq!(concurrency, 4);
     assert_eq!(parse_concurrency, 1);
-    assert_eq!(max_inflight_spool_bytes, 536_870_912);
+    assert_eq!(max_inflight_spool_bytes, 2_147_483_648);
     assert_eq!(shard_bucket, None);
     assert_eq!(spool_dir, PathBuf::from("data/spool"));
     assert_eq!(max_bytes, 2_147_483_648);
@@ -208,6 +210,7 @@ fn parses_derive_manifest_defaults() {
         clickhouse_user,
         clickhouse_password,
         dry_run,
+        ..
     } = cli.command
     else {
         unreachable!("expected derive-manifest command");
@@ -365,12 +368,6 @@ fn run_fleet_rejects_zero_inflight_spool_bytes() {
 }
 
 #[test]
-fn claim_batch_is_bounded_by_free_slots_and_remaining_limit() {
-    assert_eq!(claim_batch_limit(4, 2, 10).unwrap(), 2);
-    assert_eq!(claim_batch_limit(4, 0, 3).unwrap(), 3);
-}
-
-#[test]
 fn claimable_entries_for_scope_uses_shard_filter() {
     let store = SqliteLedger::open_in_memory().unwrap();
     let now = UNIX_EPOCH + Duration::from_secs(1_000);
@@ -405,8 +402,10 @@ fn persisted_host_override_loads_by_resolved_pds_host() {
         host: "pds.example.com".to_owned(),
         disabled: false,
         concurrency_cap: None,
+        min_interval: None,
         revive_after: None,
         force_mode: Some(ForcedFetchMode::ListRecords),
+        never_diff: false,
     };
     store.upsert_host_override(&override_record).unwrap();
     drop(store);
@@ -429,8 +428,10 @@ fn host_override_cache_reuses_loaded_rows_and_clears_expired_disable() {
             host: "pds.example.com".to_owned(),
             disabled: true,
             concurrency_cap: Some(1),
+            min_interval: None,
             revive_after: Some(now - Duration::from_secs(1)),
             force_mode: Some(ForcedFetchMode::ListRecords),
+            never_diff: false,
         })
         .unwrap();
     drop(store);
@@ -448,8 +449,10 @@ fn host_override_cache_reuses_loaded_rows_and_clears_expired_disable() {
             host: "pds.example.com".to_owned(),
             disabled: false,
             concurrency_cap: Some(2),
+            min_interval: None,
             revive_after: None,
             force_mode: Some(ForcedFetchMode::GetRepo),
+            never_diff: false,
         })
         .unwrap();
     drop(store);
@@ -471,8 +474,10 @@ async fn forced_list_records_host_preparation_is_allowed() {
             host: "pds.example.com".to_owned(),
             disabled: false,
             concurrency_cap: None,
+            min_interval: None,
             revive_after: None,
             force_mode: Some(ForcedFetchMode::ListRecords),
+            never_diff: false,
         })
         .unwrap();
     drop(store);
@@ -500,15 +505,19 @@ fn host_override_force_mode_and_disable_are_applied() {
         host: "pds.example.com".to_owned(),
         disabled: false,
         concurrency_cap: None,
+        min_interval: None,
         revive_after: None,
         force_mode: Some(ForcedFetchMode::ListRecords),
+        never_diff: false,
     };
     let disabled = HostOverride {
         host: "pds.example.com".to_owned(),
         disabled: true,
         concurrency_cap: None,
+        min_interval: None,
         revive_after: Some(now + Duration::from_secs(30)),
         force_mode: Some(ForcedFetchMode::GetRepo),
+        never_diff: false,
     };
 
     assert_eq!(
@@ -531,8 +540,10 @@ fn host_override_force_mode_and_disable_are_applied() {
         host: "pds.example.com".to_owned(),
         disabled: true,
         concurrency_cap: None,
+        min_interval: None,
         revive_after: None,
         force_mode: Some(ForcedFetchMode::GetRepo),
+        never_diff: false,
     };
     let failure = fetch_mode_for_host("pds.example.com", Some(&parked), now).unwrap_err();
     assert_eq!(
@@ -583,6 +594,14 @@ fn get_repo_method_wall_uses_list_records_fallback() {
             status: 429,
             error_code: None,
             message: Some("rate limited".into()),
+            rate_limit: Box::new(RateLimitSnapshot::default()),
+        }
+    ));
+    assert!(!should_fallback_get_repo_to_list_records(
+        &FetchError::HttpStatus {
+            status: 429,
+            error_code: None,
+            message: Some("temporarily disabled".into()),
             rate_limit: Box::new(RateLimitSnapshot::default()),
         }
     ));

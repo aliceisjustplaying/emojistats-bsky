@@ -636,8 +636,10 @@ fn sqlite_host_overrides_round_trip() {
         host: "pds.example.com".to_owned(),
         disabled: true,
         concurrency_cap: Some(3),
+        min_interval: None,
         revive_after: Some(UNIX_EPOCH + Duration::from_secs(60)),
         force_mode: Some(ForcedFetchMode::ListRecords),
+        never_diff: false,
     };
 
     store.upsert_host_override(&override_record).unwrap();
@@ -655,15 +657,19 @@ fn sqlite_host_overrides_reject_blank_hosts_and_zero_caps() {
         host: " ".to_owned(),
         disabled: true,
         concurrency_cap: None,
+        min_interval: None,
         revive_after: None,
         force_mode: None,
+        never_diff: false,
     };
     let zero_cap = HostOverride {
         host: "pds.example.com".to_owned(),
         disabled: false,
         concurrency_cap: Some(0),
+        min_interval: None,
         revive_after: None,
         force_mode: Some(ForcedFetchMode::GetRepo),
+        never_diff: false,
     };
 
     assert!(matches!(

@@ -1,9 +1,9 @@
 # Emojistats Backfill v2 — Design & Decision Record
 
-> **Status:** Architecture direction accepted, pre-implementation. Public release policy
-> and exact canary thresholds remain pending until explicitly resolved. This document is
-> the implementation source of truth after applying the 2026-06-15 review-packet
-> corrections.
+> **Status:** Architecture direction accepted; Rust proof and production-readiness
+> boundaries are current as of 2026-06-16. Public release policy and exact canary
+> thresholds remain pending until explicitly resolved. This document is the implementation
+> source of truth after applying the 2026-06-15 review-packet corrections.
 >
 > v2 is a clean **Rust rewrite** of the v1 TypeScript backfill (`packages/backfill`). v1
 > already crawled ~35.89M repos / ~2.59B posts; the retro's thesis is that **the data was
@@ -51,7 +51,7 @@ enumerate: PLC export + did:web best-effort seeds
        getRepo via Jacquard download() + own reqwest HttpClient
        -> spool CAR to local disk under Loud Resource Caps
        -> parse: on-disk BlockStore + MST walk
-       -> VERIFY: Snapshot Completeness, not identity/authorship
+       -> VERIFY: content_addressed_snapshot, not identity/authorship or canonical root recomputation
        -> write Parquet + row-content receipt + committed manifest to Storage Box
        -> discard CAR
   || DERIVE POOL:
@@ -89,14 +89,15 @@ it is not part of the Raw Archive or the Published Raw Observed Corpus.
   ETA.
 - **Indie / third-party PDSes** get conservative defaults plus the same header pacing and
   backoff. Small hosts should drain politely, and host-specific incidents must not require
-  a global fleet stop.
+  a global fleet stop. The current Rust fleet command is bounded batch mode; it is not a
+  daemon loop until that loop is explicitly added.
 - **Host override mechanism required.** It can be a SQLite table, Nix option, CLI-managed
   table, or checked-in config; it does not need to be a separate TOML file. It must support
   disabling a host, capping host concurrency, changing a minimum interval, forcing
   `getRepo`/`listRecords` mode, reviving a host, and marking aggregators as never-diff.
 - **Bridgy / capability-variant PDSes:** `getRepo` can return HTTP 429 for a permanent
   method wall. Carry a capability probe and a `getRepo` -> `listRecords` fallback, but
-  label fallback output as **Collection-Paginated Record** data with weaker proof.
+  label fallback output as `collection_paginated_posts` data with weaker proof.
 
 ---
 
@@ -128,23 +129,24 @@ it is not part of the Raw Archive or the Published Raw Observed Corpus.
   recovery/operator-action path.
 - **Parsing uses an on-disk BlockStore + MST walk.** Jacquard's built-in `Repository` is an
   in-RAM `BTreeMap` and cannot hold multi-GB whales. v2 implements an on-disk BlockStore
-  over the spooled CAR and drives the MST cursor over it. The MST walk is required because
-  rkeys live in MST leaf keys, and the verification proof needs the reconstructed tree.
-- **Snapshot Completeness only.** Given a validated commit block and validated MST
-  traversal from `commit.data`, if every reachable node and record block resolves by CID
-  and the reconstructed root CID equals `commit.data`, then the CAR contains a complete,
-  self-consistent repo snapshot for that commit. This is not an authorship or identity
-  proof.
+  over the spooled CAR and walks from `commit.data`. The MST walk is required because
+  rkeys live in MST leaf keys. The current Rust proof validates content-addressed traversal
+  from the commit root; it does not perform canonical MST root recomputation from leaves.
+- **Current `getRepo` proof class: `content_addressed_snapshot`.** Given a validated commit
+  block and validated traversal from `commit.data`, every reachable node and record block
+  must resolve by CID. This proves the archive rows came from a content-addressed repo
+  snapshot for that commit; it is not canonical snapshot-complete/root-recomputed,
+  authorship, or identity proof.
 - **Signature and identity verification are separate fields.** By default:
   `completeness_verified = true`, `repo_commit_signature_verified = false`,
   `identity_verified = false`. If signature sampling or suspicious-host verification is
   added later, receipts record exactly what was checked.
 - **Root mismatch, missing block, invalid MST, malformed CAR, or resource exhaustion never
   silently pass.** They produce loud terminal or operator-action statuses.
-- **No LOOSE band for root-proofed archive verification.** The old v1 loose band existed
+- **No LOOSE band for archive receipt verification.** The old v1 loose band existed
   because ClickHouse and live/backfill overlap could not prove set-subset. v2 archive
-  verification is per repo from the CAR/MST and then from Parquet receipts. `listRecords`
-  fallback and serving projection dedupe have separate proof classes.
+  verification is per repo from the CAR/MST traversal proof and then from Parquet receipts.
+  `listRecords` fallback and serving projection dedupe have separate proof classes.
 
 ---
 
@@ -156,7 +158,7 @@ derive marks data loadable.
 Minimum receipt fields:
 
 - `fetch_method = getRepo | listRecords`
-- `completeness_class = snapshot_complete | collection_paginated`
+- `completeness_class = content_addressed_snapshot | collection_paginated_posts`
 - `all_records_count`
 - `all_posts_count`
 - `emoji_posts_count`
@@ -184,8 +186,9 @@ system only ingests `app.bsky.feed.post`.
 ## Storage & the Raw Archive
 
 - **All backfill snapshot posts -> zstd Parquet on a 1 TB Hetzner Storage Box.** This is
-  the private Raw Archive and source for candidate public packaging. ClickHouse holds only
-  the serving projection.
+  the intended private Raw Archive and source for candidate public packaging. ClickHouse
+  holds only the serving projection. The Rust `StorageBox` backend remains experimental
+  until a production archive backend is configured and canary-proven.
 - **Schema is Data-Model Lossless, not byte-lossless.** It preserves ATProto data-model
   fields after normalization into typed columns and canonical extras JSON. It does not
   promise byte-for-byte reconstruction of the original CBOR/CAR encoding.
@@ -208,7 +211,9 @@ system only ingests `app.bsky.feed.post`.
 ### Storage Box committed manifest
 
 Storage Box is treated as durable file storage, not a transactional object store. Derive
-reads only committed manifest entries.
+reads only committed manifest entries. The current Rust backend has the committed-artifact
+protocol and SSH transport skeleton; production archive writes are not ready until the real
+backend is wired and canary-proven.
 
 Commit protocol:
 
@@ -443,8 +448,9 @@ search in ClickHouse; mandatory handle-enrichment crawl; old v1 data migration; 
 ClickHouse as the full raw post store; byte-for-byte CAR preservation after successful
 archive receipt.
 
-`listRecords` fallback is in scope for serving projection only. It is out of scope for
-Snapshot Completeness and root-proofed raw corpus counts.
+`listRecords` fallback is in scope for serving projection only. Its artifacts are
+`collection_paginated_posts`, not `raw_archive_posts`, and are out of scope for canonical
+snapshot-complete raw corpus counts.
 
 ---
 
@@ -484,7 +490,7 @@ emojistats-backfill fetch-one did:plc:...
 - parse through the on-disk BlockStore + MST walk;
 - extract posts;
 - extract profile sidecar if present;
-- compute Snapshot Completeness;
+- compute the `content_addressed_snapshot` proof class;
 - compute canonical row-content receipt;
 - write local Parquet;
 - write local manifest entry;
@@ -512,7 +518,8 @@ abstraction, stop and reassess.
 Compiled 2026-06-15 from: the original v2 design, a full read of
 [`docs/retro.md`](retro.md), the second-round critique, the resolved review packet,
 [`CONTEXT.md`](../CONTEXT.md), and ADR 0001. The major corrections are: Raw Archive vs
-candidate public corpus, Observed Corpus not cumulative-ever, Snapshot Completeness not
-authorship, row-content receipts, Loud Resource Caps, committed manifests, post-backfill
-Jetstream Catch-Up, stratified canary, best-effort `did:web`, guarded `listRepos`
-absence, host override control, and a vertical-slice-first Rust rewrite.
+candidate public corpus, Observed Corpus not cumulative-ever, content-addressed snapshot
+proof not authorship or canonical root recomputation, row-content receipts, Loud Resource
+Caps, committed manifests, post-backfill Jetstream Catch-Up, stratified canary,
+best-effort `did:web`, guarded `listRepos` absence, host override control, and a
+vertical-slice-first Rust rewrite.

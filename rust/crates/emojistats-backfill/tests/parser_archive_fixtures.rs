@@ -102,7 +102,7 @@ fn reports_snapshot_complete_proof_for_verified_mst_root_block() {
 
     assert_eq!(
         parsed.completeness.class,
-        ParseCompletenessClass::SnapshotComplete
+        ParseCompletenessClass::ContentAddressedSnapshot
     );
     assert_eq!(
         parsed.completeness.car_roots.as_slice(),
@@ -393,7 +393,7 @@ fn archive_row_content_change_changes_receipt_hashes() {
     assert_eq!(receipt.fetch_method, FetchMethod::GetRepo);
     assert_eq!(
         receipt.completeness_class,
-        CompletenessClass::SnapshotComplete
+        CompletenessClass::ContentAddressedSnapshot
     );
 }
 

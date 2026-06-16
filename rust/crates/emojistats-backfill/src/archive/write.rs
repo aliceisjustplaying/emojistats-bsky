@@ -521,13 +521,14 @@ impl StreamingArchiveSink {
         self.finish_stream_files()?;
         let receipt = self.build_streaming_receipt(input);
         let receipt_hash = hash_serialized_json(&receipt)?;
-        let artifact_stem =
-            stable_artifact_stem(&self.did, "raw_archive_posts", &receipt.post_rows_hash);
+        let dataset = receipt_dataset(&receipt);
+        let artifact_stem = stable_artifact_stem(&self.did, dataset, &receipt.post_rows_hash);
         let receipt_path = self
             .output_dir
             .join(stable_repo_receipt_name(&self.did, &receipt_hash));
         write_temp_idempotent(&receipt_path, |path| write_json_pretty(path, &receipt))?;
-        let committed_posts = self.commit_streaming_posts(&receipt_hash, &artifact_stem)?;
+        let committed_posts =
+            self.commit_streaming_posts(&receipt_hash, &artifact_stem, dataset)?;
         let emoji_stem = stable_artifact_stem(
             &self.did,
             "emoji_projection",
@@ -590,6 +591,7 @@ impl StreamingArchiveSink {
         &self,
         receipt_hash: &str,
         artifact_stem: &str,
+        dataset: &str,
     ) -> Result<crate::commit::Artifact, ArchiveError> {
         let store = LocalStore::new(&self.output_dir);
         let request = Request {
@@ -597,17 +599,17 @@ impl StreamingArchiveSink {
             receipt_path: PathBuf::from(format!("{artifact_stem}.object-receipt.json")),
             manifest_path: PathBuf::from(format!("{artifact_stem}.manifest.jsonl")),
             manifest_mode: ManifestMode::AppendJsonl,
-            metadata: self.streaming_posts_metadata(receipt_hash),
+            metadata: self.streaming_posts_metadata(receipt_hash, dataset),
         };
         Ok(store.commit_prepared_temp(&request, self.parquet_temp_path.as_ref())?)
     }
 
-    fn streaming_posts_metadata(&self, receipt_hash: &str) -> Metadata {
+    fn streaming_posts_metadata(&self, receipt_hash: &str, dataset: &str) -> Metadata {
         Metadata {
             run_id: self.commit_context.run_id.clone(),
             shard: self.commit_context.shard.clone(),
             file_sequence: self.commit_context.file_sequence,
-            dataset: "raw_archive_posts".to_owned(),
+            dataset: dataset.to_owned(),
             row_count: self.archived_post_rows_count,
             min_created_at_normalized: self.min_created_at_normalized.clone(),
             max_created_at_normalized: self.max_created_at_normalized.clone(),
@@ -682,6 +684,19 @@ impl StreamingArchiveSink {
             .write(&batch)?;
         self.batch.clear();
         Ok(())
+    }
+}
+
+const fn receipt_dataset(receipt: &RepoReceipt) -> &'static str {
+    match (receipt.fetch_method, receipt.completeness_class) {
+        (FetchMethod::GetRepo, CompletenessClass::ContentAddressedSnapshot) => "raw_archive_posts",
+        (FetchMethod::ListRecords, CompletenessClass::CollectionPaginated) => {
+            "collection_paginated_posts"
+        }
+        (FetchMethod::GetRepo, CompletenessClass::CollectionPaginated)
+        | (FetchMethod::ListRecords, CompletenessClass::ContentAddressedSnapshot) => {
+            "noncanonical_posts"
+        }
     }
 }
 

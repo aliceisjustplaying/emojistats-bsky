@@ -12,8 +12,9 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   error cleanly. Full muster green.
 - **Checkpoint B/C/D done locally:** `fetch-one <did>` now resolves DID→PDS, streams
   `getRepo` to a spooled `CAR`, parses from the `CAR` path with block `CID` verification
-  and `MST` completeness, writes `Parquet` posts, writes receipt + local manifest JSON, and
-  derives compact emoji JSONL rows.
+  and a `content_addressed_snapshot` traversal proof, writes `Parquet` posts, writes receipt
+  + local manifest JSON, and derives compact emoji JSONL rows. It does not perform canonical
+  snapshot-complete root recomputation.
 - **Next-lane foundations started:** `ledger.rs` has retry/account-state transition types,
   shard buckets, host overrides, and a SQLite store; `commit.rs` has a local Storage
   Box-shaped committed-artifact protocol; `derive.rs` has manifest-to-ClickHouse DTOs and
@@ -35,13 +36,15 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   `--claim-limit` or idle, filters persisted shard buckets via `--shard-bucket`, runs
   bounded concurrent attempts via `--concurrency`, serializes parse/archive by default via
   `--parse-concurrency 1`, and holds a fleet-wide in-flight spool byte budget via
-  `--max-inflight-spool-bytes 536870912` so only one whale can occupy the budget while
-  fetch/parse/archive owns the local `CAR`. It applies host retry-after cooldowns, loads
-  persisted host overrides by resolved PDS host, and persists claimed/completed transitions.
+  `--max-inflight-spool-bytes 2147483648`, validated against the per-repo `--max-bytes`
+  cap so default whale handling fails loudly only above the stated single-repo cap. It
+  applies header-derived host pacing, default per-host concurrency caps, persisted host
+  overrides by resolved PDS host, and claimed/completed transitions with heartbeat repair.
   It emits `smoke_telemetry` JSONL lines with per-repo fetch/parse/archive timings, bytes,
   rows, decode errors, emoji rows, host, stage, outcome, and current process `VmRSS` in KiB.
-  `force_mode = list_records` currently stops loudly because the `listRecords` fetch lane is
-  not implemented yet.
+  `force_mode = list_records` writes `collection_paginated_posts` artifacts; raw archive
+  derive only accepts content-addressed `getRepo` artifacts. The command is bounded batch
+  mode; a long-running daemon loop is future work.
 - `derive-manifest <manifest.jsonl>` verifies committed raw archive manifest entries,
   streams local `Parquet` archive rows in bounded batches, validates row hashes/counts against
   adjacent receipts, formats bounded `JSONEachRow` payloads, and inserts them into
@@ -98,10 +101,10 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   454.1s, parse 438.1s, archive finalization 3.2s. Streaming derive loaded that manifest
   into `emojistats_smoke` in 29.6s with max RSS 54,080 KiB. Smoke tables then held 497,605
   emoji serving rows across 12 DIDs and 17 counter rows totalling 10,172,807 posts.
-- Whale transport hardening: repo fetches use an HTTP/1-only `reqwest` client with TCP
-  keepalive and 30s connect timeout, and retry retryable body-stream transport/idle failures
-  up to 3 full download attempts. Transport errors now report bytes observed before failure
-  when the stream had started.
+- Whale transport hardening: repo fetches default to HTTP/1 with an explicit
+  `--http-protocol auto` escape hatch, TCP keepalive, and 30s connect timeout, and retry
+  retryable body-stream transport/idle failures up to 3 full download attempts. Transport
+  errors now report bytes observed before failure when the stream had started.
 - Jacquard 0.12.0 via **fork-mirror git deps**: `github.com/aliceisjustplaying/jacquard`
   @ `39648622522fa62c4c0b12ac22b8a5f6893c845a` (== tag 0.12.0). reqwest pulls **rustls**
   (no openssl). Full 0.12.0 source also at `/tmp/jacquard` for reading (ephemeral).
@@ -123,6 +126,8 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
 - **D — archive/derive:** `src/archive.rs` converts parsed posts to archive rows, computes
   row-content receipt hashes and counts, writes `Parquet` with flat lossless columns plus
   `extras_json`, writes a local manifest entry, and derives local compact emoji JSONL rows.
+  `getRepo` receipts currently report `content_addressed_snapshot`; future `listRecords`
+  artifacts must be labeled `collection_paginated_posts`, not `raw_archive_posts`.
 
 ## Next roadmap
 
@@ -130,7 +135,8 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   `host_overrides`, advertised rate-limit pacing, host deadness, durable fleet telemetry,
   and the `listRecords` fallback lane for hosts forced away from `getRepo`.
 - Wire remaining archive artifacts through the committed-artifact protocol, then configure
-  the `storage_box.rs` `ssh` transport for the real Storage Box.
+  the `storage_box.rs` `ssh` transport for the real Storage Box. The `StorageBox` backend is
+  still experimental until a production archive backend is wired and canary-proven.
 - Add durable derive progress/attempt telemetry and resumable per-manifest chunk status so a
   process crash can replay only uncertain ClickHouse chunks with the same dedupe tokens.
 - Finish emoji normalization parity with the TypeScript data tables, then add WASM bindings

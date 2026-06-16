@@ -27,9 +27,24 @@ pub fn version() -> NormalizerVersion {
     NormalizerVersion {
         name: NORMALIZER_NAME.to_owned(),
         semver: env!("CARGO_PKG_VERSION").to_owned(),
-        git_rev: option_env!("GIT_REV").unwrap_or("unknown").to_owned(),
+        git_rev: git_rev().to_owned(),
         unicode_version: unicode_version.clone(),
         emoji_data_version: format!("{EMOJI_DATA_SOURCE}-{unicode_version}"),
+    }
+}
+
+#[must_use]
+fn git_rev() -> &'static str {
+    #[cfg(any(debug_assertions, test))]
+    {
+        option_env!("GIT_REV").unwrap_or("unknown")
+    }
+    #[cfg(all(not(debug_assertions), not(test)))]
+    {
+        env!(
+            "GIT_REV",
+            "release builds must set GIT_REV for archive reproducibility"
+        )
     }
 }
 

@@ -4,17 +4,20 @@ use jacquard_identity::resolver::IdentityResolver;
 
 use super::{
     super::{
-        Arc, ArchiveCommitContext, AttemptOutcome, CRAWLER_USER_AGENT, ClaimScope, Did, Digest,
-        Duration, FETCH_TRANSPORT_ATTEMPTS, FETCH_TRANSPORT_RETRY_BASE_DELAY,
-        FETCH_TRANSPORT_RETRY_MAX_DELAY, FetchByteBudget, FetchConfig, FetchError, FetchOneFailure,
-        ForcedFetchMode, HashMap, HostConcurrencyLimiter, HostConcurrencyPermit, HostOverride,
-        HostPacer, Instant, ListRecordsConfig, Mutex, ParseConfig, Path, PathBuf, PublicResolver,
-        Semaphore, Sha256, SharedHostPacer, SmokeTelemetry, SystemTime, Uri, classify_fetch_error,
+        Arc, ArchiveCommitContext, AttemptOutcome, CRAWLER_USER_AGENT, ClaimScope,
+        DEFAULT_HOST_CONCURRENCY_CAP, Did, Digest, Duration, FETCH_TRANSPORT_ATTEMPTS,
+        FETCH_TRANSPORT_RETRY_BASE_DELAY, FETCH_TRANSPORT_RETRY_MAX_DELAY, FetchByteBudget,
+        FetchConfig, FetchError, FetchOneFailure, ForcedFetchMode, HashMap, HostConcurrencyLimiter,
+        HostConcurrencyPermit, HostOverride, HostPacer, HttpProtocol, Instant, ListRecordsConfig,
+        Mutex, ParseConfig, Path, PathBuf, PublicResolver, RepoLedgerEntry, Semaphore, Sha256,
+        SharedHostPacer, SmokeTelemetry, SystemTime, Uri, classify_fetch_error,
         classify_list_records_error, current_rss_kb, elapsed_ms, emit_smoke_telemetry,
         fetch_and_archive_list_records_with_rate_limit_observer, fetch_repo, outcome_name,
         permanent_failure, retryable_failure,
     },
-    archive_host::{PreparedFetchHost, parse_and_archive_spooled_repo, prepare_fetch_host},
+    archive_host::{
+        ArchiveClaimCheck, PreparedFetchHost, parse_and_archive_spooled_repo, prepare_fetch_host,
+    },
 };
 
 pub(crate) async fn fetch_one_attempt(
@@ -24,6 +27,7 @@ pub(crate) async fn fetch_one_attempt(
     archive_dir: PathBuf,
     archive_context: ArchiveCommitContext,
     parse_config: ParseConfig,
+    http_protocol: HttpProtocol,
 ) -> Result<(), FetchOneFailure> {
     let claim_scope = ClaimScope::default();
     fetch_one_attempt_with_pacer(FetchOneAttemptConfig {
@@ -34,6 +38,7 @@ pub(crate) async fn fetch_one_attempt(
         archive_context,
         runtime: AttemptRuntime::Local { claim_scope },
         parse_config,
+        http_protocol,
     })
     .await
 }
@@ -46,6 +51,7 @@ pub(crate) struct FetchOneAttemptConfig<'a> {
     pub(crate) archive_context: ArchiveCommitContext,
     pub(crate) runtime: AttemptRuntime<'a>,
     pub(crate) parse_config: ParseConfig,
+    pub(crate) http_protocol: HttpProtocol,
 }
 
 pub(crate) enum AttemptRuntime<'a> {
@@ -57,6 +63,7 @@ pub(crate) enum AttemptRuntime<'a> {
         host_limiter: HostConcurrencyLimiter,
         parse_permits: Arc<Semaphore>,
         byte_budget: FetchByteBudget,
+        claimed: Box<RepoLedgerEntry>,
         claim_scope: &'a ClaimScope,
         host_override_ledger_path: &'a Path,
         host_override_cache: HostOverrideCache,
@@ -118,6 +125,20 @@ impl AttemptRuntime<'_> {
             Self::Fleet { byte_budget, .. } => Some(byte_budget.clone()),
         }
     }
+
+    fn archive_claim_check(&self) -> Option<ArchiveClaimCheck> {
+        match self {
+            Self::Local { .. } => None,
+            Self::Fleet {
+                claimed,
+                host_override_ledger_path,
+                ..
+            } => Some(ArchiveClaimCheck {
+                ledger_path: (*host_override_ledger_path).to_path_buf(),
+                claimed: (**claimed).clone(),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -158,7 +179,7 @@ pub(crate) async fn fetch_one_attempt_with_pacer(
     let _host_permit =
         acquire_host_fetch_permit(config.runtime.host_limiter(), &prepared_host).await?;
     let host = prepared_host.host;
-    let http = repo_fetch_client().map_err(|err| {
+    let http = repo_fetch_client(config.http_protocol).map_err(|err| {
         retryable_failure(format!("build repo fetch HTTP client for {did_str}: {err}"))
     })?;
     let mut fetch_config = FetchConfig::new(config.spool_dir);
@@ -177,6 +198,7 @@ pub(crate) async fn fetch_one_attempt_with_pacer(
             archive_context: config.archive_context,
             host_pacer: config.runtime.host_pacer(),
             parse_permits: config.runtime.parse_permits(),
+            claim_check: config.runtime.archive_claim_check(),
             parse_config: config.parse_config,
             attempt_started,
         },
@@ -206,6 +228,7 @@ pub(crate) async fn fetch_one_attempt_with_pacer(
         host: Some(host.as_str()),
         outcome: "succeeded",
         stage: "complete",
+        pressure_state: None,
         elapsed_ms: elapsed_ms(attempt_started),
         fetch_ms: processed.fetch_ms_opt(),
         parse_ms: processed.parse_ms(),
@@ -234,7 +257,8 @@ async fn acquire_host_fetch_permit(
             prepared_host
                 .host_override
                 .as_ref()
-                .and_then(|override_record| override_record.concurrency_cap),
+                .and_then(|override_record| override_record.concurrency_cap)
+                .or(Some(DEFAULT_HOST_CONCURRENCY_CAP)),
         )
         .await
 }
@@ -250,6 +274,7 @@ struct FetchModeStep<'a> {
     archive_context: ArchiveCommitContext,
     host_pacer: Option<&'a SharedHostPacer>,
     parse_permits: Option<&'a Arc<Semaphore>>,
+    claim_check: Option<ArchiveClaimCheck>,
     parse_config: ParseConfig,
     attempt_started: Instant,
 }
@@ -308,6 +333,14 @@ async fn fetch_get_repo_and_archive(
             .await;
         }
         Err(err) => {
+            if let Some(rate_limit) = err.rate_limit() {
+                record_rate_limit_snapshot(
+                    step.host_pacer,
+                    step.host,
+                    rate_limit,
+                    SystemTime::now(),
+                );
+            }
             let failure = classify_fetch_error(step.did_str, &err);
             emit_fetch_failure(&step, &failure, step.attempt_started);
             record_rate_limit_cooldown(step.host_pacer, step.host, &failure);
@@ -326,6 +359,7 @@ async fn fetch_get_repo_and_archive(
         fetched: &fetched,
         archive_dir: step.archive_dir,
         parse_permits: step.parse_permits,
+        claim_check: step.claim_check,
         archive_context: step.archive_context,
         parse_config: step.parse_config,
         attempt_started: step.attempt_started,
@@ -342,6 +376,7 @@ fn emit_get_repo_fallback(did_str: &str, host: &str, attempt_started: Instant, e
         host: Some(host),
         outcome: "running",
         stage: "get_repo_fallback_list_records",
+        pressure_state: None,
         elapsed_ms: elapsed_ms(attempt_started),
         fetch_ms: None,
         parse_ms: None,
@@ -416,6 +451,7 @@ fn emit_fetch_failure(step: &FetchModeStep<'_>, failure: &FetchOneFailure, start
         host: Some(step.host),
         outcome: outcome_name(&failure.outcome),
         stage: "fetch",
+        pressure_state: None,
         elapsed_ms: elapsed_ms(step.attempt_started),
         fetch_ms: Some(elapsed_ms(started)),
         parse_ms: None,
@@ -457,16 +493,19 @@ fn is_get_repo_method_wall_text(value: &str) -> bool {
         || lower.contains("not implemented")
         || lower.contains("not supported")
         || lower.contains("unsupported")
-        || lower.contains("temporarily disabled")
+        || (lower.contains("getrepo") && lower.contains("disabled"))
+        || (lower.contains("sync") && lower.contains("disabled"))
 }
 
-fn repo_fetch_client() -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder()
+fn repo_fetch_client(http_protocol: HttpProtocol) -> Result<reqwest::Client, reqwest::Error> {
+    let builder = reqwest::Client::builder()
         .user_agent(CRAWLER_USER_AGENT)
-        .http1_only()
         .tcp_keepalive(Duration::from_secs(60))
-        .connect_timeout(Duration::from_secs(30))
-        .build()
+        .connect_timeout(Duration::from_secs(30));
+    match http_protocol {
+        HttpProtocol::Http1 => builder.http1_only().build(),
+        HttpProtocol::Auto => builder.build(),
+    }
 }
 
 fn transport_retry_delay(did: &str, failed_attempt: u8) -> Duration {
@@ -538,6 +577,7 @@ struct ParseArchiveStep<'a> {
     fetched: &'a FetchedRepo,
     archive_dir: &'a Path,
     parse_permits: Option<&'a Arc<Semaphore>>,
+    claim_check: Option<ArchiveClaimCheck>,
     archive_context: ArchiveCommitContext,
     parse_config: ParseConfig,
     attempt_started: Instant,
@@ -560,8 +600,16 @@ async fn parse_archive_or_emit_failure(
     let archive_dir = step.archive_dir.to_path_buf();
     let archive_context = step.archive_context;
     let parse_config = step.parse_config;
+    let claim_check = step.claim_check;
     let parsed = tokio::task::spawn_blocking(move || {
-        parse_and_archive_spooled_repo(&did, &car_path, &archive_dir, archive_context, parse_config)
+        parse_and_archive_spooled_repo(
+            &did,
+            &car_path,
+            &archive_dir,
+            archive_context,
+            parse_config,
+            claim_check,
+        )
     })
     .await
     .map_err(|err| {
@@ -579,6 +627,7 @@ async fn parse_archive_or_emit_failure(
                 host: Some(step.host),
                 outcome: "running",
                 stage: "parse_archive_done",
+                pressure_state: None,
                 elapsed_ms: elapsed_ms(step.attempt_started),
                 fetch_ms: Some(step.fetched.fetch_ms),
                 parse_ms: processed.parse_ms(),
@@ -600,6 +649,7 @@ async fn parse_archive_or_emit_failure(
                 host: Some(step.host),
                 outcome: outcome_name(&failure.outcome),
                 stage: "parse_archive",
+                pressure_state: None,
                 elapsed_ms: elapsed_ms(step.attempt_started),
                 fetch_ms: Some(step.fetched.fetch_ms),
                 parse_ms: None,
@@ -624,6 +674,7 @@ fn emit_parse_archive_running(step: &ParseArchiveStep<'_>, stage: &'static str) 
         host: Some(step.host),
         outcome: "running",
         stage,
+        pressure_state: pressure_state_for_stage(stage),
         elapsed_ms: elapsed_ms(step.attempt_started),
         fetch_ms: Some(step.fetched.fetch_ms),
         parse_ms: None,
@@ -636,6 +687,14 @@ fn emit_parse_archive_running(step: &ParseArchiveStep<'_>, stage: &'static str) 
         rss_kb: current_rss_kb(),
         error: None,
     });
+}
+
+fn pressure_state_for_stage(stage: &str) -> Option<&'static str> {
+    match stage {
+        "parse_wait" => Some("parse_backpressure"),
+        "parse_start" => Some("parse_active"),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -829,6 +888,7 @@ fn emit_list_records_running(step: &ListRecordsStep<'_>) {
         host: Some(step.host),
         outcome: "running",
         stage: "list_records_fetch",
+        pressure_state: None,
         elapsed_ms: elapsed_ms(step.attempt_started),
         fetch_ms: None,
         parse_ms: None,
@@ -851,6 +911,7 @@ fn emit_list_records_success(step: &ListRecordsStep<'_>, processed: &ProcessedRe
         host: Some(step.host),
         outcome: "running",
         stage: "list_records_archive_done",
+        pressure_state: None,
         elapsed_ms: elapsed_ms(step.attempt_started),
         fetch_ms: processed.fetch_ms_opt(),
         parse_ms: processed.parse_ms(),
@@ -876,6 +937,7 @@ fn emit_list_records_failure(
         host: Some(step.host),
         outcome: outcome_name(&failure.outcome),
         stage: "list_records_fetch",
+        pressure_state: None,
         elapsed_ms: elapsed_ms(step.attempt_started),
         fetch_ms: Some(elapsed_ms(fetch_started)),
         parse_ms: None,

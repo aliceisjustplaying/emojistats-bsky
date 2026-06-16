@@ -127,6 +127,23 @@ impl StorageBoxCommands for FakeCommands {
             .extend_from_slice(bytes);
         Ok(())
     }
+
+    fn contains_manifest_record(
+        &mut self,
+        remote_path: &str,
+        record_without_newline: &[u8],
+    ) -> Result<bool, CommandError> {
+        self.operations.push(Operation {
+            name: "contains_manifest_record",
+            path: remote_path.to_owned(),
+            target: None,
+        });
+        Ok(self.files.get(remote_path).is_some_and(|bytes| {
+            bytes
+                .split(|byte| *byte == b'\n')
+                .any(|line| line == record_without_newline)
+        }))
+    }
 }
 
 fn normalizer() -> NormalizerVersion {
@@ -209,7 +226,9 @@ fn commits_in_verified_remote_order_before_manifest_append() {
             "rename",
             "stat",
             "sha256",
-            "append"
+            "contains_manifest_record",
+            "append",
+            "contains_manifest_record"
         ]
     );
     assert_eq!(
@@ -224,7 +243,7 @@ fn commits_in_verified_remote_order_before_manifest_append() {
     assert_eq!(
         commands
             .operations
-            .get(14)
+            .get(15)
             .expect("manifest append operation should exist")
             .path,
         "/storage-box/emojistats/manifests/raw.jsonl"

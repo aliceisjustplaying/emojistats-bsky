@@ -141,6 +141,9 @@ impl FetchByteBudgetReservation {
                 observed_bytes: bytes,
             });
         }
+        if bytes <= self.charged_bytes {
+            return Ok(());
+        }
         let charged_target = bytes;
         let delta = charged_target.checked_sub(self.charged_bytes).ok_or(
             FetchError::InFlightBytesExceeded {
@@ -387,6 +390,24 @@ impl fmt::Display for FetchError {
     }
 }
 
+impl FetchError {
+    #[must_use]
+    pub const fn rate_limit(&self) -> Option<&RateLimitSnapshot> {
+        match self {
+            Self::AccountState { rate_limit, .. } | Self::HttpStatus { rate_limit, .. } => {
+                Some(rate_limit)
+            }
+            Self::InactivityTimeout { .. }
+            | Self::MaxBytesExceeded { .. }
+            | Self::ErrorBodyTooLarge { .. }
+            | Self::InFlightBytesExceeded { .. }
+            | Self::ByteBudgetPoisoned
+            | Self::Transport { .. }
+            | Self::Io { .. } => None,
+        }
+    }
+}
+
 impl Error for FetchError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
@@ -440,6 +461,11 @@ where
         })?;
     let status = response.status();
     let rate_limit = RateLimitSnapshot::from_headers(response.headers());
+    let expected_body_bytes = if status.is_success() {
+        Some(expected_body_bytes(response.headers(), config.max_bytes)?)
+    } else {
+        None
+    };
     let (_parts, body) = response.into_parts();
 
     if !status.is_success() {
@@ -454,6 +480,7 @@ where
         &car_path,
         config.chunk_idle_timeout,
         config.max_bytes,
+        expected_body_bytes.unwrap_or(config.max_bytes),
         config.byte_budget.as_ref(),
     )
     .await?;
@@ -472,6 +499,7 @@ async fn stream_to_file(
     car_path: &Path,
     chunk_idle_timeout: Duration,
     max_bytes: u64,
+    expected_body_bytes: u64,
     byte_budget: Option<&FetchByteBudget>,
 ) -> Result<(u64, Option<FetchByteBudgetReservation>), FetchError> {
     let parent = car_path
@@ -479,6 +507,9 @@ async fn stream_to_file(
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "spool path has no parent"))?;
     let mut temp_file = NamedTempFile::new_in(parent)?;
     let mut reservation = byte_budget.map(FetchByteBudget::reservation);
+    if let Some(reservation) = reservation.as_mut() {
+        reservation.reserve_capacity(expected_body_bytes).await?;
+    }
     match stream_to_temp_file(
         body,
         temp_file.as_file_mut(),
@@ -650,6 +681,25 @@ fn classify_http_error(
             rate_limit: Box::new(rate_limit),
         },
     }
+}
+
+fn expected_body_bytes(headers: &HeaderMap, max_bytes: u64) -> Result<u64, FetchError> {
+    let Some(value) = headers.get(http::header::CONTENT_LENGTH) else {
+        return Ok(max_bytes);
+    };
+    let Ok(value) = value.to_str() else {
+        return Ok(max_bytes);
+    };
+    let Ok(bytes) = value.parse::<u64>() else {
+        return Ok(max_bytes);
+    };
+    if bytes > max_bytes {
+        return Err(FetchError::MaxBytesExceeded {
+            max_bytes,
+            observed_bytes: bytes,
+        });
+    }
+    Ok(bytes)
 }
 
 fn spool_path(spool_dir: &Path, did: &Did) -> PathBuf {
@@ -911,7 +961,15 @@ mod tests {
         let body = ByteStream::new(futures_util::stream::iter([Ok(Bytes::from_static(b"abc"))]));
         let task_path = path.clone();
         let handle = tokio::spawn(async move {
-            stream_to_file(body, &task_path, Duration::from_secs(1), 3, Some(&budget)).await
+            stream_to_file(
+                body,
+                &task_path,
+                Duration::from_secs(1),
+                3,
+                3,
+                Some(&budget),
+            )
+            .await
         });
 
         tokio::time::sleep(Duration::from_millis(20)).await;

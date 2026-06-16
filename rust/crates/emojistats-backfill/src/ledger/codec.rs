@@ -250,15 +250,19 @@ pub(super) fn row_to_host_override(
     let host: String = row.get(0)?;
     let disabled: i64 = row.get(1)?;
     let concurrency_cap: Option<i64> = row.get(2)?;
-    let revive_after_ms: Option<i64> = row.get(3)?;
-    let force_mode: Option<String> = row.get(4)?;
+    let min_interval_ms: Option<i64> = row.get(3)?;
+    let revive_after_ms: Option<i64> = row.get(4)?;
+    let force_mode: Option<String> = row.get(5)?;
+    let never_diff: i64 = row.get(6)?;
 
     Ok(build_host_override(
         host,
         disabled,
         concurrency_cap,
+        min_interval_ms,
         revive_after_ms,
         force_mode,
+        never_diff,
     ))
 }
 
@@ -266,10 +270,17 @@ fn build_host_override(
     host: String,
     disabled: i64,
     concurrency_cap: Option<i64>,
+    min_interval_ms: Option<i64>,
     revive_after_ms: Option<i64>,
     force_mode: Option<String>,
+    never_diff: i64,
 ) -> Result<HostOverride, LedgerStoreError> {
     let disabled = match disabled {
+        0 => false,
+        1 => true,
+        value => return Err(LedgerStoreError::InvalidHostOverrideDisabled { value }),
+    };
+    let never_diff = match never_diff {
         0 => false,
         1 => true,
         value => return Err(LedgerStoreError::InvalidHostOverrideDisabled { value }),
@@ -278,14 +289,21 @@ fn build_host_override(
         .map(u32::try_from)
         .transpose()
         .map_err(|_err| LedgerStoreError::IntegerOverflow)?;
+    let min_interval = min_interval_ms
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|_err| LedgerStoreError::IntegerOverflow)?
+        .map(Duration::from_millis);
     let revive_after = revive_after_ms.map(time_from_millis).transpose()?;
     let force_mode = force_mode.map(|mode| parse_force_mode(&mode)).transpose()?;
     let record = HostOverride {
         host,
         disabled,
         concurrency_cap,
+        min_interval,
         revive_after,
         force_mode,
+        never_diff,
     };
     validate_host_override(&record)?;
     Ok(record)
@@ -410,6 +428,11 @@ pub(super) fn validate_host_override(record: &HostOverride) -> Result<(), Ledger
             message: "concurrency cap must be greater than zero".to_owned(),
         });
     }
+    if record.min_interval == Some(Duration::ZERO) {
+        return Err(LedgerStoreError::InvalidHostOverride {
+            message: "min interval must be greater than zero".to_owned(),
+        });
+    }
     Ok(())
 }
 
@@ -425,6 +448,16 @@ pub(super) fn optional_time_to_millis(
     time: Option<SystemTime>,
 ) -> Result<Option<i64>, LedgerStoreError> {
     time.map(time_to_millis).transpose()
+}
+
+pub(super) fn optional_duration_to_millis(
+    duration: Option<Duration>,
+) -> Result<Option<i64>, LedgerStoreError> {
+    duration
+        .map(|value| {
+            i64::try_from(value.as_millis()).map_err(|_err| LedgerStoreError::IntegerOverflow)
+        })
+        .transpose()
 }
 
 pub(super) fn time_to_millis(time: SystemTime) -> Result<i64, LedgerStoreError> {

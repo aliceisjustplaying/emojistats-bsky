@@ -101,6 +101,19 @@ impl SshStorageBoxCommands {
         );
         self.config.ssh_command("append", script, true)
     }
+
+    fn contains_manifest_record_command(
+        &self,
+        remote_path: &str,
+    ) -> Result<CommandSpec, CommandError> {
+        validate_remote_path(remote_path)?;
+        let path = shell_quote(remote_path);
+        let script = format!(
+            "record=$(cat); if [ -e {path} ] && grep -Fqx -- \"$record\" {path}; then printf 'present\\n'; else printf 'absent\\n'; fi"
+        );
+        self.config
+            .ssh_command("contains_manifest_record", script, true)
+    }
 }
 
 impl StorageBoxCommands for SshStorageBoxCommands {
@@ -176,6 +189,23 @@ impl StorageBoxCommands for SshStorageBoxCommands {
         let command = self.append_command(remote_path)?;
         let mut reader = Cursor::new(bytes);
         run_command(&command, Some(&mut reader)).map(|_stdout| ())
+    }
+
+    fn contains_manifest_record(
+        &mut self,
+        remote_path: &str,
+        record_without_newline: &[u8],
+    ) -> Result<bool, CommandError> {
+        let command = self.contains_manifest_record_command(remote_path)?;
+        let mut reader = Cursor::new(record_without_newline);
+        let stdout = run_command(&command, Some(&mut reader))?;
+        match stdout.as_slice() {
+            b"present\n" => Ok(true),
+            b"absent\n" => Ok(false),
+            _other => Err(CommandError::new(
+                "manifest contains output had no presence marker",
+            )),
+        }
     }
 }
 

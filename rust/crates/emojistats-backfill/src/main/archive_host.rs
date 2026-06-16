@@ -1,12 +1,12 @@
 use super::{
     super::{
         ArchiveCommitContext, ArchiveError, AttemptOutcome, ClaimScope, CompletenessClass,
-        FetchMethod, FetchOneFailure, ForcedFetchMode, HOST_OVERRIDE_CACHE_TTL, HostOverride,
-        HostPacer, Instant, NormalizerVersion, ParseConfig, ParseVisitError, ParsedRepoSummary,
-        Path, SharedHostPacer, SqliteLedger, StreamingArchiveSink, StreamingReceiptInput,
-        SystemTime, Uri, archive_row_from_owned_post_observed_at, classify_archive_error,
-        classify_parse_error, elapsed_ms, hash_profile_record, parse_repo_for_did_with_state,
-        retryable_failure,
+        DEFAULT_CLAIM_LEASE_DURATION, FetchMethod, FetchOneFailure, ForcedFetchMode,
+        HOST_OVERRIDE_CACHE_TTL, HostOverride, HostPacer, Instant, NormalizerVersion, ParseConfig,
+        ParseVisitError, ParsedRepoSummary, Path, PathBuf, RepoLedgerEntry, SharedHostPacer,
+        SqliteLedger, StreamingArchiveSink, StreamingReceiptInput, SystemTime, Uri,
+        archive_row_from_owned_post_observed_at, classify_archive_error, classify_parse_error,
+        elapsed_ms, hash_profile_record, parse_repo_for_did_with_state, retryable_failure,
     },
     fetch_attempt::{
         GetRepoProcessed, GetRepoTimings, HostOverrideCache, HostOverrideCacheEntry, ProcessedRepo,
@@ -27,6 +27,7 @@ pub fn parse_and_archive_spooled_repo(
     archive_dir: &Path,
     archive_context: ArchiveCommitContext,
     parse_config: ParseConfig,
+    claim_check: Option<ArchiveClaimCheck>,
 ) -> Result<ProcessedRepo, FetchOneFailure> {
     let parse_started = Instant::now();
     let sink = StreamingArchiveSink::new(archive_dir, did_str, archive_context).map_err(|err| {
@@ -71,11 +72,14 @@ pub fn parse_and_archive_spooled_repo(
     let archive_started = Instant::now();
     let profile_row_hash = hash_profile_record(parsed.profile.as_ref())
         .map_err(|err| classify_archive_error(&format!("hash profile row for {did_str}"), &err))?;
+    if let Some(claim_check) = claim_check {
+        claim_check.ensure_owned_before_commit(did_str)?;
+    }
     let (receipt, artifacts) = sink
         .finish(
             StreamingReceiptInput {
                 fetch_method: FetchMethod::GetRepo,
-                completeness_class: CompletenessClass::SnapshotComplete,
+                completeness_class: CompletenessClass::ContentAddressedSnapshot,
                 reachable_records_count: parsed.rkey_digest.all_records_count,
                 reachable_post_records_count: parsed.rkey_digest.post_records_count,
                 post_decode_error_count: parsed.post_decode_error_count,
@@ -112,6 +116,41 @@ pub fn parse_and_archive_spooled_repo(
             archive_ms: elapsed_ms(archive_started),
         },
     }))
+}
+
+#[derive(Debug, Clone)]
+pub struct ArchiveClaimCheck {
+    pub ledger_path: PathBuf,
+    pub claimed: RepoLedgerEntry,
+}
+
+impl ArchiveClaimCheck {
+    pub fn ensure_owned_before_commit(&self, did_str: &str) -> Result<(), FetchOneFailure> {
+        let ledger = SqliteLedger::open(&self.ledger_path).map_err(|err| {
+            retryable_failure(format!(
+                "open ledger before archive commit for {did_str}: {err}"
+            ))
+        })?;
+        ledger
+            .extend_owned_claim_lease(
+                &self.claimed,
+                SystemTime::now(),
+                DEFAULT_CLAIM_LEASE_DURATION,
+            )
+            .map_err(|err| {
+                retryable_failure(format!(
+                    "verify claim ownership before archive commit for {did_str}: {err}"
+                ))
+            })?
+            .map_or_else(
+                || {
+                    Err(retryable_failure(format!(
+                        "claim ownership lost before archive commit for {did_str}"
+                    )))
+                },
+                |_entry| Ok(()),
+            )
+    }
 }
 
 fn parse_repo_streaming_archive_unprofiled(
@@ -197,6 +236,14 @@ pub async fn prepare_fetch_host(
         HostPacer::wait_until_ready(pacer, &host)
             .await
             .map_err(|err| retryable_failure(format!("host pacing for {host}: {err}")))?;
+        if let Some(min_interval) = host_override
+            .as_ref()
+            .and_then(|override_record| override_record.min_interval)
+        {
+            HostPacer::record_retry_after(pacer, &host, min_interval).map_err(|err| {
+                retryable_failure(format!("host min-interval pacing for {host}: {err}"))
+            })?;
+        }
     }
     Ok(PreparedFetchHost {
         host,

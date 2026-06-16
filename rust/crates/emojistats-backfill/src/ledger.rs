@@ -202,8 +202,10 @@ pub struct HostOverride {
     pub host: String,
     pub disabled: bool,
     pub concurrency_cap: Option<u32>,
+    pub min_interval: Option<Duration>,
     pub revive_after: Option<SystemTime>,
     pub force_mode: Option<ForcedFetchMode>,
+    pub never_diff: bool,
 }
 
 /// Mark a pending repo as claimed by a concrete attempt.

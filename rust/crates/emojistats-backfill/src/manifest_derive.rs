@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     archive::{
-        ArchiveError, LocalManifestEntry, RepoReceipt, hash_post_rows, read_archive_post_rows,
+        ArchiveError, LocalManifestEntry, RepoReceipt, hash_post_rows, read_all_archive_post_rows,
     },
     commit::{ManifestEntry, Receipt},
     derive::{
@@ -276,10 +276,11 @@ pub fn load_verified_clickhouse_batch_with_caps(
         validate_object_receipt(&receipt_path, &input.manifest, &receipt)?;
     }
 
-    let archive_rows = read_archive_post_rows(&object_path).map_err(|source| Error::Archive {
-        path: object_path.clone(),
-        source,
-    })?;
+    let archive_rows =
+        read_all_archive_post_rows(&object_path).map_err(|source| Error::Archive {
+            path: object_path.clone(),
+            source,
+        })?;
 
     if let Some(receipt_path) =
         first_existing_path(repo_receipt_candidates(&object_path, &input.manifest))

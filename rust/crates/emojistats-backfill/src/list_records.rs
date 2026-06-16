@@ -1,6 +1,11 @@
 //! `com.atproto.repo.listRecords` fallback fetch and archive path.
 
-use std::{collections::HashSet, fmt, path::Path, time::Duration};
+use std::{
+    collections::HashSet,
+    fmt,
+    path::Path,
+    time::{Duration, SystemTime},
+};
 
 use futures_util::StreamExt as _;
 use jacquard_common::{deps::fluent_uri::Uri, types::did::Did};
@@ -11,10 +16,12 @@ use tokio::time;
 use crate::{
     archive::{
         ArchiveArtifacts, ArchiveCommitContext, ArchiveError, CompletenessClass, FetchMethod,
-        RepoReceipt, StreamingArchiveSink, StreamingReceiptInput, archive_row_from_post,
+        RepoReceipt, StreamingArchiveSink, StreamingReceiptInput,
+        archive_row_from_post_observed_at,
     },
     parse::PostRecord,
     post_decode,
+    scheduler::HostPacer,
     transport::{AccountState, RateLimitSnapshot},
 };
 
@@ -192,6 +199,7 @@ pub async fn fetch_and_archive_list_records_with_rate_limit_observer(
 
     loop {
         let fetched = fetch_list_records_page(http, pds, did, cursor.as_deref(), config).await?;
+        let observed_at = SystemTime::now();
         observe_rate_limit(&fetched.rate_limit);
         rate_limits.push(fetched.rate_limit);
         let next_cursor = fetched.page.cursor.clone();
@@ -208,6 +216,14 @@ pub async fn fetch_and_archive_list_records_with_rate_limit_observer(
             return Err(ListRecordsError::Protocol(
                 "PDS returned a repeated listRecords cursor".to_owned(),
             ));
+        }
+        if let Some(delay) = HostPacer::rate_limit_delay(
+            rate_limits.last().ok_or_else(|| {
+                ListRecordsError::Protocol("missing rate-limit snapshot".to_owned())
+            })?,
+            observed_at,
+        ) {
+            time::sleep(delay).await;
         }
         cursor = next_cursor;
     }
@@ -302,10 +318,11 @@ impl<'a> ListRecordsArchiver<'a> {
                 if decoded.typed_decode_failed {
                     self.increment_decode_errors()?;
                 }
-                let row = archive_row_from_post(
+                let row = archive_row_from_post_observed_at(
                     self.did_str,
                     &decoded.post,
                     &self.sink.normalizer().clone(),
+                    self.sink.observed_at(),
                 )?;
                 self.sink.push_row(row)?;
             }
@@ -510,10 +527,10 @@ fn post_record_from_list_record(
 
 fn validated_record_cid(cid: Option<String>) -> Result<String, ListRecordDecodeError> {
     let Some(cid) = cid else {
-        return Ok(String::new());
+        return Err(ListRecordDecodeError);
     };
     if cid.is_empty() {
-        return Ok(cid);
+        return Err(ListRecordDecodeError);
     }
     cid::Cid::try_from(cid.as_str()).map_err(|_error| ListRecordDecodeError)?;
     Ok(cid)
@@ -554,7 +571,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::archive::{CompletenessClass, FetchMethod, read_archive_post_rows};
+    use crate::archive::{CompletenessClass, FetchMethod, read_all_archive_post_rows};
 
     const TEST_CID_A: &str = "bafyreihyrpejdc3l3wqlbm7vuzx7hhvx6r5eg44vqyqjna6u6kwtpoyqte";
     const TEST_CID_B: &str = "bafyreibqj2lhp4fpizc2zstcsl2mzo6fycjfnwc6kyz4xpr2lzyqlw6wxi";
@@ -588,7 +605,8 @@ mod tests {
         );
         assert_eq!(output.receipt.mst_root_cid, None);
         assert_eq!(output.receipt.commit_cid, None);
-        let rows = read_archive_post_rows(&output.artifacts.parquet_path).expect("read parquet");
+        let rows =
+            read_all_archive_post_rows(&output.artifacts.parquet_path).expect("read parquet");
         assert_eq!(rows.len(), 2);
         let first = rows.first().expect("first row");
         let second = rows.get(1).expect("second row");
@@ -619,7 +637,8 @@ mod tests {
         assert_eq!(output.archived_posts, 1);
         assert_eq!(output.decode_errors, 1);
         assert_eq!(output.receipt.post_decode_error_count, 1);
-        let rows = read_archive_post_rows(&output.artifacts.parquet_path).expect("read parquet");
+        let rows =
+            read_all_archive_post_rows(&output.artifacts.parquet_path).expect("read parquet");
         assert_eq!(rows.len(), 1);
         let row = rows.first().expect("partial row");
         assert_eq!(row.record_status.as_deref(), Some("typed_decode_failed"));
@@ -659,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_record_cid_archives_with_empty_cid() {
+    fn missing_record_cid_is_counted_as_decode_error() {
         let archive_dir = temp_dir("list-records-missing-cid");
         let did = "did:plc:testrepo";
         let pages = vec![ListRecordsPage {
@@ -680,9 +699,8 @@ mod tests {
                 .expect("archive listRecords pages");
 
         assert_eq!(output.records, 1);
-        assert_eq!(output.archived_posts, 1);
-        let rows = read_archive_post_rows(&output.artifacts.parquet_path).expect("read parquet");
-        assert_eq!(rows.first().expect("row").cid, "");
+        assert_eq!(output.archived_posts, 0);
+        assert_eq!(output.decode_errors, 1);
         fs::remove_dir_all(archive_dir).expect("remove archive dir");
     }
 

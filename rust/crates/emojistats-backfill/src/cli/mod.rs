@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use emojistats_backfill::{ledger::ShardFilter, parse::default_cid_verification_threads};
 
 const DEFAULT_PARSE_CONCURRENCY: usize = 1;
-const DEFAULT_MAX_INFLIGHT_SPOOL_BYTES: u64 = 536_870_912;
+const DEFAULT_MAX_INFLIGHT_SPOOL_BYTES: u64 = 2_147_483_648;
 
 /// emojistats v2 backfill tool.
 #[derive(Parser, Debug)]
@@ -12,6 +12,14 @@ const DEFAULT_MAX_INFLIGHT_SPOOL_BYTES: u64 = 536_870_912;
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum HttpProtocol {
+    /// Force HTTP/1.1 for repo fetches.
+    Http1,
+    /// Let reqwest negotiate the protocol.
+    Auto,
 }
 
 #[derive(Subcommand, Debug)]
@@ -32,6 +40,9 @@ pub enum Command {
         /// Worker threads used for CAR block CID verification.
         #[arg(long, default_value_t = default_cid_verification_threads(), value_parser = parse_positive_usize)]
         cid_verification_threads: usize,
+        /// HTTP protocol behavior for repo fetches.
+        #[arg(long, value_enum, default_value_t = HttpProtocol::Http1)]
+        http_protocol: HttpProtocol,
     },
     /// Parse and archive an existing `CAR` without fetching it.
     ProfileCar {
@@ -86,6 +97,9 @@ pub enum Command {
         /// Worker threads used for CAR block CID verification.
         #[arg(long, default_value_t = default_cid_verification_threads(), value_parser = parse_positive_usize)]
         cid_verification_threads: usize,
+        /// HTTP protocol behavior for repo fetches.
+        #[arg(long, value_enum, default_value_t = HttpProtocol::Http1)]
+        http_protocol: HttpProtocol,
     },
     /// Verify a committed archive manifest and load derived rows into `ClickHouse`.
     DeriveManifest {
@@ -109,6 +123,9 @@ pub enum Command {
         /// Validate and format payloads without sending inserts.
         #[arg(long)]
         dry_run: bool,
+        /// Optional JSONL ledger recording successful derive payload inserts.
+        #[arg(long)]
+        derive_ledger_path: Option<PathBuf>,
     },
     /// Print the v2 `ClickHouse` schema SQL.
     ClickhouseSchema {

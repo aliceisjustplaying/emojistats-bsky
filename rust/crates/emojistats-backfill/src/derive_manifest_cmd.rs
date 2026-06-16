@@ -1,14 +1,15 @@
 use std::{
-    fs::File,
-    io::BufReader,
+    fs::{self, File, OpenOptions},
+    io::{BufReader, Write},
     path::{Path, PathBuf},
 };
 
 use emojistats_backfill::{
     archive::{ArchivePostRowsHasher, EmojiProjectionRow, archive_post_rows_from_record_batch},
     clickhouse::{
-        ClickHouseClientConfig, ClickHouseInsertPayload, emoji_serving_rows_insert_payload,
-        execute_insert_payloads, total_post_counter_insert_payload_for_counter,
+        ClickHouseClientConfig, ClickHouseInsertPayload, ClickHouseInsertReceipt,
+        emoji_serving_rows_insert_payload, execute_insert_payloads,
+        total_post_counter_insert_payload_for_counter,
     },
     derive::{
         BACKFILL_DERIVE_SOURCE, DeriveManifestIdentity, TotalPostCounterInput,
@@ -37,6 +38,7 @@ pub struct DeriveManifestConfig {
     pub clickhouse_user: String,
     pub clickhouse_password: String,
     pub dry_run: bool,
+    pub derive_ledger_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -48,6 +50,83 @@ struct DeriveManifestSummary {
     attempted_insert_rows: u64,
     inserted_payloads: u64,
     inserted_rows: u64,
+}
+
+#[derive(Debug)]
+struct DeriveLedger {
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize)]
+struct DeriveLedgerRecord<'a> {
+    source: &'static str,
+    run_id: &'a str,
+    shard: &'a str,
+    file_sequence: u64,
+    dataset: &'a str,
+    content_hash: &'a str,
+    receipt_hash: &'a str,
+    schema_version: u16,
+    object_path: String,
+    table: &'static str,
+    dedupe_token: &'a str,
+    row_count: usize,
+    payload_hash: String,
+    clickhouse_status: u16,
+}
+
+impl DeriveLedger {
+    fn new(path: Option<&Path>) -> anyhow::Result<Self> {
+        if let Some(path) = path
+            && let Some(parent) = path.parent()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        Ok(Self {
+            path: path.map(Path::to_path_buf),
+        })
+    }
+
+    fn append_successes(
+        &self,
+        verified: &VerifiedLoaderInput,
+        payloads: &[ClickHouseInsertPayload],
+        receipts: &[ClickHouseInsertReceipt],
+    ) -> anyhow::Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        if payloads.len() != receipts.len() {
+            anyhow::bail!(
+                "derive ledger payload/receipt count mismatch: {} payloads, {} receipts",
+                payloads.len(),
+                receipts.len()
+            );
+        }
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        for (payload, receipt) in payloads.iter().zip(receipts) {
+            let record = DeriveLedgerRecord {
+                source: BACKFILL_DERIVE_SOURCE,
+                run_id: &verified.manifest.run_id,
+                shard: &verified.manifest.shard,
+                file_sequence: verified.manifest.file_sequence,
+                dataset: &verified.manifest.dataset,
+                content_hash: &verified.manifest.content_hash,
+                receipt_hash: &verified.manifest.receipt_hash,
+                schema_version: verified.manifest.schema_version,
+                object_path: verified.object_path.to_string_lossy().into_owned(),
+                table: payload.table.name(),
+                dedupe_token: &payload.dedupe_token,
+                row_count: payload.row_count,
+                payload_hash: hash_payload_body(&payload.body),
+                clickhouse_status: receipt.status,
+            };
+            serde_json::to_writer(&mut file, &record)?;
+            file.write_all(b"\n")?;
+        }
+        file.sync_all()?;
+        Ok(())
+    }
 }
 
 pub async fn run(config: DeriveManifestConfig) -> anyhow::Result<()> {
@@ -66,6 +145,7 @@ pub async fn run(config: DeriveManifestConfig) -> anyhow::Result<()> {
         skipped_entries: count_len(plan.skipped_entries.len(), "skipped_entries")?,
         ..DeriveManifestSummary::default()
     };
+    let derive_ledger = DeriveLedger::new(config.derive_ledger_path.as_deref())?;
 
     for input in &plan.inputs {
         derive_loader_input_streaming(
@@ -74,6 +154,7 @@ pub async fn run(config: DeriveManifestConfig) -> anyhow::Result<()> {
             &http,
             &clickhouse,
             config.dry_run,
+            &derive_ledger,
             &mut summary,
         )
         .await?;
@@ -92,10 +173,12 @@ async fn derive_loader_input_streaming(
     http: &reqwest::Client,
     clickhouse: &ClickHouseClientConfig,
     dry_run: bool,
+    derive_ledger: &DeriveLedger,
     summary: &mut DeriveManifestSummary,
 ) -> anyhow::Result<()> {
     let verified = verify_loader_input_for_streaming(archive_root, input)?;
-    derive_verified_input_streaming(&verified, http, clickhouse, dry_run, summary).await
+    derive_verified_input_streaming(&verified, http, clickhouse, dry_run, derive_ledger, summary)
+        .await
 }
 
 async fn derive_verified_input_streaming(
@@ -103,10 +186,12 @@ async fn derive_verified_input_streaming(
     http: &reqwest::Client,
     clickhouse: &ClickHouseClientConfig,
     dry_run: bool,
+    derive_ledger: &DeriveLedger,
     summary: &mut DeriveManifestSummary,
 ) -> anyhow::Result<()> {
     validate_verified_input_streaming(verified)?;
-    insert_verified_input_streaming(verified, http, clickhouse, dry_run, summary).await?;
+    insert_verified_input_streaming(verified, http, clickhouse, dry_run, derive_ledger, summary)
+        .await?;
     increment(&mut summary.archive_files, "derive archive file count")
 }
 
@@ -128,6 +213,7 @@ async fn insert_verified_input_streaming(
     http: &reqwest::Client,
     clickhouse: &ClickHouseClientConfig,
     dry_run: bool,
+    derive_ledger: &DeriveLedger,
     summary: &mut DeriveManifestSummary,
 ) -> anyhow::Result<()> {
     let file = File::open(&verified.object_path)?;
@@ -137,18 +223,38 @@ async fn insert_verified_input_streaming(
     for batch in reader {
         let rows = archive_post_rows_from_record_batch(&batch?)?;
         let payloads = state.consume_rows(&rows)?;
-        apply_derive_payloads(http, clickhouse, dry_run, summary, &payloads).await?;
+        apply_derive_payloads(
+            http,
+            clickhouse,
+            dry_run,
+            derive_ledger,
+            summary,
+            verified,
+            &payloads,
+        )
+        .await?;
     }
 
     let payloads = state.finish()?;
-    apply_derive_payloads(http, clickhouse, dry_run, summary, &payloads).await
+    apply_derive_payloads(
+        http,
+        clickhouse,
+        dry_run,
+        derive_ledger,
+        summary,
+        verified,
+        &payloads,
+    )
+    .await
 }
 
 async fn apply_derive_payloads(
     http: &reqwest::Client,
     clickhouse: &ClickHouseClientConfig,
     dry_run: bool,
+    derive_ledger: &DeriveLedger,
     summary: &mut DeriveManifestSummary,
+    verified: &VerifiedLoaderInput,
     payloads: &[ClickHouseInsertPayload],
 ) -> anyhow::Result<()> {
     if payloads.is_empty() {
@@ -167,6 +273,7 @@ async fn apply_derive_payloads(
     )?;
     if !dry_run {
         let receipts = execute_insert_payloads(http, clickhouse, payloads).await?;
+        derive_ledger.append_successes(verified, payloads, &receipts)?;
         add_count(
             &mut summary.inserted_payloads,
             count_len(receipts.len(), "insert receipt count")?,
@@ -425,6 +532,12 @@ fn streaming_dedupe_token(lane: StreamingDedupeLane, hasher: Sha256) -> String {
         lane.as_str(),
         hex::encode(hasher.finalize())
     )
+}
+
+fn hash_payload_body(body: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(body.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 fn hash_identity_frames(
@@ -735,6 +848,7 @@ mod tests {
         fs::remove_file(&artifacts.receipt_path).expect("repo receipt should be removable");
         let clickhouse = clickhouse_config();
         let http = clickhouse.http_client().expect("http client");
+        let derive_ledger = DeriveLedger::new(None).expect("derive ledger");
         let mut summary = DeriveManifestSummary::default();
 
         let error = derive_loader_input_streaming(
@@ -743,6 +857,7 @@ mod tests {
             &http,
             &clickhouse,
             true,
+            &derive_ledger,
             &mut summary,
         )
         .await
@@ -781,6 +896,7 @@ mod tests {
         .expect("corrupt receipt should write");
         let clickhouse = clickhouse_config();
         let http = clickhouse.http_client().expect("http client");
+        let derive_ledger = DeriveLedger::new(None).expect("derive ledger");
         let mut summary = DeriveManifestSummary::default();
 
         let error = derive_loader_input_streaming(
@@ -789,6 +905,7 @@ mod tests {
             &http,
             &clickhouse,
             true,
+            &derive_ledger,
             &mut summary,
         )
         .await

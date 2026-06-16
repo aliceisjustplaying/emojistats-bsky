@@ -27,6 +27,7 @@ pub fn run(
         archive_dir,
         ArchiveCommitContext::fetch_one_local(),
         parse_config_for_threads(cid_verification_threads),
+        None,
     )
     .map_err(|failure| {
         anyhow::anyhow!(

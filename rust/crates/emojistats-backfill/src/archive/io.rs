@@ -17,7 +17,11 @@ use super::{
 ///
 /// Returns [`ArchiveError`] when the file cannot be read as the expected archive schema,
 /// or when JSON-encoded row fields fail to decode.
-pub fn read_archive_post_rows(path: &Path) -> Result<Vec<ArchivePostRow>, ArchiveError> {
+/// Read every archive post row into memory.
+///
+/// This is intended for tests and explicitly capped full-load verification paths. Whale-scale
+/// derive code should use `ParquetRecordBatchReaderBuilder` directly and stream batches.
+pub fn read_all_archive_post_rows(path: &Path) -> Result<Vec<ArchivePostRow>, ArchiveError> {
     let file = File::open(path)?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
     let mut rows = Vec::new();
@@ -55,7 +59,7 @@ pub fn build_repo_receipt(input: RepoReceiptInput<'_>) -> Result<RepoReceipt, Ar
     Ok(RepoReceipt {
         observed_at: format_observed_at(Utc::now()),
         fetch_method: FetchMethod::GetRepo,
-        completeness_class: CompletenessClass::SnapshotComplete,
+        completeness_class: CompletenessClass::ContentAddressedSnapshot,
         reachable_records_count: input.reachable_records_count,
         reachable_post_records_count: input.reachable_post_records_count,
         archived_post_rows_count: u64::try_from(rows.len()).map_err(|_error| {
@@ -560,7 +564,7 @@ fn extras_json_string(value: &serde_json::Value) -> Result<Cow<'static, str>, Ar
     if matches!(value, serde_json::Value::Object(fields) if fields.is_empty()) {
         return Ok(Cow::Borrowed("{}"));
     }
-    Ok(Cow::Owned(canonical_json(value)?))
+    Ok(Cow::Owned(stable_rust_json(value)?))
 }
 
 pub(super) fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), ArchiveError> {
@@ -754,7 +758,7 @@ pub(super) fn hash_extras_json(
     hash_field_bytes(hasher, &json_bytes(value)?)
 }
 
-fn canonical_json(value: &serde_json::Value) -> Result<String, ArchiveError> {
+fn stable_rust_json(value: &serde_json::Value) -> Result<String, ArchiveError> {
     Ok(serde_json::to_string(value)?)
 }
 

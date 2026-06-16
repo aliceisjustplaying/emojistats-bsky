@@ -1,0 +1,27 @@
+name: rust
+
+on:
+  push:
+    branches:
+      - main
+      - v2-rust-backfill
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, llvm-tools-preview
+      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@cargo-deny
+      - uses: taiki-e/install-action@cargo-audit
+      - uses: taiki-e/install-action@cargo-machete
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Rust gate
+        run: ./check.sh

@@ -11,14 +11,67 @@ use super::{
     complete_attempt, did_shard_bucket, validate_worker_id,
 };
 use crate::ledger::codec::{
-    StoredStatus, bool_to_i64, force_mode_name, load_entry_in_transaction, optional_time_to_millis,
-    row_to_entry, row_to_host_override, shard_bucket_to_i64, time_to_millis, update_entry_if_owned,
-    update_expired_claim, validate_host_override,
+    StoredStatus, bool_to_i64, force_mode_name, load_entry_in_transaction,
+    optional_duration_to_millis, optional_time_to_millis, row_to_entry, row_to_host_override,
+    shard_bucket_to_i64, time_to_millis, update_entry_if_owned, update_expired_claim,
+    validate_host_override,
 };
 
 /// SQLite-backed store for durable per-repo crawler state.
 pub struct SqliteLedger {
     pub(super) connection: Connection,
+}
+
+fn select_claimable_did(
+    transaction: &Transaction<'_>,
+    now_ms: i64,
+    shard_bucket: Option<i64>,
+) -> Result<Option<String>, rusqlite::Error> {
+    transaction
+        .query_row(
+            "
+            SELECT did
+            FROM (
+                SELECT did, 0 AS ready_at
+                FROM repo_ledger
+                WHERE status = 'pending'
+                    AND next_attempt_after_ms IS NULL
+                    AND (?2 IS NULL OR shard_bucket = ?2)
+                UNION ALL
+                SELECT did, next_attempt_after_ms AS ready_at
+                FROM repo_ledger
+                WHERE status = 'pending'
+                    AND next_attempt_after_ms IS NOT NULL
+                    AND next_attempt_after_ms <= ?1
+                    AND (?2 IS NULL OR shard_bucket = ?2)
+                UNION ALL
+                SELECT did, 0 AS ready_at
+                FROM repo_ledger
+                WHERE status = 'retryable_failure'
+                    AND next_attempt_after_ms IS NULL
+                    AND (?2 IS NULL OR shard_bucket = ?2)
+                UNION ALL
+                SELECT did, next_attempt_after_ms AS ready_at
+                FROM repo_ledger
+                WHERE status = 'retryable_failure'
+                    AND next_attempt_after_ms IS NOT NULL
+                    AND next_attempt_after_ms <= ?1
+                    AND (?2 IS NULL OR shard_bucket = ?2)
+                UNION ALL
+                SELECT did, next_attempt_after_ms AS ready_at
+                FROM repo_ledger
+                WHERE status = 'throttled'
+                    AND next_attempt_after_ms IS NOT NULL
+                    AND next_attempt_after_ms <= ?1
+                    AND (?2 IS NULL OR shard_bucket = ?2)
+            )
+            ORDER BY ready_at, did
+            LIMIT 1
+            ",
+            params![now_ms, shard_bucket],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
 }
 
 impl SqliteLedger {
@@ -97,10 +150,12 @@ impl SqliteLedger {
                 host TEXT PRIMARY KEY NOT NULL,
                 disabled INTEGER NOT NULL CHECK (disabled IN (0, 1)),
                 concurrency_cap INTEGER CHECK (concurrency_cap IS NULL OR concurrency_cap > 0),
+                min_interval_ms INTEGER CHECK (min_interval_ms IS NULL OR min_interval_ms > 0),
                 revive_after_ms INTEGER,
                 force_mode TEXT CHECK (
                     force_mode IS NULL OR force_mode IN ('get_repo', 'list_records')
-                )
+                ),
+                never_diff INTEGER NOT NULL DEFAULT 0 CHECK (never_diff IN (0, 1))
             );
 
             CREATE TABLE IF NOT EXISTS manifest_sequences (
@@ -112,6 +167,7 @@ impl SqliteLedger {
             ",
         )?;
         self.ensure_repo_ledger_columns()?;
+        self.ensure_host_override_columns()?;
         self.connection.execute_batch(
             "
             CREATE INDEX IF NOT EXISTS idx_repo_ledger_claim
@@ -280,31 +336,7 @@ impl SqliteLedger {
             .map(|filter| shard_bucket_to_i64(filter.bucket()))
             .transpose()?;
         let transaction = self.connection.unchecked_transaction()?;
-        let did = transaction
-            .query_row(
-                "
-                SELECT did
-                FROM repo_ledger
-                WHERE
-                    (
-                        (
-                            status IN ('pending', 'retryable_failure')
-                            AND (next_attempt_after_ms IS NULL OR next_attempt_after_ms <= ?1)
-                        )
-                        OR (
-                            status = 'throttled'
-                            AND next_attempt_after_ms IS NOT NULL
-                            AND next_attempt_after_ms <= ?1
-                        )
-                    )
-                    AND (?2 IS NULL OR shard_bucket = ?2)
-                ORDER BY COALESCE(next_attempt_after_ms, 0), did
-                LIMIT 1
-                ",
-                params![now_ms, shard_bucket],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
+        let did = select_claimable_did(&transaction, now_ms, shard_bucket)?;
         let Some(did) = did else {
             transaction.commit()?;
             return Ok(None);
@@ -642,6 +674,7 @@ impl SqliteLedger {
     pub fn upsert_host_override(&self, record: &HostOverride) -> Result<(), LedgerStoreError> {
         validate_host_override(record)?;
         let concurrency_cap = record.concurrency_cap.map(i64::from);
+        let min_interval_ms = optional_duration_to_millis(record.min_interval)?;
         let revive_after_ms = optional_time_to_millis(record.revive_after)?;
         self.connection.execute(
             "
@@ -649,21 +682,27 @@ impl SqliteLedger {
                 host,
                 disabled,
                 concurrency_cap,
+                min_interval_ms,
                 revive_after_ms,
-                force_mode
-            ) VALUES (?1, ?2, ?3, ?4, ?5)
+                force_mode,
+                never_diff
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             ON CONFLICT(host) DO UPDATE SET
                 disabled = excluded.disabled,
                 concurrency_cap = excluded.concurrency_cap,
+                min_interval_ms = excluded.min_interval_ms,
                 revive_after_ms = excluded.revive_after_ms,
-                force_mode = excluded.force_mode
+                force_mode = excluded.force_mode,
+                never_diff = excluded.never_diff
             ",
             params![
                 record.host.as_str(),
                 bool_to_i64(record.disabled),
                 concurrency_cap,
+                min_interval_ms,
                 revive_after_ms,
                 record.force_mode.map(force_mode_name),
+                bool_to_i64(record.never_diff),
             ],
         )?;
         Ok(())
@@ -678,7 +717,7 @@ impl SqliteLedger {
         self.connection
             .query_row(
                 "
-                SELECT host, disabled, concurrency_cap, revive_after_ms, force_mode
+                SELECT host, disabled, concurrency_cap, min_interval_ms, revive_after_ms, force_mode, never_diff
                 FROM host_overrides
                 WHERE host = ?1
                 ",
@@ -767,6 +806,28 @@ impl SqliteLedger {
             )?;
         }
         self.backfill_missing_shard_buckets()
+    }
+
+    fn ensure_host_override_columns(&self) -> Result<(), LedgerStoreError> {
+        let mut statement = self
+            .connection
+            .prepare("PRAGMA table_info(host_overrides)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !columns.iter().any(|column| column == "min_interval_ms") {
+            self.connection.execute(
+                "ALTER TABLE host_overrides ADD COLUMN min_interval_ms INTEGER CHECK (min_interval_ms IS NULL OR min_interval_ms > 0)",
+                [],
+            )?;
+        }
+        if !columns.iter().any(|column| column == "never_diff") {
+            self.connection.execute(
+                "ALTER TABLE host_overrides ADD COLUMN never_diff INTEGER NOT NULL DEFAULT 0 CHECK (never_diff IN (0, 1))",
+                [],
+            )?;
+        }
+        Ok(())
     }
 
     fn backfill_missing_shard_buckets(&self) -> Result<(), LedgerStoreError> {

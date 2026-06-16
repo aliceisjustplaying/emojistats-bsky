@@ -131,7 +131,7 @@ fn streaming_sink_writes_committed_manifest_entry() {
         .finish(
             StreamingReceiptInput {
                 fetch_method: FetchMethod::GetRepo,
-                completeness_class: CompletenessClass::SnapshotComplete,
+                completeness_class: CompletenessClass::ContentAddressedSnapshot,
                 reachable_records_count: 1,
                 reachable_post_records_count: 1,
                 post_decode_error_count: 0,

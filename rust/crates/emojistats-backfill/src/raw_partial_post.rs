@@ -255,11 +255,14 @@ fn ipld_to_json(ipld: Ipld) -> Option<serde_json::Value> {
     match ipld {
         Ipld::Null => Some(serde_json::Value::Null),
         Ipld::Bool(value) => Some(serde_json::Value::Bool(value)),
-        Ipld::Integer(value) => i64::try_from(value)
-            .map(serde_json::Number::from)
-            .map(serde_json::Value::Number)
-            .ok(),
-        Ipld::Float(value) => serde_json::Number::from_f64(value).map(serde_json::Value::Number),
+        Ipld::Integer(value) => Some(i64::try_from(value).map_or_else(
+            |_err| serde_json::json!({ "$integer": value.to_string() }),
+            |number| serde_json::Value::Number(serde_json::Number::from(number)),
+        )),
+        Ipld::Float(value) => Some(serde_json::Number::from_f64(value).map_or_else(
+            || serde_json::json!({ "$float": value.to_string() }),
+            serde_json::Value::Number,
+        )),
         Ipld::String(value) => Some(serde_json::Value::String(value)),
         Ipld::Bytes(value) => Some(serde_json::json!({ "$bytes": hex::encode(value) })),
         Ipld::List(values) => values

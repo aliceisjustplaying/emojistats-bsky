@@ -21,8 +21,8 @@ use emojistats_backfill::{
     },
     clickhouse::create_schema_sql,
     ledger::{
-        AttemptId, AttemptOutcome, ForcedFetchMode, HostOverride, RepoLedgerEntry, RetryPolicy,
-        SqliteLedger, claim_repo, complete_attempt,
+        AttemptId, AttemptOutcome, DEFAULT_CLAIM_LEASE_DURATION, ForcedFetchMode, HostOverride,
+        RepoLedgerEntry, RetryPolicy, SqliteLedger, claim_repo, complete_attempt,
     },
     list_records::{ListRecordsConfig, fetch_and_archive_list_records_with_rate_limit_observer},
     parse::{ParseConfig, ParseVisitError, ParsedRepoSummary, parse_repo_for_did_with_state},
@@ -42,14 +42,17 @@ mod fleet;
 pub(crate) mod main;
 mod profile_cmd;
 
-use cli::{Cli, Command};
+use cli::{Cli, Command, HttpProtocol};
 use derive_manifest_cmd::DeriveManifestConfig;
 use failure::{
     FetchOneFailure, SmokeTelemetry, classify_archive_error, classify_fetch_error,
     classify_list_records_error, classify_parse_error, current_rss_kb, elapsed_ms,
     emit_smoke_telemetry, outcome_name, permanent_failure, retryable_failure,
 };
-use fleet::{FleetConfig, HostConcurrencyLimiter, HostConcurrencyPermit, default_worker_id};
+use fleet::{
+    DEFAULT_HOST_CONCURRENCY_CAP, FleetConfig, HostConcurrencyLimiter, HostConcurrencyPermit,
+    default_worker_id,
+};
 use main::{archive_host::parse_and_archive_spooled_repo, fetch_attempt::fetch_one_attempt};
 #[cfg(test)]
 use main::{
@@ -73,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
             max_bytes,
             archive_dir,
             cid_verification_threads,
+            http_protocol,
         } => {
             fetch_one(
                 &did,
@@ -80,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
                 max_bytes,
                 archive_dir,
                 cid_verification_threads,
+                http_protocol,
             )
             .await
         }
@@ -109,7 +114,9 @@ async fn main() -> anyhow::Result<()> {
             max_bytes,
             archive_dir,
             cid_verification_threads,
+            http_protocol,
         } => {
+            validate_fleet_spool_budget(max_inflight_spool_bytes, max_bytes)?;
             let worker_id = default_worker_id(&run_id);
             fleet::run(FleetConfig {
                 dids_file,
@@ -124,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
                 max_bytes,
                 archive_dir,
                 cid_verification_threads,
+                http_protocol,
                 claim_scope: ClaimScope {
                     shard_filter: shard_bucket,
                 },
@@ -138,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
             clickhouse_user,
             clickhouse_password,
             dry_run,
+            derive_ledger_path,
         } => {
             derive_manifest_cmd::run(DeriveManifestConfig {
                 manifest_path,
@@ -147,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
                 clickhouse_user,
                 clickhouse_password,
                 dry_run,
+                derive_ledger_path,
             })
             .await
         }
@@ -166,6 +176,18 @@ fn parse_config_for_threads(cid_verification_threads: usize) -> ParseConfig {
     }
 }
 
+fn validate_fleet_spool_budget(
+    max_inflight_spool_bytes: u64,
+    max_bytes: u64,
+) -> anyhow::Result<()> {
+    if max_inflight_spool_bytes < max_bytes {
+        anyhow::bail!(
+            "--max-inflight-spool-bytes ({max_inflight_spool_bytes}) must be at least --max-bytes ({max_bytes}) so one repo cannot exceed the fleet byte budget"
+        );
+    }
+    Ok(())
+}
+
 /// Resolve a DID to its PDS endpoint.
 ///
 /// Remaining milestone steps build on this: `getRepo` via the `download()` seam over our
@@ -179,6 +201,7 @@ async fn fetch_one(
     max_bytes: u64,
     archive_dir: PathBuf,
     cid_verification_threads: usize,
+    http_protocol: cli::HttpProtocol,
 ) -> anyhow::Result<()> {
     let now = SystemTime::now();
     let ledger = RepoLedgerEntry::pending(did_str);
@@ -192,6 +215,7 @@ async fn fetch_one(
         archive_dir,
         ArchiveCommitContext::fetch_one_local(),
         parse_config_for_threads(cid_verification_threads),
+        http_protocol,
     )
     .await;
     let outcome = result.as_ref().map_or_else(

@@ -16,6 +16,8 @@ pub struct SmokeTelemetry<'a> {
     pub host: Option<&'a str>,
     pub outcome: &'static str,
     pub stage: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pressure_state: Option<&'static str>,
     pub elapsed_ms: u64,
     pub fetch_ms: Option<u64>,
     pub parse_ms: Option<u64>,

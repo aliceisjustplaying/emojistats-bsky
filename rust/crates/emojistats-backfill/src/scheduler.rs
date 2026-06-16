@@ -8,8 +8,6 @@ use std::{
 
 use crate::{ledger::ShardFilter, transport::RateLimitSnapshot};
 
-const LOW_REMAINING_RATIO_DENOMINATOR: u64 = 10;
-
 /// Shared per-host pacing state used by concurrent fleet attempts.
 pub type SharedHostPacer = Arc<Mutex<HostPacer>>;
 
@@ -121,26 +119,12 @@ impl HostPacer {
         let reset = reset_delay(rate_limit.reset?, observed_at)?;
         match rate_limit.remaining {
             Some(0) => Some(reset),
-            Some(remaining) if is_low_remaining(rate_limit.limit, remaining) => reset
+            Some(remaining) => reset
                 .checked_div(u32::try_from(remaining.saturating_add(1)).unwrap_or(u32::MAX))
                 .filter(|delay| !delay.is_zero()),
             _ => None,
         }
     }
-}
-
-fn is_low_remaining(limit: Option<u64>, remaining: u64) -> bool {
-    let Some(limit) = limit else {
-        return false;
-    };
-    if limit == 0 {
-        return false;
-    }
-    let low_watermark = limit
-        .checked_div(LOW_REMAINING_RATIO_DENOMINATOR)
-        .unwrap_or(0)
-        .max(1);
-    remaining <= low_watermark
 }
 
 fn reset_delay(reset: u64, now: SystemTime) -> Option<Duration> {
@@ -248,7 +232,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::duration_suboptimal_units)]
-    fn rate_limit_delay_spreads_low_remaining_across_reset_window() {
+    fn rate_limit_delay_spreads_remaining_across_reset_window() {
         let observed_at = UNIX_EPOCH + Duration::from_secs(1_781_568_000);
         let snapshot = RateLimitSnapshot {
             limit: Some(100),
@@ -265,7 +249,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::duration_suboptimal_units)]
-    fn rate_limit_delay_ignores_non_low_remaining() {
+    fn rate_limit_delay_spreads_high_remaining_across_reset_window() {
         let observed_at = UNIX_EPOCH + Duration::from_secs(1_781_568_000);
         let snapshot = RateLimitSnapshot {
             limit: Some(100),
@@ -274,7 +258,10 @@ mod tests {
             ..RateLimitSnapshot::default()
         };
 
-        assert_eq!(HostPacer::rate_limit_delay(&snapshot, observed_at), None);
+        assert_eq!(
+            HostPacer::rate_limit_delay(&snapshot, observed_at),
+            Some(Duration::new(8, 333_333_333))
+        );
     }
 
     #[test]

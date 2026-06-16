@@ -121,7 +121,7 @@ impl Default for ParseConfig {
 /// Recommended worker count for CAR block CID verification.
 #[must_use]
 pub const fn default_cid_verification_threads() -> usize {
-    1
+    4
 }
 
 /// Commit metadata needed by downstream archive and receipt code.
@@ -170,7 +170,7 @@ pub struct CompletenessProof {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletenessClass {
     /// Complete `CAR` snapshot with content-address verified commit, `MST`, and record links.
-    SnapshotComplete,
+    ContentAddressedSnapshot,
 }
 
 /// Extracted post record plus repo key context.
@@ -525,7 +525,7 @@ where
     let walk_ms = elapsed_millis(walk_started);
 
     let proof = CompletenessProof {
-        class: CompletenessClass::SnapshotComplete,
+        class: CompletenessClass::ContentAddressedSnapshot,
         car_roots: stream_summary
             .roots
             .iter()
@@ -680,8 +680,8 @@ mod tests {
     };
 
     #[test]
-    fn cid_verification_threads_default_to_one() {
-        assert_eq!(default_cid_verification_threads(), 1);
+    fn cid_verification_threads_default_to_bounded_parallelism() {
+        assert_eq!(default_cid_verification_threads(), 4);
     }
 
     #[test]

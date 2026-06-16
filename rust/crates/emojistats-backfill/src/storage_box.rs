@@ -85,6 +85,17 @@ pub trait StorageBoxCommands {
     ///
     /// Returns [`CommandError`] when the underlying remote append command fails.
     fn append(&mut self, remote_path: &str, bytes: &[u8]) -> Result<(), CommandError>;
+
+    /// Return whether a manifest already contains an exact JSONL record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandError`] when the underlying remote read/search command fails.
+    fn contains_manifest_record(
+        &mut self,
+        remote_path: &str,
+        record_without_newline: &[u8],
+    ) -> Result<bool, CommandError>;
 }
 
 /// Remote Storage Box backend using an injectable command executor.
@@ -366,13 +377,7 @@ where
         )?;
 
         let manifest_line = jsonl_bytes("manifest", &entry)?;
-        self.commands
-            .append(&paths.manifest, &manifest_line)
-            .map_err(|source| Error::Command {
-                operation: "append manifest",
-                path: paths.manifest.clone(),
-                source,
-            })?;
+        append_manifest_if_missing(&mut self.commands, &paths.manifest, &manifest_line)?;
 
         Ok(RemoteArtifact {
             remote_object_path: paths.object,
@@ -465,13 +470,7 @@ where
         )?;
 
         let manifest_line = jsonl_bytes("manifest", &entry)?;
-        self.commands
-            .append(&paths.manifest, &manifest_line)
-            .map_err(|source| Error::Command {
-                operation: "append manifest",
-                path: paths.manifest.clone(),
-                source,
-            })?;
+        append_manifest_if_missing(&mut self.commands, &paths.manifest, &manifest_line)?;
 
         Ok(RemoteArtifact {
             remote_object_path: paths.object,
@@ -483,6 +482,53 @@ where
             receipt,
         })
     }
+}
+
+fn append_manifest_if_missing<C>(
+    commands: &mut C,
+    manifest_path: &str,
+    manifest_line: &[u8],
+) -> Result<(), Error>
+where
+    C: StorageBoxCommands,
+{
+    let record = manifest_record_without_newline(manifest_line);
+    if commands
+        .contains_manifest_record(manifest_path, record)
+        .map_err(|source| Error::Command {
+            operation: "check manifest entry",
+            path: manifest_path.to_owned(),
+            source,
+        })?
+    {
+        return Ok(());
+    }
+    commands
+        .append(manifest_path, manifest_line)
+        .map_err(|source| Error::Command {
+            operation: "append manifest",
+            path: manifest_path.to_owned(),
+            source,
+        })?;
+    if commands
+        .contains_manifest_record(manifest_path, record)
+        .map_err(|source| Error::Command {
+            operation: "verify manifest entry",
+            path: manifest_path.to_owned(),
+            source,
+        })?
+    {
+        Ok(())
+    } else {
+        Err(Error::MissingRemoteFile {
+            operation: "verify manifest entry",
+            path: manifest_path.to_owned(),
+        })
+    }
+}
+
+fn manifest_record_without_newline(line: &[u8]) -> &[u8] {
+    line.strip_suffix(b"\n").unwrap_or(line)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
