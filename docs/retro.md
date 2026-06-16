@@ -2266,6 +2266,107 @@ and memory files on pix2 reveals what the ops agent learned through its own lens
   scoping, durable verification, and keeping the dashboard/telemetry truthful across multiple
   runs." This is the sentence the retro has been building toward since the first dashboard lie.
 
+### 2026-06-16 (late) — the 58-finding review, autonomous multi-agent fix sprint, and two bugs the smoke caught
+
+After the second smoke passed all whales, Alice asked the Codex agent for a comprehensive code
+review of the Rust rewrite. It came back with 58 findings across P0/P1/P2 severity levels. Alice's
+response: "how much work to fix p0/p1/p2? and also get files under 1k lines feels like we are
+creating too much spaghetti code?" Then: "two things: 1. do things in parallel when possible 2.
+i'm going to be afk for a few hours so be fully autonomous i'd like this done without any input
+from me."
+
+The agent dispatched four parallel subagents, each owning a slice of the fix list:
+
+- **Subagent 1**: shared post decode module + listRecords parity + malformed core preservation
+- **Subagent 2**: parser split (`parse.rs` 1637 lines → `parse/car.rs` + `parse/mst.rs` +
+  `parse/record.rs`), RAII cleanup for CID verifier workers, duplicate CID counting
+- **Subagent 3**: ledger split (`ledger.rs` ~2200 lines → `ledger/store.rs` + `ledger/codec.rs` +
+  `ledger/tests.rs`), lease-based stale recovery, manifest sequence allocator
+- **Subagent 4**: `storage_box` and `clickhouse` file splits under 1k lines, SSH helper boundary
+  tightening
+
+All four agents experienced compile-blocking interference from each other's concurrent edits — a
+predictable consequence of four agents editing the same Rust crate with no build isolation. Targeted
+tests passed for individual slices before cross-contamination hit. The agent merged the results
+sequentially after all four returned.
+
+Four commits landed on `v2-rust-backfill`:
+
+- `cf84de2` — the hardening checkpoint. Stable content-addressed archive paths (replacing
+  PID/timestamp names that defeated retry idempotency), idempotent receipt/sidecar promotion,
+  derive validates before ClickHouse inserts, all files under 1k lines. 9,709 insertions /
+  7,706 deletions across 37 files — the single largest commit in the rewrite.
+- `9a3c6fa` — `tempfile` crate adoption. Custom temp-name/remove/persist code replaced with
+  `NamedTempFile`/`TempPath`/`persist_noclobber`. Net LOC: 19,457 → 19,443.
+- `4911795` — pipeline hardening. Incremental spool byte reservation (fixing the deadlock below),
+  offset-first CAR indexing, `include!` seams replaced with real Rust modules, profile sidecar
+  failures now fail loudly, Storage Box can commit from file or stream.
+- `9138686` — review regression fixes. Derive memory bounded (no full payload buffering), dedupe
+  token aligned with inserted row identity, visibility narrowed.
+
+**The two bugs the smoke caught.** After the fixes landed, Alice demanded a full regression smoke.
+It found two real bugs:
+
+1. **Byte-budget deadlock.** Multiple large in-flight downloads filled the global byte budget and
+   all blocked mid-stream — none could finish to release budget. The smoke stuck for ~7 minutes
+   before being killed. Fix: switched from pre-reserve-full-cap to incremental per-chunk charging
+   in `transport.rs`. Same failure class as the v1 spool budget — shared resource pools that
+   block on full reservation instead of streaming.
+
+2. **Derive receipt lookup drift.** Archive writes repo receipts as
+   `<artifact-stem>.<receipt-hash>.receipt.json`, but derive looked for
+   `<post-object-stem>.receipt.json`. The path-contract mismatch meant derive couldn't find any
+   receipts. Regression test added at `manifest_derive/tests.rs`.
+
+**Performance profiling proved the regression was environmental.** The post-fix smoke ran in 17:36
+(1056s) vs the pre-fix 13:49 (829s). Rather than assume a code regression, the agent profiled
+the o6g whale (3.96 GB retained CAR) in isolation:
+
+| Configuration | Wall time | Notes |
+|---------------|-----------|-------|
+| Parse-only, threads=1 | 2:42 | index 36.1s, walk 125.9s |
+| Parse-only, threads=8 | 1:57 | index 57.4s, walk 60.1s |
+| Full archive, threads=1 | 2:34 | RSS 1.91 GB |
+| Full archive, threads=8 | 2:59 | RSS 1.92 GB |
+
+threads=1 beat threads=8 on the production archive path by 25 seconds. More threads help parse-only
+(-45s) but hurt the full path due to context-switching overhead on the VPS. The 17:36 vs 13:49
+difference was fleet IO/cache pressure, not a code change. ClickHouse derive remained stable at
+~2:35, 499,535 emoji rows, max RSS 69 MB.
+
+**Three more thermo-nuclear reviews.** Alice ran three independent reviews the same evening:
+
+- **TS backfill review** found host-eligibility gaps: private-PDS blocking bypassed in exact
+  recrawls, `refreshHost()` updating to unusable hosts without policy checks, IPv4-mapped IPv6
+  loopback (`::ffff:127.0.0.1`) classified as public. Architecture recommendation: single
+  host-admission boundary returning `PublicPdsHost | rejection`.
+- **First Rust review** found two blockers: fleet budget (512 MiB) vs per-repo cap (2 GiB) means
+  default settings reject default fetches; CAR parsing allocates full sections before CID handling.
+  Also flagged `include!` as structural debt (already fixed in the hardening sprint).
+- **Second Rust review** found derive payload buffering reintroducing whale-repo OOM risk, dedupe
+  tokens omitting `run_id`/`shard`/`file_sequence` allowing replay miscounts, and
+  `StorageBoxCommands::upload_reader` silently buffering instead of streaming.
+
+A LoC reduction scan also ran: the biggest target is `packages/emoji-normalization/emoji.ts` at
+68,994 generated lines — the real interface is tiny in `emojiNormalization.ts`. The TS backfill
+and archive packages are deletion targets once Rust v2 reaches parity.
+
+**The phase transition.** Alice's final question of the session: "so wahts next? are at the point
+where 'spike works, we can build the backfill-scale one'?" The answer is yes. The Rust spike
+proves the pipeline end-to-end — fetch, parse, MST proof, Parquet archive, receipt, ClickHouse
+derive. What remains is the scale infrastructure around it: Storage Box wiring, census/seed
+generation, shard workers, production observability. The rewrite estimate from the assessment
+phase (5-7 focused days narrow, 8-12 broader) is tracking against actual velocity: ~30 hours from
+design to validated spike, with extensive parallel subagent work.
+
+The `include!` → real modules lesson is worth noting. The agent used `include!` to split large
+files while keeping them in a shared private scope — technically reducing line counts while
+preserving monolithic coupling. Alice's "feels like we are creating too much spaghetti code"
+pushed the fix: real Rust modules with `pub(super)` and `pub(crate)` visibility boundaries.
+The review called `include!` "an architecture smell that looks decomposed but behaves like giant
+modules." The same pattern exists in v1's TS codebase — `verify.ts` at 1,458 lines owns too
+many responsibilities but was never split because v1 was "runs twice and done."
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
