@@ -49,6 +49,35 @@ pub struct ArchivePostRow {
     pub extras_json: serde_json::Value,
 }
 
+/// Incremental hasher for canonical archive post row content.
+#[derive(Debug, Default)]
+pub struct ArchivePostRowsHasher {
+    hasher: Sha256,
+}
+
+impl ArchivePostRowsHasher {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            hasher: Sha256::new(),
+        }
+    }
+
+    /// Add one archive row to the canonical post-row hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArchiveError`] if row content cannot be framed for hashing.
+    pub fn push_row(&mut self, row: &ArchivePostRow) -> Result<(), ArchiveError> {
+        hash_post_row_into(&mut self.hasher, row)
+    }
+
+    #[must_use]
+    pub fn finish(self) -> String {
+        hex::encode(self.hasher.finalize())
+    }
+}
+
 /// Compact local serving projection row derived from an archive row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmojiProjectionRow {
@@ -683,6 +712,20 @@ pub fn read_archive_post_rows(path: &Path) -> Result<Vec<ArchivePostRow>, Archiv
     for batch in reader {
         append_archive_rows_from_batch(&mut rows, &batch?)?;
     }
+    Ok(rows)
+}
+
+/// Decode one `Parquet` record batch into archive rows.
+///
+/// # Errors
+///
+/// Returns [`ArchiveError`] when the batch does not match the archive schema or JSON fields
+/// cannot be decoded.
+pub fn archive_post_rows_from_record_batch(
+    batch: &RecordBatch,
+) -> Result<Vec<ArchivePostRow>, ArchiveError> {
+    let mut rows = Vec::with_capacity(batch.num_rows());
+    append_archive_rows_from_batch(&mut rows, batch)?;
     Ok(rows)
 }
 

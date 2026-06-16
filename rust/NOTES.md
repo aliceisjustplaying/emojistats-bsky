@@ -43,11 +43,10 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   `force_mode = list_records` currently stops loudly because the `listRecords` fetch lane is
   not implemented yet.
 - `derive-manifest <manifest.jsonl>` verifies committed raw archive manifest entries,
-  reloads local `Parquet` archive rows, builds `ClickHouseDeriveBatch` values, formats
-  `JSONEachRow` payloads, and inserts them into `ClickHouse` with existing dedupe tokens.
-  `--dry-run` validates and counts payloads without sending inserts. It is still not
-  whale-safe: the scale smoke had to stop `lb7` derive at 7.99 GiB max RSS, so the next
-  required fix is streaming `Parquet` derive + bounded `ClickHouse` insert chunks.
+  streams local `Parquet` archive rows in bounded batches, validates row hashes/counts against
+  adjacent receipts, formats bounded `JSONEachRow` payloads, and inserts them into
+  `ClickHouse` with chunk-stable dedupe tokens. `--dry-run` validates and counts payloads
+  without sending inserts.
 - `clickhouse-schema --clickhouse-database <db>` prints the v2 `ClickHouse` schema SQL.
   Smoke bootstrap on this host created `emojistats_smoke` through `clickhouse-smoke.service`
   (`HTTP 18123`, native `19000`) and verified `v2_emoji_serving` plus
@@ -72,6 +71,11 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   posts, 463,413 emoji rows, 135.7s parse, 629 MiB telemetry RSS. `lb7` parsed 2,523,977
   posts in 79.4s at 237 MiB telemetry RSS. No stale `*.tmp.*` artifacts remained after the
   fixed run.
+- ClickHouse derive over those 16 successful manifests now streams successfully: 73 payloads,
+  464,182 inserted rows, max derive RSS 49,928 KiB (`4hm`) and 35,644 KiB (`lb7`). Smoke
+  tables contained 464,166 emoji rows and 16 total-post counters; counter sums matched the
+  archive receipts at 5,125,748 posts, 342,441 posts with emoji, and 491,357 emoji
+  occurrences.
 - Jacquard 0.12.0 via **fork-mirror git deps**: `github.com/aliceisjustplaying/jacquard`
   @ `39648622522fa62c4c0b12ac22b8a5f6893c845a` (== tag 0.12.0). reqwest pulls **rustls**
   (no openssl). Full 0.12.0 source also at `/tmp/jacquard` for reading (ephemeral).
@@ -100,9 +104,8 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   and the `listRecords` fallback lane for hosts forced away from `getRepo`.
 - Wire remaining archive artifacts through the committed-artifact protocol, then configure
   the `storage_box.rs` `ssh` transport for the real Storage Box.
-- Make `derive-manifest` whale-safe: stream `Parquet` batches, validate row hashes
-  incrementally, and insert bounded `ClickHouse` chunks. The current archive/fleet path scales
-  on the smoke set; the derive path does not.
+- Add durable derive progress/attempt telemetry and resumable per-manifest chunk status so a
+  process crash can replay only uncertain ClickHouse chunks with the same dedupe tokens.
 - Finish emoji normalization parity with the TypeScript data tables, then add WASM bindings
   before the browser/server serving path depends on it.
 - Wire derive/ClickHouse ingest from committed manifest entries, then run the stratified

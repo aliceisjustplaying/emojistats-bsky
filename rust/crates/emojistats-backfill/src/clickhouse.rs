@@ -8,7 +8,10 @@ use serde::Serialize;
 
 use crate::{
     archive::EmojiProjectionRow,
-    derive::{BACKFILL_DERIVE_SOURCE, ClickHouseDeriveBatch, TotalPostCounterInput},
+    derive::{
+        BACKFILL_DERIVE_SOURCE, ClickHouseDeriveBatch, DeriveManifestIdentity,
+        TotalPostCounterInput,
+    },
 };
 
 /// `ClickHouse` HTTP insert format used by the derive lane.
@@ -434,17 +437,33 @@ pub fn derive_insert_payloads(
 pub fn emoji_serving_insert_payload(
     batch: &ClickHouseDeriveBatch,
 ) -> Result<ClickHouseInsertPayload, ClickHouseSchemaError> {
-    let rows = batch
-        .emoji_rows
+    emoji_serving_rows_insert_payload(
+        &batch.manifest_identity,
+        &batch.emoji_rows,
+        batch.dedupe_token.clone(),
+    )
+}
+
+/// Format a bounded chunk of emoji serving rows as a `ClickHouse` `JSONEachRow` insert payload.
+///
+/// # Errors
+///
+/// Returns [`ClickHouseSchemaError`] if `JSONEachRow` serialization fails.
+pub fn emoji_serving_rows_insert_payload(
+    identity: &DeriveManifestIdentity,
+    emoji_rows: &[EmojiProjectionRow],
+    dedupe_token: String,
+) -> Result<ClickHouseInsertPayload, ClickHouseSchemaError> {
+    let rows = emoji_rows
         .iter()
-        .map(|row| EmojiServingInsertRow::from_projection(row, batch))
+        .map(|row| EmojiServingInsertRow::from_projection(row, identity))
         .collect::<Vec<_>>();
     Ok(ClickHouseInsertPayload {
         table: ClickHouseTable::EmojiServing,
         format: JSON_EACH_ROW_FORMAT,
         body: json_each_row(&rows)?,
         row_count: rows.len(),
-        dedupe_token: batch.dedupe_token.clone(),
+        dedupe_token,
     })
 }
 
@@ -456,13 +475,28 @@ pub fn emoji_serving_insert_payload(
 pub fn total_post_counter_insert_payload(
     batch: &ClickHouseDeriveBatch,
 ) -> Result<ClickHouseInsertPayload, ClickHouseSchemaError> {
-    let row = TotalPostCounterInsertRow::from_counter(&batch.total_post_counter);
+    total_post_counter_insert_payload_for_counter(
+        &batch.total_post_counter,
+        batch.dedupe_token.clone(),
+    )
+}
+
+/// Format one total-post counter as a `ClickHouse` `JSONEachRow` insert payload.
+///
+/// # Errors
+///
+/// Returns [`ClickHouseSchemaError`] if `JSONEachRow` serialization fails.
+pub fn total_post_counter_insert_payload_for_counter(
+    counter: &TotalPostCounterInput,
+    dedupe_token: String,
+) -> Result<ClickHouseInsertPayload, ClickHouseSchemaError> {
+    let row = TotalPostCounterInsertRow::from_counter(counter);
     Ok(ClickHouseInsertPayload {
         table: ClickHouseTable::TotalPostCounter,
         format: JSON_EACH_ROW_FORMAT,
         body: json_each_row(&[row])?,
         row_count: 1,
-        dedupe_token: batch.dedupe_token.clone(),
+        dedupe_token,
     })
 }
 
@@ -565,13 +599,13 @@ struct EmojiServingInsertRow<'a> {
 }
 
 impl<'a> EmojiServingInsertRow<'a> {
-    fn from_projection(row: &'a EmojiProjectionRow, batch: &'a ClickHouseDeriveBatch) -> Self {
+    fn from_projection(row: &'a EmojiProjectionRow, identity: &'a DeriveManifestIdentity) -> Self {
         Self {
             src: BACKFILL_DERIVE_SOURCE,
-            run_id: batch.manifest_identity.run_id.as_str(),
-            shard: batch.manifest_identity.shard.as_str(),
-            file_sequence: batch.manifest_identity.file_sequence,
-            receipt_hash: batch.manifest_identity.receipt_hash.as_str(),
+            run_id: identity.run_id.as_str(),
+            shard: identity.shard.as_str(),
+            file_sequence: identity.file_sequence,
+            receipt_hash: identity.receipt_hash.as_str(),
             did: row.did.as_str(),
             rkey: row.rkey.as_str(),
             created_at: row.created_at_normalized.as_deref(),

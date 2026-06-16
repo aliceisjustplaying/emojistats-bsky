@@ -30,6 +30,15 @@ pub struct LoaderInput {
     pub identity: DeriveManifestIdentity,
 }
 
+/// Verified committed archive input ready for streaming derive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedLoaderInput {
+    pub manifest: LocalManifestEntry,
+    pub identity: DeriveManifestIdentity,
+    pub object_path: PathBuf,
+    pub repo_receipt: Option<RepoReceipt>,
+}
+
 /// Result of reading a mixed committed manifest stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
@@ -227,6 +236,40 @@ pub fn load_verified_clickhouse_batch(
         manifest: &input.manifest,
         archive_rows: &archive_rows,
     })?)
+}
+
+/// Verify a committed manifest entry without materializing archive rows.
+///
+/// The object bytes and SHA-256 are verified against the manifest, adjacent object receipts are
+/// checked when present, and the adjacent repo receipt is returned for streaming row validation.
+///
+/// # Errors
+///
+/// Returns [`Error`] when the object is missing, a digest/receipt disagrees, or the local path
+/// escapes the archive root.
+pub fn verify_loader_input_for_streaming(
+    archive_root: &Path,
+    input: &LoaderInput,
+) -> Result<VerifiedLoaderInput, Error> {
+    let object_path = resolve_local_path(archive_root, &input.manifest.local_path)?;
+    let digest = hash_file(&object_path)?;
+    validate_object_digest(&object_path, &input.manifest, &digest)?;
+
+    if let Some(receipt_path) = first_existing_path(object_receipt_candidates(&object_path)) {
+        let receipt = read_receipt::<Receipt>(&receipt_path)?;
+        validate_object_receipt(&receipt_path, &input.manifest, &receipt)?;
+    }
+
+    let repo_receipt = first_existing_path(repo_receipt_candidates(&object_path))
+        .map(|receipt_path| read_receipt::<RepoReceipt>(&receipt_path))
+        .transpose()?;
+
+    Ok(VerifiedLoaderInput {
+        manifest: input.manifest.clone(),
+        identity: input.identity.clone(),
+        object_path,
+        repo_receipt,
+    })
 }
 
 /// Verify every loader input and build its `ClickHouse` derive batch.

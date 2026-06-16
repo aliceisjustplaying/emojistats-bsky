@@ -170,6 +170,17 @@ fn derive_emoji_projection_rows(
 }
 
 fn emoji_projection_rows(row: &ArchivePostRow) -> Result<Vec<EmojiProjectionRow>, DeriveError> {
+    emoji_projection_rows_for_post(row)
+}
+
+/// Derive compact emoji projection rows for one archive post row.
+///
+/// # Errors
+///
+/// Returns [`DeriveError`] if occurrence counters overflow.
+pub fn emoji_projection_rows_for_post(
+    row: &ArchivePostRow,
+) -> Result<Vec<EmojiProjectionRow>, DeriveError> {
     let mut rows = Vec::new();
     for emoji in &row.emoji_sequence {
         if let Some(existing) = rows
