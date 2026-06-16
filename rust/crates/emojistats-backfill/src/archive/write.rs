@@ -288,8 +288,8 @@ pub fn write_archive_artifacts(
 /// Streaming writer for one repo's archive artifacts.
 pub struct StreamingArchiveSink {
     output_dir: PathBuf,
-    parquet_temp_path: PathBuf,
-    emoji_projection_temp_path: PathBuf,
+    parquet_temp_path: TempPath,
+    emoji_projection_temp_path: TempPath,
     writer: Option<ArrowWriter<File>>,
     schema: Arc<Schema>,
     batch: Vec<ArchivePostRow>,
@@ -336,15 +336,12 @@ impl StreamingArchiveSink {
         commit_context: ArchiveCommitContext,
     ) -> Result<Self, ArchiveError> {
         fs::create_dir_all(output_dir)?;
-        let artifact_stem = attempt_file_stem(did);
-        let parquet_path = output_dir.join(format!("{artifact_stem}.posts.parquet"));
-        let parquet_temp_path = temp_path_for(&parquet_path)?;
-        let emoji_projection_path = output_dir.join(format!("{artifact_stem}.emoji.jsonl"));
-        let emoji_projection_temp_path = temp_path_for(&emoji_projection_path)?;
-        remove_if_exists(&parquet_temp_path)?;
-        remove_if_exists(&emoji_projection_temp_path)?;
-        let parquet_file = File::create(&parquet_temp_path)?;
-        let emoji_file = File::create(&emoji_projection_temp_path)?;
+        let parquet_temp = NamedTempFile::new_in(output_dir)?;
+        let emoji_projection_temp = NamedTempFile::new_in(output_dir)?;
+        let parquet_file = parquet_temp.reopen()?;
+        let emoji_file = emoji_projection_temp.reopen()?;
+        let parquet_temp_path = parquet_temp.into_temp_path();
+        let emoji_projection_temp_path = emoji_projection_temp.into_temp_path();
         let schema = archive_schema();
         let normalizer = current_normalizer();
         let writer = ArrowWriter::try_new(
@@ -507,7 +504,7 @@ impl StreamingArchiveSink {
             &receipt.emoji_projection_hash,
         );
         let emoji_projection_path = self.output_dir.join(format!("{emoji_stem}.emoji.jsonl"));
-        promote_temp_idempotent(&self.emoji_projection_temp_path, &emoji_projection_path)?;
+        promote_temp_idempotent(self.emoji_projection_temp_path.as_ref(), &emoji_projection_path)?;
         let manifest = local_manifest_from_committed(&committed_posts, &receipt);
         let committed_profile = self.commit_profile(profile, &receipt, &receipt_hash);
         let artifacts = self.into_artifacts(
@@ -569,7 +566,7 @@ impl StreamingArchiveSink {
             manifest_mode: ManifestMode::AppendJsonl,
             metadata: self.streaming_posts_metadata(receipt_hash),
         };
-        Ok(store.commit_prepared_temp(&request, &self.parquet_temp_path)?)
+        Ok(store.commit_prepared_temp(&request, self.parquet_temp_path.as_ref())?)
     }
 
     fn streaming_posts_metadata(&self, receipt_hash: &str) -> Metadata {
@@ -662,7 +659,5 @@ impl StreamingArchiveSink {
 impl Drop for StreamingArchiveSink {
     fn drop(&mut self) {
         self.writer.take();
-        let _ignored = fs::remove_file(&self.parquet_temp_path);
-        let _ignored = fs::remove_file(&self.emoji_projection_temp_path);
     }
 }

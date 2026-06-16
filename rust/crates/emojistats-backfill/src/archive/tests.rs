@@ -105,8 +105,8 @@ fn unfinished_streaming_sink_removes_temp_files_on_drop() {
         ArchiveCommitContext::fetch_one_local(),
     )
     .expect("create sink");
-    let parquet_temp = sink.parquet_temp_path.clone();
-    let emoji_temp = sink.emoji_projection_temp_path.clone();
+    let parquet_temp = sink.parquet_temp_path.to_path_buf();
+    let emoji_temp = sink.emoji_projection_temp_path.to_path_buf();
     assert!(parquet_temp.exists(), "{}", parquet_temp.display());
     assert!(emoji_temp.exists(), "{}", emoji_temp.display());
     drop(sink);

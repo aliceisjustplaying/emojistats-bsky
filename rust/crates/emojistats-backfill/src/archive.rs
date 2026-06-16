@@ -8,7 +8,6 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, builder::StringBuilder};
@@ -22,6 +21,7 @@ use parquet::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tempfile::{NamedTempFile, TempPath};
 
 use crate::{
     commit::{LocalStore, ManifestMode, Metadata, Request},
@@ -323,19 +323,39 @@ fn write_temp_idempotent<F>(path: &Path, write: F) -> Result<(), ArchiveError>
 where
     F: FnOnce(&Path) -> Result<(), ArchiveError>,
 {
-    let temp_path = temp_path_for(path)?;
-    if temp_path.try_exists()? {
-        fs::remove_file(&temp_path)?;
-    }
-    match write(&temp_path) {
+    let parent = path.parent().ok_or_else(|| ArchiveError::InvalidPath {
+        path: path.to_path_buf(),
+    })?;
+    let temp_file = NamedTempFile::new_in(parent).map_err(ArchiveError::Io)?;
+    match write(temp_file.path()) {
         Ok(()) => {
-            sync_file(&temp_path)?;
-            promote_temp_idempotent(&temp_path, path)
+            sync_file(temp_file.path())?;
+            promote_named_temp_idempotent(temp_file, path)
         }
-        Err(error) => {
-            let _ignored = fs::remove_file(&temp_path);
-            Err(error)
+        Err(error) => Err(error),
+    }
+}
+
+fn promote_named_temp_idempotent(
+    temp_file: NamedTempFile,
+    path: &Path,
+) -> Result<(), ArchiveError> {
+    let temp_digest = hash_file_for_archive(temp_file.path())?;
+    match temp_file.persist_noclobber(path) {
+        Ok(_file) => sync_parent_dir(path),
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+            let final_digest = hash_file_for_archive(path)?;
+            if final_digest.sha256 != temp_digest.sha256 || final_digest.bytes != temp_digest.bytes
+            {
+                return Err(ArchiveError::FinalHashMismatch {
+                    path: path.to_path_buf(),
+                    expected: temp_digest.sha256,
+                    observed: final_digest.sha256,
+                });
+            }
+            Ok(())
         }
+        Err(error) => Err(ArchiveError::Io(error.error)),
     }
 }
 
@@ -361,16 +381,6 @@ fn promote_temp_idempotent(temp_path: &Path, path: &Path) -> Result<(), ArchiveE
         }
         Err(error) => Err(ArchiveError::Io(error)),
     }
-}
-
-fn temp_path_for(path: &Path) -> Result<PathBuf, ArchiveError> {
-    let file_name = path
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .ok_or_else(|| ArchiveError::InvalidPath {
-            path: path.to_path_buf(),
-        })?;
-    Ok(path.with_file_name(format!("{file_name}.tmp.{}", std::process::id())))
 }
 
 fn sync_file(path: &Path) -> Result<(), ArchiveError> {

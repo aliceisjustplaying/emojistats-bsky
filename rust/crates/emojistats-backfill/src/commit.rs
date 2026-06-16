@@ -6,11 +6,12 @@ use std::{
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tempfile::NamedTempFile;
 
 use crate::archive::NormalizerVersion;
 
@@ -374,20 +375,64 @@ fn write_temp_promote_file<F>(
 where
     F: FnOnce(&mut File) -> Result<(), Error>,
 {
-    let temp_path = temp_path_for(path, kind)?;
-    remove_stale_temp(&temp_path)?;
-    let result = (|| {
-        let mut file = File::create(&temp_path).map_err(|source| Error::Io {
-            operation: "create temp file",
-            path: temp_path.clone(),
-            source,
-        })?;
-        write(&mut file)?;
-        drop(file);
-        promote_prepared_file(&temp_path, path, kind)
-    })();
-    let _ignored = fs::remove_file(&temp_path);
-    result
+    let parent = path.parent().ok_or_else(|| Error::MissingFileName {
+        kind,
+        path: path.to_path_buf(),
+    })?;
+    let mut temp_file = NamedTempFile::new_in(parent).map_err(|source| Error::Io {
+        operation: "create temp file",
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    write(temp_file.as_file_mut())?;
+    promote_named_temp_file(temp_file, path, kind)
+}
+
+fn promote_named_temp_file(
+    temp_file: NamedTempFile,
+    path: &Path,
+    kind: &'static str,
+) -> Result<ObjectCommitState, Error> {
+    temp_file.as_file().sync_all().map_err(|source| Error::Io {
+        operation: "fsync temp file",
+        path: temp_file.path().to_path_buf(),
+        source,
+    })?;
+    let temp_digest = hash_file(temp_file.path())?;
+    match temp_file.persist_noclobber(path) {
+        Ok(_file) => {}
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+            let final_digest = hash_file(path)?;
+            if final_digest.sha256 == temp_digest.sha256 && final_digest.bytes == temp_digest.bytes
+            {
+                return Ok(ObjectCommitState::AlreadyCommitted(final_digest));
+            }
+            return Err(Error::FinalHashMismatch {
+                kind,
+                path: path.to_path_buf(),
+                expected: temp_digest.sha256,
+                observed: final_digest.sha256,
+            });
+        }
+        Err(error) => {
+            return Err(Error::Io {
+                operation: "promote temp file without overwrite",
+                path: path.to_path_buf(),
+                source: error.error,
+            });
+        }
+    }
+    let final_digest = hash_file(path)?;
+    if final_digest.sha256 != temp_digest.sha256 || final_digest.bytes != temp_digest.bytes {
+        return Err(Error::FinalHashMismatch {
+            kind,
+            path: path.to_path_buf(),
+            expected: temp_digest.sha256,
+            observed: final_digest.sha256,
+        });
+    }
+    sync_parent_dir(path, kind)?;
+    Ok(ObjectCommitState::Promoted(final_digest))
 }
 
 fn promote_prepared_file(
@@ -694,18 +739,6 @@ fn promote_no_overwrite(temp_path: &Path, path: &Path, kind: &'static str) -> Re
     sync_parent_dir(path, kind)
 }
 
-fn remove_stale_temp(path: &Path) -> Result<(), Error> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(Error::Io {
-            operation: "remove stale temp file",
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
-}
-
 fn hash_file(path: &Path) -> Result<DigestResult, Error> {
     let mut file = File::open(path).map_err(|source| Error::Io {
         operation: "open final object for hashing",
@@ -768,24 +801,6 @@ fn sync_parent_dir(path: &Path, kind: &'static str) -> Result<(), Error> {
             path: parent.to_path_buf(),
             source,
         })
-}
-
-fn temp_path_for(path: &Path, kind: &'static str) -> Result<PathBuf, Error> {
-    let file_name =
-        path.file_name()
-            .and_then(OsStr::to_str)
-            .ok_or_else(|| Error::MissingFileName {
-                kind,
-                path: path.to_path_buf(),
-            })?;
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    Ok(path.with_file_name(format!(
-        "{file_name}.tmp.{}.{}",
-        std::process::id(),
-        timestamp
-    )))
 }
 
 fn manifest_path_string(kind: &'static str, path: &Path) -> Result<String, Error> {

@@ -3,7 +3,7 @@
 use std::{
     error::Error,
     fmt,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -21,6 +21,7 @@ use jacquard_common::{
     xrpc::XrpcExt as _,
 };
 use serde::{Deserialize, Serialize};
+use tempfile::NamedTempFile;
 use tokio::{sync::Notify, time};
 
 const DEFAULT_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -484,38 +485,41 @@ async fn stream_to_file(
     max_bytes: u64,
     byte_budget: Option<&FetchByteBudget>,
 ) -> Result<(u64, Option<FetchByteBudgetReservation>), FetchError> {
-    let temp_path = temp_spool_path(car_path)?;
+    let parent = car_path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "spool path has no parent"))?;
+    let mut temp_file = NamedTempFile::new_in(parent)?;
     let mut reservation = byte_budget.map(FetchByteBudget::reservation);
     if let Some(reservation) = &mut reservation {
         reservation.reserve_capacity(max_bytes).await?;
     }
-    match stream_to_temp_file(body, &temp_path, chunk_idle_timeout, max_bytes).await {
+    match stream_to_temp_file(body, temp_file.as_file_mut(), chunk_idle_timeout, max_bytes).await {
         Ok(bytes) => {
             if let Some(reservation) = &mut reservation {
                 reservation.shrink_to_completed(bytes);
             }
-            fs::hard_link(&temp_path, car_path)?;
-            let _ignored = fs::remove_file(&temp_path);
+            temp_file.persist_noclobber(car_path).map_err(|error| {
+                io::Error::new(
+                    error.error.kind(),
+                    format!(
+                        "persist spooled temp file without overwrite: {}",
+                        error.error
+                    ),
+                )
+            })?;
             sync_parent_dir(car_path)?;
             Ok((bytes, reservation))
         }
-        Err(error) => {
-            let _ignored = fs::remove_file(&temp_path);
-            Err(error)
-        }
+        Err(error) => Err(error),
     }
 }
 
 async fn stream_to_temp_file(
     body: ByteStream,
-    temp_path: &Path,
+    file: &mut File,
     chunk_idle_timeout: Duration,
     max_bytes: u64,
 ) -> Result<u64, FetchError> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(temp_path)?;
     let mut bytes = 0_u64;
     let mut stream = body.into_inner();
 
@@ -552,24 +556,6 @@ async fn stream_to_temp_file(
 
     file.sync_all()?;
     Ok(bytes)
-}
-
-fn temp_spool_path(car_path: &Path) -> Result<PathBuf, FetchError> {
-    let file_name = car_path
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "spool path has no file name")
-        })?;
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| io::Error::other(format!("system clock before UNIX epoch: {error}")))?;
-    let temp_name = format!(
-        ".{file_name}.{}.{}.tmp",
-        std::process::id(),
-        timestamp.as_nanos()
-    );
-    Ok(car_path.with_file_name(temp_name))
 }
 
 fn sync_parent_dir(path: &Path) -> Result<(), FetchError> {

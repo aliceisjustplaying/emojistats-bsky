@@ -552,13 +552,6 @@ fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), Archive
     Ok(())
 }
 
-fn remove_if_exists(path: &Path) -> Result<(), ArchiveError> {
-    if path.try_exists()? {
-        fs::remove_file(path)?;
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ArchiveFileDigest {
     bytes: u64,
@@ -622,18 +615,6 @@ fn max_created_at(rows: &[ArchivePostRow]) -> Option<String> {
         .filter_map(|row| row.created_at_normalized.as_deref())
         .max()
         .map(ToOwned::to_owned)
-}
-
-fn attempt_file_stem(value: &str) -> String {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    format!(
-        "{}.{}.{}",
-        safe_file_component(value),
-        std::process::id(),
-        timestamp
-    )
 }
 
 fn stable_artifact_stem(did: &str, dataset: &str, content_hash: &str) -> String {
@@ -785,4 +766,3 @@ fn insert_extra_data_json<T: Serialize>(
     }
     Ok(())
 }
-
