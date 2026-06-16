@@ -1,9 +1,10 @@
 //! Storage Box-shaped remote commit protocol skeleton.
 
 use std::{
-    io::Write,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -60,7 +61,7 @@ pub trait StorageBoxCommands {
         max_bytes: usize,
     ) -> Result<Option<Vec<u8>>, CommandError>;
 
-    /// Atomically move a verified temp file to its final path.
+    /// Atomically promote a verified temp file to its final path without overwriting a final file.
     ///
     /// # Errors
     ///
@@ -183,6 +184,9 @@ pub enum Error {
         expected: String,
         actual: String,
     },
+    /// A final path already exists with different content.
+    #[error("remote final path already exists with different content for {path}: {reason}")]
+    FinalExistsConflict { path: String, reason: String },
     /// Uploaded remote readback prefix did not match the local source.
     #[error("remote readback mismatch for {path}")]
     VerifyReadbackMismatch { path: String },
@@ -233,29 +237,28 @@ impl SshStorageBoxCommands {
         Self { config }
     }
 
-    fn upload_command(&self, remote_path: &str, bytes: &[u8]) -> Result<CommandSpec, CommandError> {
+    fn upload_command(&self, remote_path: &str) -> Result<CommandSpec, CommandError> {
         let parent = remote_parent(remote_path)?;
         let script = format!(
             "umask 077; mkdir -p -- {}; cat > {}",
             shell_quote(&parent),
             shell_quote(remote_path)
         );
-        self.config
-            .ssh_command("upload", script, Some(bytes.to_vec()))
+        self.config.ssh_command("upload", script, true)
     }
 
     fn stat_len_command(&self, remote_path: &str) -> Result<CommandSpec, CommandError> {
         validate_remote_path(remote_path)?;
         let path = shell_quote(remote_path);
         let script = format!("if [ -e {path} ]; then wc -c < {path}; fi");
-        self.config.ssh_command("stat", script, None)
+        self.config.ssh_command("stat", script, false)
     }
 
     fn sha256_command(&self, remote_path: &str) -> Result<CommandSpec, CommandError> {
         validate_remote_path(remote_path)?;
         let path = shell_quote(remote_path);
         let script = format!("if [ -e {path} ]; then sha256sum -- {path} | awk '{{print $1}}'; fi");
-        self.config.ssh_command("sha256", script, None)
+        self.config.ssh_command("sha256", script, false)
     }
 
     fn read_prefix_command(
@@ -268,40 +271,48 @@ impl SshStorageBoxCommands {
         let script = format!(
             "if [ -e {path} ]; then printf 'present\\n'; head -c {max_bytes} -- {path}; else printf 'absent\\n'; fi"
         );
-        self.config.ssh_command("read_prefix", script, None)
+        self.config.ssh_command("read_prefix", script, false)
     }
 
     fn rename_command(&self, from: &str, to: &str) -> Result<CommandSpec, CommandError> {
         validate_remote_path(from)?;
         let parent = remote_parent(to)?;
         let script = format!(
-            "mkdir -p -- {}; mv -f -- {} {}",
+            "mkdir -p -- {}; if [ -e {} ]; then printf '%s\\n' {}; exit 17; fi; mv -n -- {} {}; if [ -e {} ]; then printf '%s\\n' {}; exit 17; fi",
             shell_quote(&parent),
+            shell_quote(to),
+            shell_quote(&format!("final path already exists: {to}")),
             shell_quote(from),
-            shell_quote(to)
+            shell_quote(to),
+            shell_quote(from),
+            shell_quote(&format!("final path appeared during promotion: {to}"))
         );
-        self.config.ssh_command("rename", script, None)
+        self.config.ssh_command("rename", script, false)
     }
 
-    fn append_command(&self, remote_path: &str, bytes: &[u8]) -> Result<CommandSpec, CommandError> {
+    fn append_command(&self, remote_path: &str) -> Result<CommandSpec, CommandError> {
         let parent = remote_parent(remote_path)?;
+        let lock_path = format!("{remote_path}.lock");
         let script = format!(
-            "umask 077; mkdir -p -- {}; cat >> {}",
+            "umask 077; mkdir -p -- {}; touch -- {}; flock -- {} sh -c 'cat >> \"$1\"' sh {}",
             shell_quote(&parent),
+            shell_quote(&lock_path),
+            shell_quote(&lock_path),
             shell_quote(remote_path)
         );
-        self.config
-            .ssh_command("append", script, Some(bytes.to_vec()))
+        self.config.ssh_command("append", script, true)
     }
 }
 
 impl StorageBoxCommands for SshStorageBoxCommands {
     fn upload(&mut self, remote_path: &str, bytes: &[u8]) -> Result<(), CommandError> {
-        run_command(self.upload_command(remote_path, bytes)?).map(|_stdout| ())
+        let command = self.upload_command(remote_path)?;
+        run_command(&command, Some(bytes)).map(|_stdout| ())
     }
 
     fn stat_len(&mut self, remote_path: &str) -> Result<Option<u64>, CommandError> {
-        let stdout = run_command(self.stat_len_command(remote_path)?)?;
+        let command = self.stat_len_command(remote_path)?;
+        let stdout = run_command(&command, None)?;
         let text = std::str::from_utf8(&stdout)
             .map_err(|error| CommandError::new(format!("stat output was not UTF-8: {error}")))?;
         let trimmed = text.trim();
@@ -314,7 +325,8 @@ impl StorageBoxCommands for SshStorageBoxCommands {
     }
 
     fn sha256(&mut self, remote_path: &str) -> Result<Option<String>, CommandError> {
-        let stdout = run_command(self.sha256_command(remote_path)?)?;
+        let command = self.sha256_command(remote_path)?;
+        let stdout = run_command(&command, None)?;
         let text = std::str::from_utf8(&stdout)
             .map_err(|error| CommandError::new(format!("sha256 output was not UTF-8: {error}")))?;
         let trimmed = text.trim();
@@ -330,7 +342,8 @@ impl StorageBoxCommands for SshStorageBoxCommands {
         remote_path: &str,
         max_bytes: usize,
     ) -> Result<Option<Vec<u8>>, CommandError> {
-        let stdout = run_command(self.read_prefix_command(remote_path, max_bytes)?)?;
+        let command = self.read_prefix_command(remote_path, max_bytes)?;
+        let stdout = run_command(&command, None)?;
         stdout.strip_prefix(b"present\n").map_or_else(
             || {
                 if stdout == b"absent\n" {
@@ -346,11 +359,13 @@ impl StorageBoxCommands for SshStorageBoxCommands {
     }
 
     fn rename(&mut self, from: &str, to: &str) -> Result<(), CommandError> {
-        run_command(self.rename_command(from, to)?).map(|_stdout| ())
+        let command = self.rename_command(from, to)?;
+        run_command(&command, None).map(|_stdout| ())
     }
 
     fn append(&mut self, remote_path: &str, bytes: &[u8]) -> Result<(), CommandError> {
-        run_command(self.append_command(remote_path, bytes)?).map(|_stdout| ())
+        let command = self.append_command(remote_path)?;
+        run_command(&command, Some(bytes)).map(|_stdout| ())
     }
 }
 
@@ -377,7 +392,7 @@ struct CommandSpec {
     operation: &'static str,
     program: PathBuf,
     args: Vec<String>,
-    stdin: Option<Vec<u8>>,
+    stdin: bool,
 }
 
 impl StorageBoxSshConfig {
@@ -385,7 +400,7 @@ impl StorageBoxSshConfig {
         &self,
         operation: &'static str,
         script: String,
-        stdin: Option<Vec<u8>>,
+        stdin: bool,
     ) -> Result<CommandSpec, CommandError> {
         validate_remote(&self.remote)?;
         let mut args = self.ssh_args.clone();
@@ -400,10 +415,10 @@ impl StorageBoxSshConfig {
     }
 }
 
-fn run_command(spec: CommandSpec) -> Result<Vec<u8>, CommandError> {
+fn run_command(spec: &CommandSpec, stdin_bytes: Option<&[u8]>) -> Result<Vec<u8>, CommandError> {
     let mut command = ProcessCommand::new(&spec.program);
     command.args(&spec.args);
-    if spec.stdin.is_some() {
+    if spec.stdin || stdin_bytes.is_some() {
         command.stdin(Stdio::piped());
     }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -411,28 +426,78 @@ fn run_command(spec: CommandSpec) -> Result<Vec<u8>, CommandError> {
     let mut child = command
         .spawn()
         .map_err(|error| CommandError::new(format!("{} spawn failed: {error}", spec.operation)))?;
-    if let Some(stdin_bytes) = spec.stdin {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CommandError::new(format!("{} stdout was not available", spec.operation)))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| CommandError::new(format!("{} stderr was not available", spec.operation)))?;
+    let stdout_reader = read_pipe(spec.operation, "stdout", stdout);
+    let stderr_reader = read_pipe(spec.operation, "stderr", stderr);
+
+    let stdin_error = if let Some(stdin_bytes) = stdin_bytes {
         let mut stdin = child.stdin.take().ok_or_else(|| {
             CommandError::new(format!("{} stdin was not available", spec.operation))
         })?;
-        stdin.write_all(&stdin_bytes).map_err(|error| {
-            CommandError::new(format!("{} stdin write failed: {error}", spec.operation))
-        })?;
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|error| CommandError::new(format!("{} wait failed: {error}", spec.operation)))?;
-    if output.status.success() {
-        Ok(output.stdout)
+        let result = stdin.write_all(stdin_bytes);
+        drop(stdin);
+        result.err()
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        None
+    };
+
+    let status = child
+        .wait()
+        .map_err(|error| CommandError::new(format!("{} wait failed: {error}", spec.operation)))?;
+    let stdout = join_pipe_reader(spec.operation, "stdout", stdout_reader)?;
+    let stderr = join_pipe_reader(spec.operation, "stderr", stderr_reader)?;
+    if status.success() {
+        stdin_error.map_or(Ok(stdout), |error| {
+            Err(CommandError::new(format!(
+                "{} stdin write failed: {error}",
+                spec.operation
+            )))
+        })
+    } else {
+        let stderr = String::from_utf8_lossy(&stderr);
         Err(CommandError::new(format!(
             "{} exited with {}: {}",
             spec.operation,
-            output.status,
+            status,
             stderr.trim()
         )))
     }
+}
+
+fn read_pipe<R>(
+    operation: &'static str,
+    stream_name: &'static str,
+    mut reader: R,
+) -> thread::JoinHandle<Result<Vec<u8>, CommandError>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).map_err(|error| {
+            CommandError::new(format!("{operation} {stream_name} read failed: {error}"))
+        })?;
+        Ok(bytes)
+    })
+}
+
+fn join_pipe_reader(
+    operation: &'static str,
+    stream_name: &'static str,
+    handle: thread::JoinHandle<Result<Vec<u8>, CommandError>>,
+) -> Result<Vec<u8>, CommandError> {
+    handle.join().unwrap_or_else(|_panic| {
+        Err(CommandError::new(format!(
+            "{operation} {stream_name} reader panicked"
+        )))
+    })
 }
 
 fn validate_remote(remote: &str) -> Result<(), CommandError> {
@@ -538,14 +603,13 @@ where
             &object_digest,
             self.config.readback_bytes,
         )?;
-        self.commands
-            .rename(&paths.temp_object, &paths.object)
-            .map_err(|source| Error::Command {
-                operation: "rename object",
-                path: paths.object.clone(),
-                source,
-            })?;
-        verify_remote_final(&mut self.commands, &paths.object, object_digest.bytes)?;
+        promote_temp_to_final(
+            &mut self.commands,
+            &paths.temp_object,
+            &paths.object,
+            &object_digest,
+            "object",
+        )?;
 
         let entry = manifest_entry_from_parts(
             &request.metadata,
@@ -570,14 +634,13 @@ where
             &receipt_digest,
             self.config.readback_bytes,
         )?;
-        self.commands
-            .rename(&paths.temp_receipt, &paths.receipt)
-            .map_err(|source| Error::Command {
-                operation: "rename receipt",
-                path: paths.receipt.clone(),
-                source,
-            })?;
-        verify_remote_final(&mut self.commands, &paths.receipt, receipt_digest.bytes)?;
+        promote_temp_to_final(
+            &mut self.commands,
+            &paths.temp_receipt,
+            &paths.receipt,
+            &receipt_digest,
+            "receipt",
+        )?;
 
         let manifest_line = jsonl_bytes("manifest", &entry)?;
         self.commands
@@ -815,11 +878,13 @@ where
         }
     }
 
-    let expected_prefix: Vec<u8> = expected_bytes
-        .iter()
-        .copied()
-        .take(readback_bytes)
-        .collect();
+    let expected_prefix_len = expected_bytes.len().min(readback_bytes);
+    let expected_prefix =
+        expected_bytes
+            .get(..expected_prefix_len)
+            .ok_or_else(|| Error::VerifyReadbackMismatch {
+                path: remote_path.to_owned(),
+            })?;
     let actual_prefix = commands
         .read_prefix(remote_path, readback_bytes)
         .map_err(|source| Error::Command {
@@ -828,7 +893,7 @@ where
             source,
         })?;
     match actual_prefix {
-        Some(actual) if actual == expected_prefix => Ok(()),
+        Some(actual) if actual.as_slice() == expected_prefix => Ok(()),
         Some(_) => Err(Error::VerifyReadbackMismatch {
             path: remote_path.to_owned(),
         }),
@@ -839,28 +904,104 @@ where
     }
 }
 
-fn verify_remote_final<C>(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalState {
+    Absent,
+    Exact,
+}
+
+fn promote_temp_to_final<C>(
     commands: &mut C,
-    remote_path: &str,
-    expected_bytes: u64,
+    temp_path: &str,
+    final_path: &str,
+    expected_digest: &DigestResult,
+    artifact_kind: &'static str,
 ) -> Result<(), Error>
 where
     C: StorageBoxCommands,
 {
-    match commands
-        .stat_len(remote_path)
+    match check_final_state(commands, final_path, expected_digest)? {
+        FinalState::Exact => return Ok(()),
+        FinalState::Absent => {}
+    }
+
+    let rename_result = commands.rename(temp_path, final_path);
+    match rename_result {
+        Ok(()) => verify_remote_final(commands, final_path, expected_digest),
+        Err(source) => match check_final_state(commands, final_path, expected_digest)? {
+            FinalState::Exact => Ok(()),
+            FinalState::Absent => Err(Error::Command {
+                operation: match artifact_kind {
+                    "object" => "promote object temp",
+                    "receipt" => "promote receipt temp",
+                    _ => "promote temp",
+                },
+                path: final_path.to_owned(),
+                source,
+            }),
+        },
+    }
+}
+
+fn check_final_state<C>(
+    commands: &mut C,
+    final_path: &str,
+    expected_digest: &DigestResult,
+) -> Result<FinalState, Error>
+where
+    C: StorageBoxCommands,
+{
+    let actual_len = commands
+        .stat_len(final_path)
         .map_err(|source| Error::Command {
             operation: "stat final file",
-            path: remote_path.to_owned(),
+            path: final_path.to_owned(),
             source,
-        })? {
-        Some(actual) if actual == expected_bytes => Ok(()),
-        Some(actual) => Err(Error::VerifySizeMismatch {
-            path: remote_path.to_owned(),
-            expected: expected_bytes,
-            actual,
+        })?;
+    match actual_len {
+        None => Ok(FinalState::Absent),
+        Some(actual) if actual != expected_digest.bytes => Err(Error::FinalExistsConflict {
+            path: final_path.to_owned(),
+            reason: format!(
+                "expected {} bytes, found {actual} bytes",
+                expected_digest.bytes
+            ),
         }),
-        None => Err(Error::MissingRemoteFile {
+        Some(_) => {
+            let actual_hash = commands
+                .sha256(final_path)
+                .map_err(|source| Error::Command {
+                    operation: "hash final file",
+                    path: final_path.to_owned(),
+                    source,
+                })?;
+            match actual_hash {
+                Some(actual) if actual == expected_digest.sha256 => Ok(FinalState::Exact),
+                Some(actual) => Err(Error::FinalExistsConflict {
+                    path: final_path.to_owned(),
+                    reason: format!("expected sha256 {}, found {actual}", expected_digest.sha256),
+                }),
+                None => Err(Error::MissingRemoteFile {
+                    operation: "hash final file",
+                    path: final_path.to_owned(),
+                }),
+            }
+        }
+    }
+}
+
+fn verify_remote_final<C>(
+    commands: &mut C,
+    remote_path: &str,
+    expected_digest: &DigestResult,
+) -> Result<(), Error>
+where
+    C: StorageBoxCommands,
+{
+    let state = check_final_state(commands, remote_path, expected_digest)?;
+    match state {
+        FinalState::Exact => Ok(()),
+        FinalState::Absent => Err(Error::MissingRemoteFile {
             operation: "stat final file",
             path: remote_path.to_owned(),
         }),
@@ -1016,6 +1157,9 @@ mod tests {
                 path: from.to_owned(),
                 target: Some(to.to_owned()),
             });
+            if self.files.contains_key(to) {
+                return Err(CommandError::new("final path already exists"));
+            }
             let bytes = self
                 .files
                 .remove(from)
@@ -1108,21 +1252,25 @@ mod tests {
                 "stat",
                 "sha256",
                 "read_prefix",
+                "stat",
                 "rename",
                 "stat",
+                "sha256",
                 "upload",
                 "stat",
                 "sha256",
                 "read_prefix",
+                "stat",
                 "rename",
                 "stat",
+                "sha256",
                 "append"
             ]
         );
         assert_eq!(
             commands
                 .operations
-                .get(4)
+                .get(5)
                 .expect("object rename operation should exist")
                 .target
                 .as_deref(),
@@ -1131,7 +1279,7 @@ mod tests {
         assert_eq!(
             commands
                 .operations
-                .get(12)
+                .get(16)
                 .expect("manifest append operation should exist")
                 .path,
             "/storage-box/emojistats/manifests/raw.jsonl"
@@ -1152,6 +1300,33 @@ mod tests {
         assert_eq!(
             artifact.entry.object_path,
             "objects/run-1/shard0/42.parquet"
+        );
+    }
+
+    #[test]
+    fn final_object_conflict_fails_before_rename_or_manifest_append() {
+        let mut commands = FakeCommands::default();
+        commands.files.insert(
+            "/storage-box/emojistats/objects/run-1/shard0/42.parquet".to_owned(),
+            b"different parquet bytes".to_vec(),
+        );
+        let mut backend = backend(commands);
+
+        let result = backend.commit_bytes(&request(), b"parquet bytes");
+
+        assert!(matches!(result, Err(Error::FinalExistsConflict { .. })));
+        let commands = backend.into_commands();
+        assert!(
+            !commands
+                .operations
+                .iter()
+                .any(|operation| operation.name == "rename")
+        );
+        assert!(
+            !commands
+                .operations
+                .iter()
+                .any(|operation| operation.name == "append")
         );
     }
 
@@ -1210,10 +1385,7 @@ mod tests {
     #[test]
     fn ssh_upload_command_keeps_remote_path_inside_script_argument() {
         let command = ssh_commands()
-            .upload_command(
-                "/storage-box/emojistats/objects/run 1/quote'$(touch bad);.parquet",
-                b"parquet bytes",
-            )
+            .upload_command("/storage-box/emojistats/objects/run 1/quote'$(touch bad);.parquet")
             .expect("upload command should build");
 
         assert_eq!(command.program, PathBuf::from("/usr/bin/ssh"));
@@ -1226,24 +1398,50 @@ mod tests {
                 "umask 077; mkdir -p -- '/storage-box/emojistats/objects/run 1'; cat > '/storage-box/emojistats/objects/run 1/quote'\\''$(touch bad);.parquet'"
             ]
         );
-        assert_eq!(command.stdin.as_deref(), Some(b"parquet bytes".as_slice()));
+        assert!(command.stdin);
     }
 
     #[test]
     fn ssh_commands_reject_unsafe_remote_paths() {
         let commands = ssh_commands();
 
-        assert!(commands.upload_command("relative/path", b"bytes").is_err());
-        assert!(
-            commands
-                .upload_command("/storage/../outside", b"bytes")
-                .is_err()
-        );
-        assert!(
-            commands
-                .upload_command("/storage/newline\nname", b"bytes")
-                .is_err()
-        );
+        assert!(commands.upload_command("relative/path").is_err());
+        assert!(commands.upload_command("/storage/../outside").is_err());
+        assert!(commands.upload_command("/storage/newline\nname").is_err());
+    }
+
+    #[test]
+    fn ssh_rename_command_does_not_force_overwrite_final_path() {
+        let command = ssh_commands()
+            .rename_command(
+                "/storage-box/emojistats/.tmp/run-1/shard0/42.parquet.tmp",
+                "/storage-box/emojistats/objects/run-1/shard0/42.parquet",
+            )
+            .expect("rename command should build");
+        let script = command
+            .args
+            .last()
+            .expect("ssh script should be the final argument");
+
+        assert!(!script.contains("mv -f"));
+        assert!(script.contains("mv -n --"));
+        assert!(script.contains("final path already exists"));
+    }
+
+    #[test]
+    fn ssh_manifest_append_command_uses_flock() {
+        let command = ssh_commands()
+            .append_command("/storage-box/emojistats/manifests/raw.jsonl")
+            .expect("append command should build");
+        let script = command
+            .args
+            .last()
+            .expect("ssh script should be the final argument");
+
+        assert!(command.stdin);
+        assert!(script.contains("flock -- '/storage-box/emojistats/manifests/raw.jsonl.lock'"));
+        assert!(script.contains("cat >> \"$1\""));
+        assert!(!script.contains("cat >> '/storage-box/emojistats/manifests/raw.jsonl'"));
     }
 
     #[test]
