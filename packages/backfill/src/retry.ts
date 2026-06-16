@@ -3,6 +3,7 @@
 import type { ClickHouseClient } from '@clickhouse/client';
 
 import {
+  FINAL_SWEEP_MAX_RETRY_AFTER_MS,
   MAX_ATTEMPTS,
   PLC_DIRECTORY_URL,
   RETRY_BASE_MS,
@@ -20,6 +21,10 @@ import {
 import type { HostHealth } from './host-health.js';
 import type { HostPressure } from './host-pressure.js';
 import logger from './logger.js';
+import {
+  unusablePdsHostMessage,
+  validatePublicPdsHost,
+} from './pds-host-policy.js';
 import type { CrawlStats } from './run-state.js';
 import type { CrawlTelemetry } from './telemetry.js';
 import type { Ledger, RepoRow } from './types.js';
@@ -111,7 +116,9 @@ export interface RetryPolicy {
   /** Classifies a pipeline failure: terminal, quarantined, failed or retry wave. */
   handleRepoError(repo: RepoRow, err: unknown): Promise<'done' | 'retry-now'>;
   /** Re-resolves the DID's current PDS before a retry; 'tombstoned' is terminal. */
-  refreshHost(repo: RepoRow): Promise<'ok' | 'tombstoned' | 'host-updated'>;
+  refreshHost(
+    repo: RepoRow,
+  ): Promise<'ok' | 'tombstoned' | 'host-updated' | 'host-parked'>;
 }
 
 export interface RetryPolicyDeps {
@@ -120,10 +127,39 @@ export interface RetryPolicyDeps {
   stats: CrawlStats;
   hostPressure: HostPressure;
   hostHealth: HostHealth;
+  finalSweepStopLoss?: boolean;
 }
 
 export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
-  const { ledger, telemetry, stats, hostPressure, hostHealth } = deps;
+  const {
+    ledger,
+    telemetry,
+    stats,
+    hostPressure,
+    hostHealth,
+    finalSweepStopLoss = false,
+  } = deps;
+
+  const parkRepo = (repo: RepoRow, error: string): 'done' => {
+    ledger.parkUnreachable(repo.did, error);
+    stats.retried += 1;
+    telemetry.recordEvent({
+      did: repo.did,
+      pdsHost: repo.pdsHost,
+      event: 'retry',
+      error,
+    });
+    logger.warn({ did: repo.did, err: error }, 'repo parked unreachable');
+    return 'done';
+  };
+
+  const parkIfDeadHost = (repo: RepoRow): 'done' | undefined => {
+    if (!hostHealth.isDead(repo.pdsHost)) return undefined;
+    return parkRepo(
+      repo,
+      `host dead: ${repo.pdsHost} (in-flight failure after host trip)`,
+    );
+  };
 
   async function handleRepoError(
     repo: RepoRow,
@@ -236,6 +272,16 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
     const backoff = Math.min(RETRY_BASE_MS * 2 ** repo.attempts, RETRY_MAX_MS);
     const retryAfterHint =
       err instanceof RetryableError ? (err.retryAfterMs ?? 0) : 0;
+    if (
+      finalSweepStopLoss &&
+      transient &&
+      retryAfterHint > FINAL_SWEEP_MAX_RETRY_AFTER_MS
+    ) {
+      return parkRepo(
+        repo,
+        `host deferred beyond final-sweep budget: ${message}`,
+      );
+    }
     const retryAfterMs = Math.max(backoff, retryAfterHint);
     if (err instanceof RetryableError && err.rateLimit !== undefined) {
       hostPressure.observeRateLimit(repo.pdsHost, err.rateLimit);
@@ -246,9 +292,16 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
     // a politer pace fetched fine. The repo still backs off (flat base; the
     // host cooldown is what actually meters the pressure).
     if (/http 429/.test(message)) {
-      // Rate limiting is proof of life — never deadness evidence.
-      hostHealth.recordSuccess(repo.pdsHost);
+      // During the final sweep, a host that only ever answers 429 is not
+      // making useful progress and eventually gets parked by host-health's
+      // stop-loss. On ordinary crawls, recordFailure(classify=null) still
+      // behaves as proof of life and clears any prior DNS/legal streak.
+      hostHealth.recordFailure(repo.pdsHost, message, {
+        finalSweepEligible: true,
+      });
       hostPressure.record429(repo.pdsHost);
+      const parked = parkIfDeadHost(repo);
+      if (parked !== undefined) return parked;
       if (preserveExisting) {
         preserve('retry');
         return 'done';
@@ -275,7 +328,11 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
       // Like 429 this is host pressure, not the repo's fault, so markThrottled
       // backs the repo off WITHOUT burning its attempts budget.
       hostPressure.recordStall(repo.pdsHost);
-      hostHealth.recordFailure(repo.pdsHost, message);
+      hostHealth.recordFailure(repo.pdsHost, message, {
+        finalSweepEligible: true,
+      });
+      const parked = parkIfDeadHost(repo);
+      if (parked !== undefined) return parked;
       if (preserveExisting) {
         preserve('retry');
         return 'done';
@@ -294,7 +351,11 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
       });
       return 'done';
     }
-    hostHealth.recordFailure(repo.pdsHost, message);
+    hostHealth.recordFailure(repo.pdsHost, message, {
+      finalSweepEligible: message.startsWith('getRepo '),
+    });
+    const parked = parkIfDeadHost(repo);
+    if (parked !== undefined) return parked;
     if (preserveExisting) {
       preserve('retry');
       return 'done';
@@ -322,7 +383,7 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
   // the fetch below classifies the real failure.
   async function refreshHost(
     repo: RepoRow,
-  ): Promise<'ok' | 'tombstoned' | 'host-updated'> {
+  ): Promise<'ok' | 'tombstoned' | 'host-updated' | 'host-parked'> {
     try {
       const res = await fetch(
         `${PLC_DIRECTORY_URL}/${encodeURIComponent(repo.did)}`,
@@ -346,12 +407,34 @@ export function createRetryPolicy(deps: RetryPolicyDeps): RetryPolicy {
       // before that form existed.
       const host = pdsHostFromEndpoint(endpoint);
       if (host !== undefined && host !== repo.pdsHost) {
+        const admission = validatePublicPdsHost(host);
+        if (!admission.ok) {
+          const reason = unusablePdsHostMessage(admission.host, admission.kind);
+          ledger.addDeadHost(host);
+          hostHealth.markDead(host);
+          if (repo.preserveExisting === true) {
+            telemetry.recordEvent({
+              did: repo.did,
+              pdsHost: repo.pdsHost,
+              event: 'retry',
+              error: `refreshed PDS host refused: ${host} (${reason})`,
+            });
+          } else {
+            ledger.parkUnreachable(repo.did, `host dead: ${host} (${reason})`);
+            stats.retried += 1;
+          }
+          logger.warn(
+            { did: repo.did, from: repo.pdsHost, to: host, reason },
+            'refreshed PDS pointer refused by host admission',
+          );
+          return 'host-parked';
+        }
         logger.info(
           { did: repo.did, from: repo.pdsHost, to: host },
           'stale PDS pointer: following current DID doc',
         );
-        ledger.updateHost(repo.did, host);
-        repo.pdsHost = host;
+        ledger.updateHost(repo.did, admission.host);
+        repo.pdsHost = admission.host;
         return 'host-updated';
       }
     } catch {

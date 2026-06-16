@@ -4,6 +4,7 @@ import {
   REPO_FETCH_TIMEOUT_MS,
   USER_AGENT,
 } from './config.js';
+import { validatePublicPdsHost } from './pds-host-policy.js';
 
 /**
  * Failure classification — drives the ledger transitions in crawl.ts:
@@ -286,6 +287,13 @@ export async function fetchRepoCar(
   pdsHost: string,
   did: string,
 ): Promise<FetchedCar> {
+  const admission = validatePublicPdsHost(pdsHost);
+  if (!admission.ok) {
+    throw new RetryableError(
+      `refusing non-public PDS host ${pdsHost}: ${admission.kind}`,
+      { transient: false },
+    );
+  }
   // pds_host carries a scheme only when it isn't https (see
   // pdsHostFromEndpoint); a bare host means https. The prefix/slash trims also
   // tolerate hand-edited ledger rows.

@@ -117,36 +117,37 @@ export function createRepoPipeline(
       // bsky.social is the entryway, never a real sync host — a ledger pointer at
       // it is always a stale pre-mushroom op; resolve before wasting a request.
       const staleKnown = repo.pdsHost === 'bsky.social';
-      if (
-        (repo.attempts > 0 || staleKnown) &&
-        (await retry.refreshHost(repo)) === 'tombstoned'
-      ) {
-        if (preserveExisting) {
-          logger.warn(
-            { did: repo.did },
-            'recrawl saw PLC tombstone; preserving existing loaded/verified ledger state',
+      if (repo.attempts > 0 || staleKnown) {
+        const refresh = await retry.refreshHost(repo);
+        if (refresh === 'host-parked') return;
+        if (refresh === 'tombstoned') {
+          if (preserveExisting) {
+            logger.warn(
+              { did: repo.did },
+              'recrawl saw PLC tombstone; preserving existing loaded/verified ledger state',
+            );
+            telemetry.recordEvent({
+              did: repo.did,
+              pdsHost: repo.pdsHost,
+              event: 'retry',
+              error: 'PLC tombstone discovered during preserved recrawl',
+            });
+            return;
+          }
+          ledger.markTerminal(
+            repo.did,
+            'tombstoned',
+            'PLC tombstone discovered at retry',
           );
+          stats.terminal += 1;
           telemetry.recordEvent({
             did: repo.did,
             pdsHost: repo.pdsHost,
-            event: 'retry',
-            error: 'PLC tombstone discovered during preserved recrawl',
+            event: 'tombstoned',
+            error: 'PLC tombstone discovered at retry',
           });
           return;
         }
-        ledger.markTerminal(
-          repo.did,
-          'tombstoned',
-          'PLC tombstone discovered at retry',
-        );
-        stats.terminal += 1;
-        telemetry.recordEvent({
-          did: repo.did,
-          pdsHost: repo.pdsHost,
-          event: 'tombstoned',
-          error: 'PLC tombstone discovered at retry',
-        });
-        return;
       }
       // Fetch AND parse happen inside a repo worker; row batches come back with
       // backpressure so whale repos never materialize a second full row array

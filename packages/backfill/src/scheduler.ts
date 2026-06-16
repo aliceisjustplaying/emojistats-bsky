@@ -11,10 +11,20 @@ import { parseArgs } from 'node:util';
 
 import pLimit, { type LimitFunction } from 'p-limit';
 
-import { GLOBAL_CONCURRENCY, MAX_ATTEMPTS } from './config.js';
+import {
+  FINAL_SWEEP_HOST_STOP_LOSS_MS,
+  FINAL_SWEEP_HOST_STOP_LOSS_RETRIES,
+  GLOBAL_CONCURRENCY,
+  MAX_ATTEMPTS,
+} from './config.js';
 import type { HostHealth } from './host-health.js';
 import type { HostPressure } from './host-pressure.js';
 import logger from './logger.js';
+import {
+  classifyUnusablePdsHost,
+  unusablePdsHostMessage,
+  validatePublicPdsHost,
+} from './pds-host-policy.js';
 import type { CrawlControl, CrawlStats } from './run-state.js';
 import type { Ledger, RepoRow } from './types.js';
 
@@ -27,6 +37,8 @@ export interface CliFlags {
   didFile?: string;
   /** Stream exact-DID work from a tab/space-separated DID + PDS host file. */
   didHostFile?: string;
+  /** Re-fetch into archive only; skip ClickHouse posts inserts. */
+  archiveOnly: boolean;
   /** Final sweep: zero the attempts budget on parked unreachable rows so waves resume. */
   finalSweep: boolean;
   /**
@@ -52,6 +64,9 @@ export function parseFlags(): CliFlags {
       // populated from source-ledger DID+host rows instead of copying the source
       // SQLite DB to every recrawl worker.
       'did-host-file': { type: 'string' },
+      // Archive metadata backfill: fetch/parse/archive/count, but do not write
+      // rows to ClickHouse posts.
+      'archive-only': { type: 'boolean', default: false },
       // Explicit, not automatic: resetting budgets on every restart would let a
       // crash loop hammer dead hosts forever; a sweep is an operator decision.
       'final-sweep': { type: 'boolean', default: false },
@@ -75,6 +90,7 @@ export function parseFlags(): CliFlags {
     dids,
     didFile: values['did-file'],
     didHostFile: values['did-host-file'],
+    archiveOnly: values['archive-only'] ?? false,
     finalSweep: values['final-sweep'] ?? false,
     reviveHosts: values['revive-host'] ?? [],
   };
@@ -99,6 +115,8 @@ export interface SchedulerDeps {
   control: CrawlControl;
   hostPressure: HostPressure;
   hostHealth: HostHealth;
+  startupDeadHosts?: readonly string[];
+  finalSweepRunId?: string;
   processRepo: (repo: RepoRow) => Promise<void>;
 }
 
@@ -189,7 +207,11 @@ export function shouldWaitForUnreachableRetry(
   pdsHost: string,
   isDeadHost: (host: string) => boolean,
 ): boolean {
-  return attempts < MAX_ATTEMPTS && !isDeadHost(pdsHost);
+  return (
+    attempts < MAX_ATTEMPTS &&
+    !isDeadHost(pdsHost) &&
+    classifyUnusablePdsHost(pdsHost) === null
+  );
 }
 
 const yieldToTimers = async (): Promise<void> => {
@@ -245,6 +267,9 @@ async function* exactRepos(flags: CliFlags): AsyncGenerator<ExactRepo> {
 export function createScheduler(deps: SchedulerDeps): Scheduler {
   const { ledger, stats, control, hostPressure, hostHealth, processRepo } =
     deps;
+  const knownDeadHosts = new Set(
+    deps.startupDeadHosts ?? ledger.getDeadHosts(),
+  );
 
   const globalLimit = pLimit(GLOBAL_CONCURRENCY);
   // Keyed by the ledger's pds_host string verbatim — including the
@@ -320,6 +345,7 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
     const tracked: Promise<void> = task
       .then(() => {
         onDone?.();
+        return undefined;
       })
       .catch((err: unknown) => {
         logger.error(
@@ -329,6 +355,7 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
           },
           'unexpected pipeline error',
         );
+        return undefined;
       })
       .finally(() => {
         active.delete(tracked);
@@ -407,11 +434,30 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
       });
   };
   const parkDeadHosts = (): void => {
-    for (const host of hostHealth.takeNewlyTripped()) {
+    for (const trip of hostHealth.takeNewlyTripped()) {
       // Persist the verdict so enumeration diverts the host's future rows
-      // straight to parked and the next crawl run seeds it as dead.
-      ledger.addDeadHost(host);
-      enqueuePark(host, 'tripped', true);
+      // straight to parked and the next crawl run seeds it as dead. Final
+      // sweep stop-loss verdicts are run-scoped: sticky across restarts of
+      // this BACKFILL_RUN_ID, invisible to later runs and enumeration.
+      if (trip.persist && !knownDeadHosts.has(trip.host)) {
+        ledger.addDeadHost(trip.host);
+        knownDeadHosts.add(trip.host);
+      }
+      if (
+        !trip.persist &&
+        deps.finalSweepRunId !== undefined &&
+        !knownDeadHosts.has(trip.host)
+      ) {
+        ledger.addFinalSweepDeadHost(trip.host, deps.finalSweepRunId);
+        knownDeadHosts.add(trip.host);
+      }
+      enqueuePark(
+        trip.host,
+        trip.kind === 'final-sweep'
+          ? `final-sweep stop-loss after ${FINAL_SWEEP_HOST_STOP_LOSS_RETRIES}+ failures in ${Math.round(FINAL_SWEEP_HOST_STOP_LOSS_MS / 60_000)}m`
+          : 'tripped',
+        true,
+      );
     }
     if (Date.now() - lastDeadSweepAt >= DEAD_HOST_SWEEP_MS) {
       lastDeadSweepAt = Date.now();
@@ -419,13 +465,22 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
         enqueuePark(host, 'sweep', false);
     }
   };
+
+  const markHostUnusable = (host: string, reason: string): void => {
+    if (!knownDeadHosts.has(host)) {
+      ledger.addDeadHost(host);
+      knownDeadHosts.add(host);
+    }
+    hostHealth.markDead(host);
+    enqueuePark(host, reason, true);
+  };
   // Verdicts persisted by previous runs apply immediately — no 30-failure
   // re-trip, no scan pollution while it re-learns. The cheap pending-arm
   // park also runs at startup: rows left pending by a mid-park crash (or
   // enumerated into 'pending' before the dead list existed) would otherwise
   // sit excluded-but-pending until the first 5-minute sweep, paying the
   // NOT-IN row-filter cost on every claim scan in between.
-  for (const host of ledger.getDeadHosts()) {
+  for (const host of knownDeadHosts) {
     hostHealth.markDead(host);
     enqueuePark(host, 'startup', false);
   }
@@ -484,7 +539,37 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
         }
         if (control.stopClaiming || stats.claimed >= flags.limit) break;
         while (active.size >= maxOutstanding) await Promise.race(active);
-        if (pdsHost !== undefined) ledger.upsertPending(did, pdsHost);
+        if (pdsHost !== undefined) {
+          const admission = validatePublicPdsHost(pdsHost);
+          if (!admission.ok) {
+            const existing = ledger.getRepo(did);
+            const reason = unusablePdsHostMessage(
+              admission.host,
+              admission.kind,
+            );
+            if (
+              existing?.status === 'loaded' ||
+              existing?.status === 'verified'
+            ) {
+              logger.warn(
+                { did, status: existing.status, pdsHost },
+                'exact recrawl host refused; preserving existing loaded/verified ledger state',
+              );
+              markHostUnusable(pdsHost, reason);
+              stats.skipped += 1;
+              continue;
+            }
+            ledger.upsertParked(
+              did,
+              pdsHost,
+              `host dead: ${pdsHost} (${reason})`,
+            );
+            markHostUnusable(pdsHost, reason);
+            stats.skipped += 1;
+            continue;
+          }
+          ledger.upsertPending(did, admission.host);
+        }
         const repo = ledger.getRepo(did);
         if (repo === undefined) {
           logger.error(
@@ -495,6 +580,30 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
         }
         const preserveExisting =
           repo.status === 'loaded' || repo.status === 'verified';
+        const repoHostAdmission = validatePublicPdsHost(repo.pdsHost);
+        if (!repoHostAdmission.ok) {
+          const reason = unusablePdsHostMessage(
+            repoHostAdmission.host,
+            repoHostAdmission.kind,
+          );
+          if (preserveExisting) {
+            logger.warn(
+              { did, status: repo.status, pdsHost: repo.pdsHost },
+              'exact recrawl ledger host refused; preserving existing loaded/verified ledger state',
+            );
+            markHostUnusable(repo.pdsHost, reason);
+            stats.skipped += 1;
+            continue;
+          }
+          ledger.upsertParked(
+            did,
+            repo.pdsHost,
+            `host dead: ${repo.pdsHost} (${reason})`,
+          );
+          markHostUnusable(repo.pdsHost, reason);
+          stats.skipped += 1;
+          continue;
+        }
         if (preserveExisting) {
           logger.warn(
             { did, status: repo.status },
@@ -615,6 +724,15 @@ export function createScheduler(deps: SchedulerDeps): Scheduler {
           if (repo === undefined) break;
           if (scheduled >= claimCapacity) break;
           if (stats.claimed >= flags.limit) break;
+          const unusableKind = classifyUnusablePdsHost(repo.pdsHost);
+          if (unusableKind !== null) {
+            markHostUnusable(
+              repo.pdsHost,
+              unusablePdsHostMessage(repo.pdsHost, unusableKind),
+            );
+            stats.skipped += 1;
+            continue;
+          }
           if (hostHealth.isDead(repo.pdsHost)) {
             stats.skipped += 1;
             continue;

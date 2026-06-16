@@ -30,7 +30,7 @@ export interface ArchiveStats {
   appended: number;
   finalizedFiles: number;
   openRows: number;
-  /** Finalized-but-unsynced files drained by the startup sweep in create(). */
+  /** Finalized-but-unsynced files drained by the startup sweep sync chain. */
   sweptFiles: number;
   /** Stale `.parquet.tmp` partials from a crash mid-COPY deleted at startup. */
   removedTmpFiles: number;
@@ -53,11 +53,14 @@ export interface ArchiveSinkOptions {
    * archive is the only text home) — it is thrown from the next sink call, and
    * close() drains all pending syncs before resolving.
    *
-   * Startup re-runs the command for every finalized file still on disk (the
-   * sweep that drains files a sync-failed run left behind), so the command
-   * must either remove the local file once it is safely remote (`rclone
-   * move`) or tolerate re-running on an already-synced file (idempotent
-   * copy) — at-least-once, like everything else in the archive.
+   * Startup also re-runs the command for every finalized file still on disk
+   * (the sweep that drains files a sync-failed run left behind). Those
+   * re-uploads join the same background chain, so crawl startup does not wait
+   * behind the backlog; any failure still surfaces on the next sink call or
+   * close(). The command must therefore either remove the local file once it
+   * is safely remote (`rclone move`) or tolerate re-running on an already-
+   * synced file (idempotent copy) — at-least-once, like everything else in
+   * the archive.
    */
   syncCommand?: string;
 }

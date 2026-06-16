@@ -1,3 +1,7 @@
+import {
+  FINAL_SWEEP_HOST_STOP_LOSS_MS,
+  FINAL_SWEEP_HOST_STOP_LOSS_RETRIES,
+} from './config.js';
 import { isStallMessage } from './fetcher.js';
 import logger from './logger.js';
 
@@ -23,6 +27,8 @@ const TRIP_MIN_SPAN_MS = 30_000;
  */
 const TRIP_CONSECUTIVE_STALL = 6;
 const TRIP_MIN_SPAN_STALL_MS = 120_000;
+const TRIP_CONSECUTIVE_FINAL_SWEEP = FINAL_SWEEP_HOST_STOP_LOSS_RETRIES;
+const TRIP_MIN_SPAN_FINAL_SWEEP_MS = FINAL_SWEEP_HOST_STOP_LOSS_MS;
 
 /**
  * Host-level deadness detection. The claim scan is host-blind: a PDS whose
@@ -37,6 +43,17 @@ const TRIP_MIN_SPAN_STALL_MS = 120_000;
  * the run.
  */
 export type DeadHostKind = 'dns' | 'legal' | 'stall';
+export type DeadHostTripKind = DeadHostKind | 'final-sweep';
+
+export interface DeadHostTrip {
+  host: string;
+  kind: DeadHostTripKind;
+  persist: boolean;
+}
+
+export interface HostHealthOptions {
+  finalSweepStopLoss?: boolean;
+}
 
 export function classifyDeadness(message: string): DeadHostKind | null {
   // ENOTFOUND is DNS NXDOMAIN — a domain that stopped existing. EAI_AGAIN
@@ -55,32 +72,49 @@ export function classifyDeadness(message: string): DeadHostKind | null {
 interface HostHealthState {
   consecutive: number;
   firstAt: number;
-  kind: DeadHostKind;
+  kind: DeadHostTripKind;
   dead: boolean;
 }
 
 export interface HostHealth {
   /** Feed every classified repo failure; returns true when this call tripped the host. */
-  recordFailure(host: string, message: string): void;
+  recordFailure(
+    host: string,
+    message: string,
+    evidence?: { finalSweepEligible?: boolean },
+  ): void;
   /** Any successful response (including 429/404 — the host is alive). */
   recordSuccess(host: string): void;
   isDead(host: string): boolean;
   /** All hosts declared dead this run (for claim-scan exclusion). */
   deadHosts(): string[];
   /** Hosts that tripped since the last call — the scheduler parks these. */
-  takeNewlyTripped(): string[];
+  takeNewlyTripped(): DeadHostTrip[];
   /** Seed a host as dead without tripping (ledger-persisted verdicts at startup). */
   markDead(host: string): void;
 }
 
-export function createHostHealth(): HostHealth {
+export function createHostHealth(options: HostHealthOptions = {}): HostHealth {
   const state = new Map<string, HostHealthState>();
-  let newlyTripped: string[] = [];
+  let newlyTripped: DeadHostTrip[] = [];
 
   return {
-    recordFailure(host: string, message: string): void {
-      const kind = classifyDeadness(message);
+    recordFailure(
+      host: string,
+      message: string,
+      evidence: { finalSweepEligible?: boolean } = {},
+    ): void {
+      let kind: DeadHostTripKind | null = classifyDeadness(message);
       const prev = state.get(host);
+      const finalSweepEligible =
+        evidence.finalSweepEligible ?? message.startsWith('getRepo ');
+      if (
+        kind === null &&
+        options.finalSweepStopLoss === true &&
+        finalSweepEligible
+      ) {
+        kind = 'final-sweep';
+      }
       if (kind === null) {
         // Any HTTP status — 5xx included — is proof of life: a server
         // resolved, accepted TCP+TLS and answered. It must clear an
@@ -103,12 +137,24 @@ export function createHostHealth(): HostHealth {
           ? { consecutive: 1, firstAt: now, kind, dead: false }
           : { ...prev, consecutive: prev.consecutive + 1, kind };
       const tripCount =
-        kind === 'stall' ? TRIP_CONSECUTIVE_STALL : TRIP_CONSECUTIVE;
+        kind === 'stall'
+          ? TRIP_CONSECUTIVE_STALL
+          : kind === 'final-sweep'
+            ? TRIP_CONSECUTIVE_FINAL_SWEEP
+            : TRIP_CONSECUTIVE;
       const tripSpan =
-        kind === 'stall' ? TRIP_MIN_SPAN_STALL_MS : TRIP_MIN_SPAN_MS;
+        kind === 'stall'
+          ? TRIP_MIN_SPAN_STALL_MS
+          : kind === 'final-sweep'
+            ? TRIP_MIN_SPAN_FINAL_SWEEP_MS
+            : TRIP_MIN_SPAN_MS;
       if (next.consecutive >= tripCount && now - next.firstAt >= tripSpan) {
         next.dead = true;
-        newlyTripped.push(host);
+        newlyTripped.push({
+          host,
+          kind,
+          persist: kind !== 'final-sweep',
+        });
         logger.warn(
           { host, kind, consecutive: next.consecutive },
           'host declared dead for this run',
@@ -135,7 +181,7 @@ export function createHostHealth(): HostHealth {
         .map(([host]) => host);
     },
 
-    takeNewlyTripped(): string[] {
+    takeNewlyTripped(): DeadHostTrip[] {
       const tripped = newlyTripped;
       newlyTripped = [];
       return tripped;

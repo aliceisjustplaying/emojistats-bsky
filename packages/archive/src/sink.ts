@@ -15,8 +15,9 @@
  * - create() sweeps `finalized/` before accepting rows: stale `.parquet.tmp`
  *   partials from a crash mid-COPY are deleted (their rows are still staged —
  *   see sweepFinalized), and when syncCommand is set every finalized file
- *   still on disk is re-synced oldest-first, so a file whose sync failed is
- *   drained on the next start instead of stranding on one disk forever.
+ *   still on disk is queued for re-sync oldest-first. The queue runs on the
+ *   same background sync chain as live finalizes, so crawl startup does not
+ *   wait behind a large storage backlog before telemetry can begin.
  * - syncCommand runs on its own serialized chain (one upload at a time, in
  *   finalize order), never on the append chain: an upload to a slow Storage
  *   Box takes minutes and would otherwise stall every append() behind
@@ -185,7 +186,8 @@ class DuckDBArchiveSink implements ArchiveSink {
       await sink.seedSequence();
       // Drain what a previous run left behind (stale partials, unsynced
       // files) before the recovery rotate adds this run's first file, so
-      // the backlog goes out oldest-first.
+      // the backlog goes out oldest-first. Only the local cleanup blocks
+      // startup; uploads ride the background sync chain.
       await sink.sweepFinalized();
       // Startup recovery: rows left by a crashed run go out as their own
       // file before any new rows mix in.
@@ -371,9 +373,9 @@ class DuckDBArchiveSink implements ArchiveSink {
    * - When syncCommand is set, re-runs it for every finalized file still on
    *   disk, oldest-first. A failed or never-started background sync leaves
    *   the file finalized locally (loud, not lossy) — this sweep is the
-   *   retry. A failure here throws out of create(): refusing to start beats
-   *   stranding text rows on one disk, because the archive is the only
-   *   durable home of non-emoji post text (plan 0001).
+   *   retry. Re-uploads join the normal background sync chain so startup can
+   *   reach telemetry/crawling immediately; any failure stays sticky and
+   *   surfaces on the next sink call or close().
    */
   private async sweepFinalized(): Promise<void> {
     const backlog: { seq: number; path: string }[] = [];
@@ -397,8 +399,7 @@ class DuckDBArchiveSink implements ArchiveSink {
 
     backlog.sort((a, b) => a.seq - b.seq);
     for (const { path } of backlog) {
-      await this.runSyncCommand(path);
-      this.sweptFiles += 1;
+      this.enqueueSync(path, { swept: true });
     }
   }
 
@@ -454,10 +455,14 @@ class DuckDBArchiveSink implements ArchiveSink {
    * the next startup sweep for no reason); first failure wins because the
    * run is dead either way once assertOpen rethrows it.
    */
-  private enqueueSync(finalPath: string): void {
+  private enqueueSync(
+    finalPath: string,
+    options: { swept?: boolean } = {},
+  ): void {
     this.syncChain = this.syncChain.then(async () => {
       try {
         await this.runSyncCommand(finalPath);
+        if (options.swept) this.sweptFiles += 1;
       } catch (err) {
         this.syncFailure ??= err as Error;
       }

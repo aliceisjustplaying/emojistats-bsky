@@ -1344,3 +1344,68 @@ LESSONS:
     can poison the same way (shard4 went stale independently). The loader fix
     doesn't cover it; folding the rebuild into the telemetry client is the
     follow-up if dashboard-staleness must be fully eliminated.
+
+### 2026-06-16 UTC — loose recrawl verification cleanup notes
+
+The hard-fail path completed first; the confusing part was the loose path. The
+regular loaded-only verifier is fast because it is set-based ClickHouse SQL
+(ledger expectations staged, compare counts/digests, promote exact). The
+expensive step is `--sample-loose all`: it re-fetches every remaining loose repo
+CAR from its PDS and compares fresh repo rkeys to ClickHouse, so it is network,
+PDS, CAR-download, and parse bound.
+
+LOOSE means ClickHouse has at least the ledger count but the digest does not
+match. That is often benign (live-arrival rows, deleted-since-crawl rows, or
+post-load drift), but it can mask a lost backfill row. The safe policy is:
+promote exact immediately, promote loose only after explicit all-loose sampling,
+and keep sampled-failed DIDs loaded for another focused recrawl.
+
+Important implementation/ops fixes learned here:
+
+- Sample refetch must ignore posts whose TID timestamp is after that repo's
+  `loaded_at`; otherwise normal live posts created after the recrawl become
+  false missing-in-ClickHouse failures.
+- Sample refetch must treat post-load `RepoDeactivated`/`RepoTakendown`/
+  tombstone as non-promotable/skip-like outcomes, not broad data corruption.
+- `--sample-loose all` was originally sequential and operationally unusable for
+  ~138k loose repos. Added `VERIFY_SAMPLE_CONCURRENCY` and ran with a bounded
+  cap.
+- High sampler concurrency made the default 5-minute `REPO_FETCH_TIMEOUT_MS`
+  falsely fail large-but-progressing CAR downloads. The winning setting kept
+  the 60s no-progress stall guard but raised `REPO_FETCH_TIMEOUT_MS=1800000`.
+- All-or-nothing loose promotion wasted successful work. The verifier now
+  promotes sampled-passed loose repos and leaves sampled-failed DIDs loaded for
+  the next tiny focused recrawl.
+- Do not trust the original loose-recrawl event denominator as a finish gate.
+  For exact DID recrawls, log drain/no processes + current loaded DID set are
+  the useful gates; `backfill_repo_events` can undercount due preserved/reused
+  rows and retry/drop semantics.
+- The dashboard can look "stalled" during sampling because progress only records
+  after each repo finishes. Whale repos or slow PDSes can hold slots without
+  stale processes. Check verifier logs, CPU/RSS, and `backfill_verify_progress`
+  `age_s` before restarting.
+
+Observed loose-cleanup sequence:
+
+- `loose-sample-all-20260616T0711Z` sampled the broad loose tail and promoted:
+  crawl0 49,613; crawl3 51,293; crawl4 18,403; crawl5 18,645.
+- That left 308 loaded repos: crawl0 117, crawl3 117, crawl4 30, crawl5 44.
+- Focused recrawl `loose-failed-sample-recrawl-20260616T1330Z` reloaded most of
+  those; loaded-only verify promoted 33 exact and left 275 loose.
+- Tiny sample `loose-final-sample-all-20260616T1345Z` promoted another 183 and
+  left 92 stubborn loaded repos: crawl0 34, crawl3 30, crawl4 16, crawl5 12.
+- A final tiny recrawl `tiny-loose-recrawl-20260616T1425Z` was started for those
+  92. Its tail is dominated by repeated PDS/account-state/refetch issues rather
+  than broad ClickHouse mismatch.
+
+LESSONS:
+  - Name the phase precisely. "Regular verify" and "loose all-sample verify" are
+    very different workloads, even though both are verifier commands.
+  - Loose verification must be resumable by promotion of the good subset; otherwise
+    one flaky PDS turns a multi-hour proof into a failed all-or-nothing run.
+  - The final loose tail should be expected to converge geometrically: recrawl,
+    loaded-only classify, all-sample the leftovers, repeat only while the residue
+    meaningfully shrinks.
+  - Before final sweep, the acceptable end state is not "all loose sampled once";
+    it is "loaded leftovers are either cleared or explicitly classified as
+    persistent terminal/unrecoverable cases with evidence."

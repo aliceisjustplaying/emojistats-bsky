@@ -45,7 +45,9 @@ void describe('host health tripping', () => {
     now += 31_000;
     health.recordFailure('dead.example', 'ENOTFOUND dead.example');
     assert.equal(health.isDead('dead.example'), true);
-    assert.deepEqual(health.takeNewlyTripped(), ['dead.example']);
+    assert.deepEqual(health.takeNewlyTripped(), [
+      { host: 'dead.example', kind: 'dns', persist: true },
+    ]);
     // Drained: a second take returns nothing.
     assert.deepEqual(health.takeNewlyTripped(), []);
     assert.deepEqual(health.deadHosts(), ['dead.example']);
@@ -70,6 +72,67 @@ void describe('host health tripping', () => {
     for (let i = 0; i < 100; i += 1)
       health.recordFailure('slow.example', 'fetch timeout after 300000ms');
     assert.equal(health.isDead('slow.example'), false);
+  });
+
+  void it('final sweep stop-loss parks a host after repeated generic failures over 5 minutes', (t) => {
+    const health = createHostHealth({ finalSweepStopLoss: true });
+    let now = 1_000_000;
+    t.mock.method(Date, 'now', () => now);
+
+    for (let i = 0; i < 4; i += 1)
+      health.recordFailure(
+        'stuck.example',
+        'getRepo did@stuck.example: http 503',
+      );
+    assert.equal(health.isDead('stuck.example'), false);
+
+    now += 301_000;
+    health.recordFailure(
+      'stuck.example',
+      'getRepo did@stuck.example: http 503',
+    );
+    assert.equal(health.isDead('stuck.example'), true);
+    assert.deepEqual(health.takeNewlyTripped(), [
+      {
+        host: 'stuck.example',
+        kind: 'final-sweep',
+        persist: false,
+      },
+    ]);
+  });
+
+  void it('final sweep stop-loss resets on proof of life', (t) => {
+    const health = createHostHealth({ finalSweepStopLoss: true });
+    let now = 1_000_000;
+    t.mock.method(Date, 'now', () => now);
+
+    for (let i = 0; i < 4; i += 1)
+      health.recordFailure(
+        'recovering.example',
+        'fetch timeout after 300000ms',
+      );
+    health.recordSuccess('recovering.example');
+    now += 301_000;
+    health.recordFailure('recovering.example', 'fetch timeout after 300000ms');
+    assert.equal(health.isDead('recovering.example'), false);
+  });
+
+  void it('final sweep stop-loss counts repeated 429s against the host budget', (t) => {
+    const health = createHostHealth({ finalSweepStopLoss: true });
+    let now = 1_000_000;
+    t.mock.method(Date, 'now', () => now);
+
+    for (let i = 0; i < 4; i += 1)
+      health.recordFailure(
+        'ratelimited.example',
+        'getRepo did@ratelimited.example: http 429',
+      );
+    now += 301_000;
+    health.recordFailure(
+      'ratelimited.example',
+      'getRepo did@ratelimited.example: http 429',
+    );
+    assert.equal(health.isDead('ratelimited.example'), true);
   });
 
   void it('classifies a progress-timeout stall as a stall', () => {
@@ -102,7 +165,9 @@ void describe('host health tripping', () => {
     now += 121_000;
     health.recordFailure('brid.gy', stall);
     assert.equal(health.isDead('brid.gy'), true);
-    assert.deepEqual(health.takeNewlyTripped(), ['brid.gy']);
+    assert.deepEqual(health.takeNewlyTripped(), [
+      { host: 'brid.gy', kind: 'stall', persist: true },
+    ]);
   });
 
   void it('a success resets a stall streak before it can park', (t) => {
@@ -262,6 +327,35 @@ void describe('ledger.parkDeadHostChunk', () => {
     ledger.close();
   });
 
+  void it('final-sweep dead-host registry is scoped to one run id', () => {
+    const ledger = new SqliteLedger(
+      path.join(dir, 'final-sweep-registry.sqlite'),
+    );
+    assert.deepEqual(ledger.getFinalSweepDeadHosts('run-1'), []);
+    ledger.addFinalSweepDeadHost('stall.example', 'run-1');
+    ledger.addFinalSweepDeadHost('stall.example', 'run-1');
+    ledger.addFinalSweepDeadHost('retry.example', 'run-1');
+    assert.deepEqual(ledger.getFinalSweepDeadHosts('run-1'), [
+      'retry.example',
+      'stall.example',
+    ]);
+    assert.deepEqual(ledger.getFinalSweepDeadHosts('run-2'), []);
+
+    ledger.removeFinalSweepDeadHost('stall.example', 'run-2');
+    assert.deepEqual(ledger.getFinalSweepDeadHosts('run-1'), [
+      'retry.example',
+      'stall.example',
+    ]);
+
+    ledger.removeFinalSweepDeadHost('stall.example', 'run-1');
+    assert.deepEqual(ledger.getFinalSweepDeadHosts('run-1'), ['retry.example']);
+
+    ledger.addFinalSweepDeadHost('fresh.example', 'run-2');
+    assert.deepEqual(ledger.getFinalSweepDeadHosts('run-1'), []);
+    assert.deepEqual(ledger.getFinalSweepDeadHosts('run-2'), ['fresh.example']);
+    ledger.close();
+  });
+
   void it('revive drops a host from the registry and re-arms only its rows', () => {
     const ledger = new SqliteLedger(path.join(dir, 'revive.sqlite'));
     ledger.addDeadHost('brid.gy');
@@ -297,17 +391,28 @@ void describe('ledger.parkDeadHostChunk', () => {
 
   void it('final sweep re-arms parked rows except dead-host registry rows', () => {
     const ledger = new SqliteLedger(path.join(dir, 'final-sweep.sqlite'));
+    const runId = 'run-1';
     ledger.addDeadHost('dns.dead');
+    ledger.addFinalSweepDeadHost('stall.dead', runId);
     ledger.upsertParked('did:plc:dns1', 'dns.dead', 'host dead');
+    ledger.upsertParked('did:plc:stall1', 'stall.dead', 'host stalled');
     ledger.upsertParked('did:plc:alive1', 'alive.example', 'timed out');
 
-    const reset = ledger.resetUnreachableAttempts(ledger.getDeadHosts());
+    const reset = ledger.resetUnreachableAttempts([
+      ...ledger.getDeadHosts(),
+      ...ledger.getFinalSweepDeadHosts(runId),
+    ]);
     assert.equal(reset, 1);
 
     const dead = ledger.getRepo('did:plc:dns1')!;
     assert.equal(dead.status, 'unreachable');
     assert.equal(dead.attempts, MAX_ATTEMPTS);
     assert.equal(dead.retryAfter, null);
+
+    const stalled = ledger.getRepo('did:plc:stall1')!;
+    assert.equal(stalled.status, 'unreachable');
+    assert.equal(stalled.attempts, MAX_ATTEMPTS);
+    assert.equal(stalled.retryAfter, null);
 
     const alive = ledger.getRepo('did:plc:alive1')!;
     assert.equal(alive.status, 'unreachable');

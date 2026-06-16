@@ -10,6 +10,8 @@ import type { Ledger, RepoCounts, RepoRow, RepoStatus } from './types.js';
 const SCHEMA_PATH = fileURLToPath(new URL('./ledger.sql', import.meta.url));
 
 const DEAD_HOSTS_META_KEY = 'dead_hosts';
+const FINAL_SWEEP_DEAD_HOSTS_META_KEY = 'final_sweep_dead_hosts';
+const FINAL_SWEEP_DEAD_HOSTS_RUN_ID_META_KEY = 'final_sweep_dead_hosts_run_id';
 
 interface RepoTableRow {
   did: string;
@@ -111,6 +113,7 @@ export class SqliteLedger implements Ledger {
   private readonly stmtMarkLoaded: Database.Statement;
   private readonly stmtMarkRetry: Database.Statement;
   private readonly stmtMarkThrottled: Database.Statement;
+  private readonly stmtParkUnreachable: Database.Statement;
   private readonly stmtParkDeadHost: Database.Statement;
   private readonly stmtParkDeadHostUnreachable: Database.Statement;
   private readonly stmtUpsertParked: Database.Statement;
@@ -274,6 +277,10 @@ export class SqliteLedger implements Ledger {
       UPDATE repos SET status = 'unreachable', error = ?, retry_after = ?
       WHERE did = ?
     `);
+    this.stmtParkUnreachable = this.db.prepare(`
+      UPDATE repos SET status = 'unreachable', attempts = ${MAX_ATTEMPTS}, error = ?, retry_after = NULL
+      WHERE did = ?
+    `);
 
     // Dead-host bulk park (host-health.ts): everything still claimable on the
     // host moves to out-of-budget 'unreachable' — invisible to claims (the
@@ -423,6 +430,31 @@ export class SqliteLedger implements Ledger {
     this.stmtSetMeta.run(key, value);
   }
 
+  private readHostSetMeta(key: string): Set<string> {
+    const raw = this.getMeta(key);
+    if (raw === undefined) return new Set();
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      return new Set(
+        Array.isArray(parsed)
+          ? parsed.filter((host): host is string => typeof host === 'string')
+          : [],
+      );
+    } catch {
+      return new Set();
+    }
+  }
+
+  private writeHostSetMeta(key: string, hosts: Iterable<string>): void {
+    this.setMeta(key, JSON.stringify([...new Set(hosts)].toSorted()));
+  }
+
+  private finalSweepDeadHostSet(runId: string): Set<string> {
+    if (this.getMeta(FINAL_SWEEP_DEAD_HOSTS_RUN_ID_META_KEY) !== runId)
+      return new Set();
+    return this.readHostSetMeta(FINAL_SWEEP_DEAD_HOSTS_META_KEY);
+  }
+
   private claimableStatementsForExclusions(count: number): {
     pending: Database.Statement;
     retry: Database.Statement;
@@ -528,6 +560,10 @@ export class SqliteLedger implements Ledger {
     this.stmtMarkThrottled.run(error, Date.now() + retryAfterMs, did);
   }
 
+  parkUnreachable(did: string, error: string): void {
+    this.stmtParkUnreachable.run(error, did);
+  }
+
   parkDeadHostChunk(host: string, error: string, limit: number): number {
     return this.stmtParkDeadHost.run(error, host, limit).changes;
   }
@@ -543,29 +579,38 @@ export class SqliteLedger implements Ledger {
    * 'pending' in a race against the in-process bulk park.
    */
   addDeadHost(host: string): void {
-    const hosts = new Set(this.getDeadHosts());
+    const hosts = this.readHostSetMeta(DEAD_HOSTS_META_KEY);
     if (hosts.has(host)) return;
     hosts.add(host);
-    this.setMeta(DEAD_HOSTS_META_KEY, JSON.stringify([...hosts].toSorted()));
+    this.writeHostSetMeta(DEAD_HOSTS_META_KEY, hosts);
   }
 
   getDeadHosts(): string[] {
-    const raw = this.getMeta(DEAD_HOSTS_META_KEY);
-    if (raw === undefined) return [];
-    try {
-      const parsed: unknown = JSON.parse(raw);
-      return Array.isArray(parsed)
-        ? parsed.filter((h) => typeof h === 'string')
-        : [];
-    } catch {
-      return [];
-    }
+    return [...this.readHostSetMeta(DEAD_HOSTS_META_KEY)].toSorted();
+  }
+
+  addFinalSweepDeadHost(host: string, runId: string): void {
+    const hosts = this.finalSweepDeadHostSet(runId);
+    if (hosts.has(host)) return;
+    hosts.add(host);
+    this.setMeta(FINAL_SWEEP_DEAD_HOSTS_RUN_ID_META_KEY, runId);
+    this.writeHostSetMeta(FINAL_SWEEP_DEAD_HOSTS_META_KEY, hosts);
+  }
+
+  getFinalSweepDeadHosts(runId: string): string[] {
+    return [...this.finalSweepDeadHostSet(runId)].toSorted();
   }
 
   removeDeadHost(host: string): void {
-    const hosts = new Set(this.getDeadHosts());
+    const hosts = this.readHostSetMeta(DEAD_HOSTS_META_KEY);
     if (!hosts.delete(host)) return;
-    this.setMeta(DEAD_HOSTS_META_KEY, JSON.stringify([...hosts].toSorted()));
+    this.writeHostSetMeta(DEAD_HOSTS_META_KEY, hosts);
+  }
+
+  removeFinalSweepDeadHost(host: string, runId: string): void {
+    const hosts = this.finalSweepDeadHostSet(runId);
+    if (!hosts.delete(host)) return;
+    this.writeHostSetMeta(FINAL_SWEEP_DEAD_HOSTS_META_KEY, hosts);
   }
 
   resetUnreachableForHost(host: string): number {

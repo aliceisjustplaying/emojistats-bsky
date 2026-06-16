@@ -11,6 +11,7 @@ import { resolveStoragePolicy } from 'archive/policy';
 import { createClickHouseClient, pingClickHouse } from './clickhouse.js';
 import {
   ARCHIVE_ENABLED,
+  BACKFILL_RUN_ID,
   CRASH_RECONCILE_ON_STARTUP,
   CRAWL_SHARD_INDEX,
   CRAWL_SHARDS,
@@ -39,6 +40,16 @@ import { createCrawlStats, type CrawlControl } from './run-state.js';
 import { createScheduler, parseFlags } from './scheduler.js';
 import type { Ledger, RepoLoader } from './types.js';
 
+function createArchiveOnlyLoader(): RepoLoader {
+  return {
+    openRepo: () => ({
+      addRow: async () => {},
+      finish: async () => {},
+    }),
+    close: async () => {},
+  };
+}
+
 async function main(): Promise<void> {
   assertBackfillRunIdConfigured();
   const flags = parseFlags();
@@ -58,18 +69,27 @@ async function main(): Promise<void> {
   });
   const chClient = createClickHouseClient();
   await pingClickHouse(chClient);
-  const loader: RepoLoader = new ClickHouseRepoLoader(chClient, {
-    // Self-heal a poisoned socket pool: a stale keepalive socket makes every
-    // insert ECONNRESET/time-out and jams the loader until restart, so the
-    // retry path rebuilds the client on connection-level failures.
-    recreateClient: () => createClickHouseClient(),
-  });
   const { telemetry } = createTelemetry();
   await telemetry.assertEventColumns();
 
   const archiveSink = await openArchiveSink(policy);
+  if (flags.archiveOnly && archiveSink === null) {
+    throw new Error('--archive-only requires ARCHIVE_ENABLED=1');
+  }
+  const loader: RepoLoader = flags.archiveOnly
+    ? createArchiveOnlyLoader()
+    : new ClickHouseRepoLoader(chClient, {
+        // Self-heal a poisoned socket pool: a stale keepalive socket makes every
+        // insert ECONNRESET/time-out and jams the loader until restart, so the
+        // retry path rebuilds the client on connection-level failures.
+        recreateClient: () => createClickHouseClient(),
+      });
 
-  if (CRASH_RECONCILE_ON_STARTUP && ledger.getMeta('crawl_dirty') === '1') {
+  if (
+    !flags.archiveOnly &&
+    CRASH_RECONCILE_ON_STARTUP &&
+    ledger.getMeta('crawl_dirty') === '1'
+  ) {
     await reconcileRecentLoads(ledger, chClient);
   } else if (ledger.getMeta('crawl_dirty') === '1') {
     logger.warn(
@@ -92,18 +112,36 @@ async function main(): Promise<void> {
   }
 
   if (flags.finalSweep) {
-    const deadHosts = ledger.getDeadHosts();
+    const persistentDeadHosts = ledger.getDeadHosts();
+    const finalSweepDeadHosts = ledger.getFinalSweepDeadHosts(BACKFILL_RUN_ID);
+    const deadHosts = [
+      ...new Set([...persistentDeadHosts, ...finalSweepDeadHosts]),
+    ];
     const reset = ledger.resetUnreachableAttempts(deadHosts);
     logger.warn(
-      { reset, deadHosts: deadHosts.length },
+      {
+        reset,
+        deadHosts: deadHosts.length,
+        persistentDeadHosts: persistentDeadHosts.length,
+        finalSweepDeadHosts: finalSweepDeadHosts.length,
+      },
       'final sweep: non-dead unreachable attempt budgets zeroed, retry waves resume',
     );
   }
 
+  const startupDeadHosts = flags.finalSweep
+    ? [
+        ...new Set([
+          ...ledger.getDeadHosts(),
+          ...ledger.getFinalSweepDeadHosts(BACKFILL_RUN_ID),
+        ]),
+      ]
+    : ledger.getDeadHosts();
+
   // Revive must run BEFORE createScheduler: the scheduler seeds host-health and
-  // the scan-exclusion set from ledger.getDeadHosts() at construction, so the
-  // verdict has to be gone from the registry first or the host is re-excluded
-  // and its just-reset rows never get claimed (the final-sweep dead-host gap).
+  // the scan-exclusion set from the dead-host registries at construction, so
+  // the verdict has to be gone first or the host is re-excluded and its
+  // just-reset rows never get claimed.
   //
   // Operational notes (codex review):
   //   - Per-box: each shard owns its own ledger, so revive on every box whose
@@ -119,6 +157,7 @@ async function main(): Promise<void> {
   //     revive afterward to catch any stragglers, or revive while it is idle.
   for (const host of flags.reviveHosts) {
     ledger.removeDeadHost(host);
+    ledger.removeFinalSweepDeadHost(host, BACKFILL_RUN_ID);
     const revived = ledger.resetUnreachableForHost(host);
     logger.warn(
       { host, revived },
@@ -130,13 +169,16 @@ async function main(): Promise<void> {
   const control: CrawlControl = { stopClaiming: false };
 
   const hostPressure = createHostPressure();
-  const hostHealth = createHostHealth();
+  const hostHealth = createHostHealth({
+    finalSweepStopLoss: flags.finalSweep,
+  });
   const retry = createRetryPolicy({
     ledger,
     telemetry,
     stats,
     hostPressure,
     hostHealth,
+    finalSweepStopLoss: flags.finalSweep,
   });
   const parsePool = createParsePool();
   const processRepo = createRepoPipeline({
@@ -158,6 +200,8 @@ async function main(): Promise<void> {
     control,
     hostPressure,
     hostHealth,
+    startupDeadHosts,
+    finalSweepRunId: flags.finalSweep ? BACKFILL_RUN_ID : undefined,
     processRepo,
   });
 

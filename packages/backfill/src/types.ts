@@ -107,6 +107,12 @@ export interface Ledger {
   markRetry(did: string, error: string, retryAfterMs: number): void;
   /** Parks like markRetry but without burning an attempt — the 429 path. */
   markThrottled(did: string, error: string, retryAfterMs: number): void;
+  /**
+   * Moves one repo to out-of-budget 'unreachable' immediately. Used when a host
+   * is already dead for this run, or when final sweep refuses an absurd
+   * Retry-After horizon.
+   */
+  parkUnreachable(did: string, error: string): void;
   markTerminal(
     did: string,
     status: Extract<
@@ -139,6 +145,13 @@ export interface Ledger {
   addDeadHost(host: string): void;
   getDeadHosts(): string[];
   /**
+   * Final-sweep-only dead-host registry scoped to one BACKFILL_RUN_ID. These
+   * hosts hit the sweep stop-loss and must stay parked across restarts of the
+   * same run, but must not leak into later runs or enumeration.
+   */
+  addFinalSweepDeadHost(host: string, runId: string): void;
+  getFinalSweepDeadHosts(runId: string): string[];
+  /**
    * Revive path (--revive-host): drop a host from the dead registry so startup
    * re-seeding and the scan filter stop excluding it. No-op if absent. MUST be
    * paired with resetUnreachableForHost — removing the verdict alone leaves the
@@ -152,6 +165,8 @@ export interface Ledger {
    * which would also revive genuinely-dead DNS/legal hosts.
    */
   resetUnreachableForHost(host: string): number;
+  /** Drop one host from the current run's final-sweep dead-host registry. */
+  removeFinalSweepDeadHost(host: string, runId: string): void;
   /** Enumeration insert path for dead-host rows: born parked (final-sweep list). */
   upsertParked(did: string, pdsHost: string, error: string): void;
   /** Follow an account migration discovered after enumeration (stale PLC pointer). */

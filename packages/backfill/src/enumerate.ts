@@ -4,6 +4,10 @@ import { PLC_DIRECTORY_URL, USER_AGENT } from './config.js';
 import { pdsHostFromEndpoint } from './fetcher.js';
 import { SqliteLedger } from './ledger.js';
 import logger from './logger.js';
+import {
+  unusablePdsHostMessage,
+  validatePublicPdsHost,
+} from './pds-host-policy.js';
 
 /**
  * PLC directory enumeration: streams the /export feed into the ledger.
@@ -115,6 +119,34 @@ function endpointFromOperation(
   return undefined;
 }
 
+function upsertEnumeratedDid(
+  ledger: SqliteLedger,
+  deadHosts: Set<string>,
+  did: string,
+  host: string,
+): 'parked' | 'pending' {
+  const admission = validatePublicPdsHost(host);
+  if (!admission.ok) {
+    if (!deadHosts.has(host)) {
+      ledger.addDeadHost(host);
+      deadHosts.add(host);
+    }
+    const reason = unusablePdsHostMessage(admission.host, admission.kind);
+    ledger.upsertParked(did, host, `host dead: ${host} (${reason})`);
+    return 'parked';
+  }
+  if (deadHosts.has(host)) {
+    ledger.upsertParked(
+      did,
+      host,
+      `host dead: ${host} (enumerated onto final-sweep list)`,
+    );
+    return 'parked';
+  }
+  ledger.upsertPending(did, host);
+  return 'pending';
+}
+
 async function runExport(
   ledger: SqliteLedger,
   limit: number | undefined,
@@ -195,15 +227,10 @@ async function runExport(
           // park race enumeration forever on spam waves (pds.trump.com:
           // 17.9M rows) — the park drained 'pending' at ~18k rows/s while
           // this loop refilled it, pinning the crawl main thread.
-          if (deadHosts.has(host)) {
-            ledger.upsertParked(
-              line.did,
-              host,
-              `host dead: ${host} (enumerated onto final-sweep list)`,
-            );
+          if (
+            upsertEnumeratedDid(ledger, deadHosts, line.did, host) === 'parked'
+          ) {
             stats.parked++;
-          } else {
-            ledger.upsertPending(line.did, host);
           }
           touched.add(line.did);
           stats.upserted++;
@@ -246,6 +273,7 @@ async function runExport(
 }
 
 async function runDids(ledger: SqliteLedger, dids: string[]): Promise<void> {
+  const deadHosts = new Set(ledger.getDeadHosts());
   for (const did of dids) {
     if (stop.requested) break;
     const response = await politeFetch(`${PLC_DIRECTORY_URL}/${did}`);
@@ -276,7 +304,12 @@ async function runDids(ledger: SqliteLedger, dids: string[]): Promise<void> {
       );
       continue;
     }
-    ledger.upsertPending(did, host);
+    if (upsertEnumeratedDid(ledger, deadHosts, did, host) === 'parked') {
+      logger.warn(
+        { did, pdsHost: host },
+        'enumerated DID parked immediately on a non-public/dead PDS host',
+      );
+    }
     logger.info(
       { did, pdsHost: host, status: ledger.getRepo(did)?.status },
       'enumerated DID',

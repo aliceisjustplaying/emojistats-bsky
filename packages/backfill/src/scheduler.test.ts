@@ -10,7 +10,7 @@ import {
 } from './scheduler.js';
 
 function isDeadHost(host: string): boolean {
-  return host === 'dead.example';
+  return host === 'dead.social';
 }
 
 void describe('scheduler retained backlog policy', () => {
@@ -75,15 +75,19 @@ void describe('scheduler claim scan host exclusion', () => {
 void describe('scheduler unreachable idle policy', () => {
   void it('waits only for non-dead unreachable rows with retry budget left', () => {
     assert.equal(
-      shouldWaitForUnreachableRetry(4, 'alive.example', isDeadHost),
+      shouldWaitForUnreachableRetry(4, 'alive.social', isDeadHost),
       true,
     );
     assert.equal(
-      shouldWaitForUnreachableRetry(4, 'dead.example', isDeadHost),
+      shouldWaitForUnreachableRetry(4, 'dead.social', isDeadHost),
       false,
     );
     assert.equal(
-      shouldWaitForUnreachableRetry(5, 'alive.example', isDeadHost),
+      shouldWaitForUnreachableRetry(5, 'alive.social', isDeadHost),
+      false,
+    );
+    assert.equal(
+      shouldWaitForUnreachableRetry(4, 'http://127.0.0.1:25000', isDeadHost),
       false,
     );
   });

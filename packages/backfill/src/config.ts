@@ -94,6 +94,18 @@ export const PARSE_ROW_BATCH_ROWS = num('PARSE_ROW_BATCH_ROWS', 10_000);
 export const RETRY_BASE_MS = num('RETRY_BASE_MS', 60_000);
 export const RETRY_MAX_MS = num('RETRY_MAX_MS', 3_600_000);
 export const MAX_ATTEMPTS = num('MAX_ATTEMPTS', 5);
+export const FINAL_SWEEP_HOST_STOP_LOSS_RETRIES = num(
+  'FINAL_SWEEP_HOST_STOP_LOSS_RETRIES',
+  4,
+);
+export const FINAL_SWEEP_HOST_STOP_LOSS_MS = num(
+  'FINAL_SWEEP_HOST_STOP_LOSS_MS',
+  300_000,
+);
+export const FINAL_SWEEP_MAX_RETRY_AFTER_MS = num(
+  'FINAL_SWEEP_MAX_RETRY_AFTER_MS',
+  600_000,
+);
 
 // Cross-repo insert batching (see loader.ts): flush the shared buffer at
 // LOADER_BATCH_ROWS rows or when the oldest buffered row is LOADER_FLUSH_MS
