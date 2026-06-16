@@ -2181,6 +2181,91 @@ missing helpers and stale tests that the orchestrating agent had to reconcile ma
 concurrent sessions for the ledger lane alone produced atomic claims with CAS, worker leases,
 stale recovery, and deterministic retry jitter — with 16/16 focused tests green.
 
+### 2026-06-16 (final) — the second smoke passes all whales; the Codex agent's own memory tells the v1 story
+
+**The second full smoke test ran all whales to completion.** After the index cap fix (512 MiB
+default was too tight — f4z hit it at ~536 MiB, raised to 4 GiB; `998fee8`), a clean run
+against all 24 fixture DIDs completed in **1,379 seconds (~23 minutes)**: 19 succeeded, 5
+classified as expected terminal failures (account states, malformed CARs). Individual whale
+results:
+
+- **f4z** (1.86 GB CAR): fetched in 98.5s, parsed in 107.1s, peak 279 MB RSS at completion
+- **4hm** (1.42 GB): fetched in 161.6s, parsed in 74.6s, peak 510 MB
+- **lb7** (293 MB, 2.5M posts): parsed in 68.5s
+- **ndj** (4.80 GB, just under the 5 GiB per-repo cap): fetched + parsed in 356s, ~1.5 GB RSS
+- **o6g** (3.96 GB, 5.0M posts): transport decode error after 1.73 GB on first attempt, retried
+  successfully; total ~616s with retry overhead, parsed in 367s, ~1.34 GB RSS at completion
+
+The spool budget accounting validated under real pressure: when ndj owned a 4.69 GB CAR and
+o6g was downloading at 857 MB, the total neared the 6 GiB in-flight cap and o6g correctly
+paused until ndj's CAR was discarded. Fetch backpressure worked as designed — the budget bounds
+concurrency, the per-repo cap bounds individual downloads, and the parse semaphore bounds
+concurrent memory usage. Spool cleanup between repos kept the total smoke directory at ~1.6 GB
+after each whale completed despite multi-GB CAR spools.
+
+The 512 MiB → 4 GiB parser index cap fix is the same failure class as v1's 1 GiB CAR_MAX_BYTES:
+a well-intentioned limit set too tight, silently rejecting legitimate data. The difference is
+that v2 caught it during a smoke test, not after 16 repos had been silently dropped in production.
+This is what "no silent caps" looks like when the caps are loud: the whale failed, the error was
+obvious, and the fix was deployed before any production crawl.
+
+A ClickHouse derive smoke also ran against the same data (464,595 emoji rows, 14 DID counters
+inserted into a fresh smoke database). The derive needed schema pre-creation — the fresh smoke
+database had no tables, exposing that the derive path assumes existing schema rather than
+creating it. The session context exhausted before the derive completed.
+
+**v2 structurally eliminates the loose band.** This is worth stating directly because the loose
+convergence saga consumed more post-crawl time than the crawl itself. In v1, "loose" meant
+ClickHouse had more posts than the ledger expected — usually because firehose inserts added
+posts after the backfill loaded the repo. Reconciling this required re-fetching each loose
+repo, comparing rkey sets, filtering post-load drift, handling PDS migrations and tombstones,
+and all of it memory-bound by ClickHouse FINAL scans. The 631k loose DIDs from v1 needed
+their own mini-infrastructure.
+
+In v2, the MST root proof at parse time — reconstructing the MST and checking root CID against
+the signed commit root — proves the rkey set is complete at the moment of fetch. If the proof
+doesn't match, the repo fails loud and re-fetches immediately. There is no deferred "loose"
+category. The separate `posts_backfill` table isolation means firehose inserts can't create
+false positives. And the rkey digest is recomputed from Parquet (not from ClickHouse, which
+only holds the emoji subset and structurally can't reproduce the full-repo digest). The
+critique's #1 blocker — "emoji-only-in-CH kills v1's CH-side XOR-digest verification" — is
+the reason v2 verifies from Parquet instead.
+
+The design also includes a canary gate that goes beyond "does the pipeline pass": it requires
+an **injected single-post drop** to be detected before the 8-box fan-out is approved. Verify
+the verifier. v1's false-pass incident (shard2 promoted ~2M repos with zero CH classification
+because the completeness guard didn't exist yet) is the reason this gate exists.
+
+**What the Codex agent's own memory says about v1.** Mining the structured rollout summaries
+and memory files on pix2 reveals what the ops agent learned through its own lens:
+
+- **`backfill_repo_events` is lossy under ClickHouse pressure** — the agent learned this the
+  hard way when ETA estimates diverged. The authoritative source is `backfill_progress`; events
+  are best-effort and drop under load. This is why the dashboard lied about progress: it was
+  reading the lossy signal.
+- **Failed concurrency canaries are documented as "do not reuse"**: settings `5120/128/20` broke
+  ClickHouse uploads entirely (frozen telemetry, socket hang up), `6144/96/16` didn't improve
+  throughput. Both were tried, measured, reverted. The ETA target kept slipping — "under 4 days"
+  was never durably verified before Alice called a stop.
+- **Shard modulus mismatch** (code hardcoded 6 in `ledger.ts:81`, runbook documented 8 in
+  `docs/backfill-runbook.md:149`) — caught by the thermo-nuclear review.
+- **The Rust decision arc had three states**: assessed and deferred (Jun 14: "probably not worth
+  it before the second backfill"), confirmed deferred by Alice ("i'll pass on the rust rewrite"),
+  then reversed after the grill-with-docs session (Jun 15: "we are rewriting this whole fucking
+  thing in rust"). The golden fixture strategy — freeze TS behavior into fixtures before porting
+  — was proposed during the assessment phase and carried forward into the rewrite. The rewrite
+  estimate from the assessment (5-7 focused days narrow, 8-12 broader) is tracking against the
+  actual velocity (~24h from design to smoke test, with extensive parallel subagent work).
+- **The agent's own documented failure modes**: launching two Claude review processes
+  simultaneously (Alice: "please do not put price caps on claude ever"), planning artifacts
+  treated as project truth before validation, critique mode that never switched back to
+  implementation mode, and generic "large file" complaints filling review output instead of
+  actionable structural findings. Alice's correction: "ignore too-long-file-that-is-responsible-
+  for-5-different-things kind of issues, we are not doing big refactors like that *yet*."
+- **The summary of the second-run risk**: "less about raw throughput and more about clean
+  scoping, durable verification, and keeping the dashboard/telemetry truthful across multiple
+  runs." This is the sentence the retro has been building toward since the first dashboard lie.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
