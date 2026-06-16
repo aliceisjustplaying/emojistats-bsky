@@ -4,7 +4,7 @@ Working notes for the `emojistats-backfill` Rust rewrite. Design source of truth
 `../docs/backfill-v2-design.md`. This file is the implementation-level companion (API map,
 roadmap, conventions) so a fresh session can continue without re-deriving.
 
-## Status (2026-06-15)
+## Status (2026-06-16)
 
 - Branch `v2-rust-backfill`. Greenfield; no v1 reuse.
 - **Checkpoint A done:** `fetch-one <did>` resolves DID→PDS over the live network
@@ -76,6 +76,18 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   tables contained 464,166 emoji rows and 16 total-post counters; counter sums matched the
   archive receipts at 5,125,748 posts, 342,441 posts with emoji, and 491,357 emoji
   occurrences.
+- Largest whale smoke now succeeds end-to-end for
+  `did:plc:o6ggjvnj4ze3mnrpnv5oravg` on `mottlegill.us-west.host.bsky.network`.
+  The release run spooled a 3,960,894,200-byte `CAR`, archived 5,047,059 posts from
+  5,047,424 reachable records, carried 12 typed decode diagnostics, wrote 33,439 emoji
+  projection rows, and completed in 14:56.02 with max RSS 1,503,144 KiB. Fetch took
+  454.1s, parse 438.1s, archive finalization 3.2s. Streaming derive loaded that manifest
+  into `emojistats_smoke` in 29.6s with max RSS 54,080 KiB. Smoke tables then held 497,605
+  emoji serving rows across 12 DIDs and 17 counter rows totalling 10,172,807 posts.
+- Whale transport hardening: repo fetches use an HTTP/1-only `reqwest` client with TCP
+  keepalive and 30s connect timeout, and retry retryable body-stream transport/idle failures
+  up to 3 full download attempts. Transport errors now report bytes observed before failure
+  when the stream had started.
 - Jacquard 0.12.0 via **fork-mirror git deps**: `github.com/aliceisjustplaying/jacquard`
   @ `39648622522fa62c4c0b12ac22b8a5f6893c845a` (== tag 0.12.0). reqwest pulls **rustls**
   (no openssl). Full 0.12.0 source also at `/tmp/jacquard` for reading (ephemeral).

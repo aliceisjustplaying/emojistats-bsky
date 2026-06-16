@@ -51,6 +51,7 @@ use tokio::sync::Semaphore;
 const DEFAULT_PARSE_CONCURRENCY: usize = 1;
 const DEFAULT_MAX_INFLIGHT_SPOOL_BYTES: u64 = 536_870_912;
 const DERIVE_EMOJI_CHUNK_ROWS: usize = 10_000;
+const FETCH_TRANSPORT_ATTEMPTS: u8 = 3;
 
 /// emojistats v2 backfill tool.
 #[derive(Parser, Debug)]
@@ -931,7 +932,9 @@ async fn fetch_one_attempt_with_pacer(
         config.host_pacer.as_ref(),
     )
     .await?;
-    let http = reqwest::Client::new();
+    let http = repo_fetch_client().map_err(|err| {
+        retryable_failure(format!("build repo fetch HTTP client for {did_str}: {err}"))
+    })?;
     let mut fetch_config = FetchConfig::new(config.spool_dir);
     fetch_config.max_bytes = config.max_bytes;
     fetch_config.byte_budget = config.byte_budget;
@@ -1017,35 +1020,66 @@ struct FetchedRepo {
 
 async fn fetch_spooled_repo(step: FetchStep<'_>) -> Result<FetchedRepo, FetchOneFailure> {
     let fetch_started = Instant::now();
-    match fetch_repo(step.http, step.pds, step.did, step.config).await {
-        Ok(spooled) => Ok(FetchedRepo {
-            spooled,
-            fetch_ms: elapsed_ms(fetch_started),
-        }),
-        Err(err) => {
-            let failure = classify_fetch_error(step.did_str, &err);
-            emit_smoke_telemetry(&SmokeTelemetry {
-                event: "smoke_repo_attempt",
-                did: step.did_str,
-                host: Some(step.host),
-                outcome: outcome_name(&failure.outcome),
-                stage: "fetch",
-                elapsed_ms: elapsed_ms(step.attempt_started),
-                fetch_ms: Some(elapsed_ms(fetch_started)),
-                parse_ms: None,
-                archive_ms: None,
-                bytes: None,
-                records: None,
-                archived_posts: None,
-                decode_errors: None,
-                emoji_rows: None,
-                rss_kb: current_rss_kb(),
-                error: Some(failure.error.to_string()),
-            });
-            record_rate_limit_cooldown(step.host_pacer, step.host, &failure);
-            Err(failure)
+    let mut attempt = 1_u8;
+    loop {
+        match fetch_repo(step.http, step.pds, step.did, step.config).await {
+            Ok(spooled) => {
+                return Ok(FetchedRepo {
+                    spooled,
+                    fetch_ms: elapsed_ms(fetch_started),
+                });
+            }
+            Err(err)
+                if is_retryable_stream_fetch_error(&err) && attempt < FETCH_TRANSPORT_ATTEMPTS =>
+            {
+                eprintln!(
+                    "fetch retry {next_attempt}/{max_attempts} for {did}: {err}",
+                    next_attempt = attempt.saturating_add(1),
+                    max_attempts = FETCH_TRANSPORT_ATTEMPTS,
+                    did = step.did_str
+                );
+                attempt = attempt.saturating_add(1);
+            }
+            Err(err) => {
+                let failure = classify_fetch_error(step.did_str, &err);
+                emit_smoke_telemetry(&SmokeTelemetry {
+                    event: "smoke_repo_attempt",
+                    did: step.did_str,
+                    host: Some(step.host),
+                    outcome: outcome_name(&failure.outcome),
+                    stage: "fetch",
+                    elapsed_ms: elapsed_ms(step.attempt_started),
+                    fetch_ms: Some(elapsed_ms(fetch_started)),
+                    parse_ms: None,
+                    archive_ms: None,
+                    bytes: None,
+                    records: None,
+                    archived_posts: None,
+                    decode_errors: None,
+                    emoji_rows: None,
+                    rss_kb: current_rss_kb(),
+                    error: Some(failure.error.to_string()),
+                });
+                record_rate_limit_cooldown(step.host_pacer, step.host, &failure);
+                return Err(failure);
+            }
         }
     }
+}
+
+fn repo_fetch_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .http1_only()
+        .tcp_keepalive(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(30))
+        .build()
+}
+
+const fn is_retryable_stream_fetch_error(error: &FetchError) -> bool {
+    matches!(
+        error,
+        FetchError::Transport { .. } | FetchError::InactivityTimeout { .. }
+    )
 }
 
 fn record_rate_limit_cooldown(

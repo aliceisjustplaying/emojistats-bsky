@@ -282,6 +282,8 @@ pub enum FetchError {
     Transport {
         /// Transport error message.
         message: String,
+        /// Bytes already written before the transport failed, when the body stream had started.
+        observed_bytes: Option<u64>,
     },
     /// Local filesystem I/O failed.
     Io {
@@ -343,7 +345,13 @@ impl fmt::Display for FetchError {
                 "in-flight spooled CAR bytes exceeded max bytes: observed {observed_bytes}, max {max_bytes}"
             ),
             Self::ByteBudgetPoisoned => f.write_str("in-flight spool byte budget lock poisoned"),
-            Self::Transport { message } => write!(f, "transport error: {message}"),
+            Self::Transport {
+                message,
+                observed_bytes,
+            } => match observed_bytes {
+                Some(bytes) => write!(f, "transport error after {bytes} bytes: {message}"),
+                None => write!(f, "transport error: {message}"),
+            },
             Self::Io { source } => write!(f, "I/O error: {source}"),
         }
     }
@@ -398,6 +406,7 @@ where
         .await
         .map_err(|err| FetchError::Transport {
             message: err.to_string(),
+            observed_bytes: None,
         })?;
     let status = response.status();
     let rate_limit = RateLimitSnapshot::from_headers(response.headers());
@@ -477,6 +486,7 @@ async fn stream_to_temp_file(
     {
         let chunk = next_chunk.map_err(|err| FetchError::Transport {
             message: err.to_string(),
+            observed_bytes: Some(bytes),
         })?;
         let chunk_len =
             u64::try_from(chunk.len()).map_err(|_err| FetchError::MaxBytesExceeded {
@@ -546,6 +556,7 @@ async fn collect_body_with_cap(
     {
         let chunk = next_chunk.map_err(|err| FetchError::Transport {
             message: err.to_string(),
+            observed_bytes: Some(observed),
         })?;
         let chunk_len =
             u64::try_from(chunk.len()).map_err(|_err| FetchError::ErrorBodyTooLarge {
