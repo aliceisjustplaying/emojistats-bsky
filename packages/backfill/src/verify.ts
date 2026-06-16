@@ -58,6 +58,7 @@ import { createWriteStream, existsSync } from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 
+import { parse as parseTid } from '@atcute/tid';
 import type { ClickHouseClient, ClickHouseSettings } from '@clickhouse/client';
 import Database from 'better-sqlite3';
 import type { PostRow } from 'ingest/types';
@@ -94,6 +95,7 @@ interface LedgerRepo {
   pds_host: string;
   rev: string | null;
   rkey_digest: string | null;
+  loaded_at: number | null;
 }
 
 interface Mismatch {
@@ -323,7 +325,7 @@ async function stageExpectedRepos(
   );
 
   const stmt = db.prepare(
-    `SELECT did, status, posts_total, pds_host, rev, rkey_digest
+    `SELECT did, status, posts_total, pds_host, rev, rkey_digest, loaded_at
      FROM repos WHERE ${statusWhere}`,
   );
   const promotionStage = createLoadedPromotionStage(db);
@@ -565,7 +567,10 @@ async function queryMismatchExamples(
   }));
 }
 
-async function collectLooseRepos(ch: ClickHouseClient): Promise<LedgerRepo[]> {
+async function collectLooseRepos(
+  db: Database.Database,
+  ch: ClickHouseClient,
+): Promise<LedgerRepo[]> {
   const result = await ch.query({
     query: `
       SELECT
@@ -594,6 +599,7 @@ async function collectLooseRepos(ch: ClickHouseClient): Promise<LedgerRepo[]> {
     rev: string | null;
     rkey_digest: string;
   }>();
+  const loadedAtStmt = db.prepare('SELECT loaded_at FROM repos WHERE did = ?');
   return rows.map((row) => ({
     did: row.did,
     status: row.status,
@@ -601,6 +607,9 @@ async function collectLooseRepos(ch: ClickHouseClient): Promise<LedgerRepo[]> {
     pds_host: row.pds_host,
     rev: row.rev,
     rkey_digest: row.rkey_digest,
+    loaded_at:
+      (loadedAtStmt.get(row.did) as { loaded_at: number | null } | undefined)
+        ?.loaded_at ?? null,
   }));
 }
 
@@ -785,7 +794,7 @@ async function reconcile(
 
   const mismatches = await queryMismatchExamples(ch);
   const looseRepos = options.collectLooseRepos
-    ? await collectLooseRepos(ch)
+    ? await collectLooseRepos(db, ch)
     : [];
   const looseEmitted =
     options.emitLoosePath === undefined
@@ -908,6 +917,34 @@ const refetchPostRows: RefetchPostRows = async (did, pdsHost) => {
   return rows;
 };
 
+function rkeyTimestampMs(rkey: string): number | null {
+  try {
+    return Math.floor(parseTid(rkey).timestamp / 1000);
+  } catch {
+    return null;
+  }
+}
+
+function wasCreatedAfterLoadedAt(
+  rkey: string,
+  loadedAt: number | null,
+): boolean {
+  if (loadedAt === null) return false;
+  const timestamp = rkeyTimestampMs(rkey);
+  return timestamp !== null && timestamp > loadedAt;
+}
+
+function isPostLoadTerminalRefetchFailure(
+  repo: LedgerRepo,
+  err: unknown,
+): boolean {
+  if (repo.loaded_at === null || !(err instanceof Error)) return false;
+  return (
+    err.message.includes('RepoDeactivated') ||
+    err.message.includes('RepoTakendown')
+  );
+}
+
 /** Random draw across all loaded/verified repos (the undirected --sample pool). */
 function selectRandomRepos(
   db: Database.Database,
@@ -915,7 +952,7 @@ function selectRandomRepos(
 ): LedgerRepo[] {
   return db
     .prepare(
-      "SELECT did, status, posts_total, pds_host, rev, rkey_digest FROM repos WHERE status IN ('loaded', 'verified') ORDER BY RANDOM() LIMIT ?",
+      "SELECT did, status, posts_total, pds_host, rev, rkey_digest, loaded_at FROM repos WHERE status IN ('loaded', 'verified') ORDER BY RANDOM() LIMIT ?",
     )
     .all(sampleSize) as LedgerRepo[];
 }
@@ -956,6 +993,15 @@ async function sampleVerifyRepos(
     try {
       const rows = await refetch(repo.did, repo.pds_host);
       const fetchedRkeys = new Set(rows.map((row) => row.rkey));
+      const comparableFetchedRkeys = new Set<string>();
+      const ignoredPostLoadRkeys: string[] = [];
+      for (const rkey of fetchedRkeys) {
+        if (wasCreatedAfterLoadedAt(rkey, repo.loaded_at)) {
+          ignoredPostLoadRkeys.push(rkey);
+        } else {
+          comparableFetchedRkeys.add(rkey);
+        }
+      }
 
       const result = await ch.query({
         // Src-agnostic, same reasoning as reconciliation: live can win the merge.
@@ -974,8 +1020,19 @@ async function sampleVerifyRepos(
         (await result.json<{ rkey: string }>()).map((row) => row.rkey),
       );
 
-      const missingInCh = [...fetchedKeysDiff(fetchedRkeys, chRkeys)];
+      const missingInCh = [...fetchedKeysDiff(comparableFetchedRkeys, chRkeys)];
       const extraInCh = [...fetchedKeysDiff(chRkeys, fetchedRkeys)];
+      if (ignoredPostLoadRkeys.length > 0) {
+        logger.info(
+          {
+            did: repo.did,
+            loadedAt: repo.loaded_at,
+            ignoredPostLoadPosts: ignoredPostLoadRkeys.length,
+            ignoredRkeys: ignoredPostLoadRkeys.slice(0, 20),
+          },
+          'sample repo: ignored posts created after this repo was loaded',
+        );
+      }
       // The invariant: CH must be a SUPERSET of any later CAR fetch, because
       // nothing is ever deleted (emojitracker semantics — posts count as they
       // happened). The two divergence directions therefore mean opposite
@@ -986,7 +1043,8 @@ async function sampleVerifyRepos(
         logger.info(
           {
             did: repo.did,
-            refetched: fetchedRkeys.size,
+            refetched: comparableFetchedRkeys.size,
+            ignoredPostLoadPosts: ignoredPostLoadRkeys.length,
             clickhouse: chRkeys.size,
             deletedSinceCrawl: extraInCh.length,
             extraInClickhouse: extraInCh.slice(0, 20),
@@ -996,7 +1054,11 @@ async function sampleVerifyRepos(
       }
       if (missingInCh.length === 0) {
         logger.info(
-          { did: repo.did, posts: chRkeys.size },
+          {
+            did: repo.did,
+            posts: chRkeys.size,
+            ignoredPostLoadPosts: ignoredPostLoadRkeys.length,
+          },
           extraInCh.length === 0
             ? 'sample repo post sets identical'
             : 'sample repo: ClickHouse is a superset of the fresh CAR',
@@ -1009,7 +1071,8 @@ async function sampleVerifyRepos(
         logger.error(
           {
             did: repo.did,
-            refetched: fetchedRkeys.size,
+            refetched: comparableFetchedRkeys.size,
+            ignoredPostLoadPosts: ignoredPostLoadRkeys.length,
             clickhouse: chRkeys.size,
             missingInClickhouse: missingInCh.slice(0, 20),
           },
@@ -1017,6 +1080,24 @@ async function sampleVerifyRepos(
         );
       }
     } catch (err) {
+      if (isPostLoadTerminalRefetchFailure(repo, err)) {
+        logger.warn(
+          {
+            did: repo.did,
+            loadedAt: repo.loaded_at,
+            err: err instanceof Error ? err.message : String(err),
+          },
+          'sample re-fetch skipped: repo entered terminal account state after it was loaded',
+        );
+        await telemetry.record({
+          ...base,
+          phase: `sampling-${pool}`,
+          sampleChecked: i + 1,
+          sampleFailures: failures,
+          done: false,
+        });
+        continue;
+      }
       failures += 1;
       logger.error(
         {
