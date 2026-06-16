@@ -5,7 +5,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -13,6 +13,8 @@ use crate::transport::AccountState;
 
 /// Pinned v2 shard bucket count for persisted repo ledger rows.
 pub const DID_SHARD_BUCKET_MODULUS: u64 = 8;
+/// Default amount of time a fleet worker owns a claimed repo before recovery may requeue it.
+pub const DEFAULT_CLAIM_LEASE_DURATION: Duration = Duration::from_hours(6);
 
 /// Return the stable persisted shard bucket for a DID.
 #[must_use]
@@ -102,6 +104,9 @@ pub struct RepoLedgerEntry {
     pub next_attempt_after: Option<SystemTime>,
     pub last_attempt: Option<AttemptId>,
     pub last_error: Option<String>,
+    pub worker_id: Option<String>,
+    pub claimed_at: Option<SystemTime>,
+    pub lease_until: Option<SystemTime>,
 }
 
 impl RepoLedgerEntry {
@@ -114,6 +119,9 @@ impl RepoLedgerEntry {
             next_attempt_after: None,
             last_attempt: None,
             last_error: None,
+            worker_id: None,
+            claimed_at: None,
+            lease_until: None,
         }
     }
 
@@ -191,6 +199,40 @@ pub fn claim_repo(
     attempt: AttemptId,
     now: SystemTime,
 ) -> Result<RepoLedgerEntry, LedgerError> {
+    claim_repo_transition(entry, attempt, now, None, None)
+}
+
+/// Mark a claimable repo as claimed by a concrete worker until a lease deadline.
+///
+/// # Errors
+///
+/// Returns [`LedgerError`] if the repo is not claimable at `now`, the worker id is invalid,
+/// or `lease_duration` overflows.
+pub fn claim_repo_with_lease(
+    entry: &RepoLedgerEntry,
+    attempt: AttemptId,
+    now: SystemTime,
+    worker_id: &str,
+    lease_duration: Duration,
+) -> Result<RepoLedgerEntry, LedgerError> {
+    validate_worker_id(worker_id)?;
+    let lease_until = add_duration(now, lease_duration)?;
+    claim_repo_transition(
+        entry,
+        attempt,
+        now,
+        Some(worker_id.to_owned()),
+        Some(lease_until),
+    )
+}
+
+fn claim_repo_transition(
+    entry: &RepoLedgerEntry,
+    attempt: AttemptId,
+    now: SystemTime,
+    worker_id: Option<String>,
+    lease_until: Option<SystemTime>,
+) -> Result<RepoLedgerEntry, LedgerError> {
     if !entry.can_claim_at(now) {
         return Err(LedgerError::NotClaimable {
             did: entry.did.clone(),
@@ -206,6 +248,9 @@ pub fn claim_repo(
     claimed.last_attempt = Some(attempt);
     claimed.last_error = None;
     claimed.next_attempt_after = None;
+    claimed.worker_id = worker_id;
+    claimed.claimed_at = lease_until.map(|_| now);
+    claimed.lease_until = lease_until;
     Ok(claimed)
 }
 
@@ -228,6 +273,9 @@ pub fn complete_attempt(
     }
 
     let mut next = entry.clone();
+    next.worker_id = None;
+    next.claimed_at = None;
+    next.lease_until = None;
     match outcome {
         AttemptOutcome::Succeeded => {
             next.status = RepoLedgerStatus::Succeeded;
@@ -250,8 +298,10 @@ pub fn complete_attempt(
                 next.next_attempt_after = None;
             } else {
                 next.status = RepoLedgerStatus::RetryableFailure;
-                next.next_attempt_after =
-                    Some(add_duration(now, retry_delay(next.attempts, policy)?)?);
+                next.next_attempt_after = Some(add_duration(
+                    now,
+                    retry_delay(&next.did, next.attempts, policy)?,
+                )?);
             }
             next.last_error = Some(message);
         }
@@ -298,10 +348,20 @@ impl SqliteLedger {
     /// # Errors
     ///
     /// Returns [`LedgerStoreError`] when schema creation fails.
-    pub fn from_connection(connection: Connection) -> Result<Self, LedgerStoreError> {
+    pub fn from_connection(mut connection: Connection) -> Result<Self, LedgerStoreError> {
+        connection.set_transaction_behavior(TransactionBehavior::Immediate);
         let ledger = Self { connection };
+        ledger.configure_connection()?;
         ledger.create_schema()?;
         Ok(ledger)
+    }
+
+    fn configure_connection(&self) -> Result<(), LedgerStoreError> {
+        self.connection.busy_timeout(Duration::from_secs(30))?;
+        self.connection.pragma_update(None, "journal_mode", "WAL")?;
+        self.connection
+            .pragma_update(None, "synchronous", "NORMAL")?;
+        Ok(())
     }
 
     /// Create the ledger schema if it does not already exist.
@@ -323,6 +383,9 @@ impl SqliteLedger {
                 last_attempt_did TEXT,
                 last_attempt_sequence INTEGER,
                 last_error TEXT,
+                worker_id TEXT,
+                claimed_at_ms INTEGER,
+                lease_until_ms INTEGER,
                 CHECK (
                     (status = 'terminal_account' AND terminal_account_state IS NOT NULL)
                     OR (status <> 'terminal_account' AND terminal_account_state IS NULL)
@@ -344,13 +407,17 @@ impl SqliteLedger {
             );
             ",
         )?;
-        self.ensure_repo_ledger_shard_bucket()?;
+        self.ensure_repo_ledger_columns()?;
         self.connection.execute_batch(
             "
             CREATE INDEX IF NOT EXISTS idx_repo_ledger_claim
                 ON repo_ledger (status, shard_bucket, did);
             CREATE INDEX IF NOT EXISTS idx_repo_ledger_retry
                 ON repo_ledger (status, shard_bucket, next_attempt_after_ms);
+            CREATE INDEX IF NOT EXISTS idx_repo_ledger_claim_v2
+                ON repo_ledger (status, shard_bucket, next_attempt_after_ms, did);
+            CREATE INDEX IF NOT EXISTS idx_repo_ledger_lease_v2
+                ON repo_ledger (status, lease_until_ms);
             ",
         )?;
         Ok(())
@@ -371,6 +438,8 @@ impl SqliteLedger {
             .transpose()
             .map_err(|_err| LedgerStoreError::IntegerOverflow)?;
         let shard_bucket = shard_bucket_to_i64(did_shard_bucket(&entry.did))?;
+        let claimed_at_ms = optional_time_to_millis(entry.claimed_at)?;
+        let lease_until_ms = optional_time_to_millis(entry.lease_until)?;
         self.connection.execute(
             "
             INSERT INTO repo_ledger (
@@ -383,8 +452,11 @@ impl SqliteLedger {
                 last_attempt_run_id,
                 last_attempt_did,
                 last_attempt_sequence,
-                last_error
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                last_error,
+                worker_id,
+                claimed_at_ms,
+                lease_until_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             ON CONFLICT(did) DO UPDATE SET
                 shard_bucket = excluded.shard_bucket,
                 status = excluded.status,
@@ -394,7 +466,10 @@ impl SqliteLedger {
                 last_attempt_run_id = excluded.last_attempt_run_id,
                 last_attempt_did = excluded.last_attempt_did,
                 last_attempt_sequence = excluded.last_attempt_sequence,
-                last_error = excluded.last_error
+                last_error = excluded.last_error,
+                worker_id = excluded.worker_id,
+                claimed_at_ms = excluded.claimed_at_ms,
+                lease_until_ms = excluded.lease_until_ms
             ",
             params![
                 entry.did.as_str(),
@@ -413,6 +488,9 @@ impl SqliteLedger {
                     .map(|attempt| attempt.did.as_str()),
                 last_attempt_sequence,
                 entry.last_error.as_deref(),
+                entry.worker_id.as_deref(),
+                claimed_at_ms,
+                lease_until_ms,
             ],
         )?;
         Ok(())
@@ -425,6 +503,195 @@ impl SqliteLedger {
     /// Returns [`LedgerStoreError`] when the entry cannot be encoded or persisted.
     pub fn save_transitioned_entry(&self, entry: &RepoLedgerEntry) -> Result<(), LedgerStoreError> {
         self.upsert_entry(entry)
+    }
+
+    /// Atomically claim the next due repo for one worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerStoreError`] when SQLite fails, values cannot be encoded, or
+    /// `worker_id` is invalid.
+    pub fn try_claim_next(
+        &self,
+        now: SystemTime,
+        run_id: &str,
+        worker_id: &str,
+        lease_duration: Duration,
+        shard: Option<ShardFilter>,
+    ) -> Result<Option<RepoLedgerEntry>, LedgerStoreError> {
+        validate_worker_id(worker_id).map_err(LedgerStoreError::Ledger)?;
+        let now_ms = time_to_millis(now)?;
+        let lease_until_ms = time_to_millis(
+            now.checked_add(lease_duration)
+                .ok_or(LedgerStoreError::IntegerOverflow)?,
+        )?;
+        let shard_bucket = shard
+            .map(|filter| shard_bucket_to_i64(filter.bucket()))
+            .transpose()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let did = transaction
+            .query_row(
+                "
+                SELECT did
+                FROM repo_ledger
+                WHERE
+                    (
+                        (
+                            status IN ('pending', 'retryable_failure')
+                            AND (next_attempt_after_ms IS NULL OR next_attempt_after_ms <= ?1)
+                        )
+                        OR (
+                            status = 'throttled'
+                            AND next_attempt_after_ms IS NOT NULL
+                            AND next_attempt_after_ms <= ?1
+                        )
+                    )
+                    AND (?2 IS NULL OR shard_bucket = ?2)
+                ORDER BY COALESCE(next_attempt_after_ms, 0), did
+                LIMIT 1
+                ",
+                params![now_ms, shard_bucket],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(did) = did else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+
+        let changed = transaction.execute(
+            "
+            UPDATE repo_ledger
+            SET
+                status = 'claimed',
+                terminal_account_state = NULL,
+                attempts = attempts + 1,
+                next_attempt_after_ms = NULL,
+                last_attempt_run_id = ?2,
+                last_attempt_did = did,
+                last_attempt_sequence = attempts + 1,
+                last_error = NULL,
+                worker_id = ?3,
+                claimed_at_ms = ?4,
+                lease_until_ms = ?5
+            WHERE
+                did = ?1
+                AND (
+                    (
+                        status IN ('pending', 'retryable_failure')
+                        AND (next_attempt_after_ms IS NULL OR next_attempt_after_ms <= ?4)
+                    )
+                    OR (
+                        status = 'throttled'
+                        AND next_attempt_after_ms IS NOT NULL
+                        AND next_attempt_after_ms <= ?4
+                    )
+                )
+                AND (?6 IS NULL OR shard_bucket = ?6)
+            ",
+            params![
+                did.as_str(),
+                run_id,
+                worker_id,
+                now_ms,
+                lease_until_ms,
+                shard_bucket,
+            ],
+        )?;
+        if changed == 0 {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let entry = load_entry_in_transaction(&transaction, &did)?
+            .ok_or(LedgerStoreError::MissingClaimedEntry)?;
+        transaction.commit()?;
+        Ok(Some(entry))
+    }
+
+    /// Complete a claimed repo only when the stored row still belongs to the same worker attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerStoreError`] when SQLite fails or the completed state cannot be encoded.
+    pub fn complete_owned_claim(
+        &self,
+        claimed: &RepoLedgerEntry,
+        outcome: AttemptOutcome,
+        now: SystemTime,
+        policy: RetryPolicy,
+    ) -> Result<Option<RepoLedgerEntry>, LedgerStoreError> {
+        let Some(worker_id) = claimed.worker_id.as_deref() else {
+            return Ok(None);
+        };
+        let Some(attempt) = claimed.last_attempt.as_ref() else {
+            return Ok(None);
+        };
+        let transaction = self.connection.unchecked_transaction()?;
+        let Some(current) = load_entry_in_transaction(&transaction, &claimed.did)? else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        if current.status != RepoLedgerStatus::Claimed
+            || current.worker_id.as_deref() != Some(worker_id)
+            || current.last_attempt.as_ref() != Some(attempt)
+        {
+            transaction.commit()?;
+            return Ok(None);
+        }
+
+        let completed =
+            complete_attempt(&current, outcome, now, policy).map_err(LedgerStoreError::Ledger)?;
+        let changed = update_entry_if_owned(&transaction, &completed, worker_id, attempt)?;
+        transaction.commit()?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        Ok(Some(completed))
+    }
+
+    /// Requeue a claimed repo only after its lease has expired.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerStoreError`] when SQLite fails or the recovered state cannot be encoded.
+    pub fn recover_expired_claim(
+        &self,
+        did: &str,
+        now: SystemTime,
+        message: &str,
+    ) -> Result<Option<RepoLedgerEntry>, LedgerStoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let Some(current) = load_entry_in_transaction(&transaction, did)? else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        if current.status != RepoLedgerStatus::Claimed
+            || current
+                .lease_until
+                .is_none_or(|lease_until| lease_until > now)
+        {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let recovered = complete_attempt(
+            &current,
+            AttemptOutcome::RetryableFailure {
+                message: message.to_owned(),
+            },
+            now,
+            RetryPolicy {
+                max_attempts: u32::MAX,
+                base_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+            },
+        )
+        .map_err(LedgerStoreError::Ledger)?;
+        let changed = update_expired_claim(&transaction, &recovered, now)?;
+        transaction.commit()?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        Ok(Some(recovered))
     }
 
     /// Load one ledger entry by DID.
@@ -445,7 +712,10 @@ impl SqliteLedger {
                     last_attempt_run_id,
                     last_attempt_did,
                     last_attempt_sequence,
-                    last_error
+                    last_error,
+                    worker_id,
+                    claimed_at_ms,
+                    lease_until_ms
                 FROM repo_ledger
                 WHERE did = ?1
                 ",
@@ -562,7 +832,10 @@ impl SqliteLedger {
                 last_attempt_run_id,
                 last_attempt_did,
                 last_attempt_sequence,
-                last_error
+                last_error,
+                worker_id,
+                claimed_at_ms,
+                lease_until_ms
             FROM repo_ledger
             WHERE
                 (
@@ -586,7 +859,7 @@ impl SqliteLedger {
         entries.into_iter().collect()
     }
 
-    fn ensure_repo_ledger_shard_bucket(&self) -> Result<(), LedgerStoreError> {
+    fn ensure_repo_ledger_columns(&self) -> Result<(), LedgerStoreError> {
         let mut statement = self.connection.prepare("PRAGMA table_info(repo_ledger)")?;
         let columns = statement
             .query_map([], |row| row.get::<_, String>(1))?
@@ -594,6 +867,22 @@ impl SqliteLedger {
         if !columns.iter().any(|column| column == "shard_bucket") {
             self.connection.execute(
                 "ALTER TABLE repo_ledger ADD COLUMN shard_bucket INTEGER",
+                [],
+            )?;
+        }
+        if !columns.iter().any(|column| column == "worker_id") {
+            self.connection
+                .execute("ALTER TABLE repo_ledger ADD COLUMN worker_id TEXT", [])?;
+        }
+        if !columns.iter().any(|column| column == "claimed_at_ms") {
+            self.connection.execute(
+                "ALTER TABLE repo_ledger ADD COLUMN claimed_at_ms INTEGER",
+                [],
+            )?;
+        }
+        if !columns.iter().any(|column| column == "lease_until_ms") {
+            self.connection.execute(
+                "ALTER TABLE repo_ledger ADD COLUMN lease_until_ms INTEGER",
                 [],
             )?;
         }
@@ -622,7 +911,7 @@ impl SqliteLedger {
     }
 }
 
-fn retry_delay(attempts: u32, policy: RetryPolicy) -> Result<Duration, LedgerError> {
+fn retry_delay(did: &str, attempts: u32, policy: RetryPolicy) -> Result<Duration, LedgerError> {
     let exponent = attempts.saturating_sub(1).min(31);
     let multiplier = 1_u64
         .checked_shl(exponent)
@@ -631,7 +920,36 @@ fn retry_delay(attempts: u32, policy: RetryPolicy) -> Result<Duration, LedgerErr
         .base_delay
         .checked_mul(u32::try_from(multiplier).map_err(|_err| LedgerError::AttemptOverflow)?)
         .ok_or(LedgerError::AttemptOverflow)?;
-    Ok(delay.min(policy.max_delay))
+    let delay = delay.min(policy.max_delay);
+    let jitter = retry_jitter(did, attempts, policy.base_delay)?;
+    Ok(delay
+        .checked_add(jitter)
+        .ok_or(LedgerError::TimeOverflow)?
+        .min(policy.max_delay))
+}
+
+fn retry_jitter(did: &str, attempts: u32, base_delay: Duration) -> Result<Duration, LedgerError> {
+    let window_millis =
+        u64::try_from(base_delay.as_millis() / 4).map_err(|_err| LedgerError::AttemptOverflow)?;
+    if window_millis == 0 {
+        return Ok(Duration::ZERO);
+    }
+    let modulus = window_millis
+        .checked_add(1)
+        .ok_or(LedgerError::AttemptOverflow)?;
+    let mut hasher = Sha256::new();
+    hasher.update(did.as_bytes());
+    hasher.update(attempts.to_be_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 8];
+    for (destination, source) in bytes.iter_mut().zip(digest) {
+        *destination = source;
+    }
+    Ok(Duration::from_millis(
+        u64::from_be_bytes(bytes)
+            .checked_rem(modulus)
+            .ok_or(LedgerError::AttemptOverflow)?,
+    ))
 }
 
 fn add_duration(now: SystemTime, delay: Duration) -> Result<SystemTime, LedgerError> {
@@ -656,6 +974,8 @@ pub enum LedgerError {
     TimeOverflow,
     #[error("invalid shard bucket {bucket}; expected 0 <= bucket < {modulus}")]
     InvalidShardBucket { bucket: u64, modulus: u64 },
+    #[error("ledger worker id must not be blank")]
+    InvalidWorkerId,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -680,6 +1000,10 @@ pub enum LedgerStoreError {
     InvalidHostOverrideDisabled { value: i64 },
     #[error("invalid forced fetch mode {mode}")]
     InvalidForcedFetchMode { mode: String },
+    #[error("ledger state transition error")]
+    Ledger(#[from] LedgerError),
+    #[error("claimed entry disappeared during claim transaction")]
+    MissingClaimedEntry,
 }
 
 struct StoredStatus {
@@ -736,6 +1060,9 @@ fn row_to_entry(
     let last_attempt_run_id: Option<String> = row.get(5)?;
     let last_attempt_did: Option<String> = row.get(6)?;
     let last_attempt_sequence: Option<i64> = row.get(7)?;
+    let worker_id: Option<String> = row.get(9)?;
+    let claimed_at_ms: Option<i64> = row.get(10)?;
+    let lease_until_ms: Option<i64> = row.get(11)?;
 
     Ok(build_entry(
         row.get(0)?,
@@ -747,7 +1074,173 @@ fn row_to_entry(
         last_attempt_did,
         last_attempt_sequence,
         row.get(8)?,
+        worker_id,
+        claimed_at_ms,
+        lease_until_ms,
     ))
+}
+
+fn load_entry_in_transaction(
+    transaction: &Transaction<'_>,
+    did: &str,
+) -> Result<Option<RepoLedgerEntry>, LedgerStoreError> {
+    transaction
+        .query_row(
+            "
+            SELECT
+                did,
+                status,
+                terminal_account_state,
+                attempts,
+                next_attempt_after_ms,
+                last_attempt_run_id,
+                last_attempt_did,
+                last_attempt_sequence,
+                last_error,
+                worker_id,
+                claimed_at_ms,
+                lease_until_ms
+            FROM repo_ledger
+            WHERE did = ?1
+            ",
+            params![did],
+            row_to_entry,
+        )
+        .optional()
+        .map_err(Into::into)
+        .and_then(Option::transpose)
+}
+
+fn update_entry_if_owned(
+    transaction: &Transaction<'_>,
+    entry: &RepoLedgerEntry,
+    worker_id: &str,
+    attempt: &AttemptId,
+) -> Result<usize, LedgerStoreError> {
+    let status = StoredStatus::from(&entry.status);
+    let next_attempt_after_ms = optional_time_to_millis(entry.next_attempt_after)?;
+    let last_attempt_sequence = entry
+        .last_attempt
+        .as_ref()
+        .map(|attempt| i64::try_from(attempt.sequence))
+        .transpose()
+        .map_err(|_err| LedgerStoreError::IntegerOverflow)?;
+    let claimed_at_ms = optional_time_to_millis(entry.claimed_at)?;
+    let lease_until_ms = optional_time_to_millis(entry.lease_until)?;
+    let owned_attempt_sequence =
+        i64::try_from(attempt.sequence).map_err(|_err| LedgerStoreError::IntegerOverflow)?;
+    transaction
+        .execute(
+            "
+            UPDATE repo_ledger
+            SET
+                status = ?2,
+                terminal_account_state = ?3,
+                attempts = ?4,
+                next_attempt_after_ms = ?5,
+                last_attempt_run_id = ?6,
+                last_attempt_did = ?7,
+                last_attempt_sequence = ?8,
+                last_error = ?9,
+                worker_id = ?10,
+                claimed_at_ms = ?11,
+                lease_until_ms = ?12
+            WHERE
+                did = ?1
+                AND status = 'claimed'
+                AND worker_id = ?13
+                AND last_attempt_run_id = ?14
+                AND last_attempt_did = ?15
+                AND last_attempt_sequence = ?16
+            ",
+            params![
+                entry.did.as_str(),
+                status.status,
+                status.terminal_account_state,
+                i64::from(entry.attempts),
+                next_attempt_after_ms,
+                entry
+                    .last_attempt
+                    .as_ref()
+                    .map(|attempt| attempt.run_id.as_str()),
+                entry
+                    .last_attempt
+                    .as_ref()
+                    .map(|attempt| attempt.did.as_str()),
+                last_attempt_sequence,
+                entry.last_error.as_deref(),
+                entry.worker_id.as_deref(),
+                claimed_at_ms,
+                lease_until_ms,
+                worker_id,
+                attempt.run_id.as_str(),
+                attempt.did.as_str(),
+                owned_attempt_sequence,
+            ],
+        )
+        .map_err(Into::into)
+}
+
+fn update_expired_claim(
+    transaction: &Transaction<'_>,
+    entry: &RepoLedgerEntry,
+    now: SystemTime,
+) -> Result<usize, LedgerStoreError> {
+    let status = StoredStatus::from(&entry.status);
+    let next_attempt_after_ms = optional_time_to_millis(entry.next_attempt_after)?;
+    let last_attempt_sequence = entry
+        .last_attempt
+        .as_ref()
+        .map(|attempt| i64::try_from(attempt.sequence))
+        .transpose()
+        .map_err(|_err| LedgerStoreError::IntegerOverflow)?;
+    let claimed_at_ms = optional_time_to_millis(entry.claimed_at)?;
+    let lease_until_ms = optional_time_to_millis(entry.lease_until)?;
+    transaction
+        .execute(
+            "
+            UPDATE repo_ledger
+            SET
+                status = ?2,
+                terminal_account_state = ?3,
+                attempts = ?4,
+                next_attempt_after_ms = ?5,
+                last_attempt_run_id = ?6,
+                last_attempt_did = ?7,
+                last_attempt_sequence = ?8,
+                last_error = ?9,
+                worker_id = ?10,
+                claimed_at_ms = ?11,
+                lease_until_ms = ?12
+            WHERE
+                did = ?1
+                AND status = 'claimed'
+                AND lease_until_ms IS NOT NULL
+                AND lease_until_ms <= ?13
+            ",
+            params![
+                entry.did.as_str(),
+                status.status,
+                status.terminal_account_state,
+                i64::from(entry.attempts),
+                next_attempt_after_ms,
+                entry
+                    .last_attempt
+                    .as_ref()
+                    .map(|attempt| attempt.run_id.as_str()),
+                entry
+                    .last_attempt
+                    .as_ref()
+                    .map(|attempt| attempt.did.as_str()),
+                last_attempt_sequence,
+                entry.last_error.as_deref(),
+                entry.worker_id.as_deref(),
+                claimed_at_ms,
+                lease_until_ms,
+                time_to_millis(now)?,
+            ],
+        )
+        .map_err(Into::into)
 }
 
 fn row_to_host_override(
@@ -808,6 +1301,9 @@ fn build_entry(
     last_attempt_did: Option<String>,
     last_attempt_sequence: Option<i64>,
     last_error: Option<String>,
+    worker_id: Option<String>,
+    claimed_at_ms: Option<i64>,
+    lease_until_ms: Option<i64>,
 ) -> Result<RepoLedgerEntry, LedgerStoreError> {
     let status = parse_status(status, terminal_account_state)?;
     let attempts = u32::try_from(attempts).map_err(|_err| LedgerStoreError::IntegerOverflow)?;
@@ -829,6 +1325,9 @@ fn build_entry(
         next_attempt_after,
         last_attempt,
         last_error,
+        worker_id,
+        claimed_at: claimed_at_ms.map(time_from_millis).transpose()?,
+        lease_until: lease_until_ms.map(time_from_millis).transpose()?,
     })
 }
 
@@ -913,6 +1412,13 @@ fn validate_host_override(record: &HostOverride) -> Result<(), LedgerStoreError>
     Ok(())
 }
 
+fn validate_worker_id(worker_id: &str) -> Result<(), LedgerError> {
+    if worker_id.trim().is_empty() {
+        return Err(LedgerError::InvalidWorkerId);
+    }
+    Ok(())
+}
+
 const fn bool_to_i64(value: bool) -> i64 {
     if value { 1 } else { 0 }
 }
@@ -946,7 +1452,13 @@ fn time_from_millis(millis: i64) -> Result<SystemTime, LedgerStoreError> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{Arc, Barrier},
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
 
     use rusqlite::params;
 
@@ -1023,7 +1535,8 @@ mod tests {
 
         assert_eq!(failed.status, RepoLedgerStatus::RetryableFailure);
         assert!(!failed.can_claim_at(now + Duration::from_secs(59)));
-        assert!(failed.can_claim_at(now + Duration::from_secs(60)));
+        assert!(failed.next_attempt_after.is_some_and(|due| due > now));
+        assert!(failed.can_claim_at(failed.next_attempt_after.unwrap()));
     }
 
     #[test]
@@ -1107,6 +1620,9 @@ mod tests {
             next_attempt_after: Some(UNIX_EPOCH + Duration::from_secs(1_234)),
             last_attempt: Some(AttemptId::new("run-1", "did:plc:abc", 9)),
             last_error: Some("RepoSuspended".to_owned()),
+            worker_id: None,
+            claimed_at: None,
+            lease_until: None,
         };
 
         store.upsert_entry(&entry).unwrap();
@@ -1136,6 +1652,9 @@ mod tests {
             next_attempt_after: Some(now - Duration::from_secs(1)),
             last_attempt: Some(AttemptId::new("run-1", "did:plc:due", 1)),
             last_error: Some("rate_limited".to_owned()),
+            worker_id: None,
+            claimed_at: None,
+            lease_until: None,
         };
         let pending = RepoLedgerEntry::pending("did:plc:pending");
         let future_retry = RepoLedgerEntry {
@@ -1145,6 +1664,9 @@ mod tests {
             next_attempt_after: Some(now + Duration::from_secs(1)),
             last_attempt: Some(AttemptId::new("run-1", "did:plc:future", 1)),
             last_error: Some("timeout".to_owned()),
+            worker_id: None,
+            claimed_at: None,
+            lease_until: None,
         };
         let succeeded = RepoLedgerEntry {
             did: "did:plc:done".to_owned(),
@@ -1153,6 +1675,9 @@ mod tests {
             next_attempt_after: None,
             last_attempt: Some(AttemptId::new("run-1", "did:plc:done", 1)),
             last_error: None,
+            worker_id: None,
+            claimed_at: None,
+            lease_until: None,
         };
 
         for entry in [&due, &pending, &future_retry, &succeeded] {
@@ -1187,6 +1712,102 @@ mod tests {
             .unwrap();
 
         assert_eq!(claimable, vec![target]);
+    }
+
+    #[test]
+    fn sqlite_atomic_claim_allows_exactly_one_owner_across_connections() {
+        let db_path = temp_ledger_path("claim-race");
+        let store = SqliteLedger::open(&db_path).unwrap();
+        store
+            .upsert_entry(&RepoLedgerEntry::pending("did:plc:race"))
+            .unwrap();
+        drop(store);
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let open_barrier = Arc::new(Barrier::new(3));
+        let claim_barrier = Arc::new(Barrier::new(3));
+        let make_handle = |worker_id: &'static str| {
+            let db_path = db_path.clone();
+            let open_barrier = Arc::clone(&open_barrier);
+            let claim_barrier = Arc::clone(&claim_barrier);
+            thread::spawn(move || {
+                let store = SqliteLedger::open(&db_path).unwrap();
+                open_barrier.wait();
+                claim_barrier.wait();
+                store
+                    .try_claim_next(now, "run-1", worker_id, Duration::from_secs(60), None)
+                    .unwrap()
+            })
+        };
+        let handles = [make_handle("worker-a"), make_handle("worker-b")];
+        open_barrier.wait();
+        claim_barrier.wait();
+
+        let claims = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        let claimed = claims.iter().flatten().collect::<Vec<_>>();
+
+        assert_eq!(claimed.len(), 1);
+        let claimed = claimed.into_iter().next().unwrap();
+        assert_eq!(claimed.status, RepoLedgerStatus::Claimed);
+        assert_eq!(claimed.attempts, 1);
+        assert!(matches!(
+            claimed.worker_id.as_deref(),
+            Some("worker-a" | "worker-b")
+        ));
+        fs::remove_file(db_path).unwrap();
+    }
+
+    #[test]
+    fn sqlite_active_claim_is_not_recovered_before_lease_expiry() {
+        let store = SqliteLedger::open_in_memory().unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        store
+            .upsert_entry(&RepoLedgerEntry::pending("did:plc:active"))
+            .unwrap();
+        let claimed = store
+            .try_claim_next(now, "run-1", "worker-a", Duration::from_secs(60), None)
+            .unwrap()
+            .unwrap();
+
+        let recovered = store
+            .recover_expired_claim(
+                "did:plc:active",
+                now + Duration::from_secs(59),
+                "expired claim",
+            )
+            .unwrap();
+
+        assert_eq!(recovered, None);
+        assert_eq!(store.load_entry("did:plc:active").unwrap(), Some(claimed));
+    }
+
+    #[test]
+    fn sqlite_completion_requires_current_owner() {
+        let store = SqliteLedger::open_in_memory().unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        store
+            .upsert_entry(&RepoLedgerEntry::pending("did:plc:owned"))
+            .unwrap();
+        let claimed = store
+            .try_claim_next(now, "run-1", "worker-a", Duration::from_secs(60), None)
+            .unwrap()
+            .unwrap();
+        let mut wrong_owner = claimed.clone();
+        wrong_owner.worker_id = Some("worker-b".to_owned());
+
+        let completed = store
+            .complete_owned_claim(
+                &wrong_owner,
+                AttemptOutcome::Succeeded,
+                now + Duration::from_secs(1),
+                RetryPolicy::default(),
+            )
+            .unwrap();
+
+        assert_eq!(completed, None);
+        assert_eq!(store.load_entry("did:plc:owned").unwrap(), Some(claimed));
     }
 
     #[test]
@@ -1300,5 +1921,14 @@ mod tests {
         store.save_transitioned_entry(&completed).unwrap();
 
         assert_eq!(store.load_entry("did:plc:abc").unwrap(), Some(completed));
+    }
+
+    fn temp_ledger_path(name: &str) -> PathBuf {
+        let since_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        std::env::temp_dir().join(format!(
+            "emojistats-backfill-ledger-{name}-{}-{}.sqlite",
+            std::process::id(),
+            since_epoch.as_nanos()
+        ))
     }
 }
