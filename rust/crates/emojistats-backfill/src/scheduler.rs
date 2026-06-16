@@ -3,15 +3,17 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{ledger::ShardFilter, transport::RateLimitSnapshot};
 
+const LOW_REMAINING_RATIO_DENOMINATOR: u64 = 10;
+
 /// Shared per-host pacing state used by concurrent fleet attempts.
 pub type SharedHostPacer = Arc<Mutex<HostPacer>>;
 
-/// Host cooldown table fed by retry-after outcomes.
+/// Host cooldown table fed by retry-after outcomes and rate-limit window headers.
 #[derive(Debug, Default)]
 pub struct HostPacer {
     cooldowns: HashMap<String, Instant>,
@@ -77,7 +79,7 @@ impl HostPacer {
         rate_limit: &RateLimitSnapshot,
         observed_at: SystemTime,
     ) -> Result<(), SchedulerError> {
-        let Some(delay) = rate_limit.cooldown_delay(observed_at) else {
+        let Some(delay) = Self::rate_limit_delay(rate_limit, observed_at) else {
             return Ok(());
         };
         shared
@@ -107,6 +109,49 @@ impl HostPacer {
             })
             .or_insert(deadline);
     }
+
+    #[must_use]
+    pub fn rate_limit_delay(
+        rate_limit: &RateLimitSnapshot,
+        observed_at: SystemTime,
+    ) -> Option<Duration> {
+        if let Some(retry_after) = rate_limit.retry_after {
+            return Some(retry_after);
+        }
+        let reset = reset_delay(rate_limit.reset?, observed_at)?;
+        match rate_limit.remaining {
+            Some(0) => Some(reset),
+            Some(remaining) if is_low_remaining(rate_limit.limit, remaining) => reset
+                .checked_div(u32::try_from(remaining.saturating_add(1)).unwrap_or(u32::MAX))
+                .filter(|delay| !delay.is_zero()),
+            _ => None,
+        }
+    }
+}
+
+fn is_low_remaining(limit: Option<u64>, remaining: u64) -> bool {
+    let Some(limit) = limit else {
+        return false;
+    };
+    if limit == 0 {
+        return false;
+    }
+    let low_watermark = limit
+        .checked_div(LOW_REMAINING_RATIO_DENOMINATOR)
+        .unwrap_or(0)
+        .max(1);
+    remaining <= low_watermark
+}
+
+fn reset_delay(reset: u64, now: SystemTime) -> Option<Duration> {
+    let now = now.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    if reset > now {
+        return reset.checked_sub(now).map(Duration::from_secs);
+    }
+    if (1..=86_400).contains(&reset) {
+        return Some(Duration::from_secs(reset));
+    }
+    None
 }
 
 /// Claim-scope hooks kept explicit while the Rust fleet runner grows host and
@@ -155,9 +200,12 @@ pub const fn checked_concurrency(value: usize) -> Result<usize, SchedulerError> 
 mod tests {
     #![allow(clippy::arithmetic_side_effects)]
 
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, UNIX_EPOCH};
 
-    use crate::scheduler::{ClaimScope, HostPacer, checked_concurrency};
+    use crate::{
+        scheduler::{ClaimScope, HostPacer, checked_concurrency},
+        transport::RateLimitSnapshot,
+    };
 
     #[test]
     fn retry_after_keeps_the_longest_host_cooldown() {
@@ -179,6 +227,54 @@ mod tests {
             pacer.ready_delay("pds.example", now + Duration::from_secs(11)),
             None
         );
+    }
+
+    #[test]
+    #[allow(clippy::duration_suboptimal_units)]
+    fn rate_limit_delay_waits_until_reset_when_remaining_is_empty() {
+        let observed_at = UNIX_EPOCH + Duration::from_secs(1_781_568_000);
+        let snapshot = RateLimitSnapshot {
+            limit: Some(100),
+            remaining: Some(0),
+            reset: Some(1_781_568_030),
+            ..RateLimitSnapshot::default()
+        };
+
+        assert_eq!(
+            HostPacer::rate_limit_delay(&snapshot, observed_at),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::duration_suboptimal_units)]
+    fn rate_limit_delay_spreads_low_remaining_across_reset_window() {
+        let observed_at = UNIX_EPOCH + Duration::from_secs(1_781_568_000);
+        let snapshot = RateLimitSnapshot {
+            limit: Some(100),
+            remaining: Some(4),
+            reset: Some(1_781_568_100),
+            ..RateLimitSnapshot::default()
+        };
+
+        assert_eq!(
+            HostPacer::rate_limit_delay(&snapshot, observed_at),
+            Some(Duration::from_secs(20))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::duration_suboptimal_units)]
+    fn rate_limit_delay_ignores_non_low_remaining() {
+        let observed_at = UNIX_EPOCH + Duration::from_secs(1_781_568_000);
+        let snapshot = RateLimitSnapshot {
+            limit: Some(100),
+            remaining: Some(11),
+            reset: Some(1_781_568_100),
+            ..RateLimitSnapshot::default()
+        };
+
+        assert_eq!(HostPacer::rate_limit_delay(&snapshot, observed_at), None);
     }
 
     #[test]

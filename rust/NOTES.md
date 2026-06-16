@@ -76,6 +76,20 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   tables contained 464,166 emoji rows and 16 total-post counters; counter sums matched the
   archive receipts at 5,125,748 posts, 342,441 posts with emoji, and 491,357 emoji
   occurrences.
+- Full-whale scale smoke, release binary, `rust/fixtures/scale-smoke.dids`,
+  `--concurrency 4 --parse-concurrency 1 --max-inflight-spool-bytes 17179869184 --max-bytes
+  5368709120`, output under `rust/data/scale-smoke-review-fixed-20260616T175810Z/`: 24
+  claimed, 19 succeeded, 5 expected loud failures (3 account-state, 1 retryable dead host, 1
+  malformed `CAR`). Archive wrote 12,424,409,768 fetched bytes, 16,848,177 reachable records,
+  16,629,234 post rows, 4,986 decode diagnostics, and 499,516 emoji projection rows. Wall
+  time was 13:49.49; max RSS was 2,813,716 KiB. This run caught and fixed an in-flight byte
+  budget deadlock: repo fetch now reserves admission capacity before streaming and shrinks
+  the reservation to observed bytes after a successful download, so multiple large fetches
+  cannot fill the budget while each waits mid-body for more capacity. It also caught and
+  fixed a streaming-derive receipt lookup drift for content-addressed archive stems.
+- ClickHouse derive over those 19 full-whale manifests inserted 81 payloads and 499,535 rows
+  into `emojistats_smoke` in 2:35.55 with max RSS 70,848 KiB. Smoke tables contained 499,516
+  emoji rows and 19 total-post counters.
 - Largest whale smoke now succeeds end-to-end for
   `did:plc:o6ggjvnj4ze3mnrpnv5oravg` on `mottlegill.us-west.host.bsky.network`.
   The release run spooled a 3,960,894,200-byte `CAR`, archived 5,047,059 posts from
@@ -102,7 +116,8 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   account-state, HTTP, timeout, cap, transport, and I/O errors.
 - **C — parse:** `src/parse.rs` reads only a `CAR` path, indexes blocks by `CID`, verifies
   bytes hash back to the advertised `CID`, stores block offsets over the spooled file,
-  parses the commit, proves `MST` root equality, walks records, and extracts typed
+  parses the commit, validates that the commit-referenced `MST` root block and linked
+  record blocks resolve by verified `CID`, walks ordered records, and extracts
   `app.bsky.feed.post` plus optional profile data. Typed record decode failures are
   diagnostics; malformed records do not abort a complete snapshot.
 - **D — archive/derive:** `src/archive.rs` converts parsed posts to archive rows, computes
@@ -150,7 +165,7 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
 - All 3 built-in stores are in-RAM (incl. `FileBlockStore`, which slurps the whole CAR) → write our own.
 - `jacquard_repo::car::stream_car(path) -> CarBlockStream`; `.next() -> Option<(Cid, Bytes)>` — streaming, whale-safe. (`read_car`/`parse_car_bytes` buffer everything — avoid for whales.)
 - `jacquard_repo::commit::Commit<S>` `{ did, version, data: IpldCid (=MST root), rev, prev, sig }`; `Commit::from_cbor(&bytes)`; `commit.data()`. (Skip signature verify per design.)
-- `jacquard_repo::mst::Mst::load(Arc<Store>, cid, layer: Option<usize>)` (lazy). `mst.get_pointer()` recomputes the root CID → **Snapshot Completeness = `get_pointer() == commit.data`**. `MstCursor`/`leaves_sequential()` for whales (`leaves()`/`collect_blocks()` collect into RAM). rkeys are the reconstructed MST leaf keys.
+- `jacquard_repo::mst::Mst::load(Arc<Store>, cid, layer: Option<usize>)` (lazy). `mst.get_pointer()` can recompute the root CID in the Jacquard path, but the current streaming parser does not use Jacquard `Mst`; it proves verified traversal from `commit.data` and names canonical root recomputation as not implemented. `MstCursor`/`leaves_sequential()` for whales (`leaves()`/`collect_blocks()` collect into RAM). rkeys are the reconstructed MST leaf keys.
 - `jacquard_repo::mst::util::compute_cid(&[u8]) -> IpldCid` (SHA-256, dag-cbor codec `0x71`). **No read path verifies bytes-hash-to-CID** — WE must `compute_cid` per block at ingest and reject mismatches (the other half of completeness). Guard non-dag-cbor codecs (raw `0x55`).
 - Reference pattern: `jacquard_repo::commit::firehose::validate_v1_0` (load MST → `get_pointer()` == expected root).
 

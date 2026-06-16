@@ -1,19 +1,20 @@
 //! `com.atproto.repo.listRecords` fallback fetch and archive path.
 
-use std::{collections::HashSet, fmt, path::Path};
+use std::{collections::HashSet, fmt, path::Path, time::Duration};
 
-use jacquard_api::app_bsky::feed::post::Post;
+use futures_util::StreamExt as _;
 use jacquard_common::{deps::fluent_uri::Uri, types::did::Did};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
-use smol_str::SmolStr;
+use tokio::time;
 
 use crate::{
     archive::{
         ArchiveArtifacts, ArchiveCommitContext, ArchiveError, CompletenessClass, FetchMethod,
         RepoReceipt, StreamingArchiveSink, StreamingReceiptInput, archive_row_from_post,
     },
-    parse::{PostRecord, PostRecordBody, raw_partial_post},
+    parse::PostRecord,
+    post_decode,
     transport::{AccountState, RateLimitSnapshot},
 };
 
@@ -23,6 +24,7 @@ const DEFAULT_PAGE_LIMIT: u16 = 100;
 const DEFAULT_MAX_PAGES: u64 = 100_000;
 const DEFAULT_MAX_RECORDS: u64 = 10_000_000;
 const DEFAULT_MAX_PAGE_BYTES: u64 = 8_388_608;
+const DEFAULT_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Pagination and response-size caps for `listRecords`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +33,7 @@ pub struct ListRecordsConfig {
     pub max_pages: u64,
     pub max_records: u64,
     pub max_page_bytes: u64,
+    pub chunk_idle_timeout: Duration,
 }
 
 impl Default for ListRecordsConfig {
@@ -40,6 +43,7 @@ impl Default for ListRecordsConfig {
             max_pages: DEFAULT_MAX_PAGES,
             max_records: DEFAULT_MAX_RECORDS,
             max_page_bytes: DEFAULT_MAX_PAGE_BYTES,
+            chunk_idle_timeout: DEFAULT_CHUNK_IDLE_TIMEOUT,
         }
     }
 }
@@ -57,7 +61,8 @@ pub struct ListRecordsPage {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ListRecordsRecord {
     pub uri: String,
-    pub cid: String,
+    #[serde(default)]
+    pub cid: Option<String>,
     pub value: serde_json::Value,
 }
 
@@ -91,6 +96,8 @@ pub enum ListRecordsError {
     },
     #[error("listRecords transport failed: {0}")]
     Transport(#[from] reqwest::Error),
+    #[error("no listRecords body chunk within {timeout:?}")]
+    InactivityTimeout { timeout: Duration },
     #[error("listRecords page JSON failed to decode: {0}")]
     PageJson(#[source] serde_json::Error),
     #[error("listRecords archive failed: {0}")]
@@ -113,6 +120,7 @@ impl ListRecordsError {
                 Some(rate_limit)
             }
             Self::Transport(_)
+            | Self::InactivityTimeout { .. }
             | Self::PageJson(_)
             | Self::Archive(_)
             | Self::ResourceLimitExceeded { .. }
@@ -128,7 +136,7 @@ impl ListRecordsError {
             | Self::Archive(_)
             | Self::ResourceLimitExceeded { .. }
             | Self::Protocol(_) => false,
-            Self::Transport(_) => true,
+            Self::Transport(_) | Self::InactivityTimeout { .. } => true,
             Self::HttpStatus { status, .. } => *status >= 500 || *status == 429,
         }
     }
@@ -374,13 +382,15 @@ async fn fetch_list_records_page(
         query.push(("cursor", cursor.to_owned()));
     }
 
-    let mut response = http.get(url).query(&query).send().await?;
+    let response = http.get(url).query(&query).send().await?;
     let status = response.status();
     let rate_limit = RateLimitSnapshot::from_headers(response.headers());
     if let Some(content_length) = response.content_length() {
         enforce_cap("max_page_bytes", content_length, config.max_page_bytes)?;
     }
-    let body = read_response_body_with_cap(&mut response, config.max_page_bytes).await?;
+    let body =
+        read_response_body_with_cap(response, config.max_page_bytes, config.chunk_idle_timeout)
+            .await?;
 
     if !status.is_success() {
         return Err(classify_error_status(status, &rate_limit, &body));
@@ -392,12 +402,20 @@ async fn fetch_list_records_page(
 }
 
 async fn read_response_body_with_cap(
-    response: &mut reqwest::Response,
+    response: reqwest::Response,
     max_page_bytes: u64,
+    chunk_idle_timeout: Duration,
 ) -> Result<Vec<u8>, ListRecordsError> {
     let mut body = Vec::new();
     let mut observed = 0_u64;
-    while let Some(chunk) = response.chunk().await? {
+    let mut stream = response.bytes_stream();
+    while let Some(next_chunk) = time::timeout(chunk_idle_timeout, stream.next())
+        .await
+        .map_err(|_elapsed| ListRecordsError::InactivityTimeout {
+            timeout: chunk_idle_timeout,
+        })?
+    {
+        let chunk = next_chunk?;
         let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
         observed =
             observed
@@ -477,36 +495,28 @@ fn post_record_from_list_record(
     record: ListRecordsRecord,
 ) -> Result<DecodedListRecord, ListRecordDecodeError> {
     let rkey = rkey_from_uri(did_str, &record.uri).ok_or(ListRecordDecodeError)?;
-    let mut value = record.value;
-    if let serde_json::Value::Object(object) = &mut value {
-        object
-            .entry("$type")
-            .or_insert_with(|| serde_json::Value::String(POST_COLLECTION.to_owned()));
-    }
-    match serde_json::from_value::<Post<SmolStr>>(value.clone()) {
-        Ok(post) => Ok(DecodedListRecord {
+    let cid = validated_record_cid(record.cid)?;
+    post_decode::from_json_value(record.value).map_or(Err(ListRecordDecodeError), |decoded| {
+        Ok(DecodedListRecord {
             post: PostRecord {
                 rkey: rkey.to_owned(),
-                cid: record.cid,
-                body: PostRecordBody::Typed(Box::new(post)),
+                cid,
+                body: decoded.body,
             },
-            typed_decode_failed: false,
-        }),
-        Err(_error) => raw_partial_post::from_json_value(value).map_or(
-            Err(ListRecordDecodeError),
-            |mut post| {
-                post.typed_decode_failed = true;
-                Ok(DecodedListRecord {
-                    post: PostRecord {
-                        rkey: rkey.to_owned(),
-                        cid: record.cid,
-                        body: PostRecordBody::RawPartial(post),
-                    },
-                    typed_decode_failed: true,
-                })
-            },
-        ),
+            typed_decode_failed: decoded.typed_decode_failed,
+        })
+    })
+}
+
+fn validated_record_cid(cid: Option<String>) -> Result<String, ListRecordDecodeError> {
+    let Some(cid) = cid else {
+        return Ok(String::new());
+    };
+    if cid.is_empty() {
+        return Ok(cid);
     }
+    cid::Cid::try_from(cid.as_str()).map_err(|_error| ListRecordDecodeError)?;
+    Ok(cid)
 }
 
 fn rkey_from_uri<'a>(did_str: &str, uri: &'a str) -> Option<&'a str> {
@@ -537,7 +547,7 @@ mod tests {
         net::{TcpListener, TcpStream},
         path::PathBuf,
         thread,
-        time::SystemTime,
+        time::{Duration, SystemTime},
     };
 
     use jacquard_common::deps::fluent_uri::Uri;
@@ -546,17 +556,20 @@ mod tests {
     use super::*;
     use crate::archive::{CompletenessClass, FetchMethod, read_archive_post_rows};
 
+    const TEST_CID_A: &str = "bafyreihyrpejdc3l3wqlbm7vuzx7hhvx6r5eg44vqyqjna6u6kwtpoyqte";
+    const TEST_CID_B: &str = "bafyreibqj2lhp4fpizc2zstcsl2mzo6fycjfnwc6kyz4xpr2lzyqlw6wxi";
+
     #[test]
     fn paginated_pages_archive_collection_paginated_receipt() {
         let archive_dir = temp_dir("list-records-pages");
         let did = "did:plc:testrepo";
         let pages = vec![
             ListRecordsPage {
-                records: vec![post_record(did, "3kabc", "bafyreia", "hello")],
+                records: vec![post_record(did, "3kabc", TEST_CID_A, "hello")],
                 cursor: Some("next".to_owned()),
             },
             ListRecordsPage {
-                records: vec![post_record(did, "3kabd", "bafyreib", "second")],
+                records: vec![post_record(did, "3kabd", TEST_CID_B, "second")],
                 cursor: None,
             },
         ];
@@ -580,7 +593,7 @@ mod tests {
         let first = rows.first().expect("first row");
         let second = rows.get(1).expect("second row");
         assert_eq!(first.rkey, "3kabc");
-        assert_eq!(second.cid, "bafyreib");
+        assert_eq!(second.cid, TEST_CID_B);
 
         fs::remove_dir_all(archive_dir).expect("remove archive dir");
     }
@@ -592,7 +605,7 @@ mod tests {
         let pages = vec![ListRecordsPage {
             records: vec![ListRecordsRecord {
                 uri: format!("at://{did}/{POST_COLLECTION}/3kabc"),
-                cid: "bafyreia".to_owned(),
+                cid: Some(TEST_CID_A.to_owned()),
                 value: json!({"$type": POST_COLLECTION, "text": "missing createdAt"}),
             }],
             cursor: None,
@@ -615,6 +628,61 @@ mod tests {
             crate::archive::CreatedAtParseStatus::Missing
         );
 
+        fs::remove_dir_all(archive_dir).expect("remove archive dir");
+    }
+
+    #[test]
+    fn invalid_record_cid_is_counted_as_decode_error() {
+        let archive_dir = temp_dir("list-records-invalid-cid");
+        let did = "did:plc:testrepo";
+        let pages = vec![ListRecordsPage {
+            records: vec![ListRecordsRecord {
+                uri: format!("at://{did}/{POST_COLLECTION}/3kabc"),
+                cid: Some("not-a-cid".to_owned()),
+                value: json!({
+                    "$type": POST_COLLECTION,
+                    "createdAt": "2026-06-16T00:00:00Z",
+                    "text": "hello"
+                }),
+            }],
+            cursor: None,
+        }];
+
+        let output =
+            archive_list_records_pages(did, &archive_dir, pages, ListRecordsConfig::default())
+                .expect("archive listRecords pages");
+
+        assert_eq!(output.records, 1);
+        assert_eq!(output.archived_posts, 0);
+        assert_eq!(output.decode_errors, 1);
+        fs::remove_dir_all(archive_dir).expect("remove archive dir");
+    }
+
+    #[test]
+    fn missing_record_cid_archives_with_empty_cid() {
+        let archive_dir = temp_dir("list-records-missing-cid");
+        let did = "did:plc:testrepo";
+        let pages = vec![ListRecordsPage {
+            records: vec![ListRecordsRecord {
+                uri: format!("at://{did}/{POST_COLLECTION}/3kabc"),
+                cid: None,
+                value: json!({
+                    "$type": POST_COLLECTION,
+                    "createdAt": "2026-06-16T00:00:00Z",
+                    "text": "hello"
+                }),
+            }],
+            cursor: None,
+        }];
+
+        let output =
+            archive_list_records_pages(did, &archive_dir, pages, ListRecordsConfig::default())
+                .expect("archive listRecords pages");
+
+        assert_eq!(output.records, 1);
+        assert_eq!(output.archived_posts, 1);
+        let rows = read_archive_post_rows(&output.artifacts.parquet_path).expect("read parquet");
+        assert_eq!(rows.first().expect("row").cid, "");
         fs::remove_dir_all(archive_dir).expect("remove archive dir");
     }
 
@@ -693,11 +761,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_enforces_chunk_idle_timeout() {
+        let did_str = "did:plc:testrepo";
+        let body = json!({"records": [], "cursor": null}).to_string();
+        let (base_url, handle) = spawn_list_records_server(vec![TestResponse::raw_delayed(
+            body,
+            None,
+            true,
+            Duration::from_millis(100),
+        )]);
+        let http = Client::new();
+        let pds = Uri::parse(base_url).expect("parse pds").clone();
+        let did = Did::new_owned(did_str).expect("parse did");
+
+        let error = fetch_list_records_page(
+            &http,
+            &pds,
+            &did,
+            None,
+            ListRecordsConfig {
+                chunk_idle_timeout: Duration::from_millis(20),
+                ..ListRecordsConfig::default()
+            },
+        )
+        .await
+        .expect_err("idle page body should fail");
+
+        assert!(matches!(error, ListRecordsError::InactivityTimeout { .. }));
+        assert_eq!(handle.join().expect("server thread").len(), 1);
+    }
+
+    #[tokio::test]
     async fn rate_limit_observer_runs_after_each_fetched_page() {
         let archive_dir = temp_dir("list-records-rate-limit-observer");
         let did_str = "did:plc:testrepo";
-        let first_record = post_record(did_str, "3kabc", "bafyreia", "hello");
-        let second_record = post_record(did_str, "3kabd", "bafyreib", "second");
+        let first_record = post_record(did_str, "3kabc", TEST_CID_A, "hello");
+        let second_record = post_record(did_str, "3kabd", TEST_CID_B, "second");
         let (base_url, handle) = spawn_list_records_server(vec![
             TestResponse::json_page(Some(&first_record), Some("next"), Some(4), true),
             TestResponse::json_page(Some(&second_record), None, Some(3), true),
@@ -737,7 +836,7 @@ mod tests {
     fn post_record(did: &str, rkey: &str, cid: &str, text: &str) -> ListRecordsRecord {
         ListRecordsRecord {
             uri: format!("at://{did}/{POST_COLLECTION}/{rkey}"),
-            cid: cid.to_owned(),
+            cid: Some(cid.to_owned()),
             value: json!({
                 "$type": POST_COLLECTION,
                 "createdAt": "2026-06-16T00:00:00Z",
@@ -760,6 +859,7 @@ mod tests {
         body: String,
         remaining: Option<u64>,
         content_length: bool,
+        body_delay: Option<Duration>,
     }
 
     impl TestResponse {
@@ -785,6 +885,21 @@ mod tests {
                 body,
                 remaining,
                 content_length,
+                body_delay: None,
+            }
+        }
+
+        fn raw_delayed(
+            body: String,
+            remaining: Option<u64>,
+            content_length: bool,
+            body_delay: Duration,
+        ) -> Self {
+            Self {
+                body,
+                remaining,
+                content_length,
+                body_delay: Some(body_delay),
             }
         }
     }
@@ -855,6 +970,10 @@ mod tests {
             write!(stream, "Content-Length: {}\r\n", response.body.len())
                 .expect("write content length");
         }
-        write!(stream, "\r\n{}", response.body).expect("write body");
+        write!(stream, "\r\n").expect("write header terminator");
+        if let Some(delay) = response.body_delay {
+            thread::sleep(delay);
+        }
+        let _ = write!(stream, "{}", response.body);
     }
 }

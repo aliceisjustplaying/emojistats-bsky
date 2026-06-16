@@ -4,14 +4,13 @@ use std::{
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use emojistats_backfill::{
     archive::ArchiveCommitContext,
     ledger::{
-        AttemptOutcome, DEFAULT_CLAIM_LEASE_DURATION, RepoLedgerEntry, RepoLedgerStatus,
-        RetryPolicy, SqliteLedger,
+        AttemptOutcome, DEFAULT_CLAIM_LEASE_DURATION, RepoLedgerEntry, RetryPolicy, SqliteLedger,
     },
     parse::ParseConfig,
     scheduler::{ClaimScope, HostPacer, SchedulerError, SharedHostPacer, checked_concurrency},
@@ -25,14 +24,16 @@ use tokio::{
 };
 
 use super::{
-    AttemptRuntime, FetchOneAttemptConfig, add_count,
+    AttemptRuntime, FetchOneAttemptConfig, HostOverrideCache, add_count,
     failure::{FetchOneFailure, retryable_failure},
     fetch_one_attempt_with_pacer, increment, parse_config_for_threads,
 };
 
 const SEED_BATCH_SIZE: usize = 1_000;
+const STALE_RECOVERY_BATCH_SIZE: u32 = 512;
 #[allow(clippy::duration_suboptimal_units)]
 const CLAIM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const STALE_RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 pub struct FleetConfig {
@@ -167,16 +168,37 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
         seed: seed_ledger_from_file(&ledger, &config.dids_file)?,
         ..FleetSummary::default()
     };
-    summary.stale_recovered =
-        recover_stale_claimed_entries(&ledger, &config.dids_file, SystemTime::now())?;
+    summary.stale_recovered = recover_stale_claimed_entries_for_scope_with_message(
+        &ledger,
+        SystemTime::now(),
+        &config.claim_scope,
+        "expired claimed lease at fleet startup",
+    )?;
     let host_pacer = HostPacer::shared();
     let host_limiter = HostConcurrencyLimiter::default();
+    let host_override_cache = HostOverrideCache::default();
     let parse_permits = Arc::new(Semaphore::new(config.parse_concurrency));
     let byte_budget = FetchByteBudget::new(config.max_inflight_spool_bytes);
     let mut active = FuturesUnordered::new();
     let claim_limit = u64::from(config.claim_limit);
+    let mut next_stale_recovery = next_stale_recovery_deadline(Instant::now())?;
 
     loop {
+        let now = Instant::now();
+        if now >= next_stale_recovery {
+            let recovered = recover_stale_claimed_entries_for_scope(
+                &ledger,
+                SystemTime::now(),
+                &config.claim_scope,
+            )?;
+            add_count(
+                &mut summary.stale_recovered,
+                recovered,
+                "stale claimed recovery count",
+            )?;
+            next_stale_recovery = next_stale_recovery_deadline(now)?;
+        }
+
         while active.len() < config.concurrency && summary.claimed < claim_limit {
             let remaining = claim_limit
                 .checked_sub(summary.claimed)
@@ -206,6 +228,7 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
                 parse_config: parse_config_for_threads(config.cid_verification_threads),
                 host_pacer: host_pacer.clone(),
                 host_limiter: host_limiter.clone(),
+                host_override_cache: host_override_cache.clone(),
                 parse_permits: parse_permits.clone(),
                 byte_budget: byte_budget.clone(),
                 claim_scope: config.claim_scope.clone(),
@@ -242,6 +265,7 @@ struct FleetAttemptConfig {
     parse_config: ParseConfig,
     host_pacer: SharedHostPacer,
     host_limiter: HostConcurrencyLimiter,
+    host_override_cache: HostOverrideCache,
     parse_permits: Arc<Semaphore>,
     byte_budget: FetchByteBudget,
     claim_scope: ClaimScope,
@@ -273,6 +297,7 @@ async fn run_fleet_attempt(config: FleetAttemptConfig) -> FleetAttemptResult {
                     byte_budget: config.byte_budget,
                     claim_scope: &config.claim_scope,
                     host_override_ledger_path: &config.ledger_path,
+                    host_override_cache: config.host_override_cache,
                 },
                 parse_config: config.parse_config,
             })
@@ -408,33 +433,62 @@ pub fn claimable_entries_for_scope(
     )
 }
 
+#[cfg(test)]
 pub fn recover_stale_claimed_entries(
     ledger: &SqliteLedger,
-    dids_file: &Path,
+    _dids_file: &Path,
     now: SystemTime,
 ) -> anyhow::Result<u64> {
+    recover_stale_claimed_entries_for_scope_with_message(
+        ledger,
+        now,
+        &ClaimScope::default(),
+        "expired claimed lease at fleet startup",
+    )
+}
+
+pub fn recover_stale_claimed_entries_for_scope(
+    ledger: &SqliteLedger,
+    now: SystemTime,
+    claim_scope: &ClaimScope,
+) -> anyhow::Result<u64> {
+    recover_stale_claimed_entries_for_scope_with_message(
+        ledger,
+        now,
+        claim_scope,
+        "expired claimed lease during fleet run",
+    )
+}
+
+fn recover_stale_claimed_entries_for_scope_with_message(
+    ledger: &SqliteLedger,
+    now: SystemTime,
+    claim_scope: &ClaimScope,
+    message: &str,
+) -> anyhow::Result<u64> {
     let mut recovered = 0_u64;
-    let file = File::open(dids_file)?;
-    for line in BufReader::new(file).lines() {
-        let line = line?;
-        let did = line.trim();
-        if did.is_empty() {
-            continue;
-        }
-        let Some(entry) = ledger.load_entry(did)? else {
-            continue;
-        };
-        if entry.status != RepoLedgerStatus::Claimed {
-            continue;
-        }
-        if ledger
-            .recover_expired_claim(did, now, "expired claimed lease at fleet startup")?
-            .is_some()
-        {
-            increment(&mut recovered, "stale claimed recovery count")?;
+    loop {
+        let batch_recovered = ledger.recover_expired_claims(
+            now,
+            STALE_RECOVERY_BATCH_SIZE,
+            claim_scope.shard_filter(),
+            message,
+        )?;
+        add_count(
+            &mut recovered,
+            batch_recovered,
+            "stale claimed recovery count",
+        )?;
+        if batch_recovered < u64::from(STALE_RECOVERY_BATCH_SIZE) {
+            break;
         }
     }
     Ok(recovered)
+}
+
+fn next_stale_recovery_deadline(now: Instant) -> anyhow::Result<Instant> {
+    now.checked_add(STALE_RECOVERY_INTERVAL)
+        .ok_or_else(|| anyhow::anyhow!("stale recovery timer overflow"))
 }
 
 pub fn seed_ledger_from_file(

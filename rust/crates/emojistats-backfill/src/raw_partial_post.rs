@@ -27,13 +27,16 @@ pub fn from_json_value(value: serde_json::Value) -> Option<RawPartialPostRecord>
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned);
     let langs = json_string_array(fields.get("langs"));
+    let invalid_core = invalid_json_core_fields(&fields);
     remove_core_fields(&mut fields);
+    let mut extras_json = serde_json::Value::Object(fields);
+    insert_invalid_core(&mut extras_json, invalid_core);
     Some(RawPartialPostRecord {
         typed_decode_failed,
         created_at_raw,
         text,
         langs,
-        extras_json: serde_json::Value::Object(fields),
+        extras_json,
     })
 }
 
@@ -73,14 +76,16 @@ fn from_ipld_fields(mut fields: BTreeMap<String, Ipld>) -> Option<RawPartialPost
         .and_then(ipld_string)
         .map(ToOwned::to_owned);
     let langs = ipld_string_array(fields.get("langs"));
+    let invalid_core = invalid_ipld_core_fields(&fields)?;
     for key in ["$type", "createdAt", "langs", "text"] {
         fields.remove(key);
     }
-    let extras_json = if fields.is_empty() {
+    let mut extras_json = if fields.is_empty() {
         serde_json::Value::Object(serde_json::Map::new())
     } else {
         ipld_to_json(Ipld::Map(fields))?
     };
+    insert_invalid_core(&mut extras_json, invalid_core);
     Some(RawPartialPostRecord {
         typed_decode_failed,
         created_at_raw,
@@ -133,6 +138,66 @@ fn json_langs_decode_failed(value: Option<&serde_json::Value>) -> bool {
     values
         .iter()
         .any(|value| !matches!(value, serde_json::Value::String(_)))
+}
+
+fn invalid_ipld_core_fields(
+    fields: &BTreeMap<String, Ipld>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut invalid = serde_json::Map::new();
+    if let Some(value) = fields.get("createdAt")
+        && !matches!(value, Ipld::String(_))
+    {
+        invalid.insert("createdAt".to_owned(), ipld_to_json(value.clone())?);
+    }
+    if let Some(value) = fields.get("text")
+        && !matches!(value, Ipld::String(_))
+    {
+        invalid.insert("text".to_owned(), ipld_to_json(value.clone())?);
+    }
+    if let Some(value) = fields.get("langs")
+        && ipld_langs_decode_failed(Some(value))
+    {
+        invalid.insert("langs".to_owned(), ipld_to_json(value.clone())?);
+    }
+    Some(invalid)
+}
+
+fn invalid_json_core_fields(
+    fields: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut invalid = serde_json::Map::new();
+    if let Some(value) = fields.get("createdAt")
+        && !matches!(value, serde_json::Value::String(_))
+    {
+        invalid.insert("createdAt".to_owned(), value.clone());
+    }
+    if let Some(value) = fields.get("text")
+        && !matches!(value, serde_json::Value::String(_))
+    {
+        invalid.insert("text".to_owned(), value.clone());
+    }
+    if let Some(value) = fields.get("langs")
+        && json_langs_decode_failed(Some(value))
+    {
+        invalid.insert("langs".to_owned(), value.clone());
+    }
+    invalid
+}
+
+fn insert_invalid_core(
+    extras_json: &mut serde_json::Value,
+    invalid_core: serde_json::Map<String, serde_json::Value>,
+) {
+    if invalid_core.is_empty() {
+        return;
+    }
+    let serde_json::Value::Object(fields) = extras_json else {
+        return;
+    };
+    fields.insert(
+        "_invalid_core".to_owned(),
+        serde_json::Value::Object(invalid_core),
+    );
 }
 
 fn ipld_created_at(value: Option<&Ipld>) -> Option<String> {
@@ -234,7 +299,13 @@ mod tests {
         assert_eq!(post.created_at_raw.as_deref(), Some("2026-06-16T00:00:00Z"));
         assert_eq!(post.text.as_deref(), Some("hello"));
         assert_eq!(post.langs, vec!["en", "fr"]);
-        assert_eq!(post.extras_json, json!({"embed": {"kind": "external"}}));
+        assert_eq!(
+            post.extras_json,
+            json!({
+                "_invalid_core": {"langs": ["en", 7, "fr"]},
+                "embed": {"kind": "external"}
+            })
+        );
     }
 
     #[test]

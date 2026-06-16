@@ -9,7 +9,10 @@ use emojistats_backfill::{
         archive_rows_from_parsed_repo, build_repo_receipt, classify_created_at, current_normalizer,
         hash_post_rows,
     },
-    parse::{ParseError, parse_repo, parse_repo_for_did},
+    parse::{
+        CompletenessClass as ParseCompletenessClass, ParseConfig, ParseError, parse_repo,
+        parse_repo_for_did, parse_repo_for_did_with_config,
+    },
 };
 use jacquard_repo::mst::{NodeData, TreeEntry};
 use serde_json::json;
@@ -85,6 +88,94 @@ fn rejects_malformed_repo_keys_from_car_mst() {
         ParseError::MalformedCar(message)
             if message == "invalid repo key \"app.bsky.feed.post/\": rkey is empty"
     ));
+}
+
+#[test]
+fn reports_snapshot_complete_proof_for_verified_mst_root_block() {
+    let did = "did:plc:fixture123";
+    let car = TempCar::from_bytes(
+        "snapshot-complete-proof.car",
+        &single_post_car_bytes(did, "3kabc", &valid_post_json()),
+    );
+
+    let parsed = parse_repo_for_did(&car.path, did).expect("repo should parse");
+
+    assert_eq!(
+        parsed.completeness.class,
+        ParseCompletenessClass::SnapshotComplete
+    );
+    assert_eq!(
+        parsed.completeness.car_roots.as_slice(),
+        std::slice::from_ref(&parsed.commit.cid)
+    );
+    assert_eq!(parsed.completeness.verified_block_count, 3);
+    assert_eq!(parsed.completeness.duplicate_block_cid_count, 0);
+    assert_eq!(parsed.completeness.reachable_record_count, 1);
+    assert!(parsed.completeness.mst_root_cid_verified);
+    assert!(!parsed.completeness.repo_commit_signature_verified);
+    assert!(!parsed.completeness.identity_verified);
+    assert!(!parsed.commit.data.is_empty());
+}
+
+#[test]
+fn reports_duplicate_car_block_cids_in_snapshot_proof() {
+    let did = "did:plc:fixture123";
+    let (record_cid, record_bytes) = record_block(&valid_post_json());
+    let node = NodeData {
+        left: None,
+        entries: vec![TreeEntry {
+            key_suffix: Bytes::from_static(b"app.bsky.feed.post/3kabc"),
+            prefix_len: 0,
+            tree: None,
+            value: record_cid,
+        }],
+    };
+    let car = TempCar::from_bytes(
+        "duplicate-block-cid.car",
+        &repo_car_with_root_node_bytes(
+            did,
+            &node,
+            &[
+                (record_cid, record_bytes.clone()),
+                (record_cid, record_bytes),
+            ],
+        ),
+    );
+
+    let parsed = parse_repo_for_did(&car.path, did).expect("repo with duplicate CID should parse");
+
+    assert_eq!(parsed.completeness.verified_block_count, 4);
+    assert_eq!(parsed.completeness.duplicate_block_cid_count, 1);
+    assert_eq!(parsed.completeness.reachable_record_count, 1);
+}
+
+#[test]
+fn parallel_cid_verifier_rejects_mismatched_block_bytes() {
+    let did = "did:plc:fixture123";
+    let (record_cid, mut record_bytes) = record_block(&valid_post_json());
+    record_bytes.push(0);
+    let node = NodeData {
+        left: None,
+        entries: vec![TreeEntry {
+            key_suffix: Bytes::from_static(b"app.bsky.feed.post/3kabc"),
+            prefix_len: 0,
+            tree: None,
+            value: record_cid,
+        }],
+    };
+    let car = TempCar::from_bytes(
+        "parallel-cid-mismatch.car",
+        &repo_car_with_root_node_bytes(did, &node, &[(record_cid, record_bytes)]),
+    );
+    let config = ParseConfig {
+        cid_verification_threads: 2,
+        ..ParseConfig::default()
+    };
+
+    let error = parse_repo_for_did_with_config(&car.path, did, config)
+        .expect_err("corrupt block bytes should fail CID verification");
+
+    assert!(matches!(error, ParseError::CidMismatch { .. }));
 }
 
 #[test]

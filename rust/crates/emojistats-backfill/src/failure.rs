@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    fs, io,
     time::{Duration, Instant},
 };
 
@@ -54,6 +54,7 @@ pub const fn outcome_name(outcome: &AttemptOutcome) -> &'static str {
         AttemptOutcome::Succeeded => "succeeded",
         AttemptOutcome::AccountState(_) => "account_state",
         AttemptOutcome::RateLimited { .. } => "rate_limited",
+        AttemptOutcome::OperatorDeferred { .. } => "operator_deferred",
         AttemptOutcome::RetryableFailure { .. } => "retryable_failure",
         AttemptOutcome::ResourceLimitExceeded { .. } => "resource_limit_exceeded",
         AttemptOutcome::PermanentFailure { .. } => "permanent_failure",
@@ -127,15 +128,19 @@ pub fn classify_list_records_error(did: &str, error: &ListRecordsError) -> Fetch
                 message: message.clone(),
             }
         }
-        ListRecordsError::Transport(_) => AttemptOutcome::RetryableFailure {
-            message: message.clone(),
-        },
+        ListRecordsError::Transport(_) | ListRecordsError::InactivityTimeout { .. } => {
+            AttemptOutcome::RetryableFailure {
+                message: message.clone(),
+            }
+        }
         ListRecordsError::ResourceLimitExceeded { .. } => AttemptOutcome::ResourceLimitExceeded {
             message: message.clone(),
         },
+        ListRecordsError::Archive(error) => {
+            return classify_archive_error(&format!("archive listRecords for {did}"), error);
+        }
         ListRecordsError::HttpStatus { .. }
         | ListRecordsError::PageJson(_)
-        | ListRecordsError::Archive(_)
         | ListRecordsError::Protocol(_) => AttemptOutcome::PermanentFailure {
             message: message.clone(),
         },
@@ -188,6 +193,11 @@ pub fn classify_parse_error(did: &str, error: &ParseError) -> FetchOneFailure {
 pub fn classify_archive_error(context: &str, error: &ArchiveError) -> FetchOneFailure {
     let message = format!("{context}: {error}");
     let outcome = match error {
+        ArchiveError::Io(source) if is_operator_io_error(source) => {
+            AttemptOutcome::PermanentFailure {
+                message: message.clone(),
+            }
+        }
         ArchiveError::Io(_) | ArchiveError::Commit(_) => AttemptOutcome::RetryableFailure {
             message: message.clone(),
         },
@@ -212,6 +222,22 @@ pub fn classify_archive_error(context: &str, error: &ArchiveError) -> FetchOneFa
         outcome,
         error: anyhow::anyhow!(message),
     }
+}
+
+fn is_operator_io_error(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::PermissionDenied
+            | io::ErrorKind::AlreadyExists
+            | io::ErrorKind::NotFound
+            | io::ErrorKind::InvalidInput
+            | io::ErrorKind::InvalidData
+            | io::ErrorKind::WriteZero
+            | io::ErrorKind::UnexpectedEof
+    ) {
+        return true;
+    }
+    matches!(error.raw_os_error(), Some(28 | 30 | 122))
 }
 
 pub fn retryable_failure(message: String) -> FetchOneFailure {

@@ -133,23 +133,34 @@ pub struct FetchByteBudgetReservation {
 }
 
 impl FetchByteBudgetReservation {
-    async fn reserve_completed(&mut self, observed_bytes: u64) -> Result<(), FetchError> {
-        if observed_bytes > self.budget.inner.max_bytes {
+    async fn reserve_capacity(&mut self, bytes: u64) -> Result<(), FetchError> {
+        if bytes > self.budget.inner.max_bytes {
             return Err(FetchError::InFlightBytesExceeded {
                 max_bytes: self.budget.inner.max_bytes,
-                observed_bytes,
+                observed_bytes: bytes,
             });
         }
-        let charged_target = observed_bytes;
+        let charged_target = bytes;
         let delta = charged_target.checked_sub(self.charged_bytes).ok_or(
             FetchError::InFlightBytesExceeded {
                 max_bytes: self.budget.inner.max_bytes,
-                observed_bytes,
+                observed_bytes: bytes,
             },
         )?;
         self.budget.reserve_charged_delta(delta).await?;
         self.charged_bytes = charged_target;
         Ok(())
+    }
+
+    fn shrink_to_completed(&mut self, observed_bytes: u64) {
+        if observed_bytes >= self.charged_bytes {
+            return;
+        }
+        let Some(release) = self.charged_bytes.checked_sub(observed_bytes) else {
+            return;
+        };
+        self.charged_bytes = observed_bytes;
+        self.budget.release_charged(release);
     }
 
     #[cfg(test)]
@@ -475,16 +486,14 @@ async fn stream_to_file(
 ) -> Result<(u64, Option<FetchByteBudgetReservation>), FetchError> {
     let temp_path = temp_spool_path(car_path)?;
     let mut reservation = byte_budget.map(FetchByteBudget::reservation);
-    match stream_to_temp_file(
-        body,
-        &temp_path,
-        chunk_idle_timeout,
-        max_bytes,
-        reservation.as_mut(),
-    )
-    .await
-    {
+    if let Some(reservation) = &mut reservation {
+        reservation.reserve_capacity(max_bytes).await?;
+    }
+    match stream_to_temp_file(body, &temp_path, chunk_idle_timeout, max_bytes).await {
         Ok(bytes) => {
+            if let Some(reservation) = &mut reservation {
+                reservation.shrink_to_completed(bytes);
+            }
             fs::hard_link(&temp_path, car_path)?;
             let _ignored = fs::remove_file(&temp_path);
             sync_parent_dir(car_path)?;
@@ -502,7 +511,6 @@ async fn stream_to_temp_file(
     temp_path: &Path,
     chunk_idle_timeout: Duration,
     max_bytes: u64,
-    mut byte_budget_reservation: Option<&mut FetchByteBudgetReservation>,
 ) -> Result<u64, FetchError> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -537,9 +545,6 @@ async fn stream_to_temp_file(
                 max_bytes,
                 observed_bytes,
             });
-        }
-        if let Some(reservation) = &mut byte_budget_reservation {
-            reservation.reserve_completed(observed_bytes).await?;
         }
         file.write_all(chunk.as_ref())?;
         bytes = observed_bytes;
@@ -754,7 +759,7 @@ mod tests {
 
     use super::{
         AccountState, FetchByteBudget, FetchConfig, FetchError, RateLimitSnapshot,
-        classify_http_error, parse_http_date_retry_after, spool_path, stream_to_temp_file,
+        classify_http_error, parse_http_date_retry_after, spool_path, stream_to_file,
     };
 
     #[test]
@@ -875,15 +880,15 @@ mod tests {
     async fn byte_budget_blocks_until_prior_reservation_is_dropped() {
         let budget = FetchByteBudget::new(10);
         let mut first = budget.reservation();
-        first.reserve_completed(10).await.unwrap();
+        first.reserve_capacity(10).await.unwrap();
         let mut second = budget.reservation();
 
         let blocked =
-            tokio::time::timeout(Duration::from_millis(10), second.reserve_completed(1)).await;
+            tokio::time::timeout(Duration::from_millis(10), second.reserve_capacity(1)).await;
 
         assert!(blocked.is_err());
         drop(first);
-        tokio::time::timeout(Duration::from_secs(1), second.reserve_completed(1))
+        tokio::time::timeout(Duration::from_secs(1), second.reserve_capacity(1))
             .await
             .unwrap()
             .unwrap();
@@ -894,7 +899,7 @@ mod tests {
         let budget = FetchByteBudget::new(10);
         let mut reservation = budget.reservation();
 
-        let error = reservation.reserve_completed(11).await.unwrap_err();
+        let error = reservation.reserve_capacity(11).await.unwrap_err();
 
         match error {
             FetchError::InFlightBytesExceeded {
@@ -910,11 +915,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn byte_budget_blocks_while_streaming_chunk() {
+    async fn byte_budget_blocks_before_streaming_file() {
         let budget = FetchByteBudget::new(10);
         let mut first = budget.reservation();
-        first.reserve_completed(8).await.unwrap();
-        let mut second = budget.reservation();
+        first.reserve_capacity(8).await.unwrap();
         let path = std::env::temp_dir().join(format!(
             "emojistats-byte-budget-stream-{}-{}.car",
             std::process::id(),
@@ -926,15 +930,7 @@ mod tests {
         let body = ByteStream::new(futures_util::stream::iter([Ok(Bytes::from_static(b"abc"))]));
         let task_path = path.clone();
         let handle = tokio::spawn(async move {
-            let result = stream_to_temp_file(
-                body,
-                &task_path,
-                Duration::from_secs(1),
-                100,
-                Some(&mut second),
-            )
-            .await;
-            (result, second.charged_bytes())
+            stream_to_file(body, &task_path, Duration::from_secs(1), 3, Some(&budget)).await
         });
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -942,12 +938,13 @@ mod tests {
         assert!(!path.exists() || std::fs::metadata(&path).unwrap().len() == 0);
 
         drop(first);
-        let (result, charged_bytes) = tokio::time::timeout(Duration::from_secs(1), handle)
+        let (result, reservation) = tokio::time::timeout(Duration::from_secs(1), handle)
             .await
             .unwrap()
+            .unwrap()
             .unwrap();
-        assert_eq!(result.unwrap(), 3);
-        assert_eq!(charged_bytes, 3);
+        assert_eq!(result, 3);
+        assert_eq!(reservation.unwrap().charged_bytes(), 3);
         std::fs::remove_file(path).unwrap();
     }
 
