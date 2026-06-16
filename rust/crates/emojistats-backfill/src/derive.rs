@@ -50,6 +50,32 @@ pub struct ClickHouseDeriveBatch {
     pub total_post_counter: TotalPostCounterInput,
 }
 
+/// Durable key for a derived `ClickHouse` write unit.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeriveCheckpointKey {
+    pub source: String,
+    pub receipt_hash: String,
+    pub lane: DeriveCheckpointLane,
+    pub chunk_index: Option<u64>,
+}
+
+/// Derive write lane represented by a checkpoint key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeriveCheckpointLane {
+    EmojiServing,
+    TotalPostCounter,
+}
+
+/// Durable checkpoint value for replaying or auditing a completed derive write.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeriveCheckpointRecord {
+    pub key: DeriveCheckpointKey,
+    pub dedupe_token: String,
+    pub row_count: u64,
+    pub payload_hash: String,
+}
+
 /// Derive-lane failures before any `ClickHouse` network write is attempted.
 #[derive(Debug, thiserror::Error)]
 pub enum DeriveError {
@@ -62,6 +88,54 @@ pub enum DeriveError {
     },
     #[error("resource counter overflow: {field}")]
     CountOverflow { field: &'static str },
+}
+
+impl DeriveCheckpointKey {
+    /// Build a stable checkpoint key for an emoji-serving chunk.
+    #[must_use]
+    pub fn emoji_serving(identity: &DeriveManifestIdentity, chunk_index: u64) -> Self {
+        Self {
+            source: BACKFILL_DERIVE_SOURCE.to_owned(),
+            receipt_hash: identity.receipt_hash.clone(),
+            lane: DeriveCheckpointLane::EmojiServing,
+            chunk_index: Some(chunk_index),
+        }
+    }
+
+    /// Build a stable checkpoint key for the total-post counter.
+    #[must_use]
+    pub fn total_post_counter(identity: &DeriveManifestIdentity) -> Self {
+        Self {
+            source: BACKFILL_DERIVE_SOURCE.to_owned(),
+            receipt_hash: identity.receipt_hash.clone(),
+            lane: DeriveCheckpointLane::TotalPostCounter,
+            chunk_index: None,
+        }
+    }
+}
+
+impl DeriveCheckpointRecord {
+    /// Build a checkpoint record for a serialized payload body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeriveError`] if the row count cannot fit in `u64`.
+    pub fn from_payload_body(
+        key: DeriveCheckpointKey,
+        dedupe_token: String,
+        row_count: usize,
+        payload_body: &str,
+    ) -> Result<Self, DeriveError> {
+        let row_count = u64::try_from(row_count).map_err(|_error| DeriveError::CountOverflow {
+            field: "checkpoint_row_count",
+        })?;
+        Ok(Self {
+            key,
+            dedupe_token,
+            row_count,
+            payload_hash: hash_payload_body(payload_body),
+        })
+    }
 }
 
 /// Build the DTOs a `ClickHouse` insert lane needs from one committed manifest entry.
@@ -308,12 +382,19 @@ fn hash_u16(hasher: &mut Sha256, value: u16) {
     hasher.update(value.to_be_bytes());
 }
 
+fn hash_payload_body(payload_body: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(payload_body.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use super::{
-        DeriveBatchInput, DeriveError, derive_clickhouse_batch, derive_dedupe_token,
+        BACKFILL_DERIVE_SOURCE, DeriveBatchInput, DeriveCheckpointKey, DeriveCheckpointLane,
+        DeriveCheckpointRecord, DeriveError, derive_clickhouse_batch, derive_dedupe_token,
         manifest_identity,
     };
     use crate::archive::{
@@ -445,5 +526,43 @@ mod tests {
         let second = manifest_identity(&second_manifest);
 
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn checkpoint_keys_are_stable_across_replay_manifest_sequence() {
+        let first = manifest_identity(&manifest(1));
+        let mut replay_manifest = manifest(1);
+        replay_manifest.run_id = "run-2".to_owned();
+        replay_manifest.shard = "shard9".to_owned();
+        replay_manifest.file_sequence = 99;
+        let replay = manifest_identity(&replay_manifest);
+
+        assert_eq!(
+            DeriveCheckpointKey::emoji_serving(&first, 2),
+            DeriveCheckpointKey::emoji_serving(&replay, 2)
+        );
+        assert_eq!(
+            DeriveCheckpointKey::total_post_counter(&first),
+            DeriveCheckpointKey::total_post_counter(&replay)
+        );
+    }
+
+    #[test]
+    fn checkpoint_record_hashes_payload_body() {
+        let key = DeriveCheckpointKey {
+            source: BACKFILL_DERIVE_SOURCE.to_owned(),
+            receipt_hash: "receipt-hash".to_owned(),
+            lane: DeriveCheckpointLane::TotalPostCounter,
+            chunk_index: None,
+        };
+
+        let first =
+            DeriveCheckpointRecord::from_payload_body(key.clone(), "token".to_owned(), 1, "a\n")
+                .expect("checkpoint record");
+        let second = DeriveCheckpointRecord::from_payload_body(key, "token".to_owned(), 1, "b\n")
+            .expect("checkpoint record");
+
+        assert_eq!(first.row_count, 1);
+        assert_ne!(first.payload_hash, second.payload_hash);
     }
 }

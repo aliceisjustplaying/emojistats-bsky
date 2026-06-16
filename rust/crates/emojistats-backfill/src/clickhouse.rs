@@ -1,5 +1,7 @@
 //! `ClickHouse` schema and insert-format skeleton for the v2 derive lane.
 
+use std::{cmp, time::Duration};
+
 use reqwest::{
     Client, Method, Request, Response, StatusCode, Url,
     header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT},
@@ -20,7 +22,12 @@ pub const JSON_EACH_ROW_FORMAT: &str = "JSONEachRow";
 const INSERT_DEDUPLICATE_SETTING: &str = "insert_deduplicate";
 const INSERT_DEDUPLICATION_TOKEN_SETTING: &str = "insert_deduplication_token";
 const DATE_TIME_INPUT_FORMAT_SETTING: &str = "date_time_input_format";
-const CLICKHOUSE_RESPONSE_SNIPPET_MAX_CHARS: usize = 4_096;
+const CLICKHOUSE_RESPONSE_SNIPPET_MAX_BYTES: usize = 4_096;
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+const DEFAULT_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(2);
+const DEFAULT_MAX_INSERT_ATTEMPTS: u8 = 3;
 const CLICKHOUSE_USER_HEADER: HeaderName = HeaderName::from_static("x-clickhouse-user");
 const CLICKHOUSE_KEY_HEADER: HeaderName = HeaderName::from_static("x-clickhouse-key");
 const CLICKHOUSE_DATABASE_HEADER: HeaderName = HeaderName::from_static("x-clickhouse-database");
@@ -87,6 +94,16 @@ pub struct ClickHouseClientConfig {
     pub password: String,
     /// User-Agent/application marker visible in `ClickHouse` logs.
     pub application: String,
+    /// Per-request timeout applied to inserts.
+    pub request_timeout: Duration,
+    /// Connect timeout for clients built from this config.
+    pub connect_timeout: Duration,
+    /// Initial retry delay for retryable insert failures.
+    pub retry_initial_backoff: Duration,
+    /// Maximum retry delay for retryable insert failures.
+    pub retry_max_backoff: Duration,
+    /// Maximum insert attempts, including the first try.
+    pub max_insert_attempts: u8,
 }
 
 impl ClickHouseClientConfig {
@@ -112,7 +129,43 @@ impl ClickHouseClientConfig {
             username: username.into(),
             password: password.into(),
             application: application.into(),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            retry_initial_backoff: DEFAULT_RETRY_INITIAL_BACKOFF,
+            retry_max_backoff: DEFAULT_RETRY_MAX_BACKOFF,
+            max_insert_attempts: DEFAULT_MAX_INSERT_ATTEMPTS,
         })
+    }
+
+    /// Return a copy with an explicit timeout and retry policy.
+    #[must_use]
+    pub const fn with_timeout_and_retry_policy(
+        mut self,
+        request_timeout: Duration,
+        connect_timeout: Duration,
+        retry_initial_backoff: Duration,
+        retry_max_backoff: Duration,
+        max_insert_attempts: u8,
+    ) -> Self {
+        self.request_timeout = request_timeout;
+        self.connect_timeout = connect_timeout;
+        self.retry_initial_backoff = retry_initial_backoff;
+        self.retry_max_backoff = retry_max_backoff;
+        self.max_insert_attempts = max_insert_attempts;
+        self
+    }
+
+    /// Build a `reqwest` client with this config's client-level timeouts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClickHouseSchemaError`] if the client cannot be built.
+    pub fn http_client(&self) -> Result<Client, ClickHouseSchemaError> {
+        Client::builder()
+            .connect_timeout(self.connect_timeout)
+            .timeout(self.request_timeout)
+            .build()
+            .map_err(ClickHouseSchemaError::Request)
     }
 
     /// Build a `reqwest` request for an insert payload without sending it.
@@ -158,6 +211,7 @@ impl ClickHouseClientConfig {
                 ),
                 (DATE_TIME_INPUT_FORMAT_SETTING, "best_effort"),
             ])
+            .timeout(self.request_timeout)
             .body(payload.body.clone())
             .build()
             .map_err(ClickHouseSchemaError::Request)?;
@@ -319,49 +373,102 @@ pub async fn execute_insert_payloads(
     let mut receipts = Vec::with_capacity(payloads.len());
 
     for payload in payloads {
-        let context = ClickHouseInsertContext::from_payload(payload);
-        let request = config
-            .insert_request_with_client(client, payload)
-            .map_err(|source| ClickHouseInsertError::RequestBuild {
-                context: context.clone(),
-                source,
-            })?;
-        let response =
-            client
-                .execute(request)
-                .await
-                .map_err(|source| ClickHouseInsertError::Transport {
-                    context: context.clone(),
-                    source,
-                })?;
-        let status = response.status();
-        let response_snippet = response_snippet(response).await.map_err(|source| {
-            ClickHouseInsertError::Transport {
-                context: context.clone(),
-                source,
-            }
-        })?;
-
-        if !status.is_success() {
-            return Err(classify_insert_status(context, status, response_snippet));
-        }
-
-        receipts.push(ClickHouseInsertReceipt {
-            context,
-            status: status.as_u16(),
-            response_snippet,
-        });
+        receipts.push(execute_insert_payload_with_retries(client, config, payload).await?);
     }
 
     Ok(receipts)
 }
 
-async fn response_snippet(response: Response) -> Result<Option<String>, reqwest::Error> {
-    let body = response.text().await?;
-    let snippet = body
-        .chars()
-        .take(CLICKHOUSE_RESPONSE_SNIPPET_MAX_CHARS)
-        .collect::<String>();
+async fn execute_insert_payload_with_retries(
+    client: &Client,
+    config: &ClickHouseClientConfig,
+    payload: &ClickHouseInsertPayload,
+) -> Result<ClickHouseInsertReceipt, ClickHouseInsertError> {
+    let context = ClickHouseInsertContext::from_payload(payload);
+    let mut attempt = 1_u8;
+    let mut backoff = config.retry_initial_backoff;
+    let max_attempts = cmp::max(1, config.max_insert_attempts);
+
+    loop {
+        match execute_insert_payload_once(client, config, payload, &context).await {
+            Ok(receipt) => return Ok(receipt),
+            Err(error) if should_retry_insert_error(&error) && attempt < max_attempts => {
+                tokio::time::sleep(backoff).await;
+                attempt = attempt.checked_add(1).unwrap_or(max_attempts);
+                backoff = cmp::min(backoff.saturating_mul(2), config.retry_max_backoff);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn execute_insert_payload_once(
+    client: &Client,
+    config: &ClickHouseClientConfig,
+    payload: &ClickHouseInsertPayload,
+    context: &ClickHouseInsertContext,
+) -> Result<ClickHouseInsertReceipt, ClickHouseInsertError> {
+    let request = config
+        .insert_request_with_client(client, payload)
+        .map_err(|source| ClickHouseInsertError::RequestBuild {
+            context: context.clone(),
+            source,
+        })?;
+    let response =
+        client
+            .execute(request)
+            .await
+            .map_err(|source| ClickHouseInsertError::Transport {
+                context: context.clone(),
+                source,
+            })?;
+    let status = response.status();
+    let response_snippet =
+        response_snippet(response)
+            .await
+            .map_err(|source| ClickHouseInsertError::Transport {
+                context: context.clone(),
+                source,
+            })?;
+
+    if !status.is_success() {
+        return Err(classify_insert_status(
+            context.clone(),
+            status,
+            response_snippet,
+        ));
+    }
+
+    Ok(ClickHouseInsertReceipt {
+        context: context.clone(),
+        status: status.as_u16(),
+        response_snippet,
+    })
+}
+
+fn should_retry_insert_error(error: &ClickHouseInsertError) -> bool {
+    match error {
+        ClickHouseInsertError::Transport { source, .. } => {
+            source.is_timeout() || source.is_connect() || source.is_body()
+        }
+        ClickHouseInsertError::RetryableStatus { .. } => true,
+        ClickHouseInsertError::RequestBuild { .. }
+        | ClickHouseInsertError::PermanentStatus { .. } => false,
+    }
+}
+
+async fn response_snippet(mut response: Response) -> Result<Option<String>, reqwest::Error> {
+    let mut bytes = Vec::with_capacity(CLICKHOUSE_RESPONSE_SNIPPET_MAX_BYTES);
+    while bytes.len() < CLICKHOUSE_RESPONSE_SNIPPET_MAX_BYTES {
+        let Some(chunk) = response.chunk().await? else {
+            break;
+        };
+        let remaining = CLICKHOUSE_RESPONSE_SNIPPET_MAX_BYTES.saturating_sub(bytes.len());
+        let take = cmp::min(remaining, chunk.len());
+        bytes.extend(chunk.iter().take(take).copied());
+    }
+
+    let snippet = String::from_utf8_lossy(&bytes).into_owned();
     if snippet.is_empty() {
         Ok(None)
     } else {
@@ -517,7 +624,7 @@ fn emoji_serving_table_sql(database: &ClickHouseIdentifier) -> String {
   inserted_at DateTime64(6, 'UTC') DEFAULT now64(6)
 ) ENGINE = ReplacingMergeTree(inserted_at)
 PARTITION BY toYYYYMM(coalesce(created_at, toDateTime64('1970-01-01 00:00:00', 6, 'UTC')))
-ORDER BY (did, rkey, emoji, run_id, shard, file_sequence)
+ORDER BY (src, did, rkey, emoji)
 SETTINGS non_replicated_deduplication_window = 10000;"
     )
 }
@@ -537,7 +644,7 @@ fn total_post_counter_table_sql(database: &ClickHouseIdentifier) -> String {
   max_created_at Nullable(DateTime64(6, 'UTC')) CODEC(Delta(8), ZSTD(1)),
   inserted_at DateTime64(6, 'UTC') DEFAULT now64(6)
 ) ENGINE = ReplacingMergeTree(inserted_at)
-ORDER BY (run_id, shard, file_sequence, receipt_hash)
+ORDER BY (src, receipt_hash)
 SETTINGS non_replicated_deduplication_window = 10000;"
     )
 }
@@ -655,13 +762,14 @@ mod tests {
         io::{Read, Write},
         net::{TcpListener, TcpStream},
         thread,
+        time::Duration,
     };
 
     use reqwest::{Client, StatusCode};
     use serde_json::Value;
 
     use super::{
-        CLICKHOUSE_DATABASE_HEADER, CLICKHOUSE_KEY_HEADER, CLICKHOUSE_RESPONSE_SNIPPET_MAX_CHARS,
+        CLICKHOUSE_DATABASE_HEADER, CLICKHOUSE_KEY_HEADER, CLICKHOUSE_RESPONSE_SNIPPET_MAX_BYTES,
         CLICKHOUSE_USER_HEADER, ClickHouseClientConfig, ClickHouseInsertContext,
         ClickHouseInsertError, ClickHouseSchemaError, ClickHouseTable, JSON_EACH_ROW_FORMAT,
         classify_insert_status, create_schema_sql, derive_insert_payloads, execute_insert_payloads,
@@ -808,6 +916,8 @@ mod tests {
         assert!(sql.contains("ENGINE = ReplacingMergeTree(inserted_at)"));
         assert!(sql.contains("non_replicated_deduplication_window = 10000"));
         assert!(sql.contains("LowCardinality(String)"));
+        assert!(sql.contains("ORDER BY (src, did, rkey, emoji)"));
+        assert!(sql.contains("ORDER BY (src, receipt_hash)"));
     }
 
     #[test]
@@ -875,6 +985,7 @@ mod tests {
         let url = request.url().as_str();
 
         assert_eq!(request.method(), "POST");
+        assert_eq!(request.timeout(), Some(&Duration::from_secs(30)));
         assert!(url.contains("database=emojistats"));
         assert!(url.contains("query=INSERT"));
         assert!(url.contains("insert_deduplicate=1"));
@@ -908,7 +1019,14 @@ mod tests {
             "secret",
             "emojistats-backfill-test",
         )
-        .expect("client config");
+        .expect("client config")
+        .with_timeout_and_retry_policy(
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            Duration::ZERO,
+            Duration::ZERO,
+            1,
+        );
         let client = Client::new();
 
         let receipts = execute_insert_payloads(&client, &config, &payloads)
@@ -964,7 +1082,7 @@ mod tests {
             .remove(0);
         let response_body = format!(
             "too many parts {}",
-            "x".repeat(CLICKHOUSE_RESPONSE_SNIPPET_MAX_CHARS + 20)
+            "x".repeat(CLICKHOUSE_RESPONSE_SNIPPET_MAX_BYTES + 20)
         );
         let (url, handle) = spawn_http_server(vec![(503, response_body)]);
         let config = ClickHouseClientConfig::new(
@@ -974,7 +1092,14 @@ mod tests {
             "secret",
             "emojistats-backfill-test",
         )
-        .expect("client config");
+        .expect("client config")
+        .with_timeout_and_retry_policy(
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            Duration::ZERO,
+            Duration::ZERO,
+            1,
+        );
         let client = Client::new();
 
         let error = execute_insert_payloads(&client, &config, &[payload])
@@ -994,12 +1119,45 @@ mod tests {
                 assert_eq!(context.dedupe_token, "derive:test-token");
                 assert!(context.insert_deduplicate);
                 assert_eq!(
-                    response_snippet.expect("response snippet").chars().count(),
-                    CLICKHOUSE_RESPONSE_SNIPPET_MAX_CHARS
+                    response_snippet.expect("response snippet").len(),
+                    CLICKHOUSE_RESPONSE_SNIPPET_MAX_BYTES
                 );
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn execute_insert_payloads_retries_bounded_retryable_statuses() {
+        let payload = derive_insert_payloads(&batch())
+            .expect("payloads")
+            .remove(0);
+        let (url, handle) =
+            spawn_http_server(vec![(503, "busy".to_owned()), (200, "emoji-ok".to_owned())]);
+        let config = ClickHouseClientConfig::new(
+            &url,
+            "emojistats",
+            "alice",
+            "secret",
+            "emojistats-backfill-test",
+        )
+        .expect("client config")
+        .with_timeout_and_retry_policy(
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            Duration::ZERO,
+            Duration::ZERO,
+            2,
+        );
+        let client = Client::new();
+
+        let receipts = execute_insert_payloads(&client, &config, &[payload])
+            .await
+            .expect("retry should succeed");
+        let requests = handle.join().expect("server thread");
+
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(requests.len(), 2);
     }
 
     #[test]

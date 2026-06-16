@@ -22,6 +22,8 @@ use crate::{
 
 const RAW_ARCHIVE_POSTS_DATASET: &str = "raw_archive_posts";
 const RAW_ARCHIVE_POSTS_SCHEMA_VERSION: u16 = 1;
+const DEFAULT_MAX_FULL_DERIVE_ROWS: u64 = 50_000;
+const DEFAULT_MAX_FULL_DERIVE_BYTES: u64 = 536_870_912;
 
 /// A committed raw-archive manifest prepared for the derive loader.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +39,22 @@ pub struct VerifiedLoaderInput {
     pub identity: DeriveManifestIdentity,
     pub object_path: PathBuf,
     pub repo_receipt: Option<RepoReceipt>,
+}
+
+/// Explicit caps for helpers that materialize a whole archive object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FullLoadCaps {
+    pub max_rows: u64,
+    pub max_bytes: u64,
+}
+
+impl Default for FullLoadCaps {
+    fn default() -> Self {
+        Self {
+            max_rows: DEFAULT_MAX_FULL_DERIVE_ROWS,
+            max_bytes: DEFAULT_MAX_FULL_DERIVE_BYTES,
+        }
+    }
 }
 
 /// Result of reading a mixed committed manifest stream.
@@ -150,6 +168,24 @@ pub enum Error {
         #[source]
         source: ArchiveError,
     },
+    #[error(
+        "committed artifact row count {actual} exceeds full derive load cap {max} for {}",
+        path.display()
+    )]
+    FullLoadRowCapExceeded {
+        path: PathBuf,
+        actual: u64,
+        max: u64,
+    },
+    #[error(
+        "committed artifact bytes {actual} exceeds full derive load cap {max} for {}",
+        path.display()
+    )]
+    FullLoadByteCapExceeded {
+        path: PathBuf,
+        actual: u64,
+        max: u64,
+    },
     #[error("derive batch failed: {source}")]
     Derive {
         #[from]
@@ -213,7 +249,23 @@ pub fn load_verified_clickhouse_batch(
     archive_root: &Path,
     input: &LoaderInput,
 ) -> Result<ClickHouseDeriveBatch, Error> {
+    load_verified_clickhouse_batch_with_caps(archive_root, input, FullLoadCaps::default())
+}
+
+/// Verify a parsed committed manifest entry and build its `ClickHouse` derive batch with
+/// caller-supplied full-object load caps.
+///
+/// # Errors
+///
+/// Returns [`Error`] when the artifact exceeds a cap, is missing, any available receipt
+/// disagrees, or the verified rows cannot form a derive batch.
+pub fn load_verified_clickhouse_batch_with_caps(
+    archive_root: &Path,
+    input: &LoaderInput,
+    caps: FullLoadCaps,
+) -> Result<ClickHouseDeriveBatch, Error> {
     let object_path = resolve_local_path(archive_root, &input.manifest.local_path)?;
+    validate_full_load_caps(&object_path, &input.manifest, caps)?;
     let digest = hash_file(&object_path)?;
     validate_object_digest(&object_path, &input.manifest, &digest)?;
 
@@ -481,6 +533,28 @@ fn validate_object_digest(
     Ok(())
 }
 
+fn validate_full_load_caps(
+    path: &Path,
+    manifest: &LocalManifestEntry,
+    caps: FullLoadCaps,
+) -> Result<(), Error> {
+    if manifest.row_count > caps.max_rows {
+        return Err(Error::FullLoadRowCapExceeded {
+            path: path.to_path_buf(),
+            actual: manifest.row_count,
+            max: caps.max_rows,
+        });
+    }
+    if manifest.bytes > caps.max_bytes {
+        return Err(Error::FullLoadByteCapExceeded {
+            path: path.to_path_buf(),
+            actual: manifest.bytes,
+            max: caps.max_bytes,
+        });
+    }
+    Ok(())
+}
+
 fn read_receipt<T>(path: &Path) -> Result<T, Error>
 where
     T: serde::de::DeserializeOwned,
@@ -658,7 +732,10 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use super::{Error, load_verified_clickhouse_batch, read_committed_jsonl};
+    use super::{
+        Error, FullLoadCaps, load_verified_clickhouse_batch,
+        load_verified_clickhouse_batch_with_caps, read_committed_jsonl,
+    };
     use crate::{
         archive::{
             ArchivePostRow, CreatedAtParseStatus, NormalizerVersion, RepoReceipt, RepoReceiptInput,
@@ -891,6 +968,31 @@ mod tests {
             error,
             Error::ByteMismatch { .. } | Error::ContentHashMismatch { .. }
         ));
+    }
+
+    #[test]
+    fn full_batch_load_rejects_manifest_above_explicit_caps_before_reading_rows() {
+        let temp = TempDir::new("row-cap");
+        let output_dir = temp.path.join("archive");
+        let rows = vec![archive_row("a", "hello ✅", &["✅"])];
+        let receipt = repo_receipt(&rows);
+        let artifacts =
+            write_archive_artifacts(&output_dir, "did:plc:fixture123", &rows, None, &receipt)
+                .expect("archive artifacts should write");
+        let plan = read_plan_from_path(&artifacts.manifest_path);
+        let input = plan.inputs.first().expect("loader input");
+
+        let error = load_verified_clickhouse_batch_with_caps(
+            &output_dir,
+            input,
+            FullLoadCaps {
+                max_rows: 0,
+                max_bytes: u64::MAX,
+            },
+        )
+        .expect_err("row cap should fail");
+
+        assert!(matches!(error, Error::FullLoadRowCapExceeded { .. }));
     }
 
     struct TempDir {
