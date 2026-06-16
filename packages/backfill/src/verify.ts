@@ -185,6 +185,10 @@ const VERIFY_MAX_MEMORY_USAGE_BYTES = positiveIntEnv(
   'VERIFY_MAX_MEMORY_USAGE_BYTES',
   8 * 1024 ** 3,
 );
+const VERIFY_SAMPLE_CONCURRENCY = positiveIntEnv(
+  'VERIFY_SAMPLE_CONCURRENCY',
+  1,
+);
 const VERIFY_QUERY_SETTINGS: ClickHouseSettings = {
   send_progress_in_http_headers: 0,
   wait_end_of_query: 1,
@@ -983,13 +987,14 @@ async function sampleVerifyRepos(
 ): Promise<number> {
   const refetch = refetchPostRows;
   logger.info(
-    { sampled: repos.length, pool },
+    { sampled: repos.length, pool, concurrency: VERIFY_SAMPLE_CONCURRENCY },
     'sample verification: re-fetching repos for exact rkey-superset check',
   );
 
   let failures = 0;
-  for (let i = 0; i < repos.length; i += 1) {
-    const repo = repos[i];
+  let checked = 0;
+  let next = 0;
+  const checkRepo = async (repo: LedgerRepo): Promise<void> => {
     try {
       const rows = await refetch(repo.did, repo.pds_host);
       const fetchedRkeys = new Set(rows.map((row) => row.rkey));
@@ -1089,14 +1094,7 @@ async function sampleVerifyRepos(
           },
           'sample re-fetch skipped: repo entered terminal account state after it was loaded',
         );
-        await telemetry.record({
-          ...base,
-          phase: `sampling-${pool}`,
-          sampleChecked: i + 1,
-          sampleFailures: failures,
-          done: false,
-        });
-        continue;
+        return;
       }
       failures += 1;
       logger.error(
@@ -1107,14 +1105,30 @@ async function sampleVerifyRepos(
         'sample re-fetch failed',
       );
     }
-    await telemetry.record({
-      ...base,
-      phase: `sampling-${pool}`,
-      sampleChecked: i + 1,
-      sampleFailures: failures,
-      done: false,
-    });
-  }
+  };
+
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const i = next;
+      next += 1;
+      if (i >= repos.length) return;
+      await checkRepo(repos[i]);
+      checked += 1;
+      await telemetry.record({
+        ...base,
+        phase: `sampling-${pool}`,
+        sampleChecked: checked,
+        sampleFailures: failures,
+        done: false,
+      });
+    }
+  };
+
+  const workers = Array.from(
+    { length: Math.min(VERIFY_SAMPLE_CONCURRENCY, repos.length) },
+    () => worker(),
+  );
+  await Promise.all(workers);
   return failures;
 }
 
