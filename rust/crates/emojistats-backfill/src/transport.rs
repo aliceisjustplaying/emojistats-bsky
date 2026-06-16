@@ -167,6 +167,12 @@ pub struct SpooledRepo {
     _byte_budget_reservation: Option<FetchByteBudgetReservation>,
 }
 
+impl Drop for SpooledRepo {
+    fn drop(&mut self) {
+        let _ignored = fs::remove_file(&self.car_path);
+    }
+}
+
 /// Parsed `ratelimit-*`, `x-ratelimit-*`, and `retry-after` headers.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RateLimitSnapshot {
@@ -454,7 +460,8 @@ async fn stream_to_file(
                 let _ignored = fs::remove_file(&temp_path);
                 return Err(error);
             }
-            fs::rename(&temp_path, car_path)?;
+            fs::hard_link(&temp_path, car_path)?;
+            let _ignored = fs::remove_file(&temp_path);
             sync_parent_dir(car_path)?;
             Ok((bytes, reservation))
         }
@@ -631,6 +638,9 @@ fn classify_http_error(
 }
 
 fn spool_path(spool_dir: &Path, did: &Did) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
     let mut file_name = String::from("repo-");
     for ch in did.as_str().chars() {
         if ch.is_ascii_alphanumeric() {
@@ -639,6 +649,10 @@ fn spool_path(spool_dir: &Path, did: &Did) -> PathBuf {
             file_name.push('_');
         }
     }
+    file_name.push('.');
+    file_name.push_str(&std::process::id().to_string());
+    file_name.push('.');
+    file_name.push_str(&timestamp.to_string());
     file_name.push_str(".car");
     spool_dir.join(file_name)
 }
@@ -795,6 +809,12 @@ mod tests {
 
         let path = spool_path(PathBuf::from("/tmp/spool").as_path(), &did);
 
-        assert_eq!(path, PathBuf::from("/tmp/spool/repo-did_plc_abc123.car"));
+        let file_name = path.file_name().and_then(std::ffi::OsStr::to_str).unwrap();
+        assert!(file_name.starts_with("repo-did_plc_abc123."));
+        assert!(
+            std::path::Path::new(file_name)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("car"))
+        );
     }
 }

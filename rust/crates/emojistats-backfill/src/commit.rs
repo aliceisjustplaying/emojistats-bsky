@@ -5,7 +5,8 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -156,6 +157,17 @@ pub enum Error {
     /// Caller-provided object writer failed before commit.
     #[error("{0}")]
     Writer(String),
+    /// A final artifact path already existed before promotion.
+    #[error("{kind} final path already exists: {}", path.display())]
+    FinalPathExists { kind: &'static str, path: PathBuf },
+    /// The final artifact hash did not match the temp hash after promotion.
+    #[error("{kind} final hash mismatch for {}: expected {expected}, observed {observed}", path.display())]
+    FinalHashMismatch {
+        kind: &'static str,
+        path: PathBuf,
+        expected: String,
+        observed: String,
+    },
 }
 
 impl LocalStore {
@@ -183,13 +195,12 @@ impl LocalStore {
         prepare_parent(&receipt, "receipt")?;
         prepare_parent(&manifest, "manifest")?;
 
-        write_temp_rename_file(&object, "object", write_object)?;
-        let digest = hash_file(&object)?;
+        let digest = write_temp_promote_file(&object, "object", write_object)?;
         let object_path = manifest_path_string("object", &request.object_path)?;
         let entry = ManifestEntry::from_parts(&request.metadata, object_path.clone(), &digest);
         let receipt_doc = Receipt::from_parts(&request.metadata, object_path, &digest);
 
-        write_json_temp_rename(&receipt, "receipt", &receipt_doc)?;
+        write_json_temp_promote(&receipt, "receipt", &receipt_doc)?;
         write_manifest(&manifest, request.manifest_mode, &entry)?;
 
         Ok(Artifact {
@@ -285,7 +296,11 @@ struct DigestResult {
     sha256: String,
 }
 
-fn write_temp_rename_file<F>(path: &Path, kind: &'static str, write: F) -> Result<(), Error>
+fn write_temp_promote_file<F>(
+    path: &Path,
+    kind: &'static str,
+    write: F,
+) -> Result<DigestResult, Error>
 where
     F: FnOnce(&mut File) -> Result<(), Error>,
 {
@@ -304,24 +319,28 @@ where
             source,
         })?;
         drop(file);
-        fs::rename(&temp_path, path).map_err(|source| Error::Io {
-            operation: "rename temp file",
-            path: path.to_path_buf(),
-            source,
-        })?;
-        sync_parent_dir(path, kind)
+        let temp_digest = hash_file(&temp_path)?;
+        promote_no_overwrite(&temp_path, path, kind)?;
+        let final_digest = hash_file(path)?;
+        if final_digest.sha256 != temp_digest.sha256 || final_digest.bytes != temp_digest.bytes {
+            return Err(Error::FinalHashMismatch {
+                kind,
+                path: path.to_path_buf(),
+                expected: temp_digest.sha256,
+                observed: final_digest.sha256,
+            });
+        }
+        Ok(final_digest)
     })();
-    if result.is_err() {
-        let _ignored = fs::remove_file(&temp_path);
-    }
+    let _ignored = fs::remove_file(&temp_path);
     result
 }
 
-fn write_json_temp_rename<T>(path: &Path, kind: &'static str, value: &T) -> Result<(), Error>
+fn write_json_temp_promote<T>(path: &Path, kind: &'static str, value: &T) -> Result<(), Error>
 where
     T: Serialize,
 {
-    write_temp_rename_file(path, kind, |file| {
+    write_temp_promote_file(path, kind, |file| {
         serde_json::to_writer_pretty(&mut *file, value).map_err(|source| Error::Json {
             path: path.to_path_buf(),
             source,
@@ -332,16 +351,23 @@ where
             source,
         })
     })
+    .map(|_digest| ())
 }
 
 fn write_manifest(path: &Path, mode: ManifestMode, entry: &ManifestEntry) -> Result<(), Error> {
     match mode {
         ManifestMode::AppendJsonl => append_manifest_jsonl(path, entry),
-        ManifestMode::ReplaceJsonArray => write_json_temp_rename(path, "manifest", &[entry]),
+        ManifestMode::ReplaceJsonArray => write_json_temp_promote(path, "manifest", &[entry]),
     }
 }
 
 fn append_manifest_jsonl(path: &Path, entry: &ManifestEntry) -> Result<(), Error> {
+    let _lock = ManifestAppendLock::acquire(path)?;
+    let mut line = serde_json::to_vec(entry).map_err(|source| Error::Json {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    line.push(b'\n');
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -351,12 +377,8 @@ fn append_manifest_jsonl(path: &Path, entry: &ManifestEntry) -> Result<(), Error
             path: path.to_path_buf(),
             source,
         })?;
-    serde_json::to_writer(&mut file, entry).map_err(|source| Error::Json {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    file.write_all(b"\n").map_err(|source| Error::Io {
-        operation: "write manifest newline",
+    file.write_all(&line).map_err(|source| Error::Io {
+        operation: "write manifest record",
         path: path.to_path_buf(),
         source,
     })?;
@@ -367,6 +389,84 @@ fn append_manifest_jsonl(path: &Path, entry: &ManifestEntry) -> Result<(), Error
     })?;
     drop(file);
     sync_parent_dir(path, "manifest")
+}
+
+struct ManifestAppendLock {
+    path: PathBuf,
+}
+
+impl ManifestAppendLock {
+    fn acquire(path: &Path) -> Result<Self, Error> {
+        let lock_path = manifest_lock_path(path)?;
+        let mut attempts = 0_u16;
+        loop {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(mut file) => {
+                    writeln!(file, "{}", std::process::id()).map_err(|source| Error::Io {
+                        operation: "write manifest append lock",
+                        path: lock_path.clone(),
+                        source,
+                    })?;
+                    file.sync_all().map_err(|source| Error::Io {
+                        operation: "fsync manifest append lock",
+                        path: lock_path.clone(),
+                        source,
+                    })?;
+                    return Ok(Self { path: lock_path });
+                }
+                Err(source) if source.kind() == io::ErrorKind::AlreadyExists && attempts < 200 => {
+                    attempts = attempts.saturating_add(1);
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(source) => {
+                    return Err(Error::Io {
+                        operation: "acquire manifest append lock",
+                        path: lock_path,
+                        source,
+                    });
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ManifestAppendLock {
+    fn drop(&mut self) {
+        let _ignored = fs::remove_file(&self.path);
+    }
+}
+
+fn manifest_lock_path(path: &Path) -> Result<PathBuf, Error> {
+    let file_name =
+        path.file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| Error::MissingFileName {
+                kind: "manifest lock",
+                path: path.to_path_buf(),
+            })?;
+    Ok(path.with_file_name(format!(".{file_name}.lock")))
+}
+
+fn promote_no_overwrite(temp_path: &Path, path: &Path, kind: &'static str) -> Result<(), Error> {
+    fs::hard_link(temp_path, path).map_err(|source| {
+        if source.kind() == io::ErrorKind::AlreadyExists {
+            Error::FinalPathExists {
+                kind,
+                path: path.to_path_buf(),
+            }
+        } else {
+            Error::Io {
+                operation: "promote temp file without overwrite",
+                path: path.to_path_buf(),
+                source,
+            }
+        }
+    })?;
+    sync_parent_dir(path, kind)
 }
 
 fn remove_stale_temp(path: &Path) -> Result<(), Error> {

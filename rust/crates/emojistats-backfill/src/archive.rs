@@ -6,7 +6,7 @@ use std::{
     fs::File,
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -197,13 +197,32 @@ pub enum ArchiveError {
     Arrow(arrow_schema::ArrowError),
     Json(serde_json::Error),
     Commit(crate::commit::Error),
-    CountOverflow { field: &'static str },
+    CountOverflow {
+        field: &'static str,
+    },
     InvalidCompression(String),
-    InvalidPath { path: PathBuf },
+    InvalidPath {
+        path: PathBuf,
+    },
     InvalidRecordJson,
-    InvalidParquetColumn { column: &'static str },
-    InvalidParquetValue { column: &'static str, value: String },
-    UnexpectedParquetNull { column: &'static str },
+    InvalidParquetColumn {
+        column: &'static str,
+    },
+    InvalidParquetValue {
+        column: &'static str,
+        value: String,
+    },
+    UnexpectedParquetNull {
+        column: &'static str,
+    },
+    FinalPathExists {
+        path: PathBuf,
+    },
+    FinalHashMismatch {
+        path: PathBuf,
+        expected: String,
+        observed: String,
+    },
 }
 
 /// Convert parsed post records into the first archive-row shape.
@@ -274,17 +293,17 @@ pub fn write_archive_artifacts(
     receipt: &RepoReceipt,
 ) -> Result<ArchiveArtifacts, ArchiveError> {
     fs::create_dir_all(output_dir)?;
-    let safe_did = safe_file_component(did);
-    let parquet_object_path = PathBuf::from(format!("{safe_did}.posts.parquet"));
-    let receipt_path = output_dir.join(format!("{safe_did}.receipt.json"));
-    let object_receipt_object_path = PathBuf::from(format!("{safe_did}.object-receipt.json"));
-    let manifest_object_path = PathBuf::from(format!("{safe_did}.manifest.jsonl"));
-    let emoji_projection_path = output_dir.join(format!("{safe_did}.emoji.jsonl"));
-    let profile_sidecar_object_path = PathBuf::from(format!("{safe_did}.profile.json"));
+    let artifact_stem = artifact_file_stem(did);
+    let parquet_object_path = PathBuf::from(format!("{artifact_stem}.posts.parquet"));
+    let receipt_path = output_dir.join(format!("{artifact_stem}.receipt.json"));
+    let object_receipt_object_path = PathBuf::from(format!("{artifact_stem}.object-receipt.json"));
+    let manifest_object_path = PathBuf::from(format!("{artifact_stem}.manifest.jsonl"));
+    let emoji_projection_path = output_dir.join(format!("{artifact_stem}.emoji.jsonl"));
+    let profile_sidecar_object_path = PathBuf::from(format!("{artifact_stem}.profile.json"));
     let profile_sidecar_receipt_object_path =
-        PathBuf::from(format!("{safe_did}.profile.object-receipt.json"));
+        PathBuf::from(format!("{artifact_stem}.profile.object-receipt.json"));
     let profile_sidecar_manifest_object_path =
-        PathBuf::from(format!("{safe_did}.profile.manifest.jsonl"));
+        PathBuf::from(format!("{artifact_stem}.profile.manifest.jsonl"));
 
     write_temp_rename(&receipt_path, |path| write_json_pretty(path, receipt))?;
     let store = LocalStore::new(output_dir);
@@ -344,7 +363,7 @@ pub fn write_archive_artifacts(
 /// Streaming writer for one repo's archive artifacts.
 pub struct StreamingArchiveSink {
     output_dir: PathBuf,
-    safe_did: String,
+    artifact_stem: String,
     parquet_path: PathBuf,
     parquet_temp_path: PathBuf,
     receipt_path: PathBuf,
@@ -386,13 +405,13 @@ impl StreamingArchiveSink {
     /// Returns [`ArchiveError`] if local files or the `Parquet` writer cannot be opened.
     pub fn new(output_dir: &Path, did: &str) -> Result<Self, ArchiveError> {
         fs::create_dir_all(output_dir)?;
-        let safe_did = safe_file_component(did);
-        let parquet_path = output_dir.join(format!("{safe_did}.posts.parquet"));
+        let artifact_stem = artifact_file_stem(did);
+        let parquet_path = output_dir.join(format!("{artifact_stem}.posts.parquet"));
         let parquet_temp_path = temp_path_for(&parquet_path)?;
-        let receipt_path = output_dir.join(format!("{safe_did}.receipt.json"));
-        let object_receipt_path = output_dir.join(format!("{safe_did}.object-receipt.json"));
-        let manifest_path = output_dir.join(format!("{safe_did}.manifest.jsonl"));
-        let emoji_projection_path = output_dir.join(format!("{safe_did}.emoji.jsonl"));
+        let receipt_path = output_dir.join(format!("{artifact_stem}.receipt.json"));
+        let object_receipt_path = output_dir.join(format!("{artifact_stem}.object-receipt.json"));
+        let manifest_path = output_dir.join(format!("{artifact_stem}.manifest.jsonl"));
+        let emoji_projection_path = output_dir.join(format!("{artifact_stem}.emoji.jsonl"));
         let emoji_projection_temp_path = temp_path_for(&emoji_projection_path)?;
         remove_if_exists(&parquet_temp_path)?;
         remove_if_exists(&emoji_projection_temp_path)?;
@@ -406,7 +425,7 @@ impl StreamingArchiveSink {
         )?;
         Ok(Self {
             output_dir: output_dir.to_path_buf(),
-            safe_did,
+            artifact_stem,
             parquet_path,
             parquet_temp_path,
             receipt_path,
@@ -573,7 +592,7 @@ impl StreamingArchiveSink {
                 shard: manifest.shard.clone(),
                 file_sequence: manifest.file_sequence,
                 dataset: manifest.dataset.clone(),
-                object_path: format!("{}.posts.parquet", self.safe_did),
+                object_path: format!("{}.posts.parquet", self.artifact_stem),
                 row_count: manifest.row_count,
                 bytes: manifest.bytes,
                 content_hash: manifest.content_hash.clone(),
@@ -623,7 +642,7 @@ impl StreamingArchiveSink {
             shard: manifest.shard.clone(),
             file_sequence: manifest.file_sequence,
             dataset: manifest.dataset.clone(),
-            object_path: format!("{}.posts.parquet", self.safe_did),
+            object_path: format!("{}.posts.parquet", self.artifact_stem),
             row_count: manifest.row_count,
             bytes: manifest.bytes,
             content_hash: manifest.content_hash.clone(),
@@ -642,9 +661,12 @@ impl StreamingArchiveSink {
             .map(|profile| {
                 commit_profile_sidecar(
                     &store,
-                    PathBuf::from(format!("{}.profile.json", self.safe_did)),
-                    PathBuf::from(format!("{}.profile.object-receipt.json", self.safe_did)),
-                    PathBuf::from(format!("{}.profile.manifest.jsonl", self.safe_did)),
+                    PathBuf::from(format!("{}.profile.json", self.artifact_stem)),
+                    PathBuf::from(format!(
+                        "{}.profile.object-receipt.json",
+                        self.artifact_stem
+                    )),
+                    PathBuf::from(format!("{}.profile.manifest.jsonl", self.artifact_stem)),
                     profile,
                     receipt,
                 )
@@ -1312,11 +1334,33 @@ fn max_created_at(rows: &[ArchivePostRow]) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn artifact_file_stem(value: &str) -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    format!(
+        "{}.{}.{}",
+        safe_file_component(value),
+        std::process::id(),
+        timestamp
+    )
+}
+
 fn safe_file_component(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-        .collect()
+    let mut safe = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            safe.push(ch);
+        } else {
+            safe.push('_');
+        }
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    safe.push_str("__");
+    safe.extend(digest.chars().take(16));
+    safe
 }
 
 fn hash_string_slice(hasher: &mut Sha256, values: &[String]) -> Result<(), ArchiveError> {
@@ -1367,7 +1411,7 @@ fn record_extras_json(post: &PostRecord) -> Result<serde_json::Value, ArchiveErr
     insert_optional_json(&mut extras, "labels", post.record.labels.as_ref())?;
     insert_optional_json(&mut extras, "reply", post.record.reply.as_ref())?;
     insert_optional_json(&mut extras, "tags", post.record.tags.as_ref())?;
-    insert_optional_json(&mut extras, "extra_data", post.record.extra_data.as_ref())?;
+    insert_extra_data_json(&mut extras, post.record.extra_data.as_ref())?;
     Ok(serde_json::Value::Object(extras))
 }
 
@@ -1378,6 +1422,22 @@ fn insert_optional_json<T: Serialize>(
 ) -> Result<(), ArchiveError> {
     if let Some(value) = value {
         target.insert(key.to_owned(), serde_json::to_value(value)?);
+    }
+    Ok(())
+}
+
+fn insert_extra_data_json<T: Serialize>(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    value: Option<&std::collections::BTreeMap<smol_str::SmolStr, T>>,
+) -> Result<(), ArchiveError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    for (key, extra_value) in value {
+        let key = key.to_string();
+        if !target.contains_key(&key) {
+            target.insert(key, serde_json::to_value(extra_value)?);
+        }
     }
     Ok(())
 }
@@ -1412,7 +1472,7 @@ fn classify_present_created_at(raw: &str) -> ClassifiedCreatedAt {
         (None, _now) => CreatedAtParseStatus::Invalid,
     };
     let normalized = if status == CreatedAtParseStatus::Valid {
-        Some(raw.to_owned())
+        timestamp.and_then(format_epoch_seconds)
     } else {
         None
     };
@@ -1424,8 +1484,11 @@ fn classify_present_created_at(raw: &str) -> ClassifiedCreatedAt {
 }
 
 fn current_epoch_seconds() -> Option<i64> {
-    let duration = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
-    i64::try_from(duration.as_secs()).ok()
+    static CURRENT_EPOCH_SECONDS: OnceLock<Option<i64>> = OnceLock::new();
+    *CURRENT_EPOCH_SECONDS.get_or_init(|| {
+        let duration = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+        i64::try_from(duration.as_secs()).ok()
+    })
 }
 
 fn parse_rfc3339_epoch_seconds(value: &str) -> Option<i64> {
@@ -1529,10 +1592,51 @@ fn validate_datetime_parts(
     if !(1..=days_in_month(year, month)?).contains(&day) {
         return None;
     }
-    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0..=60).contains(&second) {
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0..=59).contains(&second) {
         return None;
     }
     Some(())
+}
+
+fn format_epoch_seconds(value: i64) -> Option<String> {
+    let days = value.div_euclid(86_400);
+    let seconds_of_day = value.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days)?;
+    let hour = seconds_of_day.div_euclid(3_600);
+    let minute = seconds_of_day.checked_rem(3_600)?.div_euclid(60);
+    let second = seconds_of_day.checked_rem(60)?;
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
+    ))
+}
+
+fn civil_from_days(days: i64) -> Option<(i64, i64, i64)> {
+    let z = days.checked_add(719_468)?;
+    let era = if z >= 0 {
+        z.div_euclid(146_097)
+    } else {
+        z.checked_sub(146_096)?.div_euclid(146_097)
+    };
+    let doe = z.checked_sub(era.checked_mul(146_097)?)?;
+    let yoe = doe
+        .checked_sub(doe.div_euclid(1_460))?
+        .checked_add(doe.div_euclid(36_524))?
+        .checked_sub(doe.div_euclid(146_096))?
+        .div_euclid(365);
+    let year = yoe.checked_add(era.checked_mul(400)?)?;
+    let doy = doe.checked_sub(
+        365_i64
+            .checked_mul(yoe)?
+            .checked_add(yoe.div_euclid(4))?
+            .checked_sub(yoe.div_euclid(100))?,
+    )?;
+    let mp = 5_i64.checked_mul(doy)?.checked_add(2)?.div_euclid(153);
+    let day = doy
+        .checked_sub(153_i64.checked_mul(mp)?.checked_add(2)?.div_euclid(5))?
+        .checked_add(1)?;
+    let month = mp.checked_add(if mp < 10 { 3 } else { -9 })?;
+    let year = year.checked_add(i64::from(month <= 2))?;
+    Some((year, month, day))
 }
 
 fn validate_timezone(hour: i64, minute: i64) -> Option<()> {
@@ -1600,7 +1704,7 @@ where
     match write(&temp_path) {
         Ok(()) => {
             sync_file(&temp_path)?;
-            fs::rename(&temp_path, path)?;
+            promote_temp_no_overwrite(&temp_path, path)?;
             sync_parent_dir(path)?;
             Ok(())
         }
@@ -1609,6 +1713,29 @@ where
             Err(error)
         }
     }
+}
+
+fn promote_temp_no_overwrite(temp_path: &Path, path: &Path) -> Result<(), ArchiveError> {
+    let temp_digest = hash_file_for_archive(temp_path)?;
+    fs::hard_link(temp_path, path).map_err(|source| {
+        if source.kind() == io::ErrorKind::AlreadyExists {
+            ArchiveError::FinalPathExists {
+                path: path.to_path_buf(),
+            }
+        } else {
+            ArchiveError::Io(source)
+        }
+    })?;
+    let _ignored = fs::remove_file(temp_path);
+    let final_digest = hash_file_for_archive(path)?;
+    if final_digest.sha256 != temp_digest.sha256 || final_digest.bytes != temp_digest.bytes {
+        return Err(ArchiveError::FinalHashMismatch {
+            path: path.to_path_buf(),
+            expected: temp_digest.sha256,
+            observed: final_digest.sha256,
+        });
+    }
+    Ok(())
 }
 
 fn temp_path_for(path: &Path) -> Result<PathBuf, ArchiveError> {
@@ -1666,6 +1793,18 @@ impl fmt::Display for ArchiveError {
             Self::UnexpectedParquetNull { column } => {
                 write!(f, "unexpected null in archive Parquet column: {column}")
             }
+            Self::FinalPathExists { path } => {
+                write!(f, "archive final path already exists: {}", path.display())
+            }
+            Self::FinalHashMismatch {
+                path,
+                expected,
+                observed,
+            } => write!(
+                f,
+                "archive final hash mismatch for {}: expected {expected}, observed {observed}",
+                path.display()
+            ),
         }
     }
 }
@@ -1684,7 +1823,9 @@ impl Error for ArchiveError {
             | Self::InvalidRecordJson
             | Self::InvalidParquetColumn { .. }
             | Self::InvalidParquetValue { .. }
-            | Self::UnexpectedParquetNull { .. } => None,
+            | Self::UnexpectedParquetNull { .. }
+            | Self::FinalPathExists { .. }
+            | Self::FinalHashMismatch { .. } => None,
         }
     }
 }
@@ -1730,7 +1871,7 @@ mod tests {
     use super::{
         ArchivePostRow, CreatedAtParseStatus, NormalizerVersion, RepoReceiptInput,
         StreamingArchiveSink, StreamingReceiptInput, build_repo_receipt, classify_created_at,
-        extract_emojis, hash_post_rows, temp_path_for,
+        extract_emojis, hash_post_rows,
     };
 
     fn normalizer() -> NormalizerVersion {
@@ -1821,14 +1962,12 @@ mod tests {
     fn unfinished_streaming_sink_removes_temp_files_on_drop() {
         let output_dir = unique_test_dir("streaming-sink-drop");
         fs::create_dir_all(&output_dir).expect("create test archive dir");
-        let parquet_temp =
-            temp_path_for(&output_dir.join("did_plc_cleanup.posts.parquet")).expect("temp path");
-        let emoji_temp =
-            temp_path_for(&output_dir.join("did_plc_cleanup.emoji.jsonl")).expect("temp path");
 
         let sink = StreamingArchiveSink::new(&output_dir, "did:plc:cleanup").expect("create sink");
-        assert!(parquet_temp.exists());
-        assert!(emoji_temp.exists());
+        let parquet_temp = sink.parquet_temp_path.clone();
+        let emoji_temp = sink.emoji_projection_temp_path.clone();
+        assert!(parquet_temp.exists(), "{}", parquet_temp.display());
+        assert!(emoji_temp.exists(), "{}", emoji_temp.display());
         drop(sink);
 
         assert!(!parquet_temp.exists());
@@ -1861,7 +2000,8 @@ mod tests {
         let entry: crate::commit::ManifestEntry =
             serde_json::from_str(&manifest_json).expect("parse committed manifest");
 
-        assert_eq!(entry.object_path, "did_plc_manifest.posts.parquet");
+        assert!(entry.object_path.starts_with("did_plc_manifest__"));
+        assert!(entry.object_path.ends_with(".posts.parquet"));
         assert_eq!(entry.dataset, "raw_archive_posts");
         assert_eq!(entry.row_count, 1);
         fs::remove_dir_all(output_dir).expect("remove test archive dir");

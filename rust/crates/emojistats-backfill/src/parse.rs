@@ -87,7 +87,8 @@ impl Default for ParseConfig {
             max_records: 10_000_000,
             max_mst_depth: 256,
             max_decode_errors: 1_000_000,
-            max_parse_wall_clock: Duration::from_mins(15),
+            #[allow(clippy::duration_suboptimal_units)]
+            max_parse_wall_clock: Duration::from_secs(15 * 60),
         }
     }
 }

@@ -59,20 +59,21 @@ fn profile_sidecar_is_written_as_committed_artifact() {
     .expect("profile sidecar manifest entry should decode");
 
     assert!(lines.next().is_none());
-    assert_eq!(
-        profile_path,
-        output_dir.join("did_plc_fixture123.profile.json")
+    assert_eq!(profile_path.parent(), Some(output_dir.as_path()));
+    assert_path_name_shape(&profile_path, "did_plc_fixture123__", ".profile.json");
+    assert_path_name_shape(
+        &profile_receipt_path,
+        "did_plc_fixture123__",
+        ".profile.object-receipt.json",
     );
-    assert_eq!(
-        profile_receipt_path,
-        output_dir.join("did_plc_fixture123.profile.object-receipt.json")
-    );
-    assert_eq!(
-        profile_manifest_path,
-        output_dir.join("did_plc_fixture123.profile.manifest.jsonl")
+    assert_path_name_shape(
+        &profile_manifest_path,
+        "did_plc_fixture123__",
+        ".profile.manifest.jsonl",
     );
     assert_eq!(receipt.dataset, "raw_profile_sidecar");
-    assert_eq!(receipt.object_path, "did_plc_fixture123.profile.json");
+    assert!(receipt.object_path.starts_with("did_plc_fixture123__"));
+    assert!(receipt.object_path.ends_with(".profile.json"));
     assert_eq!(receipt.row_count, 1);
     assert_eq!(receipt.content_hash, sha256_file(&profile_path));
     assert_eq!(entry.dataset, receipt.dataset);
@@ -92,6 +93,15 @@ fn profile_sidecar_is_written_as_committed_artifact() {
             .and_then(serde_json::Value::as_str),
         Some("alice")
     );
+}
+
+fn assert_path_name_shape(path: &Path, prefix: &str, suffix: &str) {
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .expect("path should have UTF-8 file name");
+    assert!(name.starts_with(prefix), "{name}");
+    assert!(name.ends_with(suffix), "{name}");
 }
 
 fn receipt_for(rows: &[ArchivePostRow], profile: &ProfileRecord) -> RepoReceipt {
