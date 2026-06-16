@@ -30,7 +30,7 @@ use emojistats_backfill::{
     transport::{FetchByteBudget, FetchConfig, FetchError, fetch_repo},
 };
 use jacquard_common::{deps::fluent_uri::Uri, types::did::Did};
-use jacquard_identity::{PublicResolver, resolver::IdentityResolver};
+use jacquard_identity::PublicResolver;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
@@ -38,6 +38,8 @@ mod cli;
 mod derive_manifest_cmd;
 mod failure;
 mod fleet;
+#[path = "main/mod.rs"]
+mod main;
 mod profile_cmd;
 
 use cli::{Cli, Command};
@@ -48,6 +50,12 @@ use failure::{
     emit_smoke_telemetry, outcome_name, permanent_failure, retryable_failure,
 };
 use fleet::{FleetConfig, HostConcurrencyLimiter, HostConcurrencyPermit, default_worker_id};
+use main::{archive_host::parse_and_archive_spooled_repo, fetch_attempt::fetch_one_attempt};
+#[cfg(test)]
+use main::{
+    archive_host::{fetch_mode_for_host, load_host_override, pds_host_key, prepare_fetch_host},
+    fetch_attempt::{HostOverrideCache, should_fallback_get_repo_to_list_records},
+};
 
 const FETCH_TRANSPORT_ATTEMPTS: u8 = 3;
 const FETCH_TRANSPORT_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
@@ -228,10 +236,6 @@ fn payload_row_count(
             .ok_or_else(|| anyhow::anyhow!("payload row total overflow"))
     })
 }
-
-include!("main/fetch_attempt.rs");
-
-include!("main/archive_host.rs");
 
 #[cfg(test)]
 #[path = "main/tests.rs"]

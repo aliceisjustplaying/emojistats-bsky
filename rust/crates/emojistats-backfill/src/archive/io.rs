@@ -1,3 +1,16 @@
+use sha2::Digest as _;
+
+use super::{
+    ARCHIVE_SCHEMA_VERSION, Arc, ArchiveCommitContext, ArchiveError, ArchivePostRow, Array,
+    ArrayRef, ArrowWriter, CompletenessClass, Compression, Cow, CreatedAtParseStatus, DataType,
+    DeriveError, EmojiProjectionRow, FetchMethod, Field, File, LocalManifestEntry, LocalStore,
+    ManifestMode, Metadata, NormalizerVersion, PARQUET_BATCH_ROWS, POST_COLLECTION,
+    ParquetRecordBatchReaderBuilder, Path, PathBuf, ProfileRecord, ProfileSidecarRow, RecordBatch,
+    RepoReceipt, RepoReceiptInput, Request, Schema, Serialize, Sha256, StringArray, StringBuilder,
+    Utc, Write, WriterProperties, ZstdLevel, derive_emoji_projection_rows, format_observed_at,
+    hash_serialized_json,
+};
+
 /// Read raw archive post rows from the Stage D Parquet shape.
 ///
 /// # Errors
@@ -78,7 +91,10 @@ pub fn hash_post_rows(rows: &[ArchivePostRow]) -> Result<String, ArchiveError> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn hash_post_row_into(hasher: &mut Sha256, row: &ArchivePostRow) -> Result<(), ArchiveError> {
+pub(super) fn hash_post_row_into(
+    hasher: &mut Sha256,
+    row: &ArchivePostRow,
+) -> Result<(), ArchiveError> {
     hash_field(hasher, POST_COLLECTION)?;
     hash_field(hasher, &row.did)?;
     hash_field(hasher, &row.rkey)?;
@@ -121,7 +137,10 @@ fn hash_emoji_projection_rows(rows: &[EmojiProjectionRow]) -> Result<String, Arc
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn write_posts_parquet_to_writer<W>(writer: W, rows: &[ArchivePostRow]) -> Result<(), ArchiveError>
+pub(super) fn write_posts_parquet_to_writer<W>(
+    writer: W,
+    rows: &[ArchivePostRow],
+) -> Result<(), ArchiveError>
 where
     W: Write + Send,
 {
@@ -139,7 +158,7 @@ where
     Ok(())
 }
 
-fn archive_schema() -> Arc<Schema> {
+pub(super) fn archive_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("did", DataType::Utf8, false),
         Field::new("rkey", DataType::Utf8, false),
@@ -162,7 +181,7 @@ fn archive_schema() -> Arc<Schema> {
     ]))
 }
 
-fn parquet_writer_properties() -> Result<WriterProperties, ArchiveError> {
+pub(super) fn parquet_writer_properties() -> Result<WriterProperties, ArchiveError> {
     Ok(WriterProperties::builder()
         .set_compression(Compression::ZSTD(
             ZstdLevel::try_new(1)
@@ -171,7 +190,7 @@ fn parquet_writer_properties() -> Result<WriterProperties, ArchiveError> {
         .build())
 }
 
-fn post_record_batch(
+pub(super) fn post_record_batch(
     schema: &Arc<Schema>,
     rows: &[ArchivePostRow],
 ) -> Result<RecordBatch, ArchiveError> {
@@ -358,7 +377,7 @@ fn parse_created_at_parse_status(value: &str) -> Result<CreatedAtParseStatus, Ar
     }
 }
 
-fn build_commit_metadata(
+pub(super) fn build_commit_metadata(
     rows: &[ArchivePostRow],
     receipt: &RepoReceipt,
     commit_context: &ArchiveCommitContext,
@@ -396,7 +415,7 @@ fn build_profile_sidecar_metadata(
     })
 }
 
-fn commit_profile_sidecar(
+pub(super) fn commit_profile_sidecar(
     store: &LocalStore,
     object_path: PathBuf,
     receipt_path: PathBuf,
@@ -419,7 +438,7 @@ fn commit_profile_sidecar(
     })?)
 }
 
-fn local_manifest_from_committed(
+pub(super) fn local_manifest_from_committed(
     committed: &crate::commit::Artifact,
     receipt: &RepoReceipt,
 ) -> LocalManifestEntry {
@@ -440,7 +459,7 @@ fn local_manifest_from_committed(
     }
 }
 
-fn write_emoji_projection_jsonl(
+pub(super) fn write_emoji_projection_jsonl(
     path: &Path,
     rows: &[EmojiProjectionRow],
 ) -> Result<(), ArchiveError> {
@@ -473,11 +492,11 @@ fn profile_sidecar_row(profile: &ProfileRecord) -> ProfileSidecarRow<'_> {
     }
 }
 
-fn extract_emojis(text: &str) -> Vec<String> {
+pub(super) fn extract_emojis(text: &str) -> Vec<String> {
     emoji_normalizer::extract_emoji_sequence(text)
 }
 
-const fn archive_error_from_derive(error: DeriveError) -> ArchiveError {
+pub(super) const fn archive_error_from_derive(error: DeriveError) -> ArchiveError {
     match error {
         DeriveError::CountOverflow { field } => ArchiveError::CountOverflow { field },
         DeriveError::RowCountMismatch { .. } => ArchiveError::CountOverflow {
@@ -522,7 +541,7 @@ fn json_string_array(
     Ok(Arc::new(builder.finish()))
 }
 
-fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, ArchiveError> {
+pub(super) fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, ArchiveError> {
     Ok(serde_json::to_vec(value)?)
 }
 
@@ -544,7 +563,7 @@ fn extras_json_string(value: &serde_json::Value) -> Result<Cow<'static, str>, Ar
     Ok(Cow::Owned(canonical_json(value)?))
 }
 
-fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), ArchiveError> {
+pub(super) fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), ArchiveError> {
     let mut file = File::create(path)?;
     serde_json::to_writer_pretty(&mut file, value)?;
     file.write_all(b"\n")?;
@@ -553,12 +572,12 @@ fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), Archive
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ArchiveFileDigest {
-    bytes: u64,
-    sha256: String,
+pub(super) struct ArchiveFileDigest {
+    pub(super) bytes: u64,
+    pub(super) sha256: String,
 }
 
-fn hash_file_for_archive(path: &Path) -> Result<ArchiveFileDigest, ArchiveError> {
+pub(super) fn hash_file_for_archive(path: &Path) -> Result<ArchiveFileDigest, ArchiveError> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut bytes = 0_u64;
@@ -594,7 +613,7 @@ fn min_created_at(rows: &[ArchivePostRow]) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn update_min_max_created_at(
+pub(super) fn update_min_max_created_at(
     min_value: &mut Option<String>,
     max_value: &mut Option<String>,
     value: Option<&str>,
@@ -617,7 +636,7 @@ fn max_created_at(rows: &[ArchivePostRow]) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn stable_artifact_stem(did: &str, dataset: &str, content_hash: &str) -> String {
+pub(super) fn stable_artifact_stem(did: &str, dataset: &str, content_hash: &str) -> String {
     format!(
         "{}.{}.{}",
         safe_file_component(did),
@@ -626,7 +645,7 @@ fn stable_artifact_stem(did: &str, dataset: &str, content_hash: &str) -> String 
     )
 }
 
-fn stable_repo_receipt_name(did: &str, receipt_hash: &str) -> String {
+pub(super) fn stable_repo_receipt_name(did: &str, receipt_hash: &str) -> String {
     format!("{}.{}.receipt.json", safe_file_component(did), receipt_hash)
 }
 
@@ -647,14 +666,20 @@ fn safe_file_component(value: &str) -> String {
     safe
 }
 
-fn hash_string_slice(hasher: &mut Sha256, values: &[String]) -> Result<(), ArchiveError> {
+pub(super) fn hash_string_slice(
+    hasher: &mut Sha256,
+    values: &[String],
+) -> Result<(), ArchiveError> {
     for value in values {
         hash_field(hasher, value)?;
     }
     hash_field(hasher, "")
 }
 
-fn hash_optional_field(hasher: &mut Sha256, value: Option<&str>) -> Result<(), ArchiveError> {
+pub(super) fn hash_optional_field(
+    hasher: &mut Sha256,
+    value: Option<&str>,
+) -> Result<(), ArchiveError> {
     match value {
         Some(value) => {
             hash_field(hasher, "some")?;
@@ -675,7 +700,7 @@ fn hash_normalizer(
     hash_field(hasher, &normalizer.emoji_data_version)
 }
 
-fn append_normalizer_frames(
+pub(super) fn append_normalizer_frames(
     target: &mut Vec<u8>,
     normalizer: &NormalizerVersion,
 ) -> Result<(), ArchiveError> {
@@ -686,7 +711,7 @@ fn append_normalizer_frames(
     append_hash_field_frame(target, &normalizer.emoji_data_version)
 }
 
-fn framed_fields<const N: usize>(values: [&str; N]) -> Result<Vec<u8>, ArchiveError> {
+pub(super) fn framed_fields<const N: usize>(values: [&str; N]) -> Result<Vec<u8>, ArchiveError> {
     let mut framed = Vec::new();
     for value in values {
         append_hash_field_frame(&mut framed, value)?;
@@ -694,7 +719,10 @@ fn framed_fields<const N: usize>(values: [&str; N]) -> Result<Vec<u8>, ArchiveEr
     Ok(framed)
 }
 
-fn append_hash_field_frame(target: &mut Vec<u8>, value: &str) -> Result<(), ArchiveError> {
+pub(super) fn append_hash_field_frame(
+    target: &mut Vec<u8>,
+    value: &str,
+) -> Result<(), ArchiveError> {
     let len = u64::try_from(value.len()).map_err(|_error| ArchiveError::CountOverflow {
         field: "hash_field_length",
     })?;
@@ -703,11 +731,11 @@ fn append_hash_field_frame(target: &mut Vec<u8>, value: &str) -> Result<(), Arch
     Ok(())
 }
 
-fn hash_field(hasher: &mut Sha256, value: &str) -> Result<(), ArchiveError> {
+pub(super) fn hash_field(hasher: &mut Sha256, value: &str) -> Result<(), ArchiveError> {
     hash_field_bytes(hasher, value.as_bytes())
 }
 
-fn hash_field_bytes(hasher: &mut Sha256, value: &[u8]) -> Result<(), ArchiveError> {
+pub(super) fn hash_field_bytes(hasher: &mut Sha256, value: &[u8]) -> Result<(), ArchiveError> {
     let len = u64::try_from(value.len()).map_err(|_error| ArchiveError::CountOverflow {
         field: "hash_field_length",
     })?;
@@ -716,7 +744,10 @@ fn hash_field_bytes(hasher: &mut Sha256, value: &[u8]) -> Result<(), ArchiveErro
     Ok(())
 }
 
-fn hash_extras_json(hasher: &mut Sha256, value: &serde_json::Value) -> Result<(), ArchiveError> {
+pub(super) fn hash_extras_json(
+    hasher: &mut Sha256,
+    value: &serde_json::Value,
+) -> Result<(), ArchiveError> {
     if matches!(value, serde_json::Value::Object(fields) if fields.is_empty()) {
         return hash_field(hasher, "{}");
     }
@@ -727,7 +758,7 @@ fn canonical_json(value: &serde_json::Value) -> Result<String, ArchiveError> {
     Ok(serde_json::to_string(value)?)
 }
 
-fn record_extras_json(
+pub(super) fn record_extras_json(
     record: &jacquard_api::app_bsky::feed::post::Post<smol_str::SmolStr>,
 ) -> Result<serde_json::Value, ArchiveError> {
     let mut extras = serde_json::Map::new();

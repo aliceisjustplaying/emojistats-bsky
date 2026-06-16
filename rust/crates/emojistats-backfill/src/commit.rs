@@ -50,7 +50,10 @@ pub struct Metadata {
     pub run_id: String,
     /// Canonical shard label.
     pub shard: String,
-    /// Monotonic file sequence within the shard/dataset stream.
+    /// Logical file/attempt sequence recorded for operator traceability.
+    ///
+    /// Derive idempotency is keyed by content and receipt hashes, so this value is not a
+    /// global per-shard ordering primitive.
     pub file_sequence: u64,
     /// Dataset name, such as `raw_archive_posts`.
     pub dataset: String,

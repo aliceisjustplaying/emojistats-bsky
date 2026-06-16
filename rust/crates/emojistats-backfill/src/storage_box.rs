@@ -1,6 +1,8 @@
 //! Storage Box-shaped remote commit protocol skeleton.
 
 use std::{
+    fs::File,
+    io::Read,
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -11,8 +13,6 @@ use sha2::{Digest, Sha256};
 use crate::commit::{DigestResult, ManifestEntry, ManifestMode, Receipt, Request};
 
 mod ssh;
-
-use ssh::{CommandSpec, remote_parent, run_command, shell_quote, validate_remote_path};
 
 const DEFAULT_READBACK_BYTES: usize = 4_096;
 
@@ -35,6 +35,23 @@ pub trait StorageBoxCommands {
     ///
     /// Returns [`CommandError`] when the underlying remote upload command fails.
     fn upload(&mut self, remote_path: &str, bytes: &[u8]) -> Result<(), CommandError>;
+
+    /// Upload bytes from a reader to a remote temp path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandError`] when local reading or the underlying remote upload command fails.
+    fn upload_reader(
+        &mut self,
+        remote_path: &str,
+        reader: &mut dyn Read,
+    ) -> Result<(), CommandError> {
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(|error| CommandError::new(format!("upload source read failed: {error}")))?;
+        self.upload(remote_path, &bytes)
+    }
 
     /// Return the remote file length, or `None` when the path is absent.
     ///
@@ -156,6 +173,14 @@ pub enum Error {
         #[source]
         source: serde_json::Error,
     },
+    /// A local source file could not be read.
+    #[error("local {operation} failed for {}: {source}", path.display())]
+    LocalIo {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     /// A remote command failed.
     #[error("{operation} failed for {path}: {source}")]
     Command {
@@ -236,137 +261,6 @@ impl SshStorageBoxCommands {
     pub const fn new(config: StorageBoxSshConfig) -> Self {
         Self { config }
     }
-
-    fn upload_command(&self, remote_path: &str) -> Result<CommandSpec, CommandError> {
-        let parent = remote_parent(remote_path)?;
-        let script = format!(
-            "umask 077; mkdir -p -- {}; cat > {}",
-            shell_quote(&parent),
-            shell_quote(remote_path)
-        );
-        self.config.ssh_command("upload", script, true)
-    }
-
-    fn stat_len_command(&self, remote_path: &str) -> Result<CommandSpec, CommandError> {
-        validate_remote_path(remote_path)?;
-        let path = shell_quote(remote_path);
-        let script = format!("if [ -e {path} ]; then wc -c < {path}; fi");
-        self.config.ssh_command("stat", script, false)
-    }
-
-    fn sha256_command(&self, remote_path: &str) -> Result<CommandSpec, CommandError> {
-        validate_remote_path(remote_path)?;
-        let path = shell_quote(remote_path);
-        let script = format!("if [ -e {path} ]; then sha256sum -- {path} | awk '{{print $1}}'; fi");
-        self.config.ssh_command("sha256", script, false)
-    }
-
-    fn read_prefix_command(
-        &self,
-        remote_path: &str,
-        max_bytes: usize,
-    ) -> Result<CommandSpec, CommandError> {
-        validate_remote_path(remote_path)?;
-        let path = shell_quote(remote_path);
-        let script = format!(
-            "if [ -e {path} ]; then printf 'present\\n'; head -c {max_bytes} -- {path}; else printf 'absent\\n'; fi"
-        );
-        self.config.ssh_command("read_prefix", script, false)
-    }
-
-    fn rename_command(&self, from: &str, to: &str) -> Result<CommandSpec, CommandError> {
-        validate_remote_path(from)?;
-        let parent = remote_parent(to)?;
-        let script = format!(
-            "mkdir -p -- {}; if [ -e {} ]; then printf '%s\\n' {}; exit 17; fi; mv -n -- {} {}; if [ -e {} ]; then printf '%s\\n' {}; exit 17; fi",
-            shell_quote(&parent),
-            shell_quote(to),
-            shell_quote(&format!("final path already exists: {to}")),
-            shell_quote(from),
-            shell_quote(to),
-            shell_quote(from),
-            shell_quote(&format!("final path appeared during promotion: {to}"))
-        );
-        self.config.ssh_command("rename", script, false)
-    }
-
-    fn append_command(&self, remote_path: &str) -> Result<CommandSpec, CommandError> {
-        let parent = remote_parent(remote_path)?;
-        let lock_path = format!("{remote_path}.lock");
-        let script = format!(
-            "umask 077; mkdir -p -- {}; touch -- {}; flock -- {} sh -c 'cat >> \"$1\"' sh {}",
-            shell_quote(&parent),
-            shell_quote(&lock_path),
-            shell_quote(&lock_path),
-            shell_quote(remote_path)
-        );
-        self.config.ssh_command("append", script, true)
-    }
-}
-
-impl StorageBoxCommands for SshStorageBoxCommands {
-    fn upload(&mut self, remote_path: &str, bytes: &[u8]) -> Result<(), CommandError> {
-        let command = self.upload_command(remote_path)?;
-        run_command(&command, Some(bytes)).map(|_stdout| ())
-    }
-
-    fn stat_len(&mut self, remote_path: &str) -> Result<Option<u64>, CommandError> {
-        let command = self.stat_len_command(remote_path)?;
-        let stdout = run_command(&command, None)?;
-        let text = std::str::from_utf8(&stdout)
-            .map_err(|error| CommandError::new(format!("stat output was not UTF-8: {error}")))?;
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return Ok(None);
-        }
-        trimmed.parse::<u64>().map(Some).map_err(|error| {
-            CommandError::new(format!("stat output was not a byte count: {error}"))
-        })
-    }
-
-    fn sha256(&mut self, remote_path: &str) -> Result<Option<String>, CommandError> {
-        let command = self.sha256_command(remote_path)?;
-        let stdout = run_command(&command, None)?;
-        let text = std::str::from_utf8(&stdout)
-            .map_err(|error| CommandError::new(format!("sha256 output was not UTF-8: {error}")))?;
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(trimmed.to_owned()))
-        }
-    }
-
-    fn read_prefix(
-        &mut self,
-        remote_path: &str,
-        max_bytes: usize,
-    ) -> Result<Option<Vec<u8>>, CommandError> {
-        let command = self.read_prefix_command(remote_path, max_bytes)?;
-        let stdout = run_command(&command, None)?;
-        stdout.strip_prefix(b"present\n").map_or_else(
-            || {
-                if stdout == b"absent\n" {
-                    Ok(None)
-                } else {
-                    Err(CommandError::new(
-                        "read prefix output had no presence marker",
-                    ))
-                }
-            },
-            |prefix| Ok(Some(prefix.to_vec())),
-        )
-    }
-
-    fn rename(&mut self, from: &str, to: &str) -> Result<(), CommandError> {
-        let command = self.rename_command(from, to)?;
-        run_command(&command, None).map(|_stdout| ())
-    }
-
-    fn append(&mut self, remote_path: &str, bytes: &[u8]) -> Result<(), CommandError> {
-        let command = self.append_command(remote_path)?;
-        run_command(&command, Some(bytes)).map(|_stdout| ())
-    }
 }
 
 impl CommandError {
@@ -422,6 +316,7 @@ where
 
         let paths = RemotePaths::for_request(&self.config, request)?;
         let object_digest = digest_bytes("object", object_bytes)?;
+        let object_prefix = prefix_bytes(object_bytes, self.config.readback_bytes)?;
         self.commands
             .upload(&paths.temp_object, object_bytes)
             .map_err(|source| Error::Command {
@@ -429,11 +324,11 @@ where
                 path: paths.temp_object.clone(),
                 source,
             })?;
-        verify_remote_bytes(
+        verify_remote_uploaded(
             &mut self.commands,
             &paths.temp_object,
-            object_bytes,
             &object_digest,
+            &object_prefix,
             self.config.readback_bytes,
         )?;
         promote_temp_to_final(
@@ -453,6 +348,7 @@ where
             Receipt::from_parts(&request.metadata, entry.object_path.clone(), &object_digest);
         let receipt_bytes = json_bytes("receipt", &receipt)?;
         let receipt_digest = digest_bytes("receipt", &receipt_bytes)?;
+        let receipt_prefix = prefix_bytes(&receipt_bytes, self.config.readback_bytes)?;
         self.commands
             .upload(&paths.temp_receipt, &receipt_bytes)
             .map_err(|source| Error::Command {
@@ -460,11 +356,110 @@ where
                 path: paths.temp_receipt.clone(),
                 source,
             })?;
-        verify_remote_bytes(
+        verify_remote_uploaded(
             &mut self.commands,
             &paths.temp_receipt,
-            &receipt_bytes,
             &receipt_digest,
+            &receipt_prefix,
+            self.config.readback_bytes,
+        )?;
+        promote_temp_to_final(
+            &mut self.commands,
+            &paths.temp_receipt,
+            &paths.receipt,
+            &receipt_digest,
+            "receipt",
+        )?;
+
+        let manifest_line = jsonl_bytes("manifest", &entry)?;
+        self.commands
+            .append(&paths.manifest, &manifest_line)
+            .map_err(|source| Error::Command {
+                operation: "append manifest",
+                path: paths.manifest.clone(),
+                source,
+            })?;
+
+        Ok(RemoteArtifact {
+            remote_object_path: paths.object,
+            remote_temp_object_path: paths.temp_object,
+            remote_receipt_path: paths.receipt,
+            remote_temp_receipt_path: paths.temp_receipt,
+            remote_manifest_path: paths.manifest,
+            entry,
+            receipt,
+        })
+    }
+
+    /// Commit one local object file without buffering the object bytes in memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if local reading, path validation, upload, verification, rename,
+    /// receipt serialization, or manifest append fails.
+    pub fn commit_file(
+        &mut self,
+        request: &Request,
+        object_path: &Path,
+    ) -> Result<RemoteArtifact, Error> {
+        if request.manifest_mode != ManifestMode::AppendJsonl {
+            return Err(Error::UnsupportedManifestMode);
+        }
+
+        let paths = RemotePaths::for_request(&self.config, request)?;
+        let object_source = digest_file("object", object_path, self.config.readback_bytes)?;
+        let mut object_file = File::open(object_path).map_err(|source| Error::LocalIo {
+            operation: "open object source",
+            path: object_path.to_path_buf(),
+            source,
+        })?;
+        self.commands
+            .upload_reader(&paths.temp_object, &mut object_file)
+            .map_err(|source| Error::Command {
+                operation: "upload object temp",
+                path: paths.temp_object.clone(),
+                source,
+            })?;
+        verify_remote_uploaded(
+            &mut self.commands,
+            &paths.temp_object,
+            &object_source.digest,
+            &object_source.prefix,
+            self.config.readback_bytes,
+        )?;
+        promote_temp_to_final(
+            &mut self.commands,
+            &paths.temp_object,
+            &paths.object,
+            &object_source.digest,
+            "object",
+        )?;
+
+        let entry = ManifestEntry::from_parts(
+            &request.metadata,
+            paths.object_manifest_path,
+            &object_source.digest,
+        );
+        let receipt = Receipt::from_parts(
+            &request.metadata,
+            entry.object_path.clone(),
+            &object_source.digest,
+        );
+        let receipt_bytes = json_bytes("receipt", &receipt)?;
+        let receipt_digest = digest_bytes("receipt", &receipt_bytes)?;
+        let receipt_prefix = prefix_bytes(&receipt_bytes, self.config.readback_bytes)?;
+        self.commands
+            .upload(&paths.temp_receipt, &receipt_bytes)
+            .map_err(|source| Error::Command {
+                operation: "upload receipt temp",
+                path: paths.temp_receipt.clone(),
+                source,
+            })?;
+        verify_remote_uploaded(
+            &mut self.commands,
+            &paths.temp_receipt,
+            &receipt_digest,
+            &receipt_prefix,
             self.config.readback_bytes,
         )?;
         promote_temp_to_final(
@@ -647,11 +642,73 @@ fn digest_bytes(kind: &'static str, bytes: &[u8]) -> Result<DigestResult, Error>
     })
 }
 
-fn verify_remote_bytes<C>(
+struct PreparedFileDigest {
+    digest: DigestResult,
+    prefix: Vec<u8>,
+}
+
+fn digest_file(
+    kind: &'static str,
+    path: &Path,
+    readback_bytes: usize,
+) -> Result<PreparedFileDigest, Error> {
+    let mut file = File::open(path).map_err(|source| Error::LocalIo {
+        operation: "open source",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut hasher = Sha256::new();
+    let mut byte_count = 0_u64;
+    let mut prefix = Vec::with_capacity(readback_bytes);
+    let mut buffer = vec![0_u8; 65_536].into_boxed_slice();
+    loop {
+        let read = file.read(&mut buffer).map_err(|source| Error::LocalIo {
+            operation: "read source",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if read == 0 {
+            break;
+        }
+        let chunk = buffer
+            .get(..read)
+            .ok_or(Error::ByteCountOverflow { kind })?;
+        hasher.update(chunk);
+        let read_u64 = u64::try_from(read).map_err(|_error| Error::ByteCountOverflow { kind })?;
+        byte_count = byte_count
+            .checked_add(read_u64)
+            .ok_or(Error::ByteCountOverflow { kind })?;
+        let remaining_prefix = readback_bytes.saturating_sub(prefix.len());
+        if remaining_prefix > 0 {
+            let prefix_len = remaining_prefix.min(chunk.len());
+            let prefix_chunk = chunk
+                .get(..prefix_len)
+                .ok_or(Error::ByteCountOverflow { kind })?;
+            prefix.extend_from_slice(prefix_chunk);
+        }
+    }
+    Ok(PreparedFileDigest {
+        digest: DigestResult {
+            bytes: byte_count,
+            sha256: hex::encode(hasher.finalize()),
+        },
+        prefix,
+    })
+}
+
+fn prefix_bytes(bytes: &[u8], readback_bytes: usize) -> Result<Vec<u8>, Error> {
+    let expected_prefix_len = bytes.len().min(readback_bytes);
+    let prefix = bytes
+        .get(..expected_prefix_len)
+        .ok_or(Error::ByteCountOverflow { kind: "prefix" })?;
+    Ok(prefix.to_vec())
+}
+
+fn verify_remote_uploaded<C>(
     commands: &mut C,
     remote_path: &str,
-    expected_bytes: &[u8],
     expected_digest: &DigestResult,
+    expected_prefix: &[u8],
     readback_bytes: usize,
 ) -> Result<(), Error>
 where
@@ -705,13 +762,6 @@ where
         }
     }
 
-    let expected_prefix_len = expected_bytes.len().min(readback_bytes);
-    let expected_prefix =
-        expected_bytes
-            .get(..expected_prefix_len)
-            .ok_or_else(|| Error::VerifyReadbackMismatch {
-                path: remote_path.to_owned(),
-            })?;
     let actual_prefix = commands
         .read_prefix(remote_path, readback_bytes)
         .map_err(|source| Error::Command {

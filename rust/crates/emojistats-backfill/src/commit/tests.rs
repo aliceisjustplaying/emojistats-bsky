@@ -180,6 +180,42 @@ fn retry_repairs_missing_jsonl_manifest_when_object_and_receipt_match() {
 }
 
 #[test]
+fn retry_repairs_missing_receipt_when_object_matches() {
+    let root = temp_dir("repair-missing-receipt");
+    let store = LocalStore::new(&root);
+    let request = request(6, ManifestMode::AppendJsonl);
+    let artifact = store
+        .commit(&request, |file| {
+            file.write_all(b"retryable").map_err(|source| Error::Io {
+                operation: "test write",
+                path: PathBuf::from("test"),
+                source,
+            })
+        })
+        .expect("initial commit should succeed");
+    fs::remove_file(&artifact.receipt_path).expect("receipt should be removable");
+
+    let repaired = store
+        .commit(&request, |file| {
+            file.write_all(b"retryable").map_err(|source| Error::Io {
+                operation: "test write",
+                path: PathBuf::from("test"),
+                source,
+            })
+        })
+        .expect("retry should repair missing receipt");
+
+    assert_eq!(repaired.entry, artifact.entry);
+    let receipt: Receipt = read_json(&artifact.receipt_path);
+    assert_eq!(receipt, artifact.receipt);
+    let manifest =
+        fs::read_to_string(&artifact.manifest_path).expect("manifest should be readable");
+    assert_eq!(manifest.lines().count(), 1);
+
+    fs::remove_dir_all(root).expect("test temp dir should be removed");
+}
+
+#[test]
 fn retry_with_existing_jsonl_manifest_does_not_duplicate_entry() {
     let root = temp_dir("repair-existing-manifest");
     let store = LocalStore::new(&root);

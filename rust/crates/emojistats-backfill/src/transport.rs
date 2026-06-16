@@ -153,17 +153,6 @@ impl FetchByteBudgetReservation {
         Ok(())
     }
 
-    fn shrink_to_completed(&mut self, observed_bytes: u64) {
-        if observed_bytes >= self.charged_bytes {
-            return;
-        }
-        let Some(release) = self.charged_bytes.checked_sub(observed_bytes) else {
-            return;
-        };
-        self.charged_bytes = observed_bytes;
-        self.budget.release_charged(release);
-    }
-
     #[cfg(test)]
     const fn charged_bytes(&self) -> u64 {
         self.charged_bytes
@@ -490,14 +479,16 @@ async fn stream_to_file(
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "spool path has no parent"))?;
     let mut temp_file = NamedTempFile::new_in(parent)?;
     let mut reservation = byte_budget.map(FetchByteBudget::reservation);
-    if let Some(reservation) = &mut reservation {
-        reservation.reserve_capacity(max_bytes).await?;
-    }
-    match stream_to_temp_file(body, temp_file.as_file_mut(), chunk_idle_timeout, max_bytes).await {
+    match stream_to_temp_file(
+        body,
+        temp_file.as_file_mut(),
+        chunk_idle_timeout,
+        max_bytes,
+        reservation.as_mut(),
+    )
+    .await
+    {
         Ok(bytes) => {
-            if let Some(reservation) = &mut reservation {
-                reservation.shrink_to_completed(bytes);
-            }
             temp_file.persist_noclobber(car_path).map_err(|error| {
                 io::Error::new(
                     error.error.kind(),
@@ -519,6 +510,7 @@ async fn stream_to_temp_file(
     file: &mut File,
     chunk_idle_timeout: Duration,
     max_bytes: u64,
+    mut byte_budget_reservation: Option<&mut FetchByteBudgetReservation>,
 ) -> Result<u64, FetchError> {
     let mut bytes = 0_u64;
     let mut stream = body.into_inner();
@@ -549,6 +541,9 @@ async fn stream_to_temp_file(
                 max_bytes,
                 observed_bytes,
             });
+        }
+        if let Some(reservation) = byte_budget_reservation.as_mut() {
+            reservation.reserve_capacity(observed_bytes).await?;
         }
         file.write_all(chunk.as_ref())?;
         bytes = observed_bytes;

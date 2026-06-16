@@ -7,7 +7,7 @@ use std::{
 use super::{
     ArchiveCommitContext, ArchivePostRow, CompletenessClass, CreatedAtParseStatus, FetchMethod,
     NormalizerVersion, RepoReceiptInput, StreamingArchiveSink, StreamingReceiptInput,
-    build_repo_receipt, classify_created_at, extract_emojis, hash_post_rows,
+    archive_io::extract_emojis, build_repo_receipt, classify_created_at, hash_post_rows,
 };
 
 fn normalizer() -> NormalizerVersion {
@@ -105,8 +105,8 @@ fn unfinished_streaming_sink_removes_temp_files_on_drop() {
         ArchiveCommitContext::fetch_one_local(),
     )
     .expect("create sink");
-    let parquet_temp = sink.parquet_temp_path.to_path_buf();
-    let emoji_temp = sink.emoji_projection_temp_path.to_path_buf();
+    let parquet_temp = sink.parquet_temp_path().to_path_buf();
+    let emoji_temp = sink.emoji_projection_temp_path().to_path_buf();
     assert!(parquet_temp.exists(), "{}", parquet_temp.display());
     assert!(emoji_temp.exists(), "{}", emoji_temp.display());
     drop(sink);

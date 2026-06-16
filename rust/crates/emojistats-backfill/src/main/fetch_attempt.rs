@@ -1,4 +1,21 @@
-async fn fetch_one_attempt(
+use jacquard_identity::resolver::IdentityResolver;
+
+use super::{
+    super::{
+        Arc, ArchiveCommitContext, AttemptOutcome, CRAWLER_USER_AGENT, ClaimScope, Did, Digest,
+        Duration, FETCH_TRANSPORT_ATTEMPTS, FETCH_TRANSPORT_RETRY_BASE_DELAY,
+        FETCH_TRANSPORT_RETRY_MAX_DELAY, FetchByteBudget, FetchConfig, FetchError, FetchOneFailure,
+        ForcedFetchMode, HashMap, HostConcurrencyLimiter, HostConcurrencyPermit, HostOverride,
+        HostPacer, Instant, ListRecordsConfig, Mutex, ParseConfig, Path, PathBuf, PublicResolver,
+        Semaphore, Sha256, SharedHostPacer, SmokeTelemetry, SystemTime, Uri, classify_fetch_error,
+        classify_list_records_error, current_rss_kb, elapsed_ms, emit_smoke_telemetry,
+        fetch_and_archive_list_records_with_rate_limit_observer, fetch_repo, outcome_name,
+        permanent_failure, retryable_failure,
+    },
+    archive_host::{PreparedFetchHost, parse_and_archive_spooled_repo, prepare_fetch_host},
+};
+
+pub async fn fetch_one_attempt(
     did_str: &str,
     spool_dir: PathBuf,
     max_bytes: u64,
@@ -19,17 +36,17 @@ async fn fetch_one_attempt(
     .await
 }
 
-struct FetchOneAttemptConfig<'a> {
-    did_str: &'a str,
-    spool_dir: PathBuf,
-    max_bytes: u64,
-    archive_dir: PathBuf,
-    archive_context: ArchiveCommitContext,
-    runtime: AttemptRuntime<'a>,
-    parse_config: ParseConfig,
+pub struct FetchOneAttemptConfig<'a> {
+    pub did_str: &'a str,
+    pub spool_dir: PathBuf,
+    pub max_bytes: u64,
+    pub archive_dir: PathBuf,
+    pub archive_context: ArchiveCommitContext,
+    pub runtime: AttemptRuntime<'a>,
+    pub parse_config: ParseConfig,
 }
 
-enum AttemptRuntime<'a> {
+pub enum AttemptRuntime<'a> {
     Local {
         claim_scope: ClaimScope,
     },
@@ -102,17 +119,17 @@ impl AttemptRuntime<'_> {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct HostOverrideCache {
-    entries: Arc<Mutex<HashMap<String, HostOverrideCacheEntry>>>,
+pub struct HostOverrideCache {
+    pub entries: Arc<Mutex<HashMap<String, HostOverrideCacheEntry>>>,
 }
 
 #[derive(Debug, Clone)]
-struct HostOverrideCacheEntry {
-    loaded_at: Instant,
-    value: Option<HostOverride>,
+pub struct HostOverrideCacheEntry {
+    pub loaded_at: Instant,
+    pub value: Option<HostOverride>,
 }
 
-async fn fetch_one_attempt_with_pacer(
+pub async fn fetch_one_attempt_with_pacer(
     config: FetchOneAttemptConfig<'_>,
 ) -> Result<(), FetchOneFailure> {
     let attempt_started = Instant::now();
@@ -411,7 +428,7 @@ fn emit_fetch_failure(step: &FetchModeStep<'_>, failure: &FetchOneFailure, start
     });
 }
 
-fn should_fallback_get_repo_to_list_records(error: &FetchError) -> bool {
+pub fn should_fallback_get_repo_to_list_records(error: &FetchError) -> bool {
     let FetchError::HttpStatus {
         status,
         error_code,
@@ -620,31 +637,31 @@ fn emit_parse_archive_running(step: &ParseArchiveStep<'_>, stage: &'static str) 
 }
 
 #[derive(Debug, Clone)]
-struct ProcessedRepoCounts {
-    records: u64,
-    archived_posts: u64,
-    decode_errors: u64,
-    emoji_rows: u64,
+pub struct ProcessedRepoCounts {
+    pub records: u64,
+    pub archived_posts: u64,
+    pub decode_errors: u64,
+    pub emoji_rows: u64,
 }
 
 #[derive(Debug, Clone)]
-struct ProcessedRepoArtifacts {
-    receipt_hash: String,
-    parquet_path: PathBuf,
-    receipt_path: PathBuf,
-    manifest_path: PathBuf,
-    emoji_projection_path: PathBuf,
+pub struct ProcessedRepoArtifacts {
+    pub receipt_hash: String,
+    pub parquet_path: PathBuf,
+    pub receipt_path: PathBuf,
+    pub manifest_path: PathBuf,
+    pub emoji_projection_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
-struct GetRepoTimings {
-    fetch_ms: Option<u64>,
-    bytes: Option<u64>,
-    parse_ms: u64,
-    parse_index_ms: u64,
-    parse_commit_ms: u64,
-    parse_walk_ms: u64,
-    archive_ms: u64,
+pub struct GetRepoTimings {
+    pub fetch_ms: Option<u64>,
+    pub bytes: Option<u64>,
+    pub parse_ms: u64,
+    pub parse_index_ms: u64,
+    pub parse_commit_ms: u64,
+    pub parse_walk_ms: u64,
+    pub archive_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -654,69 +671,69 @@ struct ListRecordsTimings {
 }
 
 #[derive(Debug, Clone)]
-struct GetRepoProcessed {
-    counts: ProcessedRepoCounts,
-    artifacts: ProcessedRepoArtifacts,
-    timings: GetRepoTimings,
+pub struct GetRepoProcessed {
+    pub counts: ProcessedRepoCounts,
+    pub artifacts: ProcessedRepoArtifacts,
+    pub timings: GetRepoTimings,
 }
 
 #[derive(Debug, Clone)]
-struct ListRecordsProcessed {
+pub struct ListRecordsProcessed {
     counts: ProcessedRepoCounts,
     artifacts: ProcessedRepoArtifacts,
     timings: ListRecordsTimings,
 }
 
 #[derive(Debug, Clone)]
-enum ProcessedRepo {
+pub enum ProcessedRepo {
     GetRepo(GetRepoProcessed),
     ListRecords(ListRecordsProcessed),
 }
 
 impl ProcessedRepo {
-    const fn counts(&self) -> &ProcessedRepoCounts {
+    pub const fn counts(&self) -> &ProcessedRepoCounts {
         match self {
             Self::GetRepo(processed) => &processed.counts,
             Self::ListRecords(processed) => &processed.counts,
         }
     }
 
-    const fn artifacts(&self) -> &ProcessedRepoArtifacts {
+    pub const fn artifacts(&self) -> &ProcessedRepoArtifacts {
         match self {
             Self::GetRepo(processed) => &processed.artifacts,
             Self::ListRecords(processed) => &processed.artifacts,
         }
     }
 
-    const fn fetch_ms_opt(&self) -> Option<u64> {
+    pub const fn fetch_ms_opt(&self) -> Option<u64> {
         match self {
             Self::GetRepo(processed) => processed.timings.fetch_ms,
             Self::ListRecords(processed) => Some(processed.timings.fetch_ms),
         }
     }
 
-    const fn bytes(&self) -> Option<u64> {
+    pub const fn bytes(&self) -> Option<u64> {
         match self {
             Self::GetRepo(processed) => processed.timings.bytes,
             Self::ListRecords(_) => None,
         }
     }
 
-    const fn parse_ms(&self) -> Option<u64> {
+    pub const fn parse_ms(&self) -> Option<u64> {
         match self {
             Self::GetRepo(processed) => Some(processed.timings.parse_ms),
             Self::ListRecords(_) => None,
         }
     }
 
-    const fn archive_ms(&self) -> u64 {
+    pub const fn archive_ms(&self) -> u64 {
         match self {
             Self::GetRepo(processed) => processed.timings.archive_ms,
             Self::ListRecords(processed) => processed.timings.archive_ms,
         }
     }
 
-    const fn get_repo_timings(&self) -> Option<&GetRepoTimings> {
+    pub const fn get_repo_timings(&self) -> Option<&GetRepoTimings> {
         match self {
             Self::GetRepo(processed) => Some(&processed.timings),
             Self::ListRecords(_) => None,
@@ -870,4 +887,3 @@ fn emit_list_records_failure(
         error: Some(failure.error.to_string()),
     });
 }
-

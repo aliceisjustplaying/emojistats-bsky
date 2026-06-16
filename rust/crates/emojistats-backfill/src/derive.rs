@@ -352,9 +352,6 @@ fn hash_manifest_identity(
     hasher: &mut Sha256,
     identity: &DeriveManifestIdentity,
 ) -> Result<(), DeriveError> {
-    hash_field(hasher, &identity.run_id)?;
-    hash_field(hasher, &identity.shard)?;
-    hash_u64(hasher, identity.file_sequence);
     hash_field(hasher, &identity.dataset)?;
     hash_field(hasher, &identity.content_hash)?;
     hash_field(hasher, &identity.receipt_hash)?;
@@ -379,9 +376,6 @@ fn hash_total_post_counter(
     counter: &TotalPostCounterInput,
 ) -> Result<(), DeriveError> {
     hash_field(hasher, &counter.source)?;
-    hash_field(hasher, &counter.run_id)?;
-    hash_field(hasher, &counter.shard)?;
-    hash_u64(hasher, counter.file_sequence);
     hash_field(hasher, &counter.receipt_hash)?;
     hash_u64(hasher, counter.posts_processed);
     hash_u64(hasher, counter.posts_with_emojis);
@@ -533,6 +527,27 @@ mod tests {
 
         assert_eq!(batch.dedupe_token, same_token);
         assert_ne!(batch.dedupe_token, changed.dedupe_token);
+    }
+
+    #[test]
+    fn dedupe_token_is_stable_across_replay_manifest_sequence() {
+        let rows = [row("a", &["✅"])];
+        let first = derive_clickhouse_batch(DeriveBatchInput {
+            manifest: &manifest(1),
+            archive_rows: &rows,
+        })
+        .expect("derive batch");
+        let mut replay_manifest = manifest(1);
+        replay_manifest.run_id = "run-2".to_owned();
+        replay_manifest.shard = "shard9".to_owned();
+        replay_manifest.file_sequence = 99;
+        let replay = derive_clickhouse_batch(DeriveBatchInput {
+            manifest: &replay_manifest,
+            archive_rows: &rows,
+        })
+        .expect("replay derive batch");
+
+        assert_eq!(first.dedupe_token, replay.dedupe_token);
     }
 
     #[test]

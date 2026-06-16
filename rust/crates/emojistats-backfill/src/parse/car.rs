@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, hash_map::Entry},
     fs::File,
-    io::{Cursor, Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom, Take},
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
@@ -327,21 +327,14 @@ fn read_car_block_section(
         "max_block_bytes",
         "raise parser max_block_bytes only for a known-good repo",
     )?;
-    let section_len_usize =
-        usize::try_from(section_len.value).map_err(|_err| ParseError::CarLengthOverflow {
-            field: "section length",
-        })?;
-    let mut section = vec![0_u8; section_len_usize];
-    file.read_exact(&mut section)
-        .map_err(|source| ParseError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-
-    let mut cursor = Cursor::new(section.as_slice());
-    let cid =
-        IpldCid::read_bytes(&mut cursor).map_err(|source| ParseError::CidRead(Box::new(source)))?;
-    let cid_len = cursor.position();
+    let cid_len;
+    let cid = {
+        let mut section_reader = CountingReader::new(file.take(section_len.value));
+        let cid = IpldCid::read_bytes(&mut section_reader)
+            .map_err(|source| ParseError::CidRead(Box::new(source)))?;
+        cid_len = section_reader.bytes_read();
+        cid
+    };
     let data_len = section_len
         .value
         .checked_sub(cid_len)
@@ -352,6 +345,12 @@ fn read_car_block_section(
         usize::try_from(data_len).map_err(|_err| ParseError::CarLengthOverflow {
             field: "block data length",
         })?;
+    let section_end = checked_add_u64(section_start, section_len.value, "section end")?;
+    file.seek(SeekFrom::Start(section_end))
+        .map_err(|source| ParseError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
 
     Ok(IndexedCarSection {
         cid,
@@ -361,6 +360,38 @@ fn read_car_block_section(
         },
         section_len: section_len.value,
     })
+}
+
+struct CountingReader<R> {
+    inner: R,
+    bytes_read: u64,
+}
+
+impl<R> CountingReader<R> {
+    const fn new(inner: R) -> Self {
+        Self {
+            inner,
+            bytes_read: 0,
+        }
+    }
+
+    const fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+}
+
+impl<R: Read> Read for CountingReader<Take<R>> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        let read_u64 = u64::try_from(read).map_err(|_error| {
+            io::Error::new(io::ErrorKind::InvalidData, "read size overflows u64")
+        })?;
+        self.bytes_read = self
+            .bytes_read
+            .checked_add(read_u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "read count overflow"))?;
+        Ok(read)
+    }
 }
 
 fn parse_car_header(bytes: &[u8]) -> Result<CarHeader, ParseError> {

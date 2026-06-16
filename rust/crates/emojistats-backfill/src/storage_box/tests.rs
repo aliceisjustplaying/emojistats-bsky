@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, io::Write, path::PathBuf};
 
 use sha2::{Digest, Sha256};
 
@@ -232,6 +232,31 @@ fn commits_in_verified_remote_order_before_manifest_append() {
         artifact.entry.object_path,
         "objects/run-1/shard0/42.parquet"
     );
+}
+
+#[test]
+fn commits_local_file_without_buffering_object_in_backend() {
+    let mut source = tempfile::NamedTempFile::new().expect("temp source should be created");
+    source
+        .write_all(b"parquet bytes")
+        .expect("temp source should be written");
+    source.flush().expect("temp source should be flushed");
+    let mut backend = backend(FakeCommands::default());
+
+    let artifact = backend
+        .commit_file(&request(), source.path())
+        .expect("remote file commit should succeed");
+
+    let commands = backend.into_commands();
+    assert_eq!(artifact.entry.bytes, 13);
+    assert_eq!(
+        commands
+            .files
+            .get(&artifact.remote_object_path)
+            .expect("object should be committed"),
+        b"parquet bytes"
+    );
+    assert!(commands.files.contains_key(&artifact.remote_manifest_path));
 }
 
 #[test]

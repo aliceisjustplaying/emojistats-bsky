@@ -24,9 +24,13 @@ use tokio::{
 };
 
 use super::{
-    AttemptRuntime, FetchOneAttemptConfig, HostOverrideCache, add_count,
+    add_count,
     failure::{FetchOneFailure, retryable_failure},
-    fetch_one_attempt_with_pacer, increment, parse_config_for_threads,
+    increment,
+    main::fetch_attempt::{
+        AttemptRuntime, FetchOneAttemptConfig, HostOverrideCache, fetch_one_attempt_with_pacer,
+    },
+    parse_config_for_threads,
 };
 
 const SEED_BATCH_SIZE: usize = 1_000;

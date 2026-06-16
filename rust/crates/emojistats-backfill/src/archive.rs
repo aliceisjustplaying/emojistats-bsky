@@ -5,7 +5,7 @@ use std::{
     error::Error,
     fmt, fs,
     fs::File,
-    io::{self, Write},
+    io::{self as std_io, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -74,7 +74,7 @@ impl ArchivePostRowsHasher {
     ///
     /// Returns [`ArchiveError`] if row content cannot be framed for hashing.
     pub fn push_row(&mut self, row: &ArchivePostRow) -> Result<(), ArchiveError> {
-        hash_post_row_into(&mut self.hasher, row)
+        archive_io::hash_post_row_into(&mut self.hasher, row)
     }
 
     #[must_use]
@@ -224,7 +224,7 @@ pub struct ArchiveArtifacts {
 /// Stage D archive/derive failures.
 #[derive(Debug)]
 pub enum ArchiveError {
-    Io(io::Error),
+    Io(std_io::Error),
     Parquet(parquet::errors::ParquetError),
     Arrow(arrow_schema::ArrowError),
     Json(serde_json::Error),
@@ -257,9 +257,20 @@ pub enum ArchiveError {
     },
 }
 
-include!("archive/write.rs");
+#[path = "archive/io.rs"]
+mod archive_io;
+mod write;
 
-include!("archive/io.rs");
+pub use archive_io::{
+    archive_post_rows_from_record_batch, build_repo_receipt, hash_post_rows, hash_profile_record,
+    read_archive_post_rows,
+};
+pub use write::{
+    StreamingArchiveSink, StreamingReceiptInput, archive_row_from_owned_post,
+    archive_row_from_owned_post_observed_at, archive_row_from_post,
+    archive_row_from_post_observed_at, archive_rows_from_parsed_repo, current_normalizer,
+    write_archive_artifacts,
+};
 
 /// Archive classification for an author-supplied `createdAt` value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,11 +351,11 @@ fn promote_named_temp_idempotent(
     temp_file: NamedTempFile,
     path: &Path,
 ) -> Result<(), ArchiveError> {
-    let temp_digest = hash_file_for_archive(temp_file.path())?;
+    let temp_digest = archive_io::hash_file_for_archive(temp_file.path())?;
     match temp_file.persist_noclobber(path) {
         Ok(_file) => sync_parent_dir(path),
-        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
-            let final_digest = hash_file_for_archive(path)?;
+        Err(error) if error.error.kind() == std_io::ErrorKind::AlreadyExists => {
+            let final_digest = archive_io::hash_file_for_archive(path)?;
             if final_digest.sha256 != temp_digest.sha256 || final_digest.bytes != temp_digest.bytes
             {
                 return Err(ArchiveError::FinalHashMismatch {
@@ -360,14 +371,14 @@ fn promote_named_temp_idempotent(
 }
 
 fn promote_temp_idempotent(temp_path: &Path, path: &Path) -> Result<(), ArchiveError> {
-    let temp_digest = hash_file_for_archive(temp_path)?;
+    let temp_digest = archive_io::hash_file_for_archive(temp_path)?;
     match fs::hard_link(temp_path, path) {
         Ok(()) => {
             let _ignored = fs::remove_file(temp_path);
             sync_parent_dir(path)
         }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let final_digest = hash_file_for_archive(path)?;
+        Err(error) if error.kind() == std_io::ErrorKind::AlreadyExists => {
+            let final_digest = archive_io::hash_file_for_archive(path)?;
             if final_digest.sha256 != temp_digest.sha256 || final_digest.bytes != temp_digest.bytes
             {
                 return Err(ArchiveError::FinalHashMismatch {
@@ -465,8 +476,8 @@ impl Error for ArchiveError {
     }
 }
 
-impl From<io::Error> for ArchiveError {
-    fn from(error: io::Error) -> Self {
+impl From<std_io::Error> for ArchiveError {
+    fn from(error: std_io::Error) -> Self {
         Self::Io(error)
     }
 }

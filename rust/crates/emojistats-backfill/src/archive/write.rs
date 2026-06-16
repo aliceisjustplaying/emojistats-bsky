@@ -1,3 +1,24 @@
+use super::{
+    ARCHIVE_SCHEMA_VERSION, Arc, ArchiveArtifacts, ArchiveCommitContext, ArchiveError,
+    ArchivePostRow, ArrowWriter, CompletenessClass, DateTime, Digest, FetchMethod, File,
+    LocalManifestEntry, LocalStore, ManifestMode, Metadata, NamedTempFile, NormalizerVersion,
+    PARQUET_BATCH_ROWS, PARTIAL_RECORD_STATUS, POST_COLLECTION, ParsedRepo, Path, PathBuf,
+    PostRecord, PostRecordBody, ProfileRecord, RawPartialPostRecord, RepoReceipt, Request, Schema,
+    Sha256, TempPath, Utc, Write,
+    archive_io::{
+        append_hash_field_frame, append_normalizer_frames, archive_error_from_derive,
+        archive_schema, build_commit_metadata, commit_profile_sidecar, extract_emojis,
+        framed_fields, hash_extras_json, hash_field, hash_field_bytes, hash_optional_field,
+        hash_post_row_into, hash_string_slice, json_bytes, local_manifest_from_committed,
+        parquet_writer_properties, post_record_batch, record_extras_json, stable_artifact_stem,
+        stable_repo_receipt_name, update_min_max_created_at, write_emoji_projection_jsonl,
+        write_json_pretty, write_posts_parquet_to_writer,
+    },
+    borrowed_emoji_projection_rows_for_post, classify_created_at_observed_at,
+    derive_emoji_projection_rows, format_observed_at, fs, hash_serialized_json,
+    promote_temp_idempotent, write_temp_idempotent,
+};
+
 /// Convert parsed post records into the first archive-row shape.
 ///
 /// # Errors
@@ -247,23 +268,19 @@ pub fn write_archive_artifacts(
     write_temp_idempotent(&emoji_projection_path, |path| {
         write_emoji_projection_jsonl(path, &emoji_projection_rows)
     })?;
-    let committed_profile = profile.and_then(|profile| {
-        match commit_profile_sidecar(
-            &store,
-            profile_sidecar_object_path,
-            profile_sidecar_receipt_object_path,
-            profile_sidecar_manifest_object_path,
-            profile,
-            receipt,
-            commit_context,
-        ) {
-            Ok(artifact) => Some(artifact),
-            Err(error) => {
-                eprintln!("profile sidecar commit failed for {did}: {error}");
-                None
-            }
-        }
-    });
+    let committed_profile = profile
+        .map(|profile| {
+            commit_profile_sidecar(
+                &store,
+                profile_sidecar_object_path,
+                profile_sidecar_receipt_object_path,
+                profile_sidecar_manifest_object_path,
+                profile,
+                receipt,
+                commit_context,
+            )
+        })
+        .transpose()?;
 
     let manifest = local_manifest_from_committed(&committed, receipt);
 
@@ -380,6 +397,16 @@ impl StreamingArchiveSink {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn parquet_temp_path(&self) -> &Path {
+        &self.parquet_temp_path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn emoji_projection_temp_path(&self) -> &Path {
+        &self.emoji_projection_temp_path
+    }
+
     /// Normalizer version used by this sink.
     #[must_use]
     pub const fn normalizer(&self) -> &NormalizerVersion {
@@ -494,8 +521,11 @@ impl StreamingArchiveSink {
         self.finish_stream_files()?;
         let receipt = self.build_streaming_receipt(input);
         let receipt_hash = hash_serialized_json(&receipt)?;
-        let artifact_stem = stable_artifact_stem(&self.did, "raw_archive_posts", &receipt.post_rows_hash);
-        let receipt_path = self.output_dir.join(stable_repo_receipt_name(&self.did, &receipt_hash));
+        let artifact_stem =
+            stable_artifact_stem(&self.did, "raw_archive_posts", &receipt.post_rows_hash);
+        let receipt_path = self
+            .output_dir
+            .join(stable_repo_receipt_name(&self.did, &receipt_hash));
         write_temp_idempotent(&receipt_path, |path| write_json_pretty(path, &receipt))?;
         let committed_posts = self.commit_streaming_posts(&receipt_hash, &artifact_stem)?;
         let emoji_stem = stable_artifact_stem(
@@ -504,9 +534,12 @@ impl StreamingArchiveSink {
             &receipt.emoji_projection_hash,
         );
         let emoji_projection_path = self.output_dir.join(format!("{emoji_stem}.emoji.jsonl"));
-        promote_temp_idempotent(self.emoji_projection_temp_path.as_ref(), &emoji_projection_path)?;
+        promote_temp_idempotent(
+            self.emoji_projection_temp_path.as_ref(),
+            &emoji_projection_path,
+        )?;
         let manifest = local_manifest_from_committed(&committed_posts, &receipt);
-        let committed_profile = self.commit_profile(profile, &receipt, &receipt_hash);
+        let committed_profile = self.commit_profile(profile, &receipt, &receipt_hash)?;
         let artifacts = self.into_artifacts(
             manifest,
             committed_posts,
@@ -589,15 +622,17 @@ impl StreamingArchiveSink {
         profile: Option<&ProfileRecord>,
         receipt: &RepoReceipt,
         receipt_hash: &str,
-    ) -> Option<crate::commit::Artifact> {
+    ) -> Result<Option<crate::commit::Artifact>, ArchiveError> {
         let store = LocalStore::new(&self.output_dir);
         let profile_stem = stable_artifact_stem(
             &self.did,
             "raw_profile_sidecar",
             receipt.profile_row_hash.as_deref().unwrap_or(receipt_hash),
         );
-        let profile = profile?;
-        match commit_profile_sidecar(
+        let Some(profile) = profile else {
+            return Ok(None);
+        };
+        Ok(Some(commit_profile_sidecar(
             &store,
             PathBuf::from(format!("{profile_stem}.profile.json")),
             PathBuf::from(format!("{profile_stem}.profile.object-receipt.json")),
@@ -605,13 +640,7 @@ impl StreamingArchiveSink {
             profile,
             receipt,
             &self.commit_context,
-        ) {
-            Ok(artifact) => Some(artifact),
-            Err(error) => {
-                eprintln!("profile sidecar commit failed for {}: {error}", self.did);
-                None
-            }
-        }
+        )?))
     }
 
     fn into_artifacts(

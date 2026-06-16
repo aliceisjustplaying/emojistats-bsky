@@ -1,3 +1,19 @@
+use super::{
+    super::{
+        ArchiveCommitContext, ArchiveError, AttemptOutcome, ClaimScope, CompletenessClass,
+        FetchMethod, FetchOneFailure, ForcedFetchMode, HOST_OVERRIDE_CACHE_TTL, HostOverride,
+        HostPacer, Instant, NormalizerVersion, ParseConfig, ParseVisitError, ParsedRepoSummary,
+        Path, SharedHostPacer, SqliteLedger, StreamingArchiveSink, StreamingReceiptInput,
+        SystemTime, Uri, archive_row_from_owned_post_observed_at, classify_archive_error,
+        classify_parse_error, elapsed_ms, hash_profile_record, parse_repo_for_did_with_state,
+        retryable_failure,
+    },
+    fetch_attempt::{
+        GetRepoProcessed, GetRepoTimings, HostOverrideCache, HostOverrideCacheEntry, ProcessedRepo,
+        ProcessedRepoArtifacts, ProcessedRepoCounts,
+    },
+};
+
 struct ArchiveRunState {
     sink: StreamingArchiveSink,
     archive_row_ns: u128,
@@ -5,7 +21,7 @@ struct ArchiveRunState {
     profiled_posts: u64,
 }
 
-fn parse_and_archive_spooled_repo(
+pub fn parse_and_archive_spooled_repo(
     did_str: &str,
     car_path: &Path,
     archive_dir: &Path,
@@ -159,7 +175,7 @@ fn parse_repo_streaming_archive_profiled(
     Ok((summary, state))
 }
 
-async fn prepare_fetch_host(
+pub async fn prepare_fetch_host(
     did_str: &str,
     pds: &Uri<String>,
     claim_scope: &ClaimScope,
@@ -190,20 +206,20 @@ async fn prepare_fetch_host(
 }
 
 #[derive(Debug)]
-struct PreparedFetchHost {
-    host: String,
-    host_override: Option<HostOverride>,
-    fetch_mode: ForcedFetchMode,
+pub struct PreparedFetchHost {
+    pub host: String,
+    pub host_override: Option<HostOverride>,
+    pub fetch_mode: ForcedFetchMode,
 }
 
-fn pds_host_key(pds: &Uri<String>) -> String {
+pub fn pds_host_key(pds: &Uri<String>) -> String {
     pds.authority().map_or_else(
         || pds.as_str().to_owned(),
         |authority| authority.host().to_owned(),
     )
 }
 
-fn load_host_override(
+pub fn load_host_override(
     ledger_path: Option<&Path>,
     cache: Option<HostOverrideCache>,
     host: &str,
@@ -293,7 +309,7 @@ fn normalize_host_override(
     Ok(record)
 }
 
-fn fetch_mode_for_host(
+pub fn fetch_mode_for_host(
     host: &str,
     host_override: Option<&HostOverride>,
     now: SystemTime,
@@ -325,4 +341,3 @@ fn fetch_mode_for_host(
     }
     Ok(host_override.force_mode.unwrap_or(ForcedFetchMode::GetRepo))
 }
-
