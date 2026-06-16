@@ -2077,6 +2077,51 @@ as current that's actually stale against the underlying truth. The aggregate tab
 dashboard that lies by not knowing its own truth has expired. And it's one more argument for the
 v2 architecture where Parquet is the truth and ClickHouse is explicitly disposable.
 
+### 2026-06-16 — the rewrite explodes from pipeline to smoke test; the smoke test explodes the box
+
+**The v2 Rust rewrite went from a compiling pipeline to 26,000 lines in ~24 hours.** Branch
+`v2-rust-backfill` on pix2 accumulated 45 commits between the evening of June 15 and the
+afternoon of June 16 — fetch, parse, archive, ledger, ClickHouse derive, scheduler, fleet
+orchestration, emoji normalizer, scale smoke test, all wired and building. The workspace has two
+crates (`emoji-normalizer` and `emojistats-backfill`) with Jacquard as a SHA-pinned fork-mirror
+for AT Proto primitives. The main Codex agent orchestrated via parallel subagent sessions — at
+least 6 concurrent sessions visible in the evening cluster alone, each owning a lane (ledger,
+normalizer, fleet, transport, derive).
+
+The Clippy configuration is the retro made into compiler policy. `unsafe_code = "forbid"`,
+every lint group denied (`all`, `pedantic`, `nursery`, `cargo`), plus explicit denials on
+`unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `indexing_slicing`, and
+`arithmetic_side_effects`. The v1 lesson — "make the system reject bad work before it lands" —
+is no longer a review-round finding. It's a build failure.
+
+**The scale smoke test was OOM-killed.** `run-fleet` against 3 whale repos (the same ones that
+exposed v1's 1 GiB CAR cap) at concurrency 4 hit 7 GB RSS and the kernel killed the Rust binary
+at 22:11 UTC on June 15. The tmux pane vanished; the reliable recovery path was
+`journalctl -k` → killed PID → tmux scope → Codex session JSONL. Response: `f257aef` added
+fleet memory guardrails, then two streaming-architecture commits — `60263ae` (stream whale
+archive path) and `fd94c08` (stream ClickHouse derive) — replaced the buffer-everything model.
+This is the same pattern as v1's parse-worker memory finding (review High: "workers collect all
+parsed posts into a single array") now caught at smoke-test time instead of in production under
+load. The whale repos continue to be the project's best test fixture.
+
+By the afternoon of June 16, Alice was already running thermo-nuclear code quality reviews
+against the Rust code (sessions at 14:18 and 14:51 UTC) — the same discipline cycle that
+surfaced v1's structural issues before the second backfill, now applied to v2 before a single
+production byte is crawled.
+
+**Meanwhile, the TS verify got smarter about loose samples.** Five commits to `verify.ts`
+(`2ca7c55`..`54fbc85`, June 16 01:11–06:09 UTC) addressed the "post-load drift" problem:
+repos classified as "loose" (ClickHouse has more posts than the ledger expected) because new
+posts were created via the firehose *after* the backfill loaded the repo. The fix: track
+`loaded_at` per repo, parse rkey TID timestamps, and filter out posts whose creation time
+postdates the load. One approach — cutoff loose reconciliation at load time (`6ef8e37`) — was
+reverted within five minutes (`1195e90`). The surviving approach adds bounded concurrency for
+sample verification (`a9cfce2`), PLC directory resolution for stale PDS pointers (account
+migrations and tombstones), retry with exponential backoff for transient failures, and a rule
+that failed samples stay unpromoted rather than being incorrectly marked verified (`54fbc85`).
+The five-minute revert is the verification story in miniature: every plausible shortcut through
+the loose band reveals another edge case that makes the shortcut wrong.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
