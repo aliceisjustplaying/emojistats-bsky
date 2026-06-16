@@ -34,3 +34,7 @@ arithmetic_side_effects = "deny"
 # Justified exception: transitive dependency trees we don't control will duplicate crate
 # versions. Per-crate metadata (cargo_common_metadata) is still enforced.
 multiple_crate_versions = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

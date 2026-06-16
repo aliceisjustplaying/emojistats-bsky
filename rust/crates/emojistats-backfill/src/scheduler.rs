@@ -3,10 +3,10 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
-use crate::ledger::ShardFilter;
+use crate::{ledger::ShardFilter, transport::RateLimitSnapshot};
 
 /// Shared per-host pacing state used by concurrent fleet attempts.
 pub type SharedHostPacer = Arc<Mutex<HostPacer>>;
@@ -62,6 +62,28 @@ impl HostPacer {
             .lock()
             .map_err(|_err| SchedulerError::PacerPoisoned)?
             .apply_retry_after(host, retry_after, Instant::now());
+        Ok(())
+    }
+
+    /// Record a host-level cooldown implied by successful rate-limit headers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchedulerError::PacerPoisoned`] if another holder panicked while
+    /// mutating the cooldown table.
+    pub fn record_rate_limit(
+        shared: &SharedHostPacer,
+        host: &str,
+        rate_limit: &RateLimitSnapshot,
+        observed_at: SystemTime,
+    ) -> Result<(), SchedulerError> {
+        let Some(delay) = rate_limit.cooldown_delay(observed_at) else {
+            return Ok(());
+        };
+        shared
+            .lock()
+            .map_err(|_err| SchedulerError::PacerPoisoned)?
+            .apply_retry_after(host, delay, Instant::now());
         Ok(())
     }
 

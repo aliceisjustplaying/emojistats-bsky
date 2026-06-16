@@ -6,6 +6,7 @@ pub mod clickhouse;
 pub mod commit;
 pub mod derive;
 pub mod ledger;
+pub mod list_records;
 pub mod manifest_derive;
 pub mod parse;
 pub mod scheduler;

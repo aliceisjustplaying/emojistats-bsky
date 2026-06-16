@@ -1,16 +1,19 @@
 //! Stage C `CAR` parser for the v2 backfill pipeline.
 
 use std::{
-    collections::{BTreeMap, btree_map::Entry},
+    collections::{BTreeMap, HashMap, hash_map::Entry},
     fs::File,
     io::{Cursor, Read, Seek, SeekFrom},
+    os::unix::fs::FileExt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, mpsc},
+    thread,
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
 use cid::Cid as IpldCid;
+use ipld_core::ipld::Ipld;
 use jacquard_api::app_bsky::{actor::profile::Profile, feed::post::Post};
 use jacquard_repo::{
     DAG_CBOR_CID_CODEC,
@@ -41,6 +44,8 @@ pub struct ParsedRepo {
     pub record_decode_error_count: u64,
     /// Number of typed post record decode failures observed while walking reachable records.
     pub post_decode_error_count: u64,
+    /// Coarse parser timings for crawler telemetry.
+    pub timings: ParseTimings,
 }
 
 /// Parsed one-repo summary for streaming callers that do not retain post rows.
@@ -60,6 +65,21 @@ pub struct ParsedRepoSummary {
     pub record_decode_error_count: u64,
     /// Number of typed post record decode failures observed while walking reachable records.
     pub post_decode_error_count: u64,
+    /// Coarse parser timings for crawler telemetry.
+    pub timings: ParseTimings,
+}
+
+/// Coarse parser stage timings in milliseconds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ParseTimings {
+    /// Full parser wall time.
+    pub total_ms: u64,
+    /// CAR scan, block indexing, and CID verification.
+    pub index_ms: u64,
+    /// Root commit load and requested-DID validation.
+    pub commit_ms: u64,
+    /// MST traversal, record reads, and post/profile extraction.
+    pub walk_ms: u64,
 }
 
 /// Resource caps for Stage C parsing.
@@ -77,6 +97,8 @@ pub struct ParseConfig {
     pub max_decode_errors: u64,
     /// Maximum best-effort parser wall-clock time.
     pub max_parse_wall_clock: Duration,
+    /// Worker threads used for CAR block CID verification.
+    pub cid_verification_threads: usize,
 }
 
 impl Default for ParseConfig {
@@ -89,6 +111,7 @@ impl Default for ParseConfig {
             max_decode_errors: 1_000_000,
             #[allow(clippy::duration_suboptimal_units)]
             max_parse_wall_clock: Duration::from_secs(15 * 60),
+            cid_verification_threads: 1,
         }
     }
 }
@@ -143,8 +166,32 @@ pub struct PostRecord {
     pub rkey: String,
     /// Record block `CID`.
     pub cid: String,
+    /// Typed record body, or raw recovered fields when typed decode failed.
+    pub body: PostRecordBody,
+}
+
+/// Parsed post body variants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostRecordBody {
     /// Typed Bluesky post record.
-    pub record: Post<SmolStr>,
+    Typed(Box<Post<SmolStr>>),
+    /// Raw fields recovered from a post record.
+    RawPartial(RawPartialPostRecord),
+}
+
+/// Raw post fields preserved from `app.bsky.feed.post`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawPartialPostRecord {
+    /// Whether the raw post was missing fields needed by the typed lexicon model.
+    pub typed_decode_failed: bool,
+    /// Author-supplied `createdAt` bytes represented as JSON when present.
+    pub created_at_raw: Option<String>,
+    /// Author-supplied text when it was a string.
+    pub text: Option<String>,
+    /// Author-supplied langs when they were strings.
+    pub langs: Vec<String>,
+    /// Non-core record fields preserved as JSON.
+    pub extras_json: serde_json::Value,
 }
 
 /// Extracted profile record plus repo key context.
@@ -404,17 +451,7 @@ fn parse_repo_thread(
     let car_path = car_path.to_path_buf();
     std::thread::Builder::new()
         .name("emojistats-stage-c-parse".to_owned())
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(ParseError::Runtime)?;
-            runtime.block_on(parse_repo_async(
-                &car_path,
-                requested_did.as_deref(),
-                config,
-            ))
-        })
+        .spawn(move || parse_repo_sync(&car_path, requested_did.as_deref(), config))
         .map_err(ParseError::ThreadSpawn)?
         .join()
         .map_err(|_err| ParseError::RuntimeThreadTerminated)?
@@ -436,30 +473,26 @@ where
     std::thread::Builder::new()
         .name("emojistats-stage-c-parse".to_owned())
         .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(ParseError::Runtime)?;
-            runtime.block_on(parse_repo_async_visit(
+            parse_repo_visit(
                 &car_path,
                 requested_did.as_deref(),
                 config,
                 state,
                 &mut visit_post,
-            ))
+            )
         })
         .map_err(ParseError::ThreadSpawn)?
         .join()
         .map_err(|_err| ParseError::RuntimeThreadTerminated)?
 }
 
-async fn parse_repo_async(
+fn parse_repo_sync(
     car_path: &Path,
     requested_did: Option<&str>,
     config: ParseConfig,
 ) -> Result<ParsedRepo, ParseError> {
     let mut posts = Vec::new();
-    let (summary, ()) = parse_repo_async_visit(
+    let (summary, ()) = parse_repo_visit(
         car_path,
         requested_did,
         config,
@@ -469,7 +502,6 @@ async fn parse_repo_async(
             Ok::<(), std::convert::Infallible>(())
         },
     )
-    .await
     .map_err(|error| match error {
         ParseVisitError::Parse(error) => error,
         ParseVisitError::Visit(error) => match error {},
@@ -484,10 +516,11 @@ async fn parse_repo_async(
         profile_decode_error: summary.profile_decode_error,
         record_decode_error_count: summary.record_decode_error_count,
         post_decode_error_count: summary.post_decode_error_count,
+        timings: summary.timings,
     })
 }
 
-async fn parse_repo_async_visit<S, E, F>(
+fn parse_repo_visit<S, E, F>(
     car_path: &Path,
     requested_did: Option<&str>,
     config: ParseConfig,
@@ -497,13 +530,19 @@ async fn parse_repo_async_visit<S, E, F>(
 where
     F: FnMut(&mut S, PostRecord) -> Result<(), E>,
 {
+    let total_started = Instant::now();
     let deadline = ParseDeadline::start(config.max_parse_wall_clock);
+    let index_started = Instant::now();
     let (stream_summary, store) = IndexedCarBlockStore::load(car_path, config, deadline)?;
+    let index_ms = elapsed_millis(index_started);
     deadline.ensure_not_exceeded()?;
+    let commit_started = Instant::now();
     let commit_root = single_car_root(&stream_summary.roots)?;
-    let (commit_cid, commit) = load_commit(commit_root, &store).await?;
+    let (commit_cid, commit) = load_commit(commit_root, &store)?;
     deadline.ensure_not_exceeded()?;
     assert_requested_did(requested_did, commit.did().as_str())?;
+    let commit_ms = elapsed_millis(commit_started);
+    let walk_started = Instant::now();
     let (profile, profile_decode_error, decode_digest, rkey_digest) = walk_mst_records_visit(
         commit.data,
         &store,
@@ -511,8 +550,8 @@ where
         deadline,
         &mut state,
         visit_post,
-    )
-    .await?;
+    )?;
+    let walk_ms = elapsed_millis(walk_started);
 
     let proof = CompletenessProof {
         class: CompletenessClass::SnapshotComplete,
@@ -544,6 +583,12 @@ where
             profile_decode_error,
             record_decode_error_count: decode_digest.all_decode_errors_count,
             post_decode_error_count: decode_digest.post_decode_errors_count,
+            timings: ParseTimings {
+                total_ms: elapsed_millis(total_started),
+                index_ms,
+                commit_ms,
+                walk_ms,
+            },
         },
         state,
     ))
@@ -561,11 +606,11 @@ fn single_car_root(roots: &[IpldCid]) -> Result<IpldCid, ParseError> {
     }
 }
 
-async fn load_commit(
+fn load_commit(
     root: IpldCid,
     store: &IndexedCarBlockStore,
 ) -> Result<(IpldCid, Commit<SmolStr>), ParseError> {
-    let Some(bytes) = store.get(&root).await? else {
+    let Some(bytes) = store.get_block_bytes(&root).map_err(ParseError::Repo)? else {
         return Err(ParseError::CommitNotFound {
             root: root.to_string(),
         });
@@ -594,14 +639,7 @@ fn assert_requested_did(requested_did: Option<&str>, actual_did: &str) -> Result
     })
 }
 
-async fn walk_mst_records_visit<S, E, F>(
-    root: IpldCid,
-    store: &IndexedCarBlockStore,
-    config: ParseConfig,
-    deadline: ParseDeadline,
-    state: &mut S,
-    visit_post: &mut F,
-) -> Result<
+type WalkMstRecordsResult<E> = Result<
     (
         Option<ProfileRecord>,
         Option<String>,
@@ -609,7 +647,16 @@ async fn walk_mst_records_visit<S, E, F>(
         RkeyDigest,
     ),
     ParseVisitError<E>,
->
+>;
+
+fn walk_mst_records_visit<S, E, F>(
+    root: IpldCid,
+    store: &IndexedCarBlockStore,
+    config: ParseConfig,
+    deadline: ParseDeadline,
+    state: &mut S,
+    visit_post: &mut F,
+) -> WalkMstRecordsResult<E>
 where
     F: FnMut(&mut S, PostRecord) -> Result<(), E>,
 {
@@ -619,11 +666,10 @@ where
     let mut decode_digest = DecodeDigest::default();
     let mut digest = RkeyDigest::default();
 
-    while let Some(leaf) = cursor.next_leaf(config).await? {
+    while let Some(leaf) = cursor.next_leaf(config)? {
         deadline.ensure_not_exceeded()?;
         let record_bytes = store
-            .get(&leaf.cid)
-            .await
+            .get_block_bytes(&leaf.cid)
             .map_err(ParseError::Repo)?
             .ok_or_else(|| ParseError::MissingBlock {
                 cid: leaf.cid.to_string(),
@@ -663,13 +709,10 @@ impl<'a> StreamingMstCursor<'a> {
         }
     }
 
-    async fn next_leaf(
-        &mut self,
-        config: ParseConfig,
-    ) -> Result<Option<StreamingMstLeaf>, ParseError> {
+    fn next_leaf(&mut self, config: ParseConfig) -> Result<Option<StreamingMstLeaf>, ParseError> {
         loop {
             if let Some(root) = self.root.take() {
-                self.push_node(root, config).await?;
+                self.push_node(root, config)?;
                 continue;
             }
 
@@ -682,7 +725,7 @@ impl<'a> StreamingMstCursor<'a> {
             };
             match item {
                 StreamingMstItem::Tree(cid) => {
-                    self.push_node(cid, config).await?;
+                    self.push_node(cid, config)?;
                 }
                 StreamingMstItem::Leaf { key, cid } => {
                     return Ok(Some(StreamingMstLeaf { key, cid }));
@@ -691,7 +734,7 @@ impl<'a> StreamingMstCursor<'a> {
         }
     }
 
-    async fn push_node(&mut self, cid: IpldCid, config: ParseConfig) -> Result<(), ParseError> {
+    fn push_node(&mut self, cid: IpldCid, config: ParseConfig) -> Result<(), ParseError> {
         let depth = checked_increment(
             u64::try_from(self.stack.len()).map_err(|_err| ParseError::CarLengthOverflow {
                 field: "MST stack depth",
@@ -706,8 +749,8 @@ impl<'a> StreamingMstCursor<'a> {
         )?;
         let bytes = self
             .store
-            .get(&cid)
-            .await?
+            .get_block_bytes(&cid)
+            .map_err(ParseError::Repo)?
             .ok_or_else(|| ParseError::MissingBlock {
                 cid: cid.to_string(),
             })?;
@@ -787,18 +830,24 @@ where
     };
 
     match collection {
-        POST_COLLECTION => match serde_ipld_dagcbor::from_slice::<Post<SmolStr>>(record_bytes) {
-            Ok(record) => (sinks.visit_post)(
-                sinks.state,
-                PostRecord {
-                    rkey: rkey.to_owned(),
-                    cid: cid.to_string(),
-                    record,
-                },
-            )
-            .map_err(ParseVisitError::Visit)?,
-            Err(_error) => record_decode_failed(sinks.decode_digest, POST_COLLECTION, config)?,
-        },
+        POST_COLLECTION => {
+            if let Some(raw_record) = raw_post_from_cbor(record_bytes) {
+                if raw_record.typed_decode_failed {
+                    record_decode_failed(sinks.decode_digest, POST_COLLECTION, config)?;
+                }
+                (sinks.visit_post)(
+                    sinks.state,
+                    PostRecord {
+                        rkey: rkey.to_owned(),
+                        cid: cid.to_string(),
+                        body: PostRecordBody::RawPartial(raw_record),
+                    },
+                )
+                .map_err(ParseVisitError::Visit)?;
+            } else {
+                record_decode_failed(sinks.decode_digest, POST_COLLECTION, config)?;
+            }
+        }
         PROFILE_COLLECTION if rkey == PROFILE_RKEY => {
             match serde_ipld_dagcbor::from_slice::<Profile<SmolStr>>(record_bytes) {
                 Ok(record) => {
@@ -820,6 +869,121 @@ where
     }
 
     Ok(())
+}
+
+fn raw_post_from_cbor(record_bytes: &[u8]) -> Option<RawPartialPostRecord> {
+    if let Ok(fields) = serde_ipld_dagcbor::from_slice::<FastPostFields>(record_bytes) {
+        return raw_post_from_fast_fields(fields);
+    }
+    let ipld = serde_ipld_dagcbor::from_slice::<Ipld>(record_bytes).ok()?;
+    let Ipld::Map(fields) = ipld else {
+        return None;
+    };
+    raw_post_from_ipld_fields(fields)
+}
+
+#[derive(Debug, Deserialize)]
+struct FastPostFields {
+    #[serde(rename = "$type")]
+    _record_type: Option<String>,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+    text: String,
+    langs: Option<Vec<String>>,
+    #[serde(flatten)]
+    extras: BTreeMap<String, Ipld>,
+}
+
+fn raw_post_from_fast_fields(mut fields: FastPostFields) -> Option<RawPartialPostRecord> {
+    fields.extras.remove("$type");
+    let extras_json = if fields.extras.is_empty() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        ipld_to_json(Ipld::Map(fields.extras)).ok()?
+    };
+    Some(RawPartialPostRecord {
+        typed_decode_failed: false,
+        created_at_raw: Some(fields.created_at),
+        text: Some(fields.text),
+        langs: fields.langs.unwrap_or_default(),
+        extras_json,
+    })
+}
+
+fn raw_post_from_ipld_fields(mut fields: BTreeMap<String, Ipld>) -> Option<RawPartialPostRecord> {
+    let typed_decode_failed = raw_post_ipld_typed_decode_failed(&fields);
+    let created_at_raw = raw_ipld_created_at(fields.get("createdAt"));
+    let text = fields
+        .get("text")
+        .and_then(ipld_string)
+        .map(ToOwned::to_owned);
+    let langs = raw_ipld_string_array(fields.get("langs"));
+    for key in ["$type", "createdAt", "langs", "text"] {
+        fields.remove(key);
+    }
+    let extras_json = if fields.is_empty() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        ipld_to_json(Ipld::Map(fields)).ok()?
+    };
+    Some(RawPartialPostRecord {
+        typed_decode_failed,
+        created_at_raw,
+        text,
+        langs,
+        extras_json,
+    })
+}
+
+fn raw_post_ipld_typed_decode_failed(fields: &BTreeMap<String, Ipld>) -> bool {
+    if !matches!(fields.get("createdAt"), Some(Ipld::String(_))) {
+        return true;
+    }
+    if !matches!(fields.get("text"), Some(Ipld::String(_))) {
+        return true;
+    }
+    raw_ipld_langs_decode_failed(fields.get("langs"))
+}
+
+fn raw_ipld_langs_decode_failed(value: Option<&Ipld>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    if matches!(value, Ipld::Null) {
+        return false;
+    }
+    let Ipld::List(values) = value else {
+        return true;
+    };
+    values.iter().any(|value| !matches!(value, Ipld::String(_)))
+}
+
+fn raw_ipld_created_at(value: Option<&Ipld>) -> Option<String> {
+    match value {
+        None | Some(Ipld::Null) => None,
+        Some(Ipld::String(value)) => Some(value.clone()),
+        Some(value) => ipld_to_json(value.clone())
+            .ok()
+            .map(|json| json.to_string()),
+    }
+}
+
+fn raw_ipld_string_array(value: Option<&Ipld>) -> Vec<String> {
+    let Some(Ipld::List(values)) = value else {
+        return Vec::new();
+    };
+    values
+        .iter()
+        .filter_map(ipld_string)
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+const fn ipld_string(value: &Ipld) -> Option<&str> {
+    match value {
+        Ipld::String(value) => Some(value.as_str()),
+        _other => None,
+    }
 }
 
 struct RecordSinks<'a, S, F> {
@@ -899,10 +1063,111 @@ fn verify_block_cid(cid: IpldCid, data: &[u8]) -> Result<(), ParseError> {
     Ok(())
 }
 
+struct CidVerifyJob {
+    cid: IpldCid,
+    data: Vec<u8>,
+}
+
+enum CidVerifier {
+    Inline,
+    Parallel(ParallelCidVerifier),
+}
+
+struct ParallelCidVerifier {
+    senders: Vec<mpsc::SyncSender<CidVerifyJob>>,
+    workers: Vec<thread::JoinHandle<Result<(), ParseError>>>,
+    next_sender: usize,
+}
+
+impl CidVerifier {
+    fn start(worker_count: usize) -> Self {
+        if worker_count <= 1 {
+            return Self::Inline;
+        }
+        Self::Parallel(ParallelCidVerifier::start(worker_count))
+    }
+
+    fn verify(&mut self, cid: IpldCid, data: &[u8]) -> Result<(), ParseError> {
+        match self {
+            Self::Inline => verify_block_cid(cid, data),
+            Self::Parallel(verifier) => verifier.verify(cid, data),
+        }
+    }
+
+    fn finish(self) -> Result<(), ParseError> {
+        match self {
+            Self::Inline => Ok(()),
+            Self::Parallel(verifier) => verifier.finish(),
+        }
+    }
+}
+
+impl ParallelCidVerifier {
+    fn start(worker_count: usize) -> Self {
+        let worker_count = worker_count.max(1);
+        let mut senders = Vec::with_capacity(worker_count);
+        let mut workers = Vec::with_capacity(worker_count);
+        for _worker in 0..worker_count {
+            let (sender, receiver) = mpsc::sync_channel(2);
+            senders.push(sender);
+            workers.push(thread::spawn(move || verify_cid_jobs(receiver)));
+        }
+        Self {
+            senders,
+            workers,
+            next_sender: 0,
+        }
+    }
+
+    fn verify(&mut self, cid: IpldCid, data: &[u8]) -> Result<(), ParseError> {
+        let sender = self
+            .senders
+            .get(self.next_sender)
+            .ok_or(ParseError::MalformedCar(
+                "CID verifier has no workers".to_owned(),
+            ))?;
+        sender
+            .send(CidVerifyJob {
+                cid,
+                data: data.to_vec(),
+            })
+            .map_err(|_error| ParseError::MalformedCar("CID verifier stopped".to_owned()))?;
+        let next_sender = self
+            .next_sender
+            .checked_add(1)
+            .ok_or(ParseError::MalformedCar(
+                "CID verifier sender index overflow".to_owned(),
+            ))?;
+        self.next_sender = if next_sender == self.senders.len() {
+            0
+        } else {
+            next_sender
+        };
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(), ParseError> {
+        drop(self.senders);
+        for worker in self.workers {
+            worker
+                .join()
+                .map_err(|_error| ParseError::MalformedCar("CID verifier panicked".to_owned()))??;
+        }
+        Ok(())
+    }
+}
+
+fn verify_cid_jobs(receiver: mpsc::Receiver<CidVerifyJob>) -> Result<(), ParseError> {
+    for job in receiver {
+        verify_block_cid(job.cid, &job.data)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct IndexedCarBlockStore {
-    path: Arc<PathBuf>,
-    index: Arc<BTreeMap<IpldCid, BlockLocation>>,
+    file: Arc<File>,
+    index: Arc<HashMap<IpldCid, BlockLocation>>,
 }
 
 impl IndexedCarBlockStore {
@@ -917,23 +1182,27 @@ impl IndexedCarBlockStore {
             verified_block_count: indexed_car.verified_block_count,
         };
         let store = Self {
-            path: Arc::new(path.to_path_buf()),
+            file: Arc::new(open_file(path)?),
             index: Arc::new(indexed_car.index),
         };
         Ok((summary, store))
+    }
+
+    fn get_block_bytes(&self, cid: &IpldCid) -> jacquard_repo::Result<Option<Bytes>> {
+        let Some(location) = self.index.get(cid) else {
+            return Ok(None);
+        };
+        read_block_at(&self.file, location)
+            .map(Bytes::from)
+            .map(Some)
+            .map_err(RepoError::io)
     }
 }
 
 #[allow(clippy::unused_async_trait_impl)]
 impl BlockStore for IndexedCarBlockStore {
     async fn get(&self, cid: &IpldCid) -> jacquard_repo::Result<Option<Bytes>> {
-        let Some(location) = self.index.get(cid) else {
-            return Ok(None);
-        };
-        read_block_at(&self.path, location)
-            .map(Bytes::from)
-            .map(Some)
-            .map_err(RepoError::io)
+        self.get_block_bytes(cid)
     }
 
     async fn put(&self, _data: &[u8]) -> jacquard_repo::Result<IpldCid> {
@@ -997,7 +1266,8 @@ fn index_car_blocks(
             source,
         })?;
 
-    let mut index = BTreeMap::new();
+    let mut index = HashMap::new();
+    let mut verifier = CidVerifier::start(config.cid_verification_threads);
     let mut indexed_block_count = 0_u64;
     while let Some(section_len) = read_varint(&mut file)? {
         offset = checked_add_u64(offset, section_len.bytes_read, "section varint")?;
@@ -1034,9 +1304,9 @@ fn index_car_blocks(
                 field: "CID length",
             })?;
         let data = section.get(data_start..).ok_or(ParseError::MalformedCar(
-            "block data slice outside section".to_owned(),
+            "block data slice outside CAR section".to_owned(),
         ))?;
-        verify_block_cid(cid, data)?;
+        verifier.verify(cid, data)?;
 
         match index.entry(cid) {
             Entry::Vacant(entry) => {
@@ -1062,12 +1332,46 @@ fn index_car_blocks(
         deadline.ensure_not_exceeded()?;
         offset = checked_add_u64(section_start, section_len.value, "section end")?;
     }
+    verifier.finish()?;
 
     Ok(IndexedCar {
         roots: header.roots,
         verified_block_count: indexed_block_count,
         index,
     })
+}
+
+fn ipld_to_json(ipld: Ipld) -> Result<serde_json::Value, ParseError> {
+    match ipld {
+        Ipld::Null => Ok(serde_json::Value::Null),
+        Ipld::Bool(value) => Ok(serde_json::Value::Bool(value)),
+        Ipld::Integer(value) => {
+            let number = i64::try_from(value)
+                .map(serde_json::Number::from)
+                .map_err(|_error| {
+                    ParseError::MalformedCar("IPLD integer exceeds JSON range".to_owned())
+                })?;
+            Ok(serde_json::Value::Number(number))
+        }
+        Ipld::Float(value) => serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| ParseError::MalformedCar("IPLD float is not finite".to_owned())),
+        Ipld::String(value) => Ok(serde_json::Value::String(value)),
+        Ipld::Bytes(value) => Ok(serde_json::json!({ "$bytes": hex::encode(value) })),
+        Ipld::List(values) => values
+            .into_iter()
+            .map(ipld_to_json)
+            .collect::<Result<Vec<_>, _>>()
+            .map(serde_json::Value::Array),
+        Ipld::Map(fields) => {
+            let mut json_fields = serde_json::Map::new();
+            for (key, value) in fields {
+                json_fields.insert(key, ipld_to_json(value)?);
+            }
+            Ok(serde_json::Value::Object(json_fields))
+        }
+        Ipld::Link(cid) => Ok(serde_json::json!({ "$link": cid.to_string() })),
+    }
 }
 
 fn parse_car_header(bytes: &[u8]) -> Result<CarHeader, ParseError> {
@@ -1082,11 +1386,9 @@ fn parse_car_header(bytes: &[u8]) -> Result<CarHeader, ParseError> {
     Ok(header)
 }
 
-fn read_block_at(path: &Path, location: &BlockLocation) -> std::io::Result<Vec<u8>> {
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(location.offset))?;
+fn read_block_at(file: &File, location: &BlockLocation) -> std::io::Result<Vec<u8>> {
     let mut bytes = vec![0_u8; location.len];
-    file.read_exact(&mut bytes)?;
+    file.read_exact_at(&mut bytes, location.offset)?;
     Ok(bytes)
 }
 
@@ -1205,6 +1507,10 @@ impl ParseDeadline {
     }
 }
 
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 fn read_only_store_error() -> RepoError {
     RepoError::storage(std::io::Error::other(
         "indexed CAR block store is read-only",
@@ -1221,7 +1527,7 @@ struct CarStreamSummary {
 struct IndexedCar {
     roots: Vec<IpldCid>,
     verified_block_count: u64,
-    index: BTreeMap<IpldCid, BlockLocation>,
+    index: HashMap<IpldCid, BlockLocation>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1246,7 +1552,6 @@ const POST_COLLECTION: &str = "app.bsky.feed.post";
 const POST_PREFIX: &str = "app.bsky.feed.post/";
 const PROFILE_COLLECTION: &str = "app.bsky.actor.profile";
 const PROFILE_RKEY: &str = "self";
-
 #[cfg(test)]
 mod tests {
     use super::{

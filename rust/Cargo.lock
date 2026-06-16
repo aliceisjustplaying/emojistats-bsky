@@ -968,6 +968,7 @@ dependencies = [
  "futures-util",
  "hex",
  "http",
+ "ipld-core",
  "jacquard-api",
  "jacquard-common",
  "jacquard-identity",

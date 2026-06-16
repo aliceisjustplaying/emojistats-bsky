@@ -5,7 +5,8 @@ mod fixtures;
 use emojistats_backfill::{
     archive::{
         ArchivePostRow, CompletenessClass, CreatedAtParseStatus, FetchMethod, RepoReceiptInput,
-        build_repo_receipt, classify_created_at, current_normalizer, hash_post_rows,
+        archive_rows_from_parsed_repo, build_repo_receipt, classify_created_at, current_normalizer,
+        hash_post_rows,
     },
     parse::{ParseError, parse_repo, parse_repo_for_did},
 };
@@ -13,7 +14,7 @@ use serde_json::json;
 
 use crate::fixtures::{
     TempCar, commit_only_car_bytes, empty_roots_car_bytes, malformed_header_car_bytes,
-    non_commit_root_car_bytes, root_without_block_car_bytes,
+    non_commit_root_car_bytes, root_without_block_car_bytes, single_post_car_bytes,
 };
 
 #[test]
@@ -84,6 +85,77 @@ fn classifies_created_at_values_for_archive_rows() {
     assert_eq!(future.normalized, None);
     assert_eq!(valid.status, CreatedAtParseStatus::Valid);
     assert_eq!(valid.normalized.as_deref(), Some("2024-01-02T03:04:05Z"));
+}
+
+#[test]
+fn archives_raw_post_row_when_typed_decode_fails_for_missing_created_at() {
+    let did = "did:plc:fixture123";
+    let car = TempCar::from_bytes(
+        "missing-created-at-post.car",
+        &single_post_car_bytes(
+            did,
+            "3jui7kd54zh2y",
+            &json!({
+                "$type": "app.bsky.feed.post",
+                "text": "hello ✅",
+                "langs": ["en", "ja"],
+                "custom": { "preserved": true }
+            }),
+        ),
+    );
+
+    let parsed = parse_repo_for_did(&car.path, did).expect("repo should parse with partial row");
+    let rows = archive_rows_from_parsed_repo(&parsed).expect("archive rows should build");
+
+    assert_eq!(parsed.rkey_digest.all_records_count, 1);
+    assert_eq!(parsed.rkey_digest.post_records_count, 1);
+    assert_eq!(parsed.post_decode_error_count, 1);
+    assert_eq!(rows.len(), 1);
+    let row = rows.first().expect("partial archive row");
+    assert_eq!(row.did, did);
+    assert_eq!(row.rkey, "3jui7kd54zh2y");
+    assert!(!row.cid.is_empty());
+    assert_eq!(row.record_status.as_deref(), Some("typed_decode_failed"));
+    assert_eq!(row.created_at_parse_status, CreatedAtParseStatus::Missing);
+    assert_eq!(row.created_at_raw, None);
+    assert_eq!(row.created_at_normalized, None);
+    assert_eq!(row.text, "hello ✅");
+    assert_eq!(row.langs, ["en", "ja"]);
+    assert_eq!(row.emoji_sequence, ["✅"]);
+    assert_eq!(row.extras_json, json!({ "custom": { "preserved": true } }));
+}
+
+#[test]
+fn archives_raw_post_row_when_typed_decode_fails_for_invalid_created_at() {
+    let did = "did:plc:fixture123";
+    let car = TempCar::from_bytes(
+        "invalid-created-at-post.car",
+        &single_post_car_bytes(
+            did,
+            "3jui7kd54zh2z",
+            &json!({
+                "$type": "app.bsky.feed.post",
+                "createdAt": { "not": "a string" },
+                "text": "raw text",
+                "langs": ["en"]
+            }),
+        ),
+    );
+
+    let parsed = parse_repo_for_did(&car.path, did).expect("repo should parse with partial row");
+    let rows = archive_rows_from_parsed_repo(&parsed).expect("archive rows should build");
+
+    assert_eq!(parsed.rkey_digest.all_records_count, 1);
+    assert_eq!(parsed.rkey_digest.post_records_count, 1);
+    assert_eq!(parsed.post_decode_error_count, 1);
+    assert_eq!(rows.len(), 1);
+    let row = rows.first().expect("partial archive row");
+    assert_eq!(row.record_status.as_deref(), Some("typed_decode_failed"));
+    assert_eq!(row.created_at_parse_status, CreatedAtParseStatus::Invalid);
+    assert_eq!(row.created_at_raw.as_deref(), Some(r#"{"not":"a string"}"#));
+    assert_eq!(row.created_at_normalized, None);
+    assert_eq!(row.text, "raw text");
+    assert_eq!(row.langs, ["en"]);
 }
 
 #[test]

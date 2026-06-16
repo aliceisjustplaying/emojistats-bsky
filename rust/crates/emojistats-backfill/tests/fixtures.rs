@@ -13,7 +13,10 @@ use std::{
 use bytes::Bytes;
 use cid::Cid as IpldCid;
 use jacquard_common::types::string::{Did, Tid};
-use jacquard_repo::{commit::Commit, mst::util::compute_cid};
+use jacquard_repo::{
+    commit::Commit,
+    mst::{NodeData, TreeEntry, util::compute_cid},
+};
 use serde::Serialize;
 use smol_str::SmolStr;
 
@@ -96,11 +99,46 @@ pub fn commit_only_car_bytes(actual_did: &str) -> Vec<u8> {
     car_bytes(&[root], &[(root, block)])
 }
 
-fn dag_cbor_cid(value: &serde_json::Value) -> IpldCid {
+pub fn single_post_car_bytes(actual_did: &str, rkey: &str, record: &serde_json::Value) -> Vec<u8> {
+    let record_block = dag_cbor_bytes(record);
+    let record_cid = compute_cid(&record_block).expect("fixture record CID should compute");
+    let key = format!("app.bsky.feed.post/{rkey}");
+    let node = NodeData {
+        left: None,
+        entries: vec![TreeEntry {
+            key_suffix: Bytes::from(key.into_bytes()),
+            prefix_len: 0,
+            tree: None,
+            value: record_cid,
+        }],
+    };
+    let node_block = dag_cbor_bytes(&node);
+    let node_cid = compute_cid(&node_block).expect("fixture MST CID should compute");
+    let commit = Commit {
+        did: Did::<SmolStr>::new_owned(actual_did).expect("fixture DID should be valid"),
+        version: 3,
+        data: node_cid,
+        rev: Tid::new("3jui7kd54zh2y").expect("fixture TID should be valid"),
+        prev: None,
+        sig: Bytes::new(),
+    };
+    let commit_block = commit.to_cbor().expect("fixture commit should encode");
+    let commit_cid = compute_cid(&commit_block).expect("fixture commit CID should compute");
+    car_bytes(
+        &[commit_cid],
+        &[
+            (commit_cid, commit_block),
+            (node_cid, node_block),
+            (record_cid, record_block),
+        ],
+    )
+}
+
+fn dag_cbor_cid<T: Serialize>(value: &T) -> IpldCid {
     compute_cid(&dag_cbor_bytes(value)).expect("fixture CID should compute")
 }
 
-fn dag_cbor_bytes(value: &serde_json::Value) -> Vec<u8> {
+fn dag_cbor_bytes<T: Serialize>(value: &T) -> Vec<u8> {
     serde_ipld_dagcbor::to_vec(value).expect("fixture value should encode as DAG-CBOR")
 }
 

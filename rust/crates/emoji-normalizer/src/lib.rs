@@ -36,6 +36,9 @@ pub fn version() -> NormalizerVersion {
 /// Extract normalized emoji glyph strings, preserving order and repeated occurrences.
 #[must_use]
 pub fn extract_emoji_sequence(text: &str) -> Vec<String> {
+    if text.is_ascii() {
+        return Vec::new();
+    }
     text.graphemes(true)
         .filter_map(normalize_emoji_glyph)
         .collect()

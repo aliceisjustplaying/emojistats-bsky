@@ -36,6 +36,7 @@ futures-util = "0.3"
 http = "1"
 bytes = "1"
 cid = { version = "0.11", features = ["serde"] }
+ipld-core = "0.4"
 serde_ipld_dagcbor = "0.6"
 smol_str = { version = "0.3", features = ["serde"] }
 thiserror = "2"

@@ -199,9 +199,21 @@ impl RateLimitSnapshot {
                 .or_else(|| parse_u64_header(headers, "x-ratelimit-remaining")),
             reset: parse_u64_header(headers, "ratelimit-reset")
                 .or_else(|| parse_u64_header(headers, "x-ratelimit-reset")),
-            retry_after: parse_u64_header(headers, "retry-after").map(Duration::from_secs),
+            retry_after: parse_retry_after_header(headers),
             policy: parse_string_header(headers, "ratelimit-policy"),
         }
+    }
+
+    /// Return the host cooldown implied by these headers, if any.
+    #[must_use]
+    pub fn cooldown_delay(&self, now: SystemTime) -> Option<Duration> {
+        if let Some(retry_after) = self.retry_after {
+            return Some(retry_after);
+        }
+        if self.remaining != Some(0) {
+            return None;
+        }
+        self.reset.and_then(|reset| reset_delay(reset, now))
     }
 }
 
@@ -664,6 +676,146 @@ fn parse_u64_header(headers: &HeaderMap, name: &'static str) -> Option<u64> {
         .and_then(|value| value.parse::<u64>().ok())
 }
 
+fn parse_retry_after_header(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get("retry-after")?.to_str().ok()?.trim();
+    value
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+        .or_else(|| parse_http_date_retry_after(value, SystemTime::now()))
+}
+
+fn parse_http_date_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+    parse_imf_fixdate_epoch_seconds(value).and_then(|deadline| {
+        let now = epoch_seconds(now)?;
+        let delay = deadline.checked_sub(now)?;
+        u64::try_from(delay).ok().map(Duration::from_secs)
+    })
+}
+
+fn reset_delay(reset: u64, now: SystemTime) -> Option<Duration> {
+    let now = u64::try_from(epoch_seconds(now)?).ok()?;
+    if reset > now {
+        return reset.checked_sub(now).map(Duration::from_secs);
+    }
+    if (1..=86_400).contains(&reset) {
+        return Some(Duration::from_secs(reset));
+    }
+    None
+}
+
+fn epoch_seconds(now: SystemTime) -> Option<i64> {
+    let duration = now.duration_since(UNIX_EPOCH).ok()?;
+    i64::try_from(duration.as_secs()).ok()
+}
+
+fn parse_imf_fixdate_epoch_seconds(value: &str) -> Option<i64> {
+    let mut parts = value.split_ascii_whitespace();
+    let _weekday = parts.next()?;
+    let day = parts.next()?.parse::<i64>().ok()?;
+    let month = month_number(parts.next()?)?;
+    let year = parts.next()?.parse::<i64>().ok()?;
+    let time = parts.next()?;
+    if parts.next()? != "GMT" || parts.next().is_some() {
+        return None;
+    }
+    let mut time_parts = time.split(':');
+    let hour = time_parts.next()?.parse::<i64>().ok()?;
+    let minute = time_parts.next()?.parse::<i64>().ok()?;
+    let second = time_parts.next()?.parse::<i64>().ok()?;
+    if time_parts.next().is_some() {
+        return None;
+    }
+    validate_http_date_parts(year, month, day, hour, minute, second)?;
+    let days = days_from_civil(year, month, day)?;
+    days.checked_mul(86_400)?
+        .checked_add(hour.checked_mul(3_600)?)?
+        .checked_add(minute.checked_mul(60)?)?
+        .checked_add(second)
+}
+
+fn month_number(value: &str) -> Option<i64> {
+    match value {
+        "Jan" => Some(1),
+        "Feb" => Some(2),
+        "Mar" => Some(3),
+        "Apr" => Some(4),
+        "May" => Some(5),
+        "Jun" => Some(6),
+        "Jul" => Some(7),
+        "Aug" => Some(8),
+        "Sep" => Some(9),
+        "Oct" => Some(10),
+        "Nov" => Some(11),
+        "Dec" => Some(12),
+        _other => None,
+    }
+}
+
+fn validate_http_date_parts(
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+) -> Option<()> {
+    if !(1970..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=days_in_month(year, month)?).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=59).contains(&second)
+    {
+        return None;
+    }
+    Some(())
+}
+
+fn days_in_month(year: i64, month: i64) -> Option<i64> {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => Some(31),
+        4 | 6 | 9 | 11 => Some(30),
+        2 if is_leap_year(year)? => Some(29),
+        2 => Some(28),
+        _other => None,
+    }
+}
+
+fn is_leap_year(year: i64) -> Option<bool> {
+    let by_four = year.checked_rem(4)? == 0;
+    let by_hundred = year.checked_rem(100)? == 0;
+    let by_four_hundred = year.checked_rem(400)? == 0;
+    Some(by_four_hundred || (by_four && !by_hundred))
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
+    let adjusted_year = if month <= 2 {
+        year.checked_sub(1)?
+    } else {
+        year
+    };
+    let era = adjusted_year.div_euclid(400);
+    let year_of_era = adjusted_year.checked_sub(era.checked_mul(400)?)?;
+    let month_prime = if month > 2 {
+        month.checked_sub(3)?
+    } else {
+        month.checked_add(9)?
+    };
+    let day_of_year = 153_i64
+        .checked_mul(month_prime)?
+        .checked_add(2)?
+        .div_euclid(5)
+        .checked_add(day)?
+        .checked_sub(1)?;
+    era.checked_mul(146_097)?
+        .checked_add(year_of_era.checked_mul(365)?)?
+        .checked_add(year_of_era.div_euclid(4))?
+        .checked_sub(year_of_era.div_euclid(100))?
+        .checked_add(day_of_year)?
+        .checked_sub(719_468)
+}
+
 fn parse_string_header(headers: &HeaderMap, name: &'static str) -> Option<String> {
     headers
         .get(name)
@@ -687,14 +839,17 @@ fn write_fetch_message(
 mod tests {
     #![allow(clippy::indexing_slicing)]
 
-    use std::{path::PathBuf, time::Duration};
+    use std::{
+        path::PathBuf,
+        time::{Duration, UNIX_EPOCH},
+    };
 
     use http::{HeaderMap, StatusCode};
     use jacquard_common::types::did::Did;
 
     use super::{
         AccountState, FetchByteBudget, FetchConfig, FetchError, RateLimitSnapshot,
-        classify_http_error, spool_path,
+        classify_http_error, parse_http_date_retry_after, spool_path,
     };
 
     #[test]
@@ -713,6 +868,32 @@ mod tests {
         assert_eq!(snapshot.reset, Some(42));
         assert_eq!(snapshot.retry_after, Some(Duration::from_secs(5)));
         assert_eq!(snapshot.policy.as_deref(), Some("3000;w=300"));
+    }
+
+    #[test]
+    #[allow(clippy::duration_suboptimal_units)]
+    fn parses_http_date_retry_after() {
+        let delay = parse_http_date_retry_after(
+            "Tue, 16 Jun 2026 00:00:10 GMT",
+            UNIX_EPOCH + Duration::from_secs(1_781_568_000),
+        );
+
+        assert_eq!(delay, Some(Duration::from_secs(10)));
+    }
+
+    #[test]
+    #[allow(clippy::duration_suboptimal_units)]
+    fn cooldown_delay_uses_empty_remaining_reset() {
+        let snapshot = RateLimitSnapshot {
+            remaining: Some(0),
+            reset: Some(1_781_568_030),
+            ..RateLimitSnapshot::default()
+        };
+
+        assert_eq!(
+            snapshot.cooldown_delay(UNIX_EPOCH + Duration::from_secs(1_781_568_000)),
+            Some(Duration::from_secs(30))
+        );
     }
 
     #[test]

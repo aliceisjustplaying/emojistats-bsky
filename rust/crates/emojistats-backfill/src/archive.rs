@@ -23,12 +23,13 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     commit::{LocalStore, ManifestMode, Metadata, Request},
-    parse::{ParsedRepo, PostRecord, ProfileRecord},
+    parse::{ParsedRepo, PostRecord, PostRecordBody, ProfileRecord, RawPartialPostRecord},
 };
 
 const POST_COLLECTION: &str = "app.bsky.feed.post";
+const PARTIAL_RECORD_STATUS: &str = "typed_decode_failed";
 const ARCHIVE_SCHEMA_VERSION: u16 = 1;
-const PARQUET_BATCH_ROWS: usize = 1_024;
+const PARQUET_BATCH_ROWS: usize = 65_536;
 
 /// Data-model-lossless post row before `Parquet` encoding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,12 +252,50 @@ pub fn archive_row_from_post(
     post: &PostRecord,
     normalizer: &NormalizerVersion,
 ) -> Result<ArchivePostRow, ArchiveError> {
-    let created_at = post.record.created_at.as_str();
+    match &post.body {
+        PostRecordBody::Typed(record) => {
+            archive_row_from_typed_post(did, &post.rkey, &post.cid, record, normalizer)
+        }
+        PostRecordBody::RawPartial(record) => Ok(archive_row_from_raw_partial_post(
+            did, post, record, normalizer,
+        )),
+    }
+}
+
+/// Convert an owned parsed post into an archive row.
+///
+/// # Errors
+///
+/// Returns [`ArchiveError`] if record extras cannot be serialized without loss.
+pub fn archive_row_from_owned_post(
+    did: &str,
+    post: PostRecord,
+    normalizer: &NormalizerVersion,
+) -> Result<ArchivePostRow, ArchiveError> {
+    let PostRecord { rkey, cid, body } = post;
+    match body {
+        PostRecordBody::Typed(record) => {
+            archive_row_from_typed_post(did, &rkey, &cid, &record, normalizer)
+        }
+        PostRecordBody::RawPartial(record) => Ok(archive_row_from_owned_raw_partial_post(
+            did, rkey, cid, record, normalizer,
+        )),
+    }
+}
+
+fn archive_row_from_typed_post(
+    did: &str,
+    rkey: &str,
+    cid: &str,
+    record: &jacquard_api::app_bsky::feed::post::Post<smol_str::SmolStr>,
+    normalizer: &NormalizerVersion,
+) -> Result<ArchivePostRow, ArchiveError> {
+    let created_at = record.created_at.as_str();
     let classified = classify_created_at(Some(created_at));
     Ok(ArchivePostRow {
         did: did.to_owned(),
-        rkey: post.rkey.clone(),
-        cid: post.cid.clone(),
+        rkey: rkey.to_owned(),
+        cid: cid.to_owned(),
         normalizer: normalizer.clone(),
         account_status: None,
         record_status: None,
@@ -264,13 +303,70 @@ pub fn archive_row_from_post(
         created_at_raw: classified.raw,
         created_at_normalized: classified.normalized,
         created_at_parse_status: classified.status,
-        text: post.record.text.to_string(),
-        langs: post.record.langs.as_ref().map_or_else(Vec::new, |langs| {
+        text: record.text.to_string(),
+        langs: record.langs.as_ref().map_or_else(Vec::new, |langs| {
             langs.iter().map(ToString::to_string).collect()
         }),
-        emoji_sequence: extract_emojis(post.record.text.as_str()),
-        extras_json: record_extras_json(post)?,
+        emoji_sequence: extract_emojis(record.text.as_str()),
+        extras_json: record_extras_json(record)?,
     })
+}
+
+fn archive_row_from_raw_partial_post(
+    did: &str,
+    post: &PostRecord,
+    partial: &RawPartialPostRecord,
+    normalizer: &NormalizerVersion,
+) -> ArchivePostRow {
+    let classified = classify_created_at(partial.created_at_raw.as_deref());
+    let text = partial.text.clone().unwrap_or_default();
+    ArchivePostRow {
+        did: did.to_owned(),
+        rkey: post.rkey.clone(),
+        cid: post.cid.clone(),
+        normalizer: normalizer.clone(),
+        account_status: None,
+        record_status: partial
+            .typed_decode_failed
+            .then(|| PARTIAL_RECORD_STATUS.to_owned()),
+        public_content_label: None,
+        created_at_raw: classified.raw,
+        created_at_normalized: classified.normalized,
+        created_at_parse_status: classified.status,
+        emoji_sequence: extract_emojis(&text),
+        text,
+        langs: partial.langs.clone(),
+        extras_json: partial.extras_json.clone(),
+    }
+}
+
+fn archive_row_from_owned_raw_partial_post(
+    did: &str,
+    rkey: String,
+    cid: String,
+    partial: RawPartialPostRecord,
+    normalizer: &NormalizerVersion,
+) -> ArchivePostRow {
+    let classified = classify_created_at(partial.created_at_raw.as_deref());
+    let text = partial.text.unwrap_or_default();
+    ArchivePostRow {
+        did: did.to_owned(),
+        rkey,
+        cid,
+        normalizer: normalizer.clone(),
+        account_status: None,
+        record_status: partial
+            .typed_decode_failed
+            .then(|| PARTIAL_RECORD_STATUS.to_owned()),
+        public_content_label: None,
+        created_at_raw: classified.raw,
+        created_at_normalized: classified.normalized,
+        created_at_parse_status: classified.status,
+        emoji_sequence: extract_emojis(&text),
+        text,
+        langs: partial.langs,
+        extras_json: partial.extras_json,
+    }
 }
 
 /// Current vertical-slice normalizer identity.
@@ -383,12 +479,18 @@ pub struct StreamingArchiveSink {
     min_created_at_normalized: Option<String>,
     max_created_at_normalized: Option<String>,
     normalizer: NormalizerVersion,
+    did: String,
+    hash_prefix: Vec<u8>,
+    hash_after_cid: Vec<u8>,
+    hash_public_none: Vec<u8>,
     emoji_file: File,
 }
 
 /// Summary fields needed to finish a streaming repo receipt.
 #[derive(Debug, Clone)]
 pub struct StreamingReceiptInput {
+    pub fetch_method: FetchMethod,
+    pub completeness_class: CompletenessClass,
     pub reachable_records_count: u64,
     pub reachable_post_records_count: u64,
     pub post_decode_error_count: u64,
@@ -418,11 +520,17 @@ impl StreamingArchiveSink {
         let parquet_file = File::create(&parquet_temp_path)?;
         let emoji_file = File::create(&emoji_projection_temp_path)?;
         let schema = archive_schema();
+        let normalizer = current_normalizer();
         let writer = ArrowWriter::try_new(
             parquet_file,
             Arc::clone(&schema),
             Some(parquet_writer_properties()?),
         )?;
+        let hash_prefix = framed_fields([POST_COLLECTION, did])?;
+        let mut hash_after_cid = Vec::new();
+        append_normalizer_frames(&mut hash_after_cid, &normalizer)?;
+        append_hash_field_frame(&mut hash_after_cid, "none")?;
+        let hash_public_none = framed_fields(["none"])?;
         Ok(Self {
             output_dir: output_dir.to_path_buf(),
             artifact_stem,
@@ -444,7 +552,11 @@ impl StreamingArchiveSink {
             emoji_rows: 0,
             min_created_at_normalized: None,
             max_created_at_normalized: None,
-            normalizer: current_normalizer(),
+            normalizer,
+            did: did.to_owned(),
+            hash_prefix,
+            hash_after_cid,
+            hash_public_none,
             emoji_file,
         })
     }
@@ -461,7 +573,7 @@ impl StreamingArchiveSink {
     ///
     /// Returns [`ArchiveError`] if hashing, JSONL writing, or `Parquet` batch writing fails.
     pub fn push_row(&mut self, row: ArchivePostRow) -> Result<(), ArchiveError> {
-        hash_post_row_into(&mut self.rows_hash, &row)?;
+        self.hash_streaming_row(&row)?;
         self.archived_post_rows_count =
             self.archived_post_rows_count
                 .checked_add(1)
@@ -492,25 +604,50 @@ impl StreamingArchiveSink {
             &mut self.max_created_at_normalized,
             row.created_at_normalized.as_deref(),
         );
-        for projection_row in emoji_projection_rows(&row)? {
-            hash_field(
-                &mut self.emoji_projection_hash,
-                &json_string(&projection_row)?,
-            )?;
-            serde_json::to_writer(&mut self.emoji_file, &projection_row)?;
-            self.emoji_file.write_all(b"\n")?;
-            self.emoji_rows =
-                self.emoji_rows
-                    .checked_add(1)
-                    .ok_or(ArchiveError::CountOverflow {
-                        field: "emoji_rows",
-                    })?;
+        if !row.emoji_sequence.is_empty() {
+            for projection_row in emoji_projection_rows(&row)? {
+                hash_field(
+                    &mut self.emoji_projection_hash,
+                    &json_string(&projection_row)?,
+                )?;
+                serde_json::to_writer(&mut self.emoji_file, &projection_row)?;
+                self.emoji_file.write_all(b"\n")?;
+                self.emoji_rows =
+                    self.emoji_rows
+                        .checked_add(1)
+                        .ok_or(ArchiveError::CountOverflow {
+                            field: "emoji_rows",
+                        })?;
+            }
         }
         self.batch.push(row);
         if self.batch.len() >= PARQUET_BATCH_ROWS {
             self.flush_batch()?;
         }
         Ok(())
+    }
+
+    fn hash_streaming_row(&mut self, row: &ArchivePostRow) -> Result<(), ArchiveError> {
+        if row.did != self.did
+            || row.normalizer != self.normalizer
+            || row.account_status.is_some()
+            || row.public_content_label.is_some()
+        {
+            return hash_post_row_into(&mut self.rows_hash, row);
+        }
+        self.rows_hash.update(&self.hash_prefix);
+        hash_field(&mut self.rows_hash, &row.rkey)?;
+        hash_field(&mut self.rows_hash, &row.cid)?;
+        self.rows_hash.update(&self.hash_after_cid);
+        hash_optional_field(&mut self.rows_hash, row.record_status.as_deref())?;
+        self.rows_hash.update(&self.hash_public_none);
+        hash_optional_field(&mut self.rows_hash, row.created_at_raw.as_deref())?;
+        hash_optional_field(&mut self.rows_hash, row.created_at_normalized.as_deref())?;
+        hash_field(&mut self.rows_hash, row.created_at_parse_status.as_str())?;
+        hash_field(&mut self.rows_hash, &row.text)?;
+        hash_string_slice(&mut self.rows_hash, &row.langs)?;
+        hash_string_slice(&mut self.rows_hash, &row.emoji_sequence)?;
+        hash_extras_json(&mut self.rows_hash, &row.extras_json)
     }
 
     /// Finish all artifacts and return the receipt plus artifact paths.
@@ -555,8 +692,8 @@ impl StreamingArchiveSink {
     fn build_streaming_receipt(&self, input: StreamingReceiptInput) -> RepoReceipt {
         let post_rows_hash = hex::encode(self.rows_hash.clone().finalize());
         RepoReceipt {
-            fetch_method: FetchMethod::GetRepo,
-            completeness_class: CompletenessClass::SnapshotComplete,
+            fetch_method: input.fetch_method,
+            completeness_class: input.completeness_class,
             reachable_records_count: input.reachable_records_count,
             reachable_post_records_count: input.reachable_post_records_count,
             archived_post_rows_count: self.archived_post_rows_count,
@@ -814,7 +951,7 @@ fn hash_post_row_into(hasher: &mut Sha256, row: &ArchivePostRow) -> Result<(), A
     hash_field(hasher, &row.text)?;
     hash_string_slice(hasher, &row.langs)?;
     hash_string_slice(hasher, &row.emoji_sequence)?;
-    hash_field(hasher, &canonical_json(&row.extras_json)?)
+    hash_extras_json(hasher, &row.extras_json)
 }
 
 /// Hash a profile sidecar row when Stage C extracted one.
@@ -886,7 +1023,7 @@ fn archive_schema() -> Arc<Schema> {
 fn parquet_writer_properties() -> Result<WriterProperties, ArchiveError> {
     Ok(WriterProperties::builder()
         .set_compression(Compression::ZSTD(
-            ZstdLevel::try_new(3)
+            ZstdLevel::try_new(1)
                 .map_err(|error| ArchiveError::InvalidCompression(error.to_string()))?,
         ))
         .build())
@@ -923,9 +1060,12 @@ fn post_record_batch(
                     .map(|row| Some(row.created_at_parse_status.as_str())),
             ),
             string_array(rows.iter().map(|row| Some(row.text.as_str()))),
-            owned_string_array(rows.iter().map(|row| json_string(&row.langs)))?,
-            owned_string_array(rows.iter().map(|row| json_string(&row.emoji_sequence)))?,
-            owned_string_array(rows.iter().map(|row| canonical_json(&row.extras_json)))?,
+            owned_string_array(rows.iter().map(|row| json_string_slice(&row.langs)))?,
+            owned_string_array(
+                rows.iter()
+                    .map(|row| json_string_slice(&row.emoji_sequence)),
+            )?,
+            owned_string_array(rows.iter().map(|row| extras_json_string(&row.extras_json)))?,
         ],
     )?)
 }
@@ -1247,6 +1387,20 @@ fn json_string<T: Serialize>(value: &T) -> Result<String, ArchiveError> {
     Ok(serde_json::to_string(value)?)
 }
 
+fn json_string_slice(value: &[String]) -> Result<String, ArchiveError> {
+    if value.is_empty() {
+        return Ok("[]".to_owned());
+    }
+    json_string(&value)
+}
+
+fn extras_json_string(value: &serde_json::Value) -> Result<String, ArchiveError> {
+    if matches!(value, serde_json::Value::Object(fields) if fields.is_empty()) {
+        return Ok("{}".to_owned());
+    }
+    canonical_json(value)
+}
+
 fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), ArchiveError> {
     let mut file = File::create(path)?;
     serde_json::to_writer_pretty(&mut file, value)?;
@@ -1391,6 +1545,34 @@ fn hash_normalizer(
     hash_field(hasher, &normalizer.emoji_data_version)
 }
 
+fn append_normalizer_frames(
+    target: &mut Vec<u8>,
+    normalizer: &NormalizerVersion,
+) -> Result<(), ArchiveError> {
+    append_hash_field_frame(target, &normalizer.name)?;
+    append_hash_field_frame(target, &normalizer.semver)?;
+    append_hash_field_frame(target, &normalizer.git_rev)?;
+    append_hash_field_frame(target, &normalizer.unicode_version)?;
+    append_hash_field_frame(target, &normalizer.emoji_data_version)
+}
+
+fn framed_fields<const N: usize>(values: [&str; N]) -> Result<Vec<u8>, ArchiveError> {
+    let mut framed = Vec::new();
+    for value in values {
+        append_hash_field_frame(&mut framed, value)?;
+    }
+    Ok(framed)
+}
+
+fn append_hash_field_frame(target: &mut Vec<u8>, value: &str) -> Result<(), ArchiveError> {
+    let len = u64::try_from(value.len()).map_err(|_error| ArchiveError::CountOverflow {
+        field: "hash_field_length",
+    })?;
+    target.extend_from_slice(&len.to_be_bytes());
+    target.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
 fn hash_field(hasher: &mut Sha256, value: &str) -> Result<(), ArchiveError> {
     let len = u64::try_from(value.len()).map_err(|_error| ArchiveError::CountOverflow {
         field: "hash_field_length",
@@ -1400,18 +1582,27 @@ fn hash_field(hasher: &mut Sha256, value: &str) -> Result<(), ArchiveError> {
     Ok(())
 }
 
+fn hash_extras_json(hasher: &mut Sha256, value: &serde_json::Value) -> Result<(), ArchiveError> {
+    if matches!(value, serde_json::Value::Object(fields) if fields.is_empty()) {
+        return hash_field(hasher, "{}");
+    }
+    hash_field(hasher, &canonical_json(value)?)
+}
+
 fn canonical_json(value: &serde_json::Value) -> Result<String, ArchiveError> {
     Ok(serde_json::to_string(value)?)
 }
 
-fn record_extras_json(post: &PostRecord) -> Result<serde_json::Value, ArchiveError> {
+fn record_extras_json(
+    record: &jacquard_api::app_bsky::feed::post::Post<smol_str::SmolStr>,
+) -> Result<serde_json::Value, ArchiveError> {
     let mut extras = serde_json::Map::new();
-    insert_optional_json(&mut extras, "embed", post.record.embed.as_ref())?;
-    insert_optional_json(&mut extras, "facets", post.record.facets.as_ref())?;
-    insert_optional_json(&mut extras, "labels", post.record.labels.as_ref())?;
-    insert_optional_json(&mut extras, "reply", post.record.reply.as_ref())?;
-    insert_optional_json(&mut extras, "tags", post.record.tags.as_ref())?;
-    insert_extra_data_json(&mut extras, post.record.extra_data.as_ref())?;
+    insert_optional_json(&mut extras, "embed", record.embed.as_ref())?;
+    insert_optional_json(&mut extras, "facets", record.facets.as_ref())?;
+    insert_optional_json(&mut extras, "labels", record.labels.as_ref())?;
+    insert_optional_json(&mut extras, "reply", record.reply.as_ref())?;
+    insert_optional_json(&mut extras, "tags", record.tags.as_ref())?;
+    insert_extra_data_json(&mut extras, record.extra_data.as_ref())?;
     Ok(serde_json::Value::Object(extras))
 }
 
@@ -1869,9 +2060,9 @@ mod tests {
     };
 
     use super::{
-        ArchivePostRow, CreatedAtParseStatus, NormalizerVersion, RepoReceiptInput,
-        StreamingArchiveSink, StreamingReceiptInput, build_repo_receipt, classify_created_at,
-        extract_emojis, hash_post_rows,
+        ArchivePostRow, CompletenessClass, CreatedAtParseStatus, FetchMethod, NormalizerVersion,
+        RepoReceiptInput, StreamingArchiveSink, StreamingReceiptInput, build_repo_receipt,
+        classify_created_at, extract_emojis, hash_post_rows,
     };
 
     fn normalizer() -> NormalizerVersion {
@@ -1985,6 +2176,8 @@ mod tests {
         let (_receipt, artifacts) = sink
             .finish(
                 StreamingReceiptInput {
+                    fetch_method: FetchMethod::GetRepo,
+                    completeness_class: CompletenessClass::SnapshotComplete,
                     reachable_records_count: 1,
                     reachable_post_records_count: 1,
                     post_decode_error_count: 0,

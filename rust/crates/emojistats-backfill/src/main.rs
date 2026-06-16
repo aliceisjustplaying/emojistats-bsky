@@ -17,9 +17,9 @@ use std::{
 use clap::{Parser, Subcommand};
 use emojistats_backfill::{
     archive::{
-        ArchiveError, ArchivePostRowsHasher, EmojiProjectionRow, StreamingArchiveSink,
-        StreamingReceiptInput, archive_post_rows_from_record_batch, archive_row_from_post,
-        hash_profile_record,
+        ArchiveError, ArchivePostRowsHasher, CompletenessClass, EmojiProjectionRow, FetchMethod,
+        StreamingArchiveSink, StreamingReceiptInput, archive_post_rows_from_record_batch,
+        archive_row_from_owned_post, hash_profile_record,
     },
     clickhouse::{
         ClickHouseClientConfig, ClickHouseInsertPayload, create_schema_sql,
@@ -35,10 +35,13 @@ use emojistats_backfill::{
         RepoLedgerEntry, RepoLedgerStatus, RetryPolicy, ShardFilter, SqliteLedger, claim_repo,
         complete_attempt,
     },
+    list_records::{ListRecordsConfig, ListRecordsError, fetch_and_archive_list_records},
     manifest_derive::{
         VerifiedLoaderInput, read_committed_jsonl, verify_loader_input_for_streaming,
     },
-    parse::{ParseConfig, ParseError, ParseVisitError, parse_repo_for_did_with_state},
+    parse::{
+        ParseConfig, ParseError, ParseVisitError, PostRecordBody, parse_repo_for_did_with_state,
+    },
     scheduler::{ClaimScope, HostPacer, SchedulerError, SharedHostPacer, checked_concurrency},
     transport::{FetchByteBudget, FetchConfig, FetchError, fetch_repo},
 };
@@ -78,6 +81,19 @@ enum Command {
         /// Directory for local archive artifacts.
         #[arg(long, default_value = "data/archive")]
         archive_dir: PathBuf,
+    },
+    /// Parse and archive an existing `CAR` without fetching it.
+    ProfileCar {
+        /// The DID expected in the repo commit.
+        did: String,
+        /// Existing `CAR` path.
+        car_path: PathBuf,
+        /// Directory for local archive artifacts.
+        #[arg(long, default_value = "data/profile-archive")]
+        archive_dir: PathBuf,
+        /// Parse and count posts without writing archive artifacts.
+        #[arg(long)]
+        parse_only: bool,
     },
     /// Seed, claim, and process repos from a newline-delimited DID file.
     RunFleet {
@@ -155,6 +171,12 @@ async fn main() -> anyhow::Result<()> {
             max_bytes,
             archive_dir,
         } => fetch_one(&did, spool_dir, max_bytes, archive_dir).await,
+        Command::ProfileCar {
+            did,
+            car_path,
+            archive_dir,
+            parse_only,
+        } => profile_car(&did, &car_path, &archive_dir, parse_only),
         Command::RunFleet {
             dids_file,
             ledger_path,
@@ -214,6 +236,100 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+fn profile_car(
+    did: &str,
+    car_path: &Path,
+    archive_dir: &Path,
+    parse_only: bool,
+) -> anyhow::Result<()> {
+    if parse_only {
+        return profile_car_parse_only(did, car_path);
+    }
+    let started = Instant::now();
+    let processed =
+        parse_and_archive_spooled_repo(did, car_path, archive_dir).map_err(|failure| {
+            anyhow::anyhow!(
+                "profile-car failed with {}: {}",
+                outcome_name(&failure.outcome),
+                failure.error
+            )
+        })?;
+    println!(
+        "profile-car parsed {} records, {} posts, {} decode errors, {} emoji rows",
+        processed.records, processed.archived_posts, processed.decode_errors, processed.emoji_rows
+    );
+    println!(
+        "timings total={}ms parse={}ms index={}ms commit={}ms walk={}ms archive={}ms rss_kb={}",
+        elapsed_ms(started),
+        processed.parse_ms,
+        processed.parse_index_ms,
+        processed.parse_commit_ms,
+        processed.parse_walk_ms,
+        processed.archive_ms,
+        current_rss_kb().unwrap_or_default()
+    );
+    println!(
+        "wrote archive {}, receipt {}, manifest {}, emoji projection {}",
+        processed.parquet_path.display(),
+        processed.receipt_path.display(),
+        processed.manifest_path.display(),
+        processed.emoji_projection_path.display()
+    );
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct ParseOnlyCounters {
+    posts: u64,
+    raw_partial_posts: u64,
+}
+
+fn profile_car_parse_only(did: &str, car_path: &Path) -> anyhow::Result<()> {
+    let started = Instant::now();
+    let (summary, counters) = parse_repo_for_did_with_state(
+        car_path,
+        did,
+        ParseConfig::default(),
+        ParseOnlyCounters::default(),
+        |state, post| {
+            state.posts = state
+                .posts
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("profile parse-only post counter overflow"))?;
+            if matches!(
+                post.body,
+                PostRecordBody::RawPartial(record) if record.typed_decode_failed
+            ) {
+                state.raw_partial_posts =
+                    state.raw_partial_posts.checked_add(1).ok_or_else(|| {
+                        anyhow::anyhow!("profile parse-only partial post counter overflow")
+                    })?;
+            }
+            Ok::<(), anyhow::Error>(())
+        },
+    )
+    .map_err(|error| match error {
+        ParseVisitError::Parse(error) => anyhow::anyhow!("profile parse-only failed: {error}"),
+        ParseVisitError::Visit(error) => error,
+    })?;
+    println!(
+        "profile-car parse-only parsed {} records, {} posts, {} raw partial posts, {} decode errors",
+        summary.rkey_digest.all_records_count,
+        counters.posts,
+        counters.raw_partial_posts,
+        summary.post_decode_error_count
+    );
+    println!(
+        "timings total={}ms index={}ms commit={}ms walk={}ms rss_kb={}",
+        elapsed_ms(started),
+        summary.timings.index_ms,
+        summary.timings.commit_ms,
+        summary.timings.walk_ms,
+        current_rss_kb().unwrap_or_default()
+    );
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -981,31 +1097,20 @@ async fn fetch_one_attempt_with_pacer(
     fetch_config.max_bytes = config.max_bytes;
     fetch_config.byte_budget = config.byte_budget;
 
-    let fetched = fetch_spooled_repo(FetchStep {
-        http: &http,
-        pds: &pds,
-        did: &did,
-        did_str,
-        host: host.as_str(),
-        config: &fetch_config,
-        host_pacer: config.host_pacer.as_ref(),
-        attempt_started,
-    })
-    .await?;
-    println!(
-        "spooled {} bytes from HTTP {} to {}",
-        fetched.spooled.bytes,
-        fetched.spooled.http_status,
-        fetched.spooled.car_path.display()
-    );
-
-    let processed = parse_archive_or_emit_failure(
-        did_str,
-        host.as_str(),
-        &fetched,
-        &config.archive_dir,
-        config.parse_permits.as_ref(),
-        attempt_started,
+    let processed = fetch_prepared_repo(
+        FetchModeStep {
+            http: &http,
+            pds: &pds,
+            did: &did,
+            did_str,
+            host: host.as_str(),
+            fetch_config: &fetch_config,
+            archive_dir: &config.archive_dir,
+            host_pacer: config.host_pacer.as_ref(),
+            parse_permits: config.parse_permits.as_ref(),
+            attempt_started,
+        },
+        prepared_host.fetch_mode,
     )
     .await?;
     println!(
@@ -1030,10 +1135,10 @@ async fn fetch_one_attempt_with_pacer(
         outcome: "succeeded",
         stage: "complete",
         elapsed_ms: elapsed_ms(attempt_started),
-        fetch_ms: Some(fetched.fetch_ms),
+        fetch_ms: processed.fetch_ms,
         parse_ms: Some(processed.parse_ms),
         archive_ms: Some(processed.archive_ms),
-        bytes: Some(fetched.spooled.bytes),
+        bytes: processed.bytes,
         records: Some(processed.records),
         archived_posts: Some(processed.archived_posts),
         decode_errors: Some(processed.decode_errors),
@@ -1062,6 +1167,75 @@ async fn acquire_host_fetch_permit(
         .await
 }
 
+struct FetchModeStep<'a> {
+    http: &'a reqwest::Client,
+    pds: &'a Uri<String>,
+    did: &'a Did,
+    did_str: &'a str,
+    host: &'a str,
+    fetch_config: &'a FetchConfig,
+    archive_dir: &'a Path,
+    host_pacer: Option<&'a SharedHostPacer>,
+    parse_permits: Option<&'a Arc<Semaphore>>,
+    attempt_started: Instant,
+}
+
+async fn fetch_prepared_repo(
+    step: FetchModeStep<'_>,
+    fetch_mode: ForcedFetchMode,
+) -> Result<ProcessedRepo, FetchOneFailure> {
+    match fetch_mode {
+        ForcedFetchMode::GetRepo => fetch_get_repo_and_archive(step).await,
+        ForcedFetchMode::ListRecords => {
+            fetch_archive_list_records_or_emit_failure(ListRecordsStep {
+                http: step.http,
+                pds: step.pds,
+                did: step.did,
+                did_str: step.did_str,
+                host: step.host,
+                archive_dir: step.archive_dir,
+                host_pacer: step.host_pacer,
+                attempt_started: step.attempt_started,
+            })
+            .await
+        }
+    }
+}
+
+async fn fetch_get_repo_and_archive(
+    step: FetchModeStep<'_>,
+) -> Result<ProcessedRepo, FetchOneFailure> {
+    let fetched = fetch_spooled_repo(FetchStep {
+        http: step.http,
+        pds: step.pds,
+        did: step.did,
+        did_str: step.did_str,
+        host: step.host,
+        config: step.fetch_config,
+        host_pacer: step.host_pacer,
+        attempt_started: step.attempt_started,
+    })
+    .await?;
+    println!(
+        "spooled {} bytes from HTTP {} to {}",
+        fetched.spooled.bytes,
+        fetched.spooled.http_status,
+        fetched.spooled.car_path.display()
+    );
+    let mut processed = parse_archive_or_emit_failure(
+        step.did_str,
+        step.host,
+        &fetched,
+        step.archive_dir,
+        step.parse_permits,
+        step.attempt_started,
+    )
+    .await?;
+    processed.fetch_ms = Some(fetched.fetch_ms);
+    processed.bytes = Some(fetched.spooled.bytes);
+    Ok(processed)
+}
+
 struct FetchStep<'a> {
     http: &'a reqwest::Client,
     pds: &'a Uri<String>,
@@ -1084,6 +1258,12 @@ async fn fetch_spooled_repo(step: FetchStep<'_>) -> Result<FetchedRepo, FetchOne
     loop {
         match fetch_repo(step.http, step.pds, step.did, step.config).await {
             Ok(spooled) => {
+                record_rate_limit_snapshot(
+                    step.host_pacer,
+                    step.host,
+                    &spooled.rate_limit,
+                    SystemTime::now(),
+                );
                 return Ok(FetchedRepo {
                     spooled,
                     fetch_ms: elapsed_ms(fetch_started),
@@ -1152,6 +1332,19 @@ fn record_rate_limit_cooldown(
         && let Err(pacer_error) = HostPacer::record_retry_after(pacer, host, *retry_after)
     {
         eprintln!("failed to record host cooldown for {host}: {pacer_error}");
+    }
+}
+
+fn record_rate_limit_snapshot(
+    host_pacer: Option<&SharedHostPacer>,
+    host: &str,
+    rate_limit: &emojistats_backfill::transport::RateLimitSnapshot,
+    observed_at: SystemTime,
+) {
+    if let Some(pacer) = host_pacer
+        && let Err(pacer_error) = HostPacer::record_rate_limit(pacer, host, rate_limit, observed_at)
+    {
+        eprintln!("failed to record host rate-limit snapshot for {host}: {pacer_error}");
     }
 }
 
@@ -1266,13 +1459,169 @@ struct ProcessedRepo {
     archived_posts: u64,
     decode_errors: u64,
     emoji_rows: u64,
+    fetch_ms: Option<u64>,
+    bytes: Option<u64>,
     receipt_hash: String,
     parquet_path: PathBuf,
     receipt_path: PathBuf,
     manifest_path: PathBuf,
     emoji_projection_path: PathBuf,
     parse_ms: u64,
+    parse_index_ms: u64,
+    parse_commit_ms: u64,
+    parse_walk_ms: u64,
     archive_ms: u64,
+}
+
+struct ListRecordsStep<'a> {
+    http: &'a reqwest::Client,
+    pds: &'a Uri<String>,
+    did: &'a Did,
+    did_str: &'a str,
+    host: &'a str,
+    archive_dir: &'a Path,
+    host_pacer: Option<&'a SharedHostPacer>,
+    attempt_started: Instant,
+}
+
+async fn fetch_archive_list_records_or_emit_failure(
+    step: ListRecordsStep<'_>,
+) -> Result<ProcessedRepo, FetchOneFailure> {
+    let fetch_started = Instant::now();
+    emit_list_records_running(&step);
+    match fetch_and_archive_list_records(
+        step.http,
+        step.pds,
+        step.did,
+        step.did_str,
+        step.archive_dir,
+        ListRecordsConfig::default(),
+    )
+    .await
+    {
+        Ok(output) => {
+            for rate_limit in &output.rate_limits {
+                record_rate_limit_snapshot(
+                    step.host_pacer,
+                    step.host,
+                    rate_limit,
+                    SystemTime::now(),
+                );
+            }
+            let processed = ProcessedRepo {
+                records: output.records,
+                archived_posts: output.archived_posts,
+                decode_errors: output.decode_errors,
+                emoji_rows: output.artifacts.emoji_rows,
+                fetch_ms: Some(elapsed_ms(fetch_started)),
+                bytes: None,
+                receipt_hash: output.receipt.post_rows_hash,
+                parquet_path: output.artifacts.parquet_path,
+                receipt_path: output.artifacts.receipt_path,
+                manifest_path: output.artifacts.manifest_path,
+                emoji_projection_path: output.artifacts.emoji_projection_path,
+                parse_ms: 0,
+                parse_index_ms: 0,
+                parse_commit_ms: 0,
+                parse_walk_ms: 0,
+                archive_ms: elapsed_ms(fetch_started),
+            };
+            emit_list_records_success(&step, &processed, fetch_started);
+            Ok(processed)
+        }
+        Err(error) => {
+            if let Some(rate_limit) = error.rate_limit() {
+                record_rate_limit_snapshot(
+                    step.host_pacer,
+                    step.host,
+                    rate_limit,
+                    SystemTime::now(),
+                );
+            }
+            let failure = classify_list_records_error(step.did_str, &error);
+            emit_list_records_failure(&step, &failure, fetch_started);
+            record_rate_limit_cooldown(step.host_pacer, step.host, &failure);
+            Err(failure)
+        }
+    }
+}
+
+fn emit_list_records_running(step: &ListRecordsStep<'_>) {
+    emit_smoke_telemetry(&SmokeTelemetry {
+        event: "smoke_repo_attempt",
+        did: step.did_str,
+        host: Some(step.host),
+        outcome: "running",
+        stage: "list_records_fetch",
+        elapsed_ms: elapsed_ms(step.attempt_started),
+        fetch_ms: None,
+        parse_ms: None,
+        archive_ms: None,
+        bytes: None,
+        records: None,
+        archived_posts: None,
+        decode_errors: None,
+        emoji_rows: None,
+        rss_kb: current_rss_kb(),
+        error: None,
+    });
+}
+
+fn emit_list_records_success(
+    step: &ListRecordsStep<'_>,
+    processed: &ProcessedRepo,
+    fetch_started: Instant,
+) {
+    emit_smoke_telemetry(&SmokeTelemetry {
+        event: "smoke_repo_attempt",
+        did: step.did_str,
+        host: Some(step.host),
+        outcome: "running",
+        stage: "list_records_archive_done",
+        elapsed_ms: elapsed_ms(step.attempt_started),
+        fetch_ms: Some(elapsed_ms(fetch_started)),
+        parse_ms: Some(processed.parse_ms),
+        archive_ms: Some(processed.archive_ms),
+        bytes: None,
+        records: Some(processed.records),
+        archived_posts: Some(processed.archived_posts),
+        decode_errors: Some(processed.decode_errors),
+        emoji_rows: Some(processed.emoji_rows),
+        rss_kb: current_rss_kb(),
+        error: None,
+    });
+}
+
+fn emit_list_records_failure(
+    step: &ListRecordsStep<'_>,
+    failure: &FetchOneFailure,
+    fetch_started: Instant,
+) {
+    emit_smoke_telemetry(&SmokeTelemetry {
+        event: "smoke_repo_attempt",
+        did: step.did_str,
+        host: Some(step.host),
+        outcome: outcome_name(&failure.outcome),
+        stage: "list_records_fetch",
+        elapsed_ms: elapsed_ms(step.attempt_started),
+        fetch_ms: Some(elapsed_ms(fetch_started)),
+        parse_ms: None,
+        archive_ms: None,
+        bytes: None,
+        records: None,
+        archived_posts: None,
+        decode_errors: None,
+        emoji_rows: None,
+        rss_kb: current_rss_kb(),
+        error: Some(failure.error.to_string()),
+    });
+}
+
+struct ArchiveRunState {
+    sink: StreamingArchiveSink,
+    archive_row_ns: u128,
+    sink_push_ns: u128,
+    profiled_posts: u64,
 }
 
 fn parse_and_archive_spooled_repo(
@@ -1284,16 +1633,39 @@ fn parse_and_archive_spooled_repo(
     let sink = StreamingArchiveSink::new(archive_dir, did_str).map_err(|err| {
         classify_archive_error(&format!("open streaming archive sink for {did_str}"), &err)
     })?;
+
     let normalizer = sink.normalizer().clone();
     let did = did_str.to_owned();
-    let (parsed, sink) = parse_repo_for_did_with_state(
+    let profile_stages = std::env::var_os("EMOJISTATS_PROFILE_STAGES").is_some();
+    let state = ArchiveRunState {
+        sink,
+        archive_row_ns: 0,
+        sink_push_ns: 0,
+        profiled_posts: 0,
+    };
+    let (parsed, state) = parse_repo_for_did_with_state(
         car_path,
         did_str,
         ParseConfig::default(),
-        sink,
-        move |sink, post| {
-            let row = archive_row_from_post(&did, &post, &normalizer)?;
-            sink.push_row(row)
+        state,
+        move |state, post| {
+            if profile_stages {
+                let archive_row_started = Instant::now();
+                let row = archive_row_from_owned_post(&did, post, &normalizer)?;
+                state.archive_row_ns = state
+                    .archive_row_ns
+                    .saturating_add(archive_row_started.elapsed().as_nanos());
+                let sink_push_started = Instant::now();
+                let result = state.sink.push_row(row);
+                state.sink_push_ns = state
+                    .sink_push_ns
+                    .saturating_add(sink_push_started.elapsed().as_nanos());
+                state.profiled_posts = state.profiled_posts.saturating_add(1);
+                result
+            } else {
+                let row = archive_row_from_owned_post(&did, post, &normalizer)?;
+                state.sink.push_row(row)
+            }
         },
     )
     .map_err(|err| match err {
@@ -1303,12 +1675,23 @@ fn parse_and_archive_spooled_repo(
         }
     })?;
     let parse_ms = elapsed_ms(parse_started);
+    if profile_stages {
+        eprintln!(
+            "stage_profile posts={} archive_row_ms={} sink_push_ms={}",
+            state.profiled_posts,
+            state.archive_row_ns / 1_000_000,
+            state.sink_push_ns / 1_000_000
+        );
+    }
+    let sink = state.sink;
     let archive_started = Instant::now();
     let profile_row_hash = hash_profile_record(parsed.profile.as_ref())
         .map_err(|err| classify_archive_error(&format!("hash profile row for {did_str}"), &err))?;
     let (receipt, artifacts) = sink
         .finish(
             StreamingReceiptInput {
+                fetch_method: FetchMethod::GetRepo,
+                completeness_class: CompletenessClass::SnapshotComplete,
                 reachable_records_count: parsed.rkey_digest.all_records_count,
                 reachable_post_records_count: parsed.rkey_digest.post_records_count,
                 post_decode_error_count: parsed.post_decode_error_count,
@@ -1326,12 +1709,17 @@ fn parse_and_archive_spooled_repo(
         archived_posts: receipt.archived_post_rows_count,
         decode_errors: parsed.record_decode_error_count,
         emoji_rows: artifacts.emoji_rows,
+        fetch_ms: None,
+        bytes: None,
         receipt_hash: receipt.post_rows_hash,
         parquet_path: artifacts.parquet_path,
         receipt_path: artifacts.receipt_path,
         manifest_path: artifacts.manifest_path,
         emoji_projection_path: artifacts.emoji_projection_path,
         parse_ms,
+        parse_index_ms: parsed.timings.index_ms,
+        parse_commit_ms: parsed.timings.commit_ms,
+        parse_walk_ms: parsed.timings.walk_ms,
         archive_ms: elapsed_ms(archive_started),
     })
 }
@@ -1402,11 +1790,6 @@ async fn prepare_fetch_host(
     let host = pds_host_key(pds);
     let host_override = load_host_override(host_override_ledger_path, &host)?;
     let fetch_mode = fetch_mode_for_host(&host, host_override.as_ref(), SystemTime::now())?;
-    if fetch_mode == ForcedFetchMode::ListRecords {
-        return Err(retryable_failure(format!(
-            "host {host} is forced to list_records, but listRecords fetch is not implemented"
-        )));
-    }
     if let Some(pacer) = host_pacer {
         HostPacer::wait_until_ready(pacer, &host)
             .await
@@ -1415,6 +1798,7 @@ async fn prepare_fetch_host(
     Ok(PreparedFetchHost {
         host,
         host_override,
+        fetch_mode,
     })
 }
 
@@ -1422,6 +1806,7 @@ async fn prepare_fetch_host(
 struct PreparedFetchHost {
     host: String,
     host_override: Option<HostOverride>,
+    fetch_mode: ForcedFetchMode,
 }
 
 fn pds_host_key(pds: &Uri<String>) -> String {
@@ -1506,6 +1891,48 @@ fn classify_fetch_error(did: &str, error: &FetchError) -> FetchOneFailure {
             message: message.clone(),
         },
         FetchError::HttpStatus { .. } => AttemptOutcome::PermanentFailure {
+            message: message.clone(),
+        },
+    };
+    FetchOneFailure {
+        outcome,
+        error: anyhow::anyhow!(message),
+    }
+}
+
+fn classify_list_records_error(did: &str, error: &ListRecordsError) -> FetchOneFailure {
+    let message = format!("fetch listRecords for {did}: {error}");
+    let outcome = match error {
+        ListRecordsError::AccountState { state, .. } => AttemptOutcome::AccountState(*state),
+        ListRecordsError::HttpStatus { status, .. }
+            if *status == 429
+                && error
+                    .rate_limit()
+                    .and_then(|limit| limit.retry_after)
+                    .is_some() =>
+        {
+            AttemptOutcome::RateLimited {
+                retry_after: error
+                    .rate_limit()
+                    .and_then(|limit| limit.retry_after)
+                    .unwrap_or(Duration::ZERO),
+            }
+        }
+        ListRecordsError::HttpStatus { .. } if error.is_retryable() => {
+            AttemptOutcome::RetryableFailure {
+                message: message.clone(),
+            }
+        }
+        ListRecordsError::Transport(_) => AttemptOutcome::RetryableFailure {
+            message: message.clone(),
+        },
+        ListRecordsError::ResourceLimitExceeded { .. } => AttemptOutcome::ResourceLimitExceeded {
+            message: message.clone(),
+        },
+        ListRecordsError::HttpStatus { .. }
+        | ListRecordsError::PageJson(_)
+        | ListRecordsError::Archive(_)
+        | ListRecordsError::Protocol(_) => AttemptOutcome::PermanentFailure {
             message: message.clone(),
         },
     };
@@ -1624,7 +2051,7 @@ mod tests {
     use super::{
         Cli, Command, HostConcurrencyLimiter, SeedSummary, claim_batch_limit,
         claimable_entries_for_scope, fetch_mode_for_host, load_host_override, pds_host_key,
-        recover_stale_claimed_entries, seed_ledger_from_file,
+        prepare_fetch_host, recover_stale_claimed_entries, seed_ledger_from_file,
     };
 
     #[test]
@@ -1973,6 +2400,36 @@ mod tests {
         let loaded = load_host_override(Some(&db_path), &host).unwrap();
 
         assert_eq!(loaded, Some(override_record));
+        fs::remove_file(db_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn forced_list_records_host_preparation_is_allowed() {
+        let db_path = temp_file_path("host-overrides-list-records").with_extension("sqlite");
+        let store = SqliteLedger::open(&db_path).unwrap();
+        store
+            .upsert_host_override(&HostOverride {
+                host: "pds.example.com".to_owned(),
+                disabled: false,
+                concurrency_cap: None,
+                revive_after: None,
+                force_mode: Some(ForcedFetchMode::ListRecords),
+            })
+            .unwrap();
+        drop(store);
+        let pds = Uri::parse("https://pds.example.com").unwrap().to_owned();
+
+        let prepared = prepare_fetch_host(
+            "did:plc:target",
+            &pds,
+            &ClaimScope::default(),
+            Some(&db_path),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(prepared.fetch_mode, ForcedFetchMode::ListRecords);
         fs::remove_file(db_path).unwrap();
     }
 
