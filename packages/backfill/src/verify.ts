@@ -58,7 +58,7 @@ import { createWriteStream, existsSync } from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 
-import { parse as parseTid } from '@atcute/tid';
+import { createRaw as createTidRaw, parse as parseTid } from '@atcute/tid';
 import type { ClickHouseClient, ClickHouseSettings } from '@clickhouse/client';
 import Database from 'better-sqlite3';
 import type { PostRow } from 'ingest/types';
@@ -138,6 +138,7 @@ interface VerifyExpectedInsertRow {
   status: string;
   expected_posts: number;
   expected_digest: string;
+  loaded_at_cutoff_rkey: string;
   pds_host: string;
   rev: string | null;
 }
@@ -221,6 +222,10 @@ function verifyQueryParams() {
   return { run_id: VERIFY_RUN_ID, shard: VERIFY_SHARD };
 }
 
+function loadedAtCutoffRkey(loadedAt: number | null): string {
+  return loadedAt === null ? '' : createTidRaw(loadedAt * 1000, 1023);
+}
+
 async function ensureExpectedTable(ch: ClickHouseClient): Promise<void> {
   await ch.command({
     query: `
@@ -232,12 +237,19 @@ async function ensureExpectedTable(ch: ClickHouseClient): Promise<void> {
         status          LowCardinality(String),
         expected_posts  UInt64,
         expected_digest String,
+        loaded_at_cutoff_rkey String DEFAULT '',
         pds_host        String CODEC(ZSTD(1)),
         rev             Nullable(String)
       ) ENGINE = MergeTree
       PARTITION BY toYYYYMM(inserted_at)
       ORDER BY (run_id, shard, did)
       TTL inserted_at + INTERVAL 7 DAY DELETE
+    `,
+  });
+  await ch.command({
+    query: `
+      ALTER TABLE ${VERIFY_EXPECTED_TABLE}
+      ADD COLUMN IF NOT EXISTS loaded_at_cutoff_rkey String DEFAULT ''
     `,
   });
 }
@@ -366,6 +378,7 @@ async function stageExpectedRepos(
       expected_posts: repo.posts_total ?? 0,
       expected_digest:
         repo.rkey_digest === null ? '' : normalizeDigestHex(repo.rkey_digest),
+      loaded_at_cutoff_rkey: loadedAtCutoffRkey(repo.loaded_at),
       pds_host: repo.pds_host,
       rev: repo.rev,
     });
@@ -398,7 +411,14 @@ function classifiedSql(selectSql: string): string {
   return `
     WITH
       expected AS (
-        SELECT did, status, expected_posts, expected_digest, pds_host, rev
+        SELECT
+          did,
+          status,
+          expected_posts,
+          expected_digest,
+          loaded_at_cutoff_rkey,
+          pds_host,
+          rev
         FROM ${VERIFY_EXPECTED_TABLE}
         WHERE run_id = {run_id:String} AND shard = {shard:String}
       ),
@@ -409,10 +429,13 @@ function classifiedSql(selectSql: string): string {
           leftPad(lower(hex(${CH_RKEY_DIGEST_EXPR})), 16, '0') AS actual_digest
         FROM
         (
-          SELECT did, rkey
-          FROM posts
-          WHERE did IN (SELECT did FROM expected)
-          GROUP BY did, rkey
+          SELECT p.did, p.rkey
+          FROM posts AS p
+          INNER JOIN expected AS e USING did
+          WHERE
+            e.loaded_at_cutoff_rkey = ''
+            OR p.rkey <= e.loaded_at_cutoff_rkey
+          GROUP BY p.did, p.rkey
         )
         GROUP BY did
       ),
