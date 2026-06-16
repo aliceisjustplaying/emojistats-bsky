@@ -64,10 +64,15 @@ import Database from 'better-sqlite3';
 import type { PostRow } from 'ingest/types';
 
 import { createClickHouseClient, pingClickHouse } from './clickhouse.js';
-import { LEDGER_DB_PATH } from './config.js';
+import { LEDGER_DB_PATH, PLC_DIRECTORY_URL, USER_AGENT } from './config.js';
 import { CH_RKEY_DIGEST_EXPR, normalizeDigestHex } from './digest.js';
 import { repoPostRows } from './extract.js';
-import { fetchRepoCar } from './fetcher.js';
+import {
+  fetchRepoCar,
+  pdsHostFromEndpoint,
+  RetryableError,
+  TerminalFetchError,
+} from './fetcher.js';
 import logger from './logger.js';
 import { parseRepoCar } from './parser.js';
 import type { RepoStatus } from './types.js';
@@ -188,6 +193,10 @@ const VERIFY_MAX_MEMORY_USAGE_BYTES = positiveIntEnv(
 const VERIFY_SAMPLE_CONCURRENCY = positiveIntEnv(
   'VERIFY_SAMPLE_CONCURRENCY',
   1,
+);
+const VERIFY_SAMPLE_REFETCH_ATTEMPTS = positiveIntEnv(
+  'VERIFY_SAMPLE_REFETCH_ATTEMPTS',
+  5,
 );
 const VERIFY_QUERY_SETTINGS: ClickHouseSettings = {
   send_progress_in_http_headers: 0,
@@ -921,6 +930,89 @@ const refetchPostRows: RefetchPostRows = async (did, pdsHost) => {
   return rows;
 };
 
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function resolveCurrentPdsHost(
+  did: string,
+): Promise<string | 'tombstoned' | null> {
+  try {
+    const res = await fetch(`${PLC_DIRECTORY_URL}/${encodeURIComponent(did)}`, {
+      headers: { 'user-agent': USER_AGENT },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (res.status === 410) return 'tombstoned';
+    if (!res.ok) return null;
+    const doc = (await res.json()) as {
+      service?: Array<{ type?: string; serviceEndpoint?: string }>;
+    };
+    const endpoint = doc.service?.find(
+      (s) => s.type === 'AtprotoPersonalDataServer',
+    )?.serviceEndpoint;
+    if (typeof endpoint !== 'string') return null;
+    return pdsHostFromEndpoint(endpoint) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function refetchSamplePostRows(repo: LedgerRepo): Promise<PostRow[]> {
+  let pdsHost = repo.pds_host;
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await refetchPostRows(repo.did, pdsHost);
+    } catch (err) {
+      if (
+        err instanceof TerminalFetchError &&
+        err.status === 'failed' &&
+        err.message.includes('RepoNotFound')
+      ) {
+        const currentHost = await resolveCurrentPdsHost(repo.did);
+        if (currentHost === 'tombstoned') {
+          throw new Error('PLC tombstone discovered after sample repo loaded');
+        }
+        if (currentHost !== null && currentHost !== pdsHost) {
+          logger.info(
+            { did: repo.did, from: pdsHost, to: currentHost },
+            'sample re-fetch saw stale PDS pointer: following current DID doc',
+          );
+          pdsHost = currentHost;
+          continue;
+        }
+      }
+
+      if (
+        err instanceof RetryableError &&
+        err.transient &&
+        attempt < VERIFY_SAMPLE_REFETCH_ATTEMPTS
+      ) {
+        const delayMs = Math.min(
+          err.retryAfterMs ?? 1000 * 2 ** (attempt - 1),
+          30_000,
+        );
+        logger.warn(
+          {
+            did: repo.did,
+            pdsHost,
+            attempt,
+            nextAttempt: attempt + 1,
+            delayMs,
+            err: err.message,
+          },
+          'sample re-fetch retrying transient failure',
+        );
+        await sleepMs(delayMs);
+        continue;
+      }
+
+      throw err;
+    }
+  }
+}
+
 function rkeyTimestampMs(rkey: string): number | null {
   try {
     return Math.floor(parseTid(rkey).timestamp / 1000);
@@ -945,7 +1037,8 @@ function isPostLoadTerminalRefetchFailure(
   if (repo.loaded_at === null || !(err instanceof Error)) return false;
   return (
     err.message.includes('RepoDeactivated') ||
-    err.message.includes('RepoTakendown')
+    err.message.includes('RepoTakendown') ||
+    err.message.includes('PLC tombstone')
   );
 }
 
@@ -978,14 +1071,19 @@ function pickSample(pool: LedgerRepo[], n: number): LedgerRepo[] {
   return arr.slice(0, n);
 }
 
+interface SampleVerifyResult {
+  checkedDids: string[];
+  failedDids: string[];
+  failures: number;
+}
+
 async function sampleVerifyRepos(
   ch: ClickHouseClient,
   repos: LedgerRepo[],
   pool: string,
   telemetry: VerifyTelemetry,
   base: VerifyProgress,
-): Promise<number> {
-  const refetch = refetchPostRows;
+): Promise<SampleVerifyResult> {
   logger.info(
     { sampled: repos.length, pool, concurrency: VERIFY_SAMPLE_CONCURRENCY },
     'sample verification: re-fetching repos for exact rkey-superset check',
@@ -994,9 +1092,15 @@ async function sampleVerifyRepos(
   let failures = 0;
   let checked = 0;
   let next = 0;
+  const checkedDids: string[] = [];
+  const failedDids = new Set<string>();
+  const markFailure = (repo: LedgerRepo): void => {
+    failures += 1;
+    failedDids.add(repo.did);
+  };
   const checkRepo = async (repo: LedgerRepo): Promise<void> => {
     try {
-      const rows = await refetch(repo.did, repo.pds_host);
+      const rows = await refetchSamplePostRows(repo);
       const fetchedRkeys = new Set(rows.map((row) => row.rkey));
       const comparableFetchedRkeys = new Set<string>();
       const ignoredPostLoadRkeys: string[] = [];
@@ -1069,7 +1173,7 @@ async function sampleVerifyRepos(
             : 'sample repo: ClickHouse is a superset of the fresh CAR',
         );
       } else {
-        failures += 1;
+        markFailure(repo);
         // In the fresh CAR but absent from CH = potential loss; the one benign
         // edge is a post created seconds before sampling that still sits in
         // the live writer's 1s flush buffer — judge a tiny tail by eye.
@@ -1096,7 +1200,7 @@ async function sampleVerifyRepos(
         );
         return;
       }
-      failures += 1;
+      markFailure(repo);
       logger.error(
         {
           did: repo.did,
@@ -1114,6 +1218,7 @@ async function sampleVerifyRepos(
       if (i >= repos.length) return;
       await checkRepo(repos[i]);
       checked += 1;
+      checkedDids.push(repos[i].did);
       await telemetry.record({
         ...base,
         phase: `sampling-${pool}`,
@@ -1129,7 +1234,7 @@ async function sampleVerifyRepos(
     () => worker(),
   );
   await Promise.all(workers);
-  return failures;
+  return { checkedDids, failedDids: [...failedDids], failures };
 }
 
 function* fetchedKeysDiff(a: Set<string>, b: Set<string>): Generator<string> {
@@ -1314,34 +1419,38 @@ async function main(): Promise<void> {
     }
 
     let sampleFailures = 0;
-    if (sampleSize !== null)
-      sampleFailures += await sampleVerifyRepos(
+    let looseSampleResult: SampleVerifyResult | null = null;
+    if (sampleSize !== null) {
+      const randomSampleResult = await sampleVerifyRepos(
         ch,
         selectRandomRepos(db, sampleSize),
         'random',
         telemetry,
         latestProgress,
       );
+      sampleFailures += randomSampleResult.failures;
+    }
     if (sampleLooseSize !== null) {
       if (looseRepos.length === 0)
         logger.info(
           {},
           'no LOOSE repos to directed-sample — reconciliation left nothing ambiguous',
         );
-      else
-        sampleFailures += await sampleVerifyRepos(
+      else {
+        looseSampleResult = await sampleVerifyRepos(
           ch,
           pickSample(looseRepos, sampleLooseSize),
           'loose',
           telemetry,
           latestProgress,
         );
+        sampleFailures += looseSampleResult.failures;
+      }
     }
     if (
       !noReconcile &&
       sampleLooseSize === Number.POSITIVE_INFINITY &&
-      mismatchCount === 0 &&
-      sampleFailures === 0
+      mismatchCount === 0
     ) {
       await telemetry.record(
         {
@@ -1355,14 +1464,22 @@ async function main(): Promise<void> {
       if (promotionStage === null) {
         throw new Error('cannot promote LOOSE repos without reconciliation');
       }
+      const failedLooseDids = new Set(looseSampleResult?.failedDids ?? []);
+      const sampledPassedLooseDids = (
+        looseSampleResult?.checkedDids ?? []
+      ).filter((did) => !failedLooseDids.has(did));
       const promoted = promoteLoadedReposByDid(
         db,
-        await collectPromotableLoadedDids(ch, true),
+        sampledPassedLooseDids,
         promotionStage,
       );
       logger.info(
-        { promotedToVerified: promoted },
-        'exhaustive loose sample passed; promoted remaining loaded repos that classified exact or loose',
+        {
+          promotedToVerified: promoted,
+          sampledPassedLoose: sampledPassedLooseDids.length,
+          sampledFailedLoose: failedLooseDids.size,
+        },
+        'exhaustive loose sample promoted sampled-passed loaded repos; sampled-failed repos remain loaded for recrawl',
       );
     } else if (!noReconcile && sampleLooseSize !== null && loose > 0) {
       logger.warn(
