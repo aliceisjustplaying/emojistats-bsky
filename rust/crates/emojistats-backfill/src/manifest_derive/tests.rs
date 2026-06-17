@@ -8,9 +8,9 @@ use std::{
 };
 
 use super::{
-    DebugFullLoadCaps, Error, ManifestReadItem, debug_load_verified_clickhouse_batch,
-    debug_load_verified_clickhouse_batch_with_caps, read_committed_jsonl, stream_committed_jsonl,
-    verify_loader_input_for_streaming,
+    DebugFullLoadCaps, Error, ManifestReadItem, debug_materialize_clickhouse_batch,
+    debug_materialize_clickhouse_batch_with_caps, debug_read_committed_jsonl,
+    stream_committed_jsonl, verify_loader_input_for_streaming,
 };
 use crate::{
     archive::{
@@ -101,14 +101,14 @@ fn repo_receipt(rows: &[ArchivePostRow]) -> RepoReceipt {
 
 fn read_plan_from_path(path: &Path) -> super::Plan {
     let file = fs::File::open(path).expect("manifest should be readable");
-    read_committed_jsonl(BufReader::new(file)).expect("manifest should parse")
+    debug_read_committed_jsonl(BufReader::new(file)).expect("manifest should parse")
 }
 
 #[test]
 fn parses_jsonl_and_builds_loader_inputs_for_raw_archive_posts() {
     let raw_entry = entry("raw_archive_posts");
     let profile_entry = entry("raw_profile_sidecar");
-    let plan = read_committed_jsonl(Cursor::new(jsonl(&[profile_entry, raw_entry.clone()])))
+    let plan = debug_read_committed_jsonl(Cursor::new(jsonl(&[profile_entry, raw_entry.clone()])))
         .expect("read manifest jsonl");
 
     assert_eq!(plan.inputs.len(), 1);
@@ -125,8 +125,9 @@ fn parses_jsonl_and_builds_loader_inputs_for_raw_archive_posts() {
 #[test]
 fn parses_collection_paginated_posts_as_loader_inputs() {
     let collection_entry = entry("collection_paginated_posts");
-    let plan = read_committed_jsonl(Cursor::new(jsonl(std::slice::from_ref(&collection_entry))))
-        .expect("read manifest jsonl");
+    let plan =
+        debug_read_committed_jsonl(Cursor::new(jsonl(std::slice::from_ref(&collection_entry))))
+            .expect("read manifest jsonl");
 
     assert_eq!(plan.inputs.len(), 1);
     assert!(plan.skipped_entries.is_empty());
@@ -165,7 +166,7 @@ fn streaming_reader_yields_first_item_before_later_parse_error() {
 
 #[test]
 fn skips_non_post_dataset_and_rejects_bad_dataset_field() {
-    let skipped = read_committed_jsonl(Cursor::new(jsonl(&[entry("raw_profile_sidecar")])))
+    let skipped = debug_read_committed_jsonl(Cursor::new(jsonl(&[entry("raw_profile_sidecar")])))
         .expect("read skipped manifest jsonl");
     assert!(skipped.inputs.is_empty());
     assert_eq!(skipped.skipped_entries.len(), 1);
@@ -173,7 +174,7 @@ fn skips_non_post_dataset_and_rejects_bad_dataset_field() {
     let mut bad = entry("");
     bad.object_path = "objects/empty-dataset.parquet".to_owned();
     let error =
-        read_committed_jsonl(Cursor::new(jsonl(&[bad]))).expect_err("empty dataset rejected");
+        debug_read_committed_jsonl(Cursor::new(jsonl(&[bad]))).expect_err("empty dataset rejected");
     assert!(matches!(
         error,
         Error::EmptyField {
@@ -188,7 +189,8 @@ fn rejects_raw_archive_schema_mismatch() {
     let mut bad = entry("raw_archive_posts");
     bad.schema_version = 1;
 
-    let error = read_committed_jsonl(Cursor::new(jsonl(&[bad]))).expect_err("bad schema rejected");
+    let error =
+        debug_read_committed_jsonl(Cursor::new(jsonl(&[bad]))).expect_err("bad schema rejected");
 
     assert!(matches!(
         error,
@@ -206,14 +208,14 @@ fn stable_identity_fields_come_from_committed_manifest() {
     raw_entry.object_path = "objects/raw_archive_posts/a.parquet".to_owned();
     raw_entry.bytes = 111;
     raw_entry.min_created_at_normalized = Some("2026-06-15T00:00:00Z".to_owned());
-    let first = read_committed_jsonl(Cursor::new(jsonl(&[raw_entry.clone()])))
+    let first = debug_read_committed_jsonl(Cursor::new(jsonl(&[raw_entry.clone()])))
         .expect("read first manifest jsonl");
 
     raw_entry.object_path = "objects/raw_archive_posts/b.parquet".to_owned();
     raw_entry.bytes = 222;
     raw_entry.min_created_at_normalized = Some("2026-06-14T00:00:00Z".to_owned());
-    let second =
-        read_committed_jsonl(Cursor::new(jsonl(&[raw_entry]))).expect("read second manifest jsonl");
+    let second = debug_read_committed_jsonl(Cursor::new(jsonl(&[raw_entry])))
+        .expect("read second manifest jsonl");
 
     let first_identity = &first.inputs.first().expect("first input").identity;
     let second_identity = &second.inputs.first().expect("second input").identity;
@@ -248,8 +250,8 @@ fn verified_manifest_entry_loads_clickhouse_batch() {
     let plan = read_plan_from_path(&artifacts.manifest_path);
     let input = plan.inputs.first().expect("loader input");
 
-    let batch = debug_load_verified_clickhouse_batch(&output_dir, input)
-        .expect("verified batch should load");
+    let batch =
+        debug_materialize_clickhouse_batch(&output_dir, input).expect("verified batch should load");
 
     assert_eq!(batch.manifest_identity, input.identity);
     assert_eq!(batch.emoji_rows.len(), 2);
@@ -322,7 +324,7 @@ fn streaming_verifier_rejects_raw_manifest_with_collection_paginated_receipt() {
         }
     ));
 
-    let full_load_error = debug_load_verified_clickhouse_batch(&output_dir, input)
+    let full_load_error = debug_materialize_clickhouse_batch(&output_dir, input)
         .expect_err("debug full-load verifier should reject same proof mismatch");
     assert!(matches!(
         full_load_error,
@@ -351,11 +353,9 @@ fn verified_manifest_entry_rejects_missing_parquet() {
     let plan = read_plan_from_path(&artifacts.manifest_path);
     fs::remove_file(&artifacts.parquet_path).expect("parquet should be removable");
 
-    let error = debug_load_verified_clickhouse_batch(
-        &output_dir,
-        plan.inputs.first().expect("loader input"),
-    )
-    .expect_err("missing parquet should fail");
+    let error =
+        debug_materialize_clickhouse_batch(&output_dir, plan.inputs.first().expect("loader input"))
+            .expect_err("missing parquet should fail");
 
     assert!(matches!(error, Error::MissingArtifact { .. }));
 }
@@ -378,11 +378,9 @@ fn verified_manifest_entry_rejects_missing_repo_receipt() {
     let plan = read_plan_from_path(&artifacts.manifest_path);
     fs::remove_file(&artifacts.receipt_path).expect("repo receipt should be removable");
 
-    let error = debug_load_verified_clickhouse_batch(
-        &output_dir,
-        plan.inputs.first().expect("loader input"),
-    )
-    .expect_err("missing repo receipt should fail");
+    let error =
+        debug_materialize_clickhouse_batch(&output_dir, plan.inputs.first().expect("loader input"))
+            .expect_err("missing repo receipt should fail");
 
     assert!(matches!(error, Error::MissingRepoReceipt { .. }));
 }
@@ -405,11 +403,9 @@ fn verified_manifest_entry_rejects_parquet_hash_mismatch() {
     let plan = read_plan_from_path(&artifacts.manifest_path);
     fs::write(&artifacts.parquet_path, b"corrupt").expect("parquet should be mutable");
 
-    let error = debug_load_verified_clickhouse_batch(
-        &output_dir,
-        plan.inputs.first().expect("loader input"),
-    )
-    .expect_err("hash mismatch should fail");
+    let error =
+        debug_materialize_clickhouse_batch(&output_dir, plan.inputs.first().expect("loader input"))
+            .expect_err("hash mismatch should fail");
 
     assert!(matches!(
         error,
@@ -435,7 +431,7 @@ fn full_batch_load_rejects_manifest_above_explicit_caps_before_reading_rows() {
     let plan = read_plan_from_path(&artifacts.manifest_path);
     let input = plan.inputs.first().expect("loader input");
 
-    let error = debug_load_verified_clickhouse_batch_with_caps(
+    let error = debug_materialize_clickhouse_batch_with_caps(
         &output_dir,
         input,
         DebugFullLoadCaps {

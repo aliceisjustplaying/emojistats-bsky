@@ -173,6 +173,13 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   completion counter, duration histogram, and active-attempt zeroing events. Dry-run
   `derive-manifest --metrics-jsonl` over the committed manifest emitted manifest-scan,
   receipt-verify, and file-read metric events and counted 2 attempted payloads / 639 rows.
+- Commit-boundary pass after `c527e80`: streaming archive writes now delegate local
+  exposure, Storage Box mirroring, repo-receipt auxiliary upload, and profile sidecar
+  commit behavior to `archive/commit_backend.rs`. `archive/write.rs` still owns row
+  conversion, streaming `Parquet`, receipt construction, and artifact naming. Runtime
+  derive uses `stream_committed_jsonl` plus canonical streaming verification/payload
+  generation; materialized manifest plans and whole-object `ClickHouse` batches are
+  debug/test-gated and named `debug_*`.
 - Whale transport hardening: repo fetches default to HTTP/1 with an explicit
   `--http-protocol auto` escape hatch, TCP keepalive, and 30s connect timeout, and retry
   retryable body-stream transport/idle failures up to 3 full download attempts. Transport

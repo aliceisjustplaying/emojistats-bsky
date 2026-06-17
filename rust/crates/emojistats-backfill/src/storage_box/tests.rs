@@ -20,7 +20,7 @@ use crate::{
     },
     commit::{ManifestEntry, ManifestMode, Metadata, Request},
     manifest_derive::{
-        ManifestReadItem, debug_load_verified_clickhouse_batch, stream_committed_jsonl,
+        ManifestReadItem, debug_materialize_clickhouse_batch, stream_committed_jsonl,
         verify_loader_input_for_streaming,
     },
 };
@@ -514,7 +514,7 @@ fn remote_only_derive_canary_commits_storage_box_artifacts() {
 
     let verified = verify_loader_input_for_streaming(&remote_archive_root, input)
         .expect("streaming derive verifier should start from remote archive root");
-    let batch = debug_load_verified_clickhouse_batch(&remote_archive_root, input)
+    let batch = debug_materialize_clickhouse_batch(&remote_archive_root, input)
         .expect("debug derive batch should load from remote archive root");
 
     assert_eq!(

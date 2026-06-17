@@ -15,7 +15,7 @@ use emojistats_backfill::{
     },
     clickhouse::{ClickHouseInsertPayload, ClickHouseTable, JSON_EACH_ROW_FORMAT},
     derive::BACKFILL_DERIVE_SOURCE,
-    manifest_derive::read_committed_jsonl,
+    manifest_derive::debug_read_committed_jsonl,
     metrics::noop_metrics_recorder,
 };
 
@@ -162,7 +162,7 @@ fn derive_run_context<'a>(
 
 fn read_first_input(manifest_path: &Path) -> LoaderInput {
     let file = fs::File::open(manifest_path).expect("manifest should be readable");
-    let plan = read_committed_jsonl(BufReader::new(file)).expect("manifest should parse");
+    let plan = debug_read_committed_jsonl(BufReader::new(file)).expect("manifest should parse");
     plan.inputs
         .first()
         .expect("manifest should contain raw archive input")

@@ -62,6 +62,7 @@ impl Default for DebugFullLoadCaps {
 }
 
 /// Result of reading a mixed committed manifest stream.
+#[cfg(any(test, debug_assertions))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     pub inputs: Vec<LoaderInput>,
@@ -225,7 +226,8 @@ pub enum Error {
 ///
 /// Returns [`Error`] when a line cannot be read or parsed, or when a target post archive
 /// manifest entry has invalid schema or required fields.
-pub fn read_committed_jsonl<R>(reader: R) -> Result<Plan, Error>
+#[cfg(any(test, debug_assertions))]
+pub fn debug_read_committed_jsonl<R>(reader: R) -> Result<Plan, Error>
 where
     R: BufRead,
 {
@@ -310,15 +312,11 @@ where
 /// Returns [`Error`] when the object is missing, exceeds a full-load cap, any available receipt
 /// disagrees with the manifest or recomputed row hashes, or the rows cannot form a derive batch.
 #[cfg(any(test, debug_assertions))]
-pub fn debug_load_verified_clickhouse_batch(
+pub fn debug_materialize_clickhouse_batch(
     archive_root: &Path,
     input: &LoaderInput,
 ) -> Result<ClickHouseDeriveBatch, Error> {
-    debug_load_verified_clickhouse_batch_with_caps(
-        archive_root,
-        input,
-        DebugFullLoadCaps::default(),
-    )
+    debug_materialize_clickhouse_batch_with_caps(archive_root, input, DebugFullLoadCaps::default())
 }
 
 /// Debug/test helper that materializes a full archive object with caller-supplied caps.
@@ -328,7 +326,7 @@ pub fn debug_load_verified_clickhouse_batch(
 /// Returns [`Error`] when the artifact exceeds a cap, is missing, any available receipt
 /// disagrees, or the verified rows cannot form a derive batch.
 #[cfg(any(test, debug_assertions))]
-pub fn debug_load_verified_clickhouse_batch_with_caps(
+pub fn debug_materialize_clickhouse_batch_with_caps(
     archive_root: &Path,
     input: &LoaderInput,
     caps: DebugFullLoadCaps,
@@ -384,13 +382,13 @@ pub fn verify_loader_input_for_streaming(
 ///
 /// Returns [`Error`] on the first failed artifact verification or derive failure.
 #[cfg(any(test, debug_assertions))]
-pub fn debug_load_verified_clickhouse_batches(
+pub fn debug_materialize_clickhouse_batches(
     archive_root: &Path,
     inputs: &[LoaderInput],
 ) -> Result<Vec<ClickHouseDeriveBatch>, Error> {
     inputs
         .iter()
-        .map(|input| debug_load_verified_clickhouse_batch(archive_root, input))
+        .map(|input| debug_materialize_clickhouse_batch(archive_root, input))
         .collect()
 }
 

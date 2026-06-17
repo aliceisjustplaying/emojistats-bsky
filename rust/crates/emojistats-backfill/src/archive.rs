@@ -356,6 +356,8 @@ pub enum ArchiveError {
 
 #[path = "archive/io.rs"]
 mod archive_io;
+#[path = "archive/commit_backend.rs"]
+mod commit_backend;
 mod write;
 
 pub use archive_io::{

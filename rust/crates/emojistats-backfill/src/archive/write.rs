@@ -4,18 +4,19 @@ use super::{
     FetchMethod, File, LocalManifestEntry, LocalStore, ManifestMode, Metadata, NamedTempFile,
     NormalizerVersion, PARQUET_BATCH_ROWS, PARTIAL_RECORD_STATUS, POST_COLLECTION, ParsedRepo,
     Path, PathBuf, PostRecord, PostRecordBody, ProfileRecord, RawPartialPostRecord, RepoReceipt,
-    Request, Schema, Sha256, StorageBoxArchiveConfig, TempPath, Utc, Write,
+    Request, Schema, Sha256, TempPath, Utc, Write,
     archive_io::{
         ProfileSidecarCommitPaths, append_hash_field_frame, append_normalizer_frames,
         archive_error_from_derive, archive_schema, build_commit_metadata, commit_profile_sidecar,
         extract_emojis, framed_fields, hash_extras_json, hash_field, hash_field_bytes,
         hash_optional_field, hash_post_row_into, hash_string_slice, json_bytes,
         local_manifest_from_committed, parquet_writer_properties, post_record_batch,
-        profile_sidecar_request, receipt_dataset, record_extras_json, stable_artifact_stem,
-        stable_object_receipt_path, stable_repo_receipt_name, update_min_max_created_at,
-        write_emoji_projection_jsonl, write_json_pretty, write_posts_parquet_to_writer,
+        receipt_dataset, record_extras_json, stable_artifact_stem, stable_object_receipt_path,
+        stable_repo_receipt_name, update_min_max_created_at, write_emoji_projection_jsonl,
+        write_json_pretty, write_posts_parquet_to_writer,
     },
     borrowed_emoji_projection_rows_for_post, classify_created_at_observed_at,
+    commit_backend::ArchiveCommitBackend,
     derive_emoji_projection_rows, format_observed_at, fs, hash_serialized_json,
     promote_temp_idempotent, write_temp_idempotent,
 };
@@ -572,7 +573,13 @@ impl StreamingArchiveSink {
             &emoji_projection_path,
         )?;
         let manifest = local_manifest_from_committed(&committed_posts, &receipt);
-        let committed_profile = self.commit_profile(profile, &receipt, &receipt_hash)?;
+        let committed_profile = self.commit_backend().commit_profile(
+            &self.did,
+            profile,
+            &receipt,
+            &receipt_hash,
+            &self.commit_context,
+        )?;
         let artifacts = self.into_artifacts(
             manifest,
             committed_posts,
@@ -627,17 +634,18 @@ impl StreamingArchiveSink {
         dataset: &str,
         repo_receipt_path: &Path,
     ) -> Result<crate::commit::Artifact, ArchiveError> {
-        let store = LocalStore::new(&self.output_dir);
         let request = Request {
             object_path: PathBuf::from(format!("{artifact_stem}.posts.parquet")),
             receipt_path: stable_object_receipt_path(artifact_stem, receipt_hash, "posts"),
             manifest_path: PathBuf::from(format!("{artifact_stem}.manifest.jsonl")),
-            manifest_mode: self.local_manifest_mode(),
+            manifest_mode: ManifestMode::AppendJsonl,
             metadata: self.streaming_posts_metadata(receipt_hash, dataset, repo_receipt_path)?,
         };
-        let committed = store.commit_prepared_temp(&request, self.parquet_temp_path.as_ref())?;
-        self.mirror_storage_box(&request, &committed, Some(repo_receipt_path))?;
-        Ok(committed)
+        self.commit_backend().commit_prepared_posts(
+            &request,
+            self.parquet_temp_path.as_ref(),
+            repo_receipt_path,
+        )
     }
 
     fn streaming_posts_metadata(
@@ -670,72 +678,8 @@ impl StreamingArchiveSink {
         })
     }
 
-    fn commit_profile(
-        &self,
-        profile: Option<&ProfileRecord>,
-        receipt: &RepoReceipt,
-        receipt_hash: &str,
-    ) -> Result<Option<crate::commit::Artifact>, ArchiveError> {
-        let store = LocalStore::new(&self.output_dir);
-        let profile_stem = stable_artifact_stem(
-            &self.did,
-            "raw_profile_sidecar",
-            receipt.profile_row_hash.as_deref().unwrap_or(receipt_hash),
-        );
-        let Some(profile) = profile else {
-            return Ok(None);
-        };
-        let object_path = PathBuf::from(format!("{profile_stem}.profile.json"));
-        let receipt_path = stable_object_receipt_path(&profile_stem, receipt_hash, "profile");
-        let manifest_path = PathBuf::from(format!("{profile_stem}.profile.manifest.jsonl"));
-        let request = profile_sidecar_request(
-            object_path.clone(),
-            receipt_path.clone(),
-            manifest_path.clone(),
-            receipt,
-            &self.commit_context,
-        )?;
-        let committed = commit_profile_sidecar(
-            &store,
-            ProfileSidecarCommitPaths {
-                object_path,
-                receipt_path,
-                manifest_path,
-                manifest_mode: self.local_manifest_mode(),
-            },
-            profile,
-            receipt,
-            &self.commit_context,
-        )?;
-        self.mirror_storage_box(&request, &committed, None)?;
-        Ok(Some(committed))
-    }
-
-    const fn local_manifest_mode(&self) -> ManifestMode {
-        match self.storage_config {
-            ArchiveStorageConfig::Local => ManifestMode::AppendJsonl,
-            ArchiveStorageConfig::StorageBoxSsh(_) => ManifestMode::Skip,
-        }
-    }
-
-    fn mirror_storage_box(
-        &self,
-        request: &Request,
-        committed: &crate::commit::Artifact,
-        repo_receipt_path: Option<&Path>,
-    ) -> Result<(), ArchiveError> {
-        let ArchiveStorageConfig::StorageBoxSsh(config) = &self.storage_config else {
-            return Ok(());
-        };
-        let mut remote_request = request.clone();
-        remote_request.manifest_mode = ManifestMode::AppendJsonl;
-        commit_file_to_storage_box(
-            config,
-            &remote_request,
-            &committed.object_path,
-            repo_receipt_path,
-        )?;
-        Ok(())
+    fn commit_backend(&self) -> ArchiveCommitBackend<'_> {
+        ArchiveCommitBackend::new(&self.output_dir, &self.storage_config)
     }
 
     fn into_artifacts(
@@ -778,38 +722,6 @@ impl StreamingArchiveSink {
         self.batch.clear();
         Ok(())
     }
-}
-
-fn commit_file_to_storage_box(
-    config: &StorageBoxArchiveConfig,
-    request: &Request,
-    object_path: &Path,
-    repo_receipt_path: Option<&Path>,
-) -> Result<(), ArchiveError> {
-    let storage_config = crate::storage_box::StorageBoxConfig::new(config.remote_root.clone());
-    let mut ssh_config = crate::storage_box::StorageBoxSshConfig::new(config.ssh_remote.clone())
-        .with_ssh_program(config.ssh_program.clone())
-        .with_command_timeout(config.command_timeout);
-    for arg in &config.ssh_args {
-        ssh_config = ssh_config.with_ssh_arg(arg.clone());
-    }
-    let commands = crate::storage_box::SshStorageBoxCommands::new(ssh_config);
-    let mut backend = crate::storage_box::StorageBoxBackend::new(storage_config, commands);
-    if let Some(repo_receipt_path) = repo_receipt_path {
-        let relative_repo_receipt_path = PathBuf::from(repo_receipt_path.file_name().ok_or(
-            ArchiveError::CountOverflow {
-                field: "repo_receipt_file_name",
-            },
-        )?);
-        backend.commit_auxiliary_file(
-            request,
-            &relative_repo_receipt_path,
-            repo_receipt_path,
-            "repo receipt",
-        )?;
-    }
-    backend.commit_file(request, object_path)?;
-    Ok(())
 }
 
 impl Drop for StreamingArchiveSink {
