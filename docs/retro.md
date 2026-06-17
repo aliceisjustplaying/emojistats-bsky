@@ -2367,6 +2367,105 @@ The review called `include!` "an architecture smell that looks decomposed but be
 modules." The same pattern exists in v1's TS codebase — `verify.ts` at 1,458 lines owns too
 many responsibilities but was never split because v1 was "runs twice and done."
 
+### 2026-06-17 — three review rounds, an overnight autonomous sprint, and production plumbing
+
+Between the end of the 58-finding review sprint and the start of Jun 17, three more full code
+review rounds ran against the Rust rewrite — each time Alice said some variant of "fix all valid
+ones" and the agent executed autonomously. The combined finding count across the three rounds was
+approximately 100 distinct items spanning correctness, retry semantics, derive integrity, failure
+classification, documentation drift and structural quality.
+
+The overnight sprint happened because Alice said: "be fully autonomous i'm literally asleep do not
+stop until the bugfixes are done, the big files are refactored into much smaller ones and split
+properly and logically and the full smoke passes with no regressions. good luck, you got this."
+
+The agent ran each round as: apply fixes → cargo test + clippy → full 24-DID whale smoke →
+ClickHouse derive verification → record evidence in NOTES.md → next round. Six commits landed in
+the Rust rewrite across this arc:
+
+- `ee66323` — 30-finding review blocker fixes. listRecords artifacts isolated into their own
+  dataset (`collection_paginated_posts`) to prevent fallback data contaminating root-proofed
+  archives. Proof class renamed from `SnapshotComplete` to `ContentAddressedSnapshot` — honest
+  about what the code actually verifies (CID traversal, not canonical MST root reconstruction).
+  HTTP/2 made configurable (`--http-protocol http1|auto`), defaulting to HTTP/1 because each
+  getRepo is one huge streaming body where multiplexing doesn't help. GitHub CI workflow added.
+  Storage Box manifest append made atomic (contains + append under same lock). GIT_REV
+  enforcement in release builds.
+- `ba4606e` — 32-finding retry and derive hardening. New `OperatorDeferred` failure status for
+  IO errors (ENOSPC, permission denied) that don't consume retry attempts and can be globally
+  resumed after the machine is healthy. Byte-budget pressure separated from per-repo resource
+  limits — fleet-wide budget occupancy becomes retryable backpressure, not terminal
+  `ResourceLimited`. Normalizer identity promoted into ClickHouse serving rows (dedupe token,
+  ORDER BY, query filters) so mixed-normalizer deployments are distinguishable. Archive encoding
+  marker added to artifact stems preventing row-hash false conflicts. CID added to emoji
+  projection for per-observation auditability.
+- `24c9549` — structural split. All Rust source files brought under 1,000 LOC. Canary, derive
+  manifest, list records and transport modules each split into implementation + test submodules.
+  Transport rate-limit logic extracted to its own submodule.
+- `16f9231` + `e09df37` — post-smoke evidence recorded in NOTES.md after each round.
+
+**Performance across the review rounds:**
+
+| Whale | Pre-review | Post ee66323 | Post 24c9549 split |
+|-------|-----------|-------------|-------------------|
+| o6g (3.96 GB) | 438s | 383s (-13%) | — |
+| 4hm | 136s | 83s (-39%) | 87s |
+| lb7 | 79s | 70s (-12%) | 93s (noise) |
+| f4z | — | 183s | 188-193s |
+| Fleet wall | — | 17:47 | 19:59 |
+| Fleet max RSS | — | 2.74 GiB | 3.25 GiB |
+| Derive | — | 2:39 / 72 MB | 2:53 / 71 MB |
+
+The 4hm improvement (136s → 83s, -39%) was the CID verifier thread count moving from 1 to 4.
+Fleet wall time regression (17:47 → 19:59) was network-dominated — longer queue times for
+same-host jobs after earlier jobs claimed the rate-limit slots. Max RSS stayed well under the
+64 GB crawler target.
+
+**Two TS v1 commits also landed.** `fa06b11` added archive-only recrawl mode with a new
+`pds-host-policy.ts` module (141 lines) — the host-eligibility boundary the TS thermo-nuclear
+review recommended. `15ff29d` hardened aggregate ClickHouse rebuilds against OOM from unbounded
+swap. v1 isn't dead yet while v2 matures.
+
+**The review bundle incident.** Alice asked for a source zip for separate review. Commit `b235a9d`
+shipped a 17.5 MB zip because `fixtures/*.car` binary test fixtures weren't excluded. Alice caught
+it immediately ("this file is 17.5mb?"). Fixed in `83a8213` with a slim 243 KB replacement. Same
+class of mistake as v1's accidental binary commits — generated artifacts in version control.
+
+**Jun 17: named parallel subagents.** The parent session dispatched three named workers in
+parallel, each on a bounded fix scope:
+
+- **Helmholtz** — canary CLI command. New `canary_cmd.rs` (154 lines) + tests (157 lines). Reads
+  JSON/JSONL evidence files, evaluates canary launch gates, prints JSON report, exits nonzero on
+  failure. Committed as part of `497ec73`.
+- **Bernoulli** — ClickHouse/derive serving identity. Propagated post CID through emoji projection
+  into serving schema and ORDER BY. Added 8 MiB byte-size-aware payload chunking for streaming
+  emoji inserts. Configured per-request timeouts. 128 tests passed.
+- **Leibniz** — failure classification and documentation drift. Reclassified commit/Storage Box
+  integrity conflicts as permanent (not retryable), transient commit IO as retryable, and
+  oversized error bodies as `OperatorDeferred`. Rewrote the runbook's stale Bun/modulus-6 wording
+  to match Rust/8-bucket reality.
+
+All three hit compile interference from each other's concurrent uncommitted edits — the same
+pattern as the prior 4-subagent sprint. Each correctly scoped verification to library-only tests
+with dead-code suppression (`RUSTFLAGS='-A dead_code'`) and noted the limitation. The parent
+session merged results and committed `497ec73` (Storage Box backend wiring + canary gate, 812
+insertions across 16 files). Bernoulli and Leibniz's work remained uncommitted as of the last
+session activity.
+
+**The Storage Box decision.** The agent explicitly stated: "I'm not going to fake Storage Box
+production readiness." Local archive path was hardened first; Storage Box documented as gated
+until a canary/self-test path existed. Commit `497ec73` wired it as opt-in
+`--archive-backend storage-box-ssh` with mirror commit semantics — local archive remains the
+default, remote is additive. This matches the v2 design's "Parquet on Storage Box is the raw
+archive, ClickHouse is derived" but doesn't pretend the remote path is battle-tested.
+
+**Where things stand.** When Alice asked "how far are we?", the agent assessed ~40% complete. The
+crawler core — fetch, parse, MST proof, Parquet archive, receipt, ClickHouse derive — is viable
+and smoke-tested. What remains is distributed system architecture: census/seed generation from
+PLC mirror, cross-box host pacing, shard workers, Jetstream catch-up spooler, production
+observability (OTEL + Prometheus, which Alice asked about — "wait whats the difference between
+otel and prometheus actually"), and the canary protocol before 8-box fan-out.
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
