@@ -1,5 +1,7 @@
 //! Shared emoji extraction and normalization.
 
+use std::{collections::HashMap, sync::LazyLock};
+
 use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -12,6 +14,16 @@ const EMOJI_DATA_SOURCE: &str = "emojis";
 const ZERO_WIDTH_JOINER: char = '\u{200d}';
 const COMBINING_ENCLOSING_KEYCAP: char = '\u{20e3}';
 const EMOJI_MAX_PER_POST: usize = 300;
+const LEGACY_EMOJI_SOURCE: &str = include_str!("../../../../packages/emoji-normalization/emoji.ts");
+const LEGACY_VARIATION_SEQUENCE_SOURCE: &str =
+    include_str!("../../../../packages/emoji-normalization/emojiVariationSequences.ts");
+#[cfg(test)]
+const LEGACY_TOP_LEVEL_NON_QUALIFIED_COUNT: usize = 365;
+#[cfg(test)]
+const LEGACY_VARIATION_SEQUENCE_COUNT: usize = 353;
+
+static LEGACY_NORMALIZATION: LazyLock<HashMap<String, String>> =
+    LazyLock::new(build_legacy_normalization);
 
 /// Version identity for emoji normalization outputs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,42 +147,166 @@ pub fn normalize_emoji_glyph(glyph: &str) -> Option<String> {
     if is_keycap_without_combining_mark(glyph) {
         return None;
     }
+    if let Some(normalized) = legacy_normalize_glyph(glyph) {
+        return Some(normalized);
+    }
     if is_emoji_modifier(glyph) {
+        return Some(glyph.to_owned());
+    }
+    if is_emoji_component(glyph) {
         return Some(glyph.to_owned());
     }
     if let Some(heart) = normalize_heart(glyph) {
         return Some(heart);
     }
 
-    if let Some(exact) = emojis::get(glyph) {
-        return Some(exact.as_str().to_owned());
+    if emojis::get(glyph).is_some() {
+        return Some(glyph.to_owned());
     }
 
     if glyph.contains(TEXT_PRESENTATION_SELECTOR) {
         let emoji_style = glyph.replace(TEXT_PRESENTATION_SELECTOR, "\u{fe0f}");
-        if let Some(exact) = emojis::get(&emoji_style) {
-            return Some(exact.as_str().to_owned());
+        if emojis::get(&emoji_style).is_some() {
+            return Some(emoji_style);
         }
 
         let stripped = glyph.replace(TEXT_PRESENTATION_SELECTOR, "");
-        if let Some(exact) = emojis::get(&stripped) {
-            return Some(exact.as_str().to_owned());
+        if emojis::get(&stripped).is_some() {
+            return Some(stripped);
         }
     }
 
     None
 }
 
+fn legacy_normalize_glyph(glyph: &str) -> Option<String> {
+    let key = codepoint_key(glyph);
+    let normalized = LEGACY_NORMALIZATION.get(&key)?;
+    if normalized == &key {
+        return None;
+    }
+    codepoint_key_to_string(normalized)
+}
+
+fn build_legacy_normalization() -> HashMap<String, String> {
+    let mut normalization = HashMap::new();
+    for block in top_level_object_blocks(LEGACY_VARIATION_SEQUENCE_SOURCE) {
+        let (Some(code), Some(text_style), Some(emoji_style)) = (
+            quoted_field(&block, "code"),
+            quoted_field(&block, "textStyle"),
+            quoted_field(&block, "emojiStyle"),
+        ) else {
+            continue;
+        };
+        let normalized_code = normalize_codepoint_key(&code);
+        if is_keycap_ascii_codepoint(&normalized_code) {
+            continue;
+        }
+        let normalized_text_style = normalize_codepoint_key(&text_style);
+        let normalized_emoji_style = normalize_codepoint_key(&emoji_style);
+        normalization.insert(normalized_code, normalized_emoji_style.clone());
+        normalization.insert(normalized_text_style, normalized_emoji_style);
+    }
+
+    for block in top_level_object_blocks(LEGACY_EMOJI_SOURCE) {
+        let (Some(unified), Some(non_qualified)) = (
+            quoted_field(&block, "unified"),
+            quoted_field(&block, "non_qualified"),
+        ) else {
+            continue;
+        };
+        normalization.insert(
+            normalize_codepoint_key(&non_qualified),
+            normalize_codepoint_key(&unified),
+        );
+    }
+    normalization
+}
+
+fn top_level_object_blocks(source: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current = Vec::new();
+    for line in source.lines() {
+        if line == "  {" {
+            current.clear();
+            current.push(line);
+        } else if !current.is_empty() {
+            current.push(line);
+            if matches!(line, "  }," | "  }") {
+                blocks.push(current.join("\n"));
+                current.clear();
+            }
+        }
+    }
+    blocks
+}
+
+fn quoted_field(block: &str, field: &str) -> Option<String> {
+    let needle = format!("    {field}: '");
+    let line = block.lines().find(|line| line.starts_with(&needle))?;
+    let start = needle.len();
+    let remainder = line.get(start..)?;
+    let end = remainder.find('\'')?;
+    Some(remainder.get(..end)?.to_owned())
+}
+
+fn normalize_codepoint_key(value: &str) -> String {
+    value.replace('-', " ").to_ascii_lowercase()
+}
+
+fn is_keycap_ascii_codepoint(value: &str) -> bool {
+    matches!(
+        value,
+        "0023"
+            | "002a"
+            | "0030"
+            | "0031"
+            | "0032"
+            | "0033"
+            | "0034"
+            | "0035"
+            | "0036"
+            | "0037"
+            | "0038"
+            | "0039"
+    )
+}
+
+fn codepoint_key(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| format!("{:04x}", u32::from(ch)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn codepoint_key_to_string(value: &str) -> Option<String> {
+    let mut codepoints = Vec::new();
+    for part in value.split(' ') {
+        let codepoint = u32::from_str_radix(part, 16).ok()?;
+        codepoints.push(char::from_u32(codepoint)?);
+    }
+    Some(codepoints.into_iter().collect())
+}
+
 fn is_keycap_without_combining_mark(glyph: &str) -> bool {
     let mut chars = glyph.chars();
     matches!(chars.next(), Some('0'..='9' | '#' | '*'))
-        && chars.next() == Some(EMOJI_PRESENTATION_SELECTOR)
+        && matches!(
+            chars.next(),
+            Some(EMOJI_PRESENTATION_SELECTOR | TEXT_PRESENTATION_SELECTOR)
+        )
         && !glyph.contains(COMBINING_ENCLOSING_KEYCAP)
 }
 
 fn is_emoji_modifier(glyph: &str) -> bool {
     let mut chars = glyph.chars();
     matches!(chars.next().map(u32::from), Some(0x1f3fb..=0x1f3ff)) && chars.next().is_none()
+}
+
+fn is_emoji_component(glyph: &str) -> bool {
+    let mut chars = glyph.chars();
+    matches!(chars.next().map(u32::from), Some(0x1f9b0..=0x1f9b3)) && chars.next().is_none()
 }
 
 fn normalize_heart(glyph: &str) -> Option<String> {
@@ -180,7 +316,7 @@ fn normalize_heart(glyph: &str) -> Option<String> {
         .or_else(|| suffix.strip_prefix(EMOJI_PRESENTATION_SELECTOR))
         .unwrap_or(suffix);
     let candidate = format!("{HEART_EMOJI_STYLE}{suffix}");
-    emojis::get(&candidate).map(|emoji| emoji.as_str().to_owned())
+    emojis::get(&candidate).map(|_emoji| candidate)
 }
 
 fn unicode_version_label(version: emojis::UnicodeVersion) -> String {
@@ -189,7 +325,13 @@ fn unicode_version_label(version: emojis::UnicodeVersion) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{EMOJI_MAX_PER_POST, extract_emoji_sequence, normalize_emoji_glyph, version};
+    use super::{
+        EMOJI_MAX_PER_POST, LEGACY_EMOJI_SOURCE, LEGACY_NORMALIZATION,
+        LEGACY_TOP_LEVEL_NON_QUALIFIED_COUNT, LEGACY_VARIATION_SEQUENCE_COUNT,
+        LEGACY_VARIATION_SEQUENCE_SOURCE, codepoint_key_to_string, extract_emoji_sequence,
+        is_keycap_ascii_codepoint, normalize_codepoint_key, normalize_emoji_glyph, quoted_field,
+        top_level_object_blocks, version,
+    };
 
     #[test]
     fn extracts_a_plain_emoji() {
@@ -234,6 +376,21 @@ mod tests {
     }
 
     #[test]
+    fn matches_legacy_variation_sequence_normalization() {
+        assert_eq!(normalize_emoji_glyph("™"), Some("™️".to_owned()));
+        assert_eq!(normalize_emoji_glyph("™︎"), Some("™️".to_owned()));
+        assert_eq!(normalize_emoji_glyph("☀"), Some("☀️".to_owned()));
+        assert_eq!(normalize_emoji_glyph("☺"), Some("☺️".to_owned()));
+    }
+
+    #[test]
+    fn normalizes_emoji_default_glyphs_like_legacy_normalization() {
+        assert_eq!(normalize_emoji_glyph("☕"), Some("☕️".to_owned()));
+        assert_eq!(normalize_emoji_glyph("⭐"), Some("⭐️".to_owned()));
+        assert_eq!(normalize_emoji_glyph("👍"), Some("👍️".to_owned()));
+    }
+
+    #[test]
     fn normalizes_non_qualified_keycaps_to_qualified_keycaps() {
         assert_eq!(normalize_emoji_glyph("#\u{20e3}"), Some("#️⃣".to_owned()));
         assert_eq!(normalize_emoji_glyph("*\u{20e3}"), Some("*️⃣".to_owned()));
@@ -249,7 +406,7 @@ mod tests {
     #[test]
     fn normalizes_zwj_sequences_with_missing_variation_selectors() {
         assert_eq!(normalize_emoji_glyph("⛹‍♀"), Some("⛹️‍♀️".to_owned()));
-        assert_eq!(normalize_emoji_glyph("⛹🏽‍♀"), Some("⛹🏽‍♀️".to_owned()));
+        assert_eq!(normalize_emoji_glyph("⛹🏽‍♀"), Some("⛹🏽‍♀".to_owned()));
     }
 
     #[test]
@@ -280,11 +437,16 @@ mod tests {
         assert_eq!(extract_emoji_sequence("😀‍😀"), vec!["😀", "😀"]);
         assert_eq!(extract_emoji_sequence("😀🏽"), vec!["😀", "🏽"]);
         assert_eq!(extract_emoji_sequence("🏽"), vec!["🏽"]);
+        assert_eq!(
+            extract_emoji_sequence("🦰🦱🦲🦳"),
+            vec!["🦰", "🦱", "🦲", "🦳"]
+        );
     }
 
     #[test]
     fn rejects_digit_variation_selector_without_keycap_mark() {
         assert_eq!(extract_emoji_sequence("1\u{fe0f}"), Vec::<String>::new());
+        assert_eq!(extract_emoji_sequence("1\u{fe0e}"), Vec::<String>::new());
     }
 
     #[test]
@@ -293,5 +455,72 @@ mod tests {
             extract_emoji_sequence(&"😀".repeat(EMOJI_MAX_PER_POST + 1)).len(),
             EMOJI_MAX_PER_POST
         );
+    }
+
+    #[test]
+    fn normalizes_legacy_datasource_forms_like_typescript_batch_normalizer() {
+        let emoji_blocks = top_level_object_blocks(LEGACY_EMOJI_SOURCE);
+        let variation_blocks = top_level_object_blocks(LEGACY_VARIATION_SEQUENCE_SOURCE);
+        assert_eq!(
+            emoji_blocks
+                .iter()
+                .filter(|block| quoted_field(block, "non_qualified").is_some())
+                .count(),
+            LEGACY_TOP_LEVEL_NON_QUALIFIED_COUNT
+        );
+        assert_eq!(
+            variation_blocks
+                .iter()
+                .filter(|block| {
+                    quoted_field(block, "code").is_some()
+                        && quoted_field(block, "textStyle").is_some()
+                        && quoted_field(block, "emojiStyle").is_some()
+                })
+                .count(),
+            LEGACY_VARIATION_SEQUENCE_COUNT
+        );
+
+        for block in emoji_blocks {
+            if let Some(unified) = quoted_field(&block, "unified") {
+                assert_legacy_normalization(&unified);
+            }
+            if let Some(non_qualified) = quoted_field(&block, "non_qualified") {
+                assert_legacy_normalization(&non_qualified);
+            }
+        }
+
+        for block in variation_blocks {
+            for field in ["code", "textStyle", "emojiStyle"] {
+                if let Some(codepoints) = quoted_field(&block, field) {
+                    if is_keycap_ascii_sequence(&normalize_codepoint_key(&codepoints)) {
+                        continue;
+                    }
+                    assert_legacy_normalization(&codepoints);
+                }
+            }
+        }
+    }
+
+    fn assert_legacy_normalization(codepoints: &str) {
+        let key = normalize_codepoint_key(codepoints);
+        let Some(glyph) = codepoint_key_to_string(&key) else {
+            panic!("invalid legacy codepoints: {codepoints}");
+        };
+        let expected_key = LEGACY_NORMALIZATION.get(&key).unwrap_or(&key);
+        let Some(expected) = codepoint_key_to_string(expected_key) else {
+            panic!("invalid expected legacy codepoints: {expected_key}");
+        };
+        assert_eq!(
+            normalize_emoji_glyph(&glyph),
+            Some(expected),
+            "{codepoints}"
+        );
+    }
+
+    fn is_keycap_ascii_sequence(value: &str) -> bool {
+        let Some(first) = value.split(' ').next() else {
+            return false;
+        };
+        is_keycap_ascii_codepoint(first)
     }
 }
