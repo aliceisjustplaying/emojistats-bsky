@@ -26,7 +26,6 @@ use tempfile::{NamedTempFile, TempPath};
 
 use crate::{
     commit::{LocalStore, ManifestMode, Metadata, Request},
-    derive::{DeriveError, borrowed_emoji_projection_rows_for_post, derive_emoji_projection_rows},
     hash::hash_serialized_json,
     parse::{ParsedRepo, PostRecord, PostRecordBody, ProfileRecord, RawPartialPostRecord},
 };
@@ -360,6 +359,10 @@ mod archive_io;
 mod commit_backend;
 #[path = "archive/full_write.rs"]
 mod full_write;
+#[path = "archive/projection.rs"]
+mod projection;
+#[path = "archive/projection_writer.rs"]
+mod projection_writer;
 #[path = "archive/row.rs"]
 mod row;
 mod write;
@@ -369,6 +372,10 @@ pub use archive_io::{
     read_all_archive_post_rows,
 };
 pub use full_write::write_archive_artifacts;
+pub use projection::{
+    BorrowedEmojiProjectionRow, borrowed_emoji_projection_rows_for_post,
+    derive_emoji_projection_rows, emoji_projection_rows_for_post,
+};
 pub use row::{
     archive_row_from_owned_post, archive_row_from_owned_post_observed_at, archive_row_from_post,
     archive_row_from_post_observed_at, archive_rows_from_parsed_repo, current_normalizer,

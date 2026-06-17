@@ -2,10 +2,10 @@ use super::{
     ArchiveArtifacts, ArchiveCommitContext, ArchiveError, ArchivePostRow, LocalManifestEntry,
     LocalStore, ManifestMode, Path, PathBuf, ProfileRecord, RepoReceipt, Request,
     archive_io::{
-        ProfileSidecarCommitPaths, archive_error_from_derive, build_commit_metadata,
-        commit_profile_sidecar, local_manifest_from_committed, receipt_dataset,
-        stable_artifact_stem, stable_object_receipt_path, stable_repo_receipt_name,
-        write_emoji_projection_jsonl, write_json_pretty, write_posts_parquet_to_writer,
+        ProfileSidecarCommitPaths, build_commit_metadata, commit_profile_sidecar,
+        local_manifest_from_committed, receipt_dataset, stable_artifact_stem,
+        stable_object_receipt_path, stable_repo_receipt_name, write_emoji_projection_jsonl,
+        write_json_pretty, write_posts_parquet_to_writer,
     },
     derive_emoji_projection_rows, fs, hash_serialized_json, write_temp_idempotent,
 };
@@ -70,8 +70,7 @@ pub fn write_archive_artifacts(
         write_posts_parquet_to_writer(file, rows)
             .map_err(|error| crate::commit::Error::writer(format!("write posts parquet: {error}")))
     })?;
-    let emoji_projection_rows =
-        derive_emoji_projection_rows(rows).map_err(archive_error_from_derive)?;
+    let emoji_projection_rows = derive_emoji_projection_rows(rows)?;
     let emoji_rows = u64::try_from(emoji_projection_rows.len()).map_err(|_error| {
         ArchiveError::CountOverflow {
             field: "emoji_rows",

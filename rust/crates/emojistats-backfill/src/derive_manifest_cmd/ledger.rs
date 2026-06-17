@@ -7,32 +7,20 @@ use std::{
 
 use emojistats_backfill::{
     clickhouse::{ClickHouseInsertPayload, ClickHouseInsertReceipt},
-    derive::BACKFILL_DERIVE_SOURCE,
+    derive::DeriveCheckpointRecord,
     manifest_derive::VerifiedLoaderInput,
 };
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 #[derive(Debug)]
 pub(super) struct DeriveLedger {
     path: Option<PathBuf>,
-    completed: HashSet<DerivePayloadCheckpoint>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Deserialize, Serialize)]
-struct DerivePayloadCheckpoint {
-    source: String,
-    content_hash: String,
-    receipt_hash: String,
-    table: String,
-    dedupe_token: String,
-    row_count: usize,
-    payload_hash: String,
+    completed: HashSet<DeriveCheckpointRecord>,
 }
 
 #[derive(Debug, serde::Deserialize, Serialize)]
 struct DeriveLedgerRecord {
-    checkpoint: DerivePayloadCheckpoint,
+    checkpoint: DeriveCheckpointRecord,
     run_id: String,
     shard: String,
     file_sequence: u64,
@@ -61,11 +49,10 @@ impl DeriveLedger {
 
     pub(super) fn is_completed(
         &self,
-        verified: &VerifiedLoaderInput,
+        _verified: &VerifiedLoaderInput,
         payload: &ClickHouseInsertPayload,
     ) -> bool {
-        self.completed
-            .contains(&Self::checkpoint(verified, payload))
+        self.completed.contains(&Self::checkpoint(payload))
     }
 
     pub(super) fn append_success(
@@ -74,7 +61,7 @@ impl DeriveLedger {
         payload: &ClickHouseInsertPayload,
         receipt: &ClickHouseInsertReceipt,
     ) -> anyhow::Result<()> {
-        let checkpoint = Self::checkpoint(verified, payload);
+        let checkpoint = Self::checkpoint(payload);
         let Some(path) = &self.path else {
             self.completed.insert(checkpoint);
             return Ok(());
@@ -97,7 +84,7 @@ impl DeriveLedger {
         Ok(())
     }
 
-    fn read_completed(path: &Path) -> anyhow::Result<HashSet<DerivePayloadCheckpoint>> {
+    fn read_completed(path: &Path) -> anyhow::Result<HashSet<DeriveCheckpointRecord>> {
         let file = File::open(path)?;
         let mut completed = HashSet::new();
         for (line_index, line) in BufReader::new(file).lines().enumerate() {
@@ -120,24 +107,18 @@ impl DeriveLedger {
         Ok(completed)
     }
 
-    fn checkpoint(
-        verified: &VerifiedLoaderInput,
-        payload: &ClickHouseInsertPayload,
-    ) -> DerivePayloadCheckpoint {
-        DerivePayloadCheckpoint {
-            source: BACKFILL_DERIVE_SOURCE.to_owned(),
-            content_hash: verified.manifest.content_hash.clone(),
-            receipt_hash: verified.manifest.receipt_hash.clone(),
-            table: payload.table.name().to_owned(),
+    fn checkpoint(payload: &ClickHouseInsertPayload) -> DeriveCheckpointRecord {
+        DeriveCheckpointRecord::from_payload_body(
+            payload.checkpoint_key.clone(),
+            payload.dedupe_token.clone(),
+            payload.row_count,
+            &payload.body,
+        )
+        .unwrap_or_else(|_err| DeriveCheckpointRecord {
+            key: payload.checkpoint_key.clone(),
             dedupe_token: payload.dedupe_token.clone(),
-            row_count: payload.row_count,
-            payload_hash: hash_payload_body(&payload.body),
-        }
+            row_count: u64::MAX,
+            payload_hash: String::new(),
+        })
     }
-}
-
-fn hash_payload_body(body: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(body.as_bytes());
-    hex::encode(hasher.finalize())
 }

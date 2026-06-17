@@ -18,8 +18,8 @@ use schema::ClickHouseIdentifier;
 pub use schema::{ClickHouseTable, aggregate_rebuild_sql, create_schema_sql};
 
 use crate::derive::{
-    BACKFILL_DERIVE_SOURCE, ClickHouseDeriveBatch, DeriveManifestIdentity, PostServingRow,
-    TotalPostCounterInput,
+    BACKFILL_DERIVE_SOURCE, ClickHouseDeriveBatch, DeriveCheckpointKey, DeriveManifestIdentity,
+    PostServingRow, TotalPostCounterInput,
 };
 
 /// `ClickHouse` HTTP insert format used by the derive lane.
@@ -52,6 +52,8 @@ pub struct ClickHouseInsertPayload {
     pub row_count: usize,
     /// Idempotent batch token from the derive output.
     pub dedupe_token: String,
+    /// Durable derive checkpoint key for this insert payload.
+    pub checkpoint_key: DeriveCheckpointKey,
 }
 
 /// Minimal `ClickHouse` HTTP client configuration.
@@ -369,6 +371,7 @@ pub fn post_serving_insert_payload(
         &batch.manifest_identity,
         &batch.post_rows,
         batch.dedupe_token.clone(),
+        DeriveCheckpointKey::post_serving(&batch.manifest_identity, 0),
     )
 }
 
@@ -382,6 +385,7 @@ pub fn post_serving_rows_insert_payload(
     identity: &DeriveManifestIdentity,
     post_rows: &[PostServingRow],
     dedupe_token: String,
+    checkpoint_key: DeriveCheckpointKey,
 ) -> Result<ClickHouseInsertPayload, ClickHouseSchemaError> {
     let rows = post_rows
         .iter()
@@ -393,6 +397,7 @@ pub fn post_serving_rows_insert_payload(
         body: json_each_row(&rows)?,
         row_count: rows.len(),
         dedupe_token,
+        checkpoint_key,
     })
 }
 
@@ -424,6 +429,7 @@ pub fn total_post_counter_insert_payload(
     total_post_counter_insert_payload_for_counter(
         &batch.total_post_counter,
         batch.dedupe_token.clone(),
+        DeriveCheckpointKey::total_post_counter(&batch.manifest_identity),
     )
 }
 
@@ -435,6 +441,7 @@ pub fn total_post_counter_insert_payload(
 pub fn total_post_counter_insert_payload_for_counter(
     counter: &TotalPostCounterInput,
     dedupe_token: String,
+    checkpoint_key: DeriveCheckpointKey,
 ) -> Result<ClickHouseInsertPayload, ClickHouseSchemaError> {
     let row = TotalPostCounterInsertRow::from_counter(counter);
     Ok(ClickHouseInsertPayload {
@@ -443,6 +450,7 @@ pub fn total_post_counter_insert_payload_for_counter(
         body: json_each_row(&[row])?,
         row_count: 1,
         dedupe_token,
+        checkpoint_key,
     })
 }
 

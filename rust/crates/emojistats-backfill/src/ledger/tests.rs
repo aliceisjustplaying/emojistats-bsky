@@ -664,6 +664,37 @@ fn sqlite_host_overrides_round_trip() {
 }
 
 #[test]
+fn sqlite_host_override_force_mode_update_preserves_operator_fields() {
+    let store = SqliteLedger::open_in_memory().unwrap();
+    let original = HostOverride {
+        host: "pds.example.com".to_owned(),
+        disabled: true,
+        concurrency_cap: Some(9),
+        min_interval: Some(Duration::from_millis(250)),
+        revive_after: Some(UNIX_EPOCH + Duration::from_secs(60)),
+        force_mode: Some(ForcedFetchMode::GetRepo),
+        never_diff: true,
+    };
+    store.upsert_host_override(&original).unwrap();
+
+    store
+        .upsert_host_override_force_mode(
+            "pds.example.com",
+            Some(ForcedFetchMode::ListRecords),
+            Some(Duration::from_secs(1)),
+        )
+        .unwrap();
+
+    assert_eq!(
+        store.load_host_override("pds.example.com").unwrap(),
+        Some(HostOverride {
+            force_mode: Some(ForcedFetchMode::ListRecords),
+            ..original
+        })
+    );
+}
+
+#[test]
 fn sqlite_host_overrides_reject_blank_hosts_and_zero_caps() {
     let store = SqliteLedger::open_in_memory().unwrap();
     let blank_host = HostOverride {

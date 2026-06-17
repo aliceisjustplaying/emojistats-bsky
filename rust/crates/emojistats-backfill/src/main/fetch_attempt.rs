@@ -13,10 +13,9 @@ pub(crate) use super::attempt_runtime::{
 use super::{
     super::{
         ArchiveCommitContext, ArchiveStorageConfig, ClaimScope, Did, Duration, FetchConfig,
-        FetchError, FetchOneFailure, ForcedFetchMode, HostOverride, Instant, ParseConfig, Path,
-        PublicResolver, SmokeTelemetry, SqliteLedger, SystemTime, Uri, classify_fetch_error,
-        current_rss_kb, elapsed_ms, emit_smoke_telemetry, outcome_name, permanent_failure,
-        retryable_failure,
+        FetchError, FetchOneFailure, ForcedFetchMode, Instant, ParseConfig, Path, PublicResolver,
+        SmokeTelemetry, SqliteLedger, SystemTime, Uri, classify_fetch_error, current_rss_kb,
+        elapsed_ms, emit_smoke_telemetry, outcome_name, permanent_failure, retryable_failure,
     },
     archive_host::{ArchiveClaimCheck, prepare_fetch_host},
     attempt_runtime::acquire_host_fetch_permit,
@@ -286,16 +285,13 @@ fn persist_list_records_method_wall_override(step: &FetchModeStep<'_>, error: &F
     let Some(ledger_path) = step.host_override_ledger_path else {
         return;
     };
-    let record = HostOverride {
-        host: step.host.to_owned(),
-        disabled: false,
-        concurrency_cap: None,
-        min_interval: step.host_min_interval,
-        revive_after: None,
-        force_mode: Some(ForcedFetchMode::ListRecords),
-        never_diff: false,
-    };
-    match SqliteLedger::open(ledger_path).and_then(|ledger| ledger.upsert_host_override(&record)) {
+    match SqliteLedger::open(ledger_path).and_then(|ledger| {
+        ledger.upsert_host_override_force_mode(
+            step.host,
+            Some(ForcedFetchMode::ListRecords),
+            step.host_min_interval,
+        )
+    }) {
         Ok(()) => eprintln!(
             "recorded listRecords host override for {} after getRepo method wall: {error}",
             step.host

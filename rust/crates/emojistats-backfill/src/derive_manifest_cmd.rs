@@ -24,16 +24,16 @@ use super::{add_count, count_len, increment, payload_row_count};
 
 mod ledger;
 mod streaming;
-mod tokens;
 
 #[cfg(test)]
 use emojistats_backfill::clickhouse::DEFAULT_POST_SERVING_PAYLOAD_MAX_BYTES;
 #[cfg(test)]
-use emojistats_backfill::derive::{DeriveManifestIdentity, PostServingRow, TotalPostCounterInput};
+use emojistats_backfill::derive::{
+    DeriveManifestIdentity, PostServingRow, TotalPostCounterInput,
+    canonical_streaming_counter_dedupe_token, canonical_streaming_post_dedupe_token,
+};
 use ledger::DeriveLedger;
-use streaming::{CanonicalStreamingPayloadState, validate_canonical_streaming_proof};
-#[cfg(test)]
-use tokens::{canonical_streaming_counter_dedupe_token, canonical_streaming_post_dedupe_token};
+use streaming::CanonicalStreamingPayloadState;
 
 pub struct DeriveManifestConfig {
     pub manifest_path: PathBuf,
@@ -142,7 +142,7 @@ async fn derive_verified_input_canonical_streaming(
     verified: &VerifiedLoaderInput,
     context: &mut DeriveRunContext<'_>,
 ) -> anyhow::Result<()> {
-    validate_canonical_streaming_proof(verified)?;
+    let payloads = build_verified_input_payloads_canonical_streaming(verified)?;
     context.metrics.increment_counter(
         MetricName::DeriveRowsVerifiedTotal,
         derive_metric_labels(
@@ -152,7 +152,7 @@ async fn derive_verified_input_canonical_streaming(
         ),
         verified.repo_receipt.archived_post_rows_count,
     );
-    insert_verified_input_canonical_streaming(verified, context).await?;
+    apply_derive_payloads(context, verified, &payloads).await?;
     context.metrics.increment_counter(
         MetricName::DeriveFilesReadTotal,
         derive_metric_labels(
@@ -168,22 +168,23 @@ async fn derive_verified_input_canonical_streaming(
     )
 }
 
-async fn insert_verified_input_canonical_streaming(
+fn build_verified_input_payloads_canonical_streaming(
     verified: &VerifiedLoaderInput,
-    context: &mut DeriveRunContext<'_>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<ClickHouseInsertPayload>> {
     let file = File::open(&verified.object_path)?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
     let mut state = CanonicalStreamingPayloadState::new(verified);
+    let mut output = Vec::new();
 
     for batch in reader {
         let rows = archive_post_rows_from_record_batch(&batch?)?;
         let payloads = state.consume_rows(&rows)?;
-        apply_derive_payloads(context, verified, &payloads).await?;
+        output.extend(payloads);
     }
 
     let payloads = state.finish()?;
-    apply_derive_payloads(context, verified, &payloads).await
+    output.extend(payloads);
+    Ok(output)
 }
 
 async fn apply_derive_payloads(

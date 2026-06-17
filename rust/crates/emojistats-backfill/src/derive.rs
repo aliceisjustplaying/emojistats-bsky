@@ -1,13 +1,14 @@
 //! Derive-lane DTOs for turning committed archive manifests into `ClickHouse` loads.
 
-use std::collections::HashMap;
-
 use sha2::{Digest, Sha256};
 
 use crate::archive::{
-    ArchivePostRow, CreatedAtParseStatus, EmojiProjectionRow, LocalManifestEntry,
-    NormalizerVersion, PostDataset,
+    ArchivePostRow, CreatedAtParseStatus, LocalManifestEntry, NormalizerVersion, PostDataset,
 };
+
+#[path = "derive/tokens.rs"]
+mod tokens;
+pub use tokens::{canonical_streaming_counter_dedupe_token, canonical_streaming_post_dedupe_token};
 
 /// Source marker for rows produced by the v2 backfill derive lane.
 pub const BACKFILL_DERIVE_SOURCE: &str = "backfill-v2-derive";
@@ -77,21 +78,8 @@ pub struct PostServingRow {
     pub emojis: Vec<String>,
 }
 
-/// Borrowed projection row derived from one archive post row.
-#[derive(Debug, Clone, Copy, serde::Serialize)]
-pub struct BorrowedEmojiProjectionRow<'a> {
-    pub did: &'a str,
-    pub rkey: &'a str,
-    pub cid: &'a str,
-    pub created_at_normalized: Option<&'a str>,
-    pub created_at_parse_status: crate::archive::CreatedAtParseStatus,
-    pub emoji: &'a str,
-    pub occurrences: u64,
-    pub langs: &'a [String],
-}
-
 /// Durable key for a derived `ClickHouse` write unit.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct DeriveCheckpointKey {
     pub source: String,
     pub receipt_hash: String,
@@ -100,7 +88,7 @@ pub struct DeriveCheckpointKey {
 }
 
 /// Derive write lane represented by a checkpoint key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeriveCheckpointLane {
     PostServing,
@@ -108,7 +96,7 @@ pub enum DeriveCheckpointLane {
 }
 
 /// Durable checkpoint value for replaying or auditing a completed derive write.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct DeriveCheckpointRecord {
     pub key: DeriveCheckpointKey,
     pub dedupe_token: String,
@@ -343,110 +331,6 @@ fn validate_manifest_row_count(
             archive_rows,
         })
     }
-}
-
-/// Derive compact emoji projection rows for archive post rows.
-///
-/// # Errors
-///
-/// Returns [`DeriveError`] if occurrence counters overflow.
-pub fn derive_emoji_projection_rows(
-    rows: &[ArchivePostRow],
-) -> Result<Vec<EmojiProjectionRow>, DeriveError> {
-    let mut projected = Vec::new();
-    for row in rows {
-        projected.extend(emoji_projection_rows_for_post(row)?);
-    }
-    Ok(projected)
-}
-
-/// Derive compact emoji projection rows for one archive post row.
-///
-/// # Errors
-///
-/// Returns [`DeriveError`] if occurrence counters overflow.
-pub fn emoji_projection_rows_for_post(
-    row: &ArchivePostRow,
-) -> Result<Vec<EmojiProjectionRow>, DeriveError> {
-    Ok(borrowed_emoji_projection_rows_for_post(row)?
-        .into_iter()
-        .map(|row| EmojiProjectionRow {
-            did: row.did.to_owned(),
-            rkey: row.rkey.to_owned(),
-            cid: row.cid.to_owned(),
-            created_at_normalized: row.created_at_normalized.map(ToOwned::to_owned),
-            created_at_parse_status: row.created_at_parse_status,
-            emoji: row.emoji.to_owned(),
-            occurrences: row.occurrences,
-            langs: row.langs.to_vec(),
-        })
-        .collect())
-}
-
-/// Derive borrowed compact emoji projection rows for one archive post row.
-///
-/// # Errors
-///
-/// Returns [`DeriveError`] if occurrence counters overflow.
-pub fn borrowed_emoji_projection_rows_for_post(
-    row: &ArchivePostRow,
-) -> Result<Vec<BorrowedEmojiProjectionRow<'_>>, DeriveError> {
-    const MAP_THRESHOLD: usize = 16;
-    let mut rows: Vec<BorrowedEmojiProjectionRow<'_>> = Vec::new();
-    if row.emoji_sequence.len() <= MAP_THRESHOLD {
-        for emoji in &row.emoji_sequence {
-            if let Some(existing) =
-                rows.iter_mut()
-                    .find(|candidate: &&mut BorrowedEmojiProjectionRow<'_>| {
-                        candidate.emoji == emoji.as_str()
-                    })
-            {
-                increment_occurrences(&mut existing.occurrences)?;
-            } else {
-                rows.push(borrowed_projection_row(row, emoji.as_str(), 1));
-            }
-        }
-        return Ok(rows);
-    }
-
-    let mut indexes: HashMap<&str, usize> = HashMap::new();
-    for emoji in &row.emoji_sequence {
-        if let Some(index) = indexes.get(emoji.as_str()).copied() {
-            let existing = rows.get_mut(index).ok_or(DeriveError::CountOverflow {
-                field: "emoji_row_index",
-            })?;
-            increment_occurrences(&mut existing.occurrences)?;
-        } else {
-            indexes.insert(emoji.as_str(), rows.len());
-            rows.push(borrowed_projection_row(row, emoji.as_str(), 1));
-        }
-    }
-
-    Ok(rows)
-}
-
-fn borrowed_projection_row<'a>(
-    row: &'a ArchivePostRow,
-    emoji: &'a str,
-    occurrences: u64,
-) -> BorrowedEmojiProjectionRow<'a> {
-    BorrowedEmojiProjectionRow {
-        did: row.did.as_str(),
-        rkey: row.rkey.as_str(),
-        cid: row.cid.as_str(),
-        created_at_normalized: row.created_at_normalized.as_deref(),
-        created_at_parse_status: row.created_at_parse_status,
-        emoji,
-        occurrences,
-        langs: &row.langs,
-    }
-}
-
-fn increment_occurrences(value: &mut u64) -> Result<(), DeriveError> {
-    *value = value.checked_add(1).ok_or(DeriveError::CountOverflow {
-        field: "emoji_occurrences",
-    })?;
-    Ok(())
 }
 
 fn count_rows(rows: &[ArchivePostRow]) -> Result<u64, DeriveError> {

@@ -1,20 +1,22 @@
+use sha2::Digest as _;
+
 use super::{
     ARCHIVE_SCHEMA_VERSION, Arc, ArchiveArtifacts, ArchiveCommitContext, ArchiveError,
-    ArchivePostRow, ArchiveStorageConfig, ArrowWriter, CompletenessClass, DateTime, Digest,
-    FetchMethod, File, LocalManifestEntry, ManifestMode, Metadata, NamedTempFile,
-    NormalizerVersion, PARQUET_BATCH_ROWS, POST_COLLECTION, Path, PathBuf, ProfileRecord,
-    RepoReceipt, Request, Schema, Sha256, TempPath, Utc, Write,
+    ArchivePostRow, ArchiveStorageConfig, ArrowWriter, CompletenessClass, DateTime, FetchMethod,
+    File, LocalManifestEntry, ManifestMode, Metadata, NamedTempFile, NormalizerVersion,
+    PARQUET_BATCH_ROWS, POST_COLLECTION, Path, PathBuf, ProfileRecord, RepoReceipt, Request,
+    Schema, Sha256, TempPath, Utc,
     archive_io::{
-        append_hash_field_frame, append_normalizer_frames, archive_error_from_derive,
-        archive_schema, framed_fields, hash_extras_json, hash_field, hash_field_bytes,
-        hash_optional_field, hash_post_row_into, hash_string_slice, json_bytes,
+        append_hash_field_frame, append_normalizer_frames, archive_schema, framed_fields,
+        hash_extras_json, hash_field, hash_optional_field, hash_post_row_into, hash_string_slice,
         local_manifest_from_committed, parquet_writer_properties, post_record_batch,
         receipt_dataset, stable_artifact_stem, stable_object_receipt_path,
         stable_repo_receipt_name, update_min_max_created_at, write_json_pretty,
     },
-    borrowed_emoji_projection_rows_for_post,
     commit_backend::ArchiveCommitBackend,
-    format_observed_at, fs, hash_serialized_json, promote_temp_idempotent,
+    format_observed_at, fs, hash_serialized_json,
+    projection_writer::StreamingProjectionWriter,
+    promote_temp_idempotent,
     row::current_normalizer,
     write_temp_idempotent,
 };
@@ -28,11 +30,10 @@ pub struct StreamingArchiveSink {
     schema: Arc<Schema>,
     batch: Vec<ArchivePostRow>,
     rows_hash: Sha256,
-    emoji_projection_hash: Sha256,
+    projection_writer: StreamingProjectionWriter,
     archived_post_rows_count: u64,
     emoji_posts_count: u64,
     emoji_occurrences_count: u64,
-    emoji_rows: u64,
     min_created_at_normalized: Option<String>,
     max_created_at_normalized: Option<String>,
     normalizer: NormalizerVersion,
@@ -43,7 +44,6 @@ pub struct StreamingArchiveSink {
     hash_prefix: Vec<u8>,
     hash_after_cid: Vec<u8>,
     hash_public_none: Vec<u8>,
-    emoji_file: File,
 }
 
 /// Summary fields needed to finish a streaming repo receipt.
@@ -111,11 +111,10 @@ impl StreamingArchiveSink {
             schema,
             batch: Vec::with_capacity(PARQUET_BATCH_ROWS),
             rows_hash: Sha256::new(),
-            emoji_projection_hash: Sha256::new(),
+            projection_writer: StreamingProjectionWriter::new(emoji_file),
             archived_post_rows_count: 0,
             emoji_posts_count: 0,
             emoji_occurrences_count: 0,
-            emoji_rows: 0,
             min_created_at_normalized: None,
             max_created_at_normalized: None,
             normalizer,
@@ -126,7 +125,6 @@ impl StreamingArchiveSink {
             hash_prefix,
             hash_after_cid,
             hash_public_none,
-            emoji_file,
         })
     }
 
@@ -190,7 +188,7 @@ impl StreamingArchiveSink {
             row.created_at_normalized.as_deref(),
         );
         if !row.emoji_sequence.is_empty() {
-            self.write_emoji_projection_rows(&row)?;
+            self.projection_writer.write_row(&row)?;
         }
         self.batch.push(row);
         if self.batch.len() >= PARQUET_BATCH_ROWS {
@@ -220,25 +218,6 @@ impl StreamingArchiveSink {
         hash_string_slice(&mut self.rows_hash, &row.langs)?;
         hash_string_slice(&mut self.rows_hash, &row.emoji_sequence)?;
         hash_extras_json(&mut self.rows_hash, &row.extras_json)
-    }
-
-    fn write_emoji_projection_rows(&mut self, row: &ArchivePostRow) -> Result<(), ArchiveError> {
-        for projection_row in
-            borrowed_emoji_projection_rows_for_post(row).map_err(archive_error_from_derive)?
-        {
-            let json = json_bytes(&projection_row)?;
-            hash_field_bytes(&mut self.emoji_projection_hash, &json)?;
-            self.emoji_file.write_all(&json)?;
-            self.emoji_file.write_all(b"\n")?;
-            self.emoji_rows =
-                self.emoji_rows
-                    .checked_add(1)
-                    .ok_or(ArchiveError::CountOverflow {
-                        field: "emoji_rows",
-                    })?;
-        }
-
-        Ok(())
     }
 
     /// Finish all artifacts and return the receipt plus artifact paths.
@@ -298,7 +277,7 @@ impl StreamingArchiveSink {
                 field: "streaming_parquet_writer_missing",
             })?
             .close()?;
-        self.emoji_file.sync_all()?;
+        self.projection_writer.sync()?;
         Ok(())
     }
 
@@ -319,7 +298,7 @@ impl StreamingArchiveSink {
             commit_cid: input.commit_cid,
             archive_rows_hash: post_rows_hash.clone(),
             post_rows_hash,
-            emoji_projection_hash: hex::encode(self.emoji_projection_hash.clone().finalize()),
+            emoji_projection_hash: self.projection_writer.hash(),
             profile_row_hash: input.profile_row_hash,
             normalizer: self.normalizer.clone(),
             repo_commit_signature_verified: false,
@@ -404,7 +383,7 @@ impl StreamingArchiveSink {
                 .map(|artifact| artifact.receipt_path.clone()),
             profile_sidecar_manifest_path: committed_profile.map(|artifact| artifact.manifest_path),
             manifest,
-            emoji_rows: self.emoji_rows,
+            emoji_rows: self.projection_writer.rows(),
         }
     }
 

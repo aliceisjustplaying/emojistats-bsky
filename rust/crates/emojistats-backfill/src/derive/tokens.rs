@@ -1,10 +1,7 @@
-use emojistats_backfill::{
-    archive::NormalizerVersion,
-    derive::{DeriveManifestIdentity, PostServingRow, TotalPostCounterInput},
-};
 use sha2::{Digest, Sha256};
 
-use super::count_len;
+use super::{DeriveError, DeriveManifestIdentity, PostServingRow, TotalPostCounterInput};
+use crate::archive::NormalizerVersion;
 
 // Canonical streaming derive tokens are lane/chunk-framed and use the same stable manifest
 // identity fields as full-batch derive tokens: dataset, DID, proof hashes, schema, and normalizer.
@@ -25,7 +22,12 @@ impl StreamingDedupeLane {
     }
 }
 
-pub(super) fn canonical_streaming_post_dedupe_token(
+/// Build the canonical `ClickHouse` dedupe token for one streaming post chunk.
+///
+/// # Errors
+///
+/// Returns an error if any framed field length or row count cannot be represented.
+pub fn canonical_streaming_post_dedupe_token(
     identity: &DeriveManifestIdentity,
     chunk_index: u64,
     rows: &[PostServingRow],
@@ -49,7 +51,12 @@ pub(super) fn canonical_streaming_post_dedupe_token(
     Ok(streaming_dedupe_token(StreamingDedupeLane::Post, hasher))
 }
 
-pub(super) fn canonical_streaming_counter_dedupe_token(
+/// Build the canonical `ClickHouse` dedupe token for one streaming total counter payload.
+///
+/// # Errors
+///
+/// Returns an error if any framed field length or counter value cannot be represented.
+pub fn canonical_streaming_counter_dedupe_token(
     identity: &DeriveManifestIdentity,
     counter: &TotalPostCounterInput,
 ) -> anyhow::Result<String> {
@@ -235,4 +242,8 @@ fn hash_frame(hasher: &mut Sha256, label: &'static str, value: &[u8]) -> anyhow:
     hasher.update(count_len(value.len(), "streaming dedupe frame value length")?.to_be_bytes());
     hasher.update(value);
     Ok(())
+}
+
+fn count_len(value: usize, field: &'static str) -> Result<u64, DeriveError> {
+    u64::try_from(value).map_err(|_err| DeriveError::CountOverflow { field })
 }

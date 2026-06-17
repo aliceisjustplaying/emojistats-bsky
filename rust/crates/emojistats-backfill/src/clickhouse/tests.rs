@@ -191,7 +191,9 @@ fn schema_sql_contains_typed_table_names_and_engines() {
 fn aggregate_rebuild_sql_uses_compact_post_rows_and_array_join() {
     let sql = aggregate_rebuild_sql("emojistats").expect("aggregate rebuild sql");
 
+    assert!(sql.contains("TRUNCATE TABLE IF EXISTS emojistats.v2_emoji_total_r3"));
     assert!(sql.contains("INSERT INTO emojistats.v2_emoji_total_r3"));
+    assert!(sql.contains("TRUNCATE TABLE IF EXISTS emojistats.v2_posts_hourly_r3"));
     assert!(sql.contains("FROM emojistats.v2_post_serving_r3 FINAL"));
     assert!(sql.contains("ARRAY JOIN emojis AS emoji"));
     assert!(sql.contains("arrayJoin(langs) AS lang"));

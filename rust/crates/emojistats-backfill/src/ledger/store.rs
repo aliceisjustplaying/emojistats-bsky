@@ -7,8 +7,8 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use rusqlite_migration::{M, Migrations};
 
 use super::{
-    AttemptOutcome, HostOverride, LedgerSeedBatchSummary, LedgerStoreError, RepoLedgerEntry,
-    RepoLedgerStatus, RetryPolicy, SHARD_BUCKET_MIGRATION_BATCH_SIZE, ShardFilter,
+    AttemptOutcome, ForcedFetchMode, HostOverride, LedgerSeedBatchSummary, LedgerStoreError,
+    RepoLedgerEntry, RepoLedgerStatus, RetryPolicy, SHARD_BUCKET_MIGRATION_BATCH_SIZE, ShardFilter,
     complete_attempt, did_shard_bucket, validate_worker_id,
 };
 use crate::ledger::codec::{
@@ -804,6 +804,47 @@ impl SqliteLedger {
                 record.force_mode.map(force_mode_name),
                 bool_to_i64(record.never_diff),
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Set only the forced fetch mode for one host, preserving existing operator policy fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerStoreError`] when the host/default record cannot be encoded or persisted.
+    pub fn upsert_host_override_force_mode(
+        &self,
+        host: &str,
+        force_mode: Option<ForcedFetchMode>,
+        default_min_interval: Option<Duration>,
+    ) -> Result<(), LedgerStoreError> {
+        let default_record = HostOverride {
+            host: host.to_owned(),
+            disabled: false,
+            concurrency_cap: None,
+            min_interval: default_min_interval,
+            revive_after: None,
+            force_mode,
+            never_diff: false,
+        };
+        validate_host_override(&default_record)?;
+        let min_interval_ms = optional_duration_to_millis(default_min_interval)?;
+        self.connection.execute(
+            "
+            INSERT INTO host_overrides (
+                host,
+                disabled,
+                concurrency_cap,
+                min_interval_ms,
+                revive_after_ms,
+                force_mode,
+                never_diff
+            ) VALUES (?1, 0, NULL, ?2, NULL, ?3, 0)
+            ON CONFLICT(host) DO UPDATE SET
+                force_mode = excluded.force_mode
+            ",
+            params![host, min_interval_ms, force_mode.map(force_mode_name)],
         )?;
         Ok(())
     }

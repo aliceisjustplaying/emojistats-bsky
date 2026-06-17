@@ -9,6 +9,8 @@ use emojistats_backfill::{
 };
 use serde::Serialize;
 
+const BYTE_PRESSURE_RETRY_AFTER: Duration = Duration::from_secs(60);
+
 #[derive(Serialize)]
 pub struct SmokeTelemetry<'a> {
     pub event: &'static str,
@@ -94,12 +96,16 @@ pub fn classify_fetch_error(did: &str, error: &FetchError) -> FetchOneFailure {
         | FetchError::Io { .. } => AttemptOutcome::RetryableFailure {
             message: message.clone(),
         },
-        FetchError::ErrorBodyTooLarge { .. }
-        | FetchError::InFlightBytesUnavailable { .. }
-        | FetchError::ByteBudgetPoisoned => AttemptOutcome::OperatorDeferred {
-            retry_after: None,
+        FetchError::InFlightBytesUnavailable { .. } => AttemptOutcome::OperatorDeferred {
+            retry_after: Some(BYTE_PRESSURE_RETRY_AFTER),
             message: message.clone(),
         },
+        FetchError::ErrorBodyTooLarge { .. } | FetchError::ByteBudgetPoisoned => {
+            AttemptOutcome::OperatorDeferred {
+                retry_after: None,
+                message: message.clone(),
+            }
+        }
         FetchError::MaxBytesExceeded { .. } | FetchError::InFlightBytesExceeded { .. } => {
             AttemptOutcome::ResourceLimitExceeded {
                 message: message.clone(),
@@ -405,7 +411,7 @@ mod tests {
         assert!(matches!(
             failure.outcome,
             AttemptOutcome::OperatorDeferred {
-                retry_after: None,
+                retry_after: Some(BYTE_PRESSURE_RETRY_AFTER),
                 ..
             }
         ));

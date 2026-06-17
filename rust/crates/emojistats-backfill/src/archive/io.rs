@@ -3,12 +3,12 @@ use sha2::Digest as _;
 use super::{
     ARCHIVE_SCHEMA_VERSION, Arc, ArchiveCommitContext, ArchiveError, ArchivePostRow, Array,
     ArrayRef, ArrowWriter, CompletenessClass, Compression, Cow, CreatedAtParseStatus, DataType,
-    DeriveError, EmojiProjectionRow, FetchMethod, Field, File, LocalManifestEntry, LocalStore,
-    ManifestMode, Metadata, NONCANONICAL_POSTS_DATASET, NormalizerVersion, PARQUET_BATCH_ROWS,
-    POST_COLLECTION, ParquetRecordBatchReaderBuilder, Path, PathBuf, PostDataset, ProfileRecord,
-    ProfileSidecarRow, RecordBatch, RepoReceipt, RepoReceiptInput, Request, Schema, Serialize,
-    Sha256, StringArray, StringBuilder, Write, WriterProperties, ZstdLevel,
-    derive_emoji_projection_rows, format_observed_at, hash_serialized_json,
+    EmojiProjectionRow, FetchMethod, Field, File, LocalManifestEntry, LocalStore, ManifestMode,
+    Metadata, NONCANONICAL_POSTS_DATASET, NormalizerVersion, PARQUET_BATCH_ROWS, POST_COLLECTION,
+    ParquetRecordBatchReaderBuilder, Path, PathBuf, PostDataset, ProfileRecord, ProfileSidecarRow,
+    RecordBatch, RepoReceipt, RepoReceiptInput, Request, Schema, Serialize, Sha256, StringArray,
+    StringBuilder, Write, WriterProperties, ZstdLevel, derive_emoji_projection_rows,
+    format_observed_at, hash_serialized_json,
 };
 
 /// Read raw archive post rows from the Stage D Parquet shape.
@@ -53,8 +53,7 @@ pub fn archive_post_rows_from_record_batch(
 pub fn build_repo_receipt(input: RepoReceiptInput<'_>) -> Result<RepoReceipt, ArchiveError> {
     let rows = input.rows;
     let post_rows_hash = hash_post_rows(rows)?;
-    let emoji_projection_rows =
-        derive_emoji_projection_rows(rows).map_err(archive_error_from_derive)?;
+    let emoji_projection_rows = derive_emoji_projection_rows(rows)?;
     let emoji_projection_hash = hash_emoji_projection_rows(&emoji_projection_rows)?;
     Ok(RepoReceipt {
         observed_at: format_observed_at(input.observed_at),
@@ -547,21 +546,6 @@ fn profile_sidecar_row(profile: &ProfileRecord) -> ProfileSidecarRow<'_> {
 
 pub(super) fn extract_emojis(text: &str) -> Vec<String> {
     emoji_normalizer::extract_emoji_sequence(text)
-}
-
-pub(super) fn archive_error_from_derive(error: DeriveError) -> ArchiveError {
-    match error {
-        DeriveError::CountOverflow { field } => ArchiveError::CountOverflow { field },
-        DeriveError::RowCountMismatch { .. } => ArchiveError::CountOverflow {
-            field: "derive_row_count_mismatch",
-        },
-        DeriveError::UnsupportedDataset { dataset } => {
-            drop(dataset);
-            ArchiveError::CountOverflow {
-                field: "derive_unsupported_dataset",
-            }
-        }
-    }
 }
 
 fn count_emoji_posts(rows: &[ArchivePostRow]) -> Result<u64, ArchiveError> {

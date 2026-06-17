@@ -14,7 +14,7 @@ use emojistats_backfill::{
         current_normalizer, write_archive_artifacts,
     },
     clickhouse::{ClickHouseInsertPayload, ClickHouseTable, JSON_EACH_ROW_FORMAT},
-    derive::BACKFILL_DERIVE_SOURCE,
+    derive::{BACKFILL_DERIVE_SOURCE, DeriveCheckpointKey},
     manifest_derive::debug_read_committed_jsonl,
     metrics::noop_metrics_recorder,
 };
@@ -243,6 +243,7 @@ fn payload(table: ClickHouseTable, token: &str, body: &str) -> ClickHouseInsertP
         body: body.to_owned(),
         row_count: body.lines().count(),
         dedupe_token: token.to_owned(),
+        checkpoint_key: DeriveCheckpointKey::total_post_counter(&identity()),
     }
 }
 

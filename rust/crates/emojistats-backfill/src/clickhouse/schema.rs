@@ -75,12 +75,20 @@ pub fn create_schema_sql(database: &str) -> Result<String, ClickHouseSchemaError
 pub fn aggregate_rebuild_sql(database: &str) -> Result<String, ClickHouseSchemaError> {
     let database = ClickHouseIdentifier::new(database)?;
     Ok([
+        truncate_table_sql(&database, ClickHouseTable::EmojiTotal),
         rebuild_emoji_total_sql(&database),
+        truncate_table_sql(&database, ClickHouseTable::EmojiTotalByLang),
         rebuild_emoji_total_by_lang_sql(&database),
+        truncate_table_sql(&database, ClickHouseTable::LangTotal),
         rebuild_lang_total_sql(&database),
+        truncate_table_sql(&database, ClickHouseTable::PostsHourly),
         rebuild_posts_hourly_sql(&database),
     ]
     .join("\n\n"))
+}
+
+fn truncate_table_sql(database: &ClickHouseIdentifier, table: ClickHouseTable) -> String {
+    format!("TRUNCATE TABLE IF EXISTS {database}.{};", table.name())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
