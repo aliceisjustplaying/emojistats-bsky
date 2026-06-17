@@ -358,18 +358,22 @@ pub enum ArchiveError {
 mod archive_io;
 #[path = "archive/commit_backend.rs"]
 mod commit_backend;
+#[path = "archive/full_write.rs"]
+mod full_write;
+#[path = "archive/row.rs"]
+mod row;
 mod write;
 
 pub use archive_io::{
     archive_post_rows_from_record_batch, build_repo_receipt, hash_post_rows, hash_profile_record,
     read_all_archive_post_rows,
 };
-pub use write::{
-    StreamingArchiveSink, StreamingReceiptInput, archive_row_from_owned_post,
-    archive_row_from_owned_post_observed_at, archive_row_from_post,
+pub use full_write::write_archive_artifacts;
+pub use row::{
+    archive_row_from_owned_post, archive_row_from_owned_post_observed_at, archive_row_from_post,
     archive_row_from_post_observed_at, archive_rows_from_parsed_repo, current_normalizer,
-    write_archive_artifacts,
 };
+pub use write::{StreamingArchiveSink, StreamingReceiptInput};
 
 /// Archive classification for an author-supplied `createdAt` value.
 #[derive(Debug, Clone, PartialEq, Eq)]

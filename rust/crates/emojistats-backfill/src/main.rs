@@ -6,9 +6,7 @@
 //! ("First implementation milestone").
 
 use std::{
-    collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -26,13 +24,11 @@ use emojistats_backfill::{
     },
     metrics::{SharedMetricsRecorder, jsonl_metrics_recorder, noop_metrics_recorder},
     parse::{ParseConfig, ParseVisitError, ParsedRepoSummary, parse_repo_for_did_with_state},
-    scheduler::{ClaimScope, HostPacer, SharedHostPacer},
-    transport::{FetchByteBudget, FetchConfig, FetchError, fetch_repo_with_rate_limit_observer},
+    scheduler::ClaimScope,
+    transport::{FetchConfig, FetchError},
 };
 use jacquard_common::{deps::fluent_uri::Uri, types::did::Did};
 use jacquard_identity::PublicResolver;
-use sha2::{Digest, Sha256};
-use tokio::sync::Semaphore;
 
 mod canary_cmd;
 mod cli;
@@ -43,17 +39,14 @@ mod fleet;
 pub(crate) mod main;
 mod profile_cmd;
 
-use cli::{ArchiveBackend, Cli, Command, HttpProtocol};
+use cli::{ArchiveBackend, Cli, Command};
 use derive_manifest_cmd::DeriveManifestConfig;
 use failure::{
     FetchOneFailure, SmokeTelemetry, classify_archive_error, classify_fetch_error,
     classify_parse_error, current_rss_kb, elapsed_ms, emit_smoke_telemetry, outcome_name,
     permanent_failure, retryable_failure,
 };
-use fleet::{
-    DEFAULT_HOST_CONCURRENCY_CAP, FleetConfig, HostConcurrencyLimiter, HostConcurrencyPermit,
-    default_worker_id,
-};
+use fleet::{FleetConfig, default_worker_id};
 use main::{
     archive_host::parse_and_archive_spooled_repo,
     fetch_attempt::{LocalFetchOneAttemptConfig, fetch_one_attempt},

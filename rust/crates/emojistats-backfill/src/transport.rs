@@ -1,18 +1,14 @@
 //! Stage B `getRepo` transport.
 
 use std::{
-    error::Error,
-    fmt,
-    fs::{self, File},
-    io,
+    fs, io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use futures_util::StreamExt as _;
-use http::{HeaderMap, StatusCode};
-use jacquard_api::com_atproto::sync::get_repo::{GetRepo, GetRepoError};
+use http::HeaderMap;
+use jacquard_api::com_atproto::sync::get_repo::GetRepo;
 use jacquard_common::{
     deps::fluent_uri::Uri,
     http_client::{HttpClient, HttpClientExt},
@@ -21,7 +17,7 @@ use jacquard_common::{
     xrpc::XrpcExt as _,
 };
 use tempfile::NamedTempFile;
-use tokio::{io::AsyncWriteExt as _, sync::Notify, time};
+use tokio::{io::AsyncWriteExt as _, time};
 
 const DEFAULT_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
@@ -74,447 +70,16 @@ impl FetchConfig {
     }
 }
 
-/// Shared cap for bytes currently held by in-flight streamed `CAR` files.
-#[derive(Debug, Clone)]
-pub struct FetchByteBudget {
-    inner: Arc<FetchByteBudgetInner>,
-}
-
-#[derive(Debug)]
-struct FetchByteBudgetInner {
-    max_bytes: u64,
-    charged_bytes: Mutex<u64>,
-    notify: Notify,
-}
-
-impl FetchByteBudget {
-    /// Build a shared in-flight byte budget.
-    #[must_use]
-    pub fn new(max_bytes: u64) -> Self {
-        Self {
-            inner: Arc::new(FetchByteBudgetInner {
-                max_bytes,
-                charged_bytes: Mutex::new(0),
-                notify: Notify::new(),
-            }),
-        }
-    }
-
-    fn reservation(&self) -> FetchByteBudgetReservation {
-        FetchByteBudgetReservation {
-            budget: self.clone(),
-            charged_bytes: 0,
-        }
-    }
-
-    async fn reserve_charged_delta(&self, delta: u64) -> Result<(), FetchError> {
-        if delta == 0 || self.inner.max_bytes == 0 {
-            return Ok(());
-        }
-        loop {
-            let notified = self.inner.notify.notified();
-            {
-                let mut charged = self
-                    .inner
-                    .charged_bytes
-                    .lock()
-                    .map_err(|_error| FetchError::ByteBudgetPoisoned)?;
-                let next = charged
-                    .checked_add(delta)
-                    .ok_or(FetchError::InFlightBytesExceeded {
-                        max_bytes: self.inner.max_bytes,
-                        observed_bytes: u64::MAX,
-                    })?;
-                if next <= self.inner.max_bytes {
-                    *charged = next;
-                    drop(charged);
-                    return Ok(());
-                }
-            }
-            notified.await;
-        }
-    }
-
-    fn release_charged(&self, bytes: u64) {
-        if bytes == 0 || self.inner.max_bytes == 0 {
-            return;
-        }
-        if let Ok(mut charged) = self.inner.charged_bytes.lock() {
-            *charged = charged.saturating_sub(bytes);
-        }
-        self.inner.notify.notify_waiters();
-    }
-}
-
-/// Held with a spooled repo until parse/archive no longer needs the local `CAR`.
-#[derive(Debug)]
-pub struct FetchByteBudgetReservation {
-    budget: FetchByteBudget,
-    charged_bytes: u64,
-}
-
-impl FetchByteBudgetReservation {
-    async fn reserve_capacity(&mut self, bytes: u64) -> Result<(), FetchError> {
-        if bytes > self.budget.inner.max_bytes {
-            return Err(FetchError::InFlightBytesExceeded {
-                max_bytes: self.budget.inner.max_bytes,
-                observed_bytes: bytes,
-            });
-        }
-        if bytes <= self.charged_bytes {
-            return Ok(());
-        }
-        let charged_target = bytes;
-        let delta = charged_target.checked_sub(self.charged_bytes).ok_or(
-            FetchError::InFlightBytesExceeded {
-                max_bytes: self.budget.inner.max_bytes,
-                observed_bytes: bytes,
-            },
-        )?;
-        self.budget.reserve_charged_delta(delta).await?;
-        self.charged_bytes = charged_target;
-        Ok(())
-    }
-
-    fn try_reserve_capacity(&mut self, bytes: u64) -> Result<(), FetchError> {
-        if bytes > self.budget.inner.max_bytes {
-            return Err(FetchError::InFlightBytesExceeded {
-                max_bytes: self.budget.inner.max_bytes,
-                observed_bytes: bytes,
-            });
-        }
-        if bytes <= self.charged_bytes {
-            return Ok(());
-        }
-        let charged_target = bytes;
-        let delta = charged_target.checked_sub(self.charged_bytes).ok_or(
-            FetchError::InFlightBytesExceeded {
-                max_bytes: self.budget.inner.max_bytes,
-                observed_bytes: bytes,
-            },
-        )?;
-        if delta == 0 || self.budget.inner.max_bytes == 0 {
-            self.charged_bytes = charged_target;
-            return Ok(());
-        }
-        let mut charged = self
-            .budget
-            .inner
-            .charged_bytes
-            .lock()
-            .map_err(|_error| FetchError::ByteBudgetPoisoned)?;
-        let next = charged
-            .checked_add(delta)
-            .ok_or(FetchError::InFlightBytesExceeded {
-                max_bytes: self.budget.inner.max_bytes,
-                observed_bytes: u64::MAX,
-            })?;
-        if next > self.budget.inner.max_bytes {
-            return Err(FetchError::InFlightBytesUnavailable {
-                max_bytes: self.budget.inner.max_bytes,
-                requested_bytes: charged_target,
-            });
-        }
-        *charged = next;
-        drop(charged);
-        self.charged_bytes = charged_target;
-        Ok(())
-    }
-
-    fn shrink_to_actual(&mut self, bytes: u64) -> Result<(), FetchError> {
-        if bytes > self.charged_bytes {
-            return Err(FetchError::InFlightBytesExceeded {
-                max_bytes: self.budget.inner.max_bytes,
-                observed_bytes: bytes,
-            });
-        }
-        let delta =
-            self.charged_bytes
-                .checked_sub(bytes)
-                .ok_or(FetchError::InFlightBytesExceeded {
-                    max_bytes: self.budget.inner.max_bytes,
-                    observed_bytes: bytes,
-                })?;
-        self.charged_bytes = bytes;
-        self.budget.release_charged(delta);
-        Ok(())
-    }
-
-    #[cfg(test)]
-    const fn charged_bytes(&self) -> u64 {
-        self.charged_bytes
-    }
-}
-
-impl Drop for FetchByteBudgetReservation {
-    fn drop(&mut self) {
-        self.budget.release_charged(self.charged_bytes);
-    }
-}
-
-/// A successfully spooled repo `CAR`.
-#[derive(Debug)]
-pub struct SpooledRepo {
-    /// Path to the local spooled `CAR`.
-    pub car_path: PathBuf,
-    /// HTTP status returned by `getRepo`.
-    pub http_status: u16,
-    /// Rate-limit headers observed on the response.
-    pub rate_limit: RateLimitSnapshot,
-    /// Bytes written to `car_path`.
-    pub bytes: u64,
-    _byte_budget_reservation: Option<FetchByteBudgetReservation>,
-}
-
-impl Drop for SpooledRepo {
-    fn drop(&mut self) {
-        let _ignored = fs::remove_file(&self.car_path);
-    }
-}
-
 mod rate_limit;
 #[cfg(test)]
 use rate_limit::parse_http_date_retry_after;
 pub use rate_limit::{AccountState, RateLimitSnapshot};
-
-/// Stage B fetch failures, split into account-state, HTTP, timeout, cap, stream, and I/O buckets.
-#[derive(Debug)]
-pub enum FetchError {
-    /// The PDS returned a terminal account-state error.
-    AccountState {
-        /// Account-state code from the XRPC body.
-        state: AccountState,
-        /// HTTP status returned by the PDS.
-        status: u16,
-        /// Optional XRPC error message.
-        message: Option<Box<str>>,
-        /// Rate-limit headers observed on the response.
-        rate_limit: Box<RateLimitSnapshot>,
-    },
-    /// The PDS returned a non-success HTTP status that was not a terminal account state.
-    HttpStatus {
-        /// HTTP status returned by the PDS.
-        status: u16,
-        /// XRPC error code when the body decoded as one.
-        error_code: Option<Box<str>>,
-        /// Optional XRPC error message.
-        message: Option<Box<str>>,
-        /// Rate-limit headers observed on the response.
-        rate_limit: Box<RateLimitSnapshot>,
-    },
-    /// No body chunk arrived inside the configured idle timeout.
-    InactivityTimeout {
-        /// Timeout used for each chunk read.
-        timeout: Duration,
-    },
-    /// The body download exceeded the configured wall-clock timeout.
-    DownloadTimeout {
-        /// Timeout used for the whole body download.
-        timeout: Duration,
-        /// Bytes already written when the timeout fired.
-        observed_bytes: u64,
-    },
-    /// The PDS did not return response headers inside the configured timeout.
-    ResponseHeaderTimeout {
-        /// Timeout used while waiting for response headers.
-        timeout: Duration,
-    },
-    /// The body trickled below the configured progress floor.
-    ProgressTimeout {
-        /// Progress window.
-        interval: Duration,
-        /// Minimum bytes expected in the window.
-        min_bytes: u64,
-        /// Bytes observed in the last window.
-        observed_bytes: u64,
-    },
-    /// The streamed body exceeded the configured single-repo byte cap.
-    MaxBytesExceeded {
-        /// Configured cap.
-        max_bytes: u64,
-        /// Bytes observed after accepting the chunk that crossed the cap.
-        observed_bytes: u64,
-    },
-    /// The PDS response body used for error classification exceeded its safety cap.
-    ErrorBodyTooLarge {
-        /// Configured cap.
-        max_bytes: u64,
-        /// Bytes observed after accepting the chunk that crossed the cap.
-        observed_bytes: u64,
-    },
-    /// The fleet-wide in-flight spool byte budget was exceeded.
-    InFlightBytesExceeded {
-        /// Configured cap.
-        max_bytes: u64,
-        /// Bytes observed after accepting the chunk that crossed the cap.
-        observed_bytes: u64,
-    },
-    /// The fleet-wide in-flight spool byte budget is temporarily occupied by other downloads.
-    InFlightBytesUnavailable {
-        /// Configured cap.
-        max_bytes: u64,
-        /// Bytes this reservation needed to hold.
-        requested_bytes: u64,
-    },
-    /// The in-flight byte budget lock was poisoned.
-    ByteBudgetPoisoned,
-    /// A streaming transport error occurred before or during body download.
-    Transport {
-        /// Transport error message.
-        message: String,
-        /// Bytes already written before the transport failed, when the body stream had started.
-        observed_bytes: Option<u64>,
-    },
-    /// Local filesystem I/O failed.
-    Io {
-        /// Underlying I/O error.
-        source: io::Error,
-    },
-}
-
-impl fmt::Display for FetchError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::AccountState {
-                state,
-                status,
-                message,
-                rate_limit: _,
-            } => write_fetch_message(
-                f,
-                &format_args!("account state {state}"),
-                *status,
-                message.as_deref(),
-            ),
-            Self::HttpStatus {
-                status,
-                error_code,
-                message,
-                rate_limit: _,
-            } => match error_code {
-                Some(code) => write_fetch_message(
-                    f,
-                    &format_args!("HTTP status {status} with XRPC error {code}"),
-                    *status,
-                    message.as_deref(),
-                ),
-                None => write!(f, "HTTP status {status}"),
-            },
-            Self::InactivityTimeout { timeout } => {
-                write!(f, "no body chunk within {}", timeout.as_secs())
-            }
-            Self::DownloadTimeout {
-                timeout,
-                observed_bytes,
-            } => write!(
-                f,
-                "body download exceeded {} seconds after {observed_bytes} bytes",
-                timeout.as_secs()
-            ),
-            Self::ResponseHeaderTimeout { timeout } => {
-                write!(
-                    f,
-                    "response headers did not arrive within {} seconds",
-                    timeout.as_secs()
-                )
-            }
-            Self::ProgressTimeout {
-                interval,
-                min_bytes,
-                observed_bytes,
-            } => write!(
-                f,
-                "body download made {observed_bytes} bytes progress in {} seconds, below minimum {min_bytes}",
-                interval.as_secs()
-            ),
-            Self::MaxBytesExceeded {
-                max_bytes,
-                observed_bytes,
-            } => write!(
-                f,
-                "spooled CAR exceeded max bytes: observed {observed_bytes}, max {max_bytes}"
-            ),
-            Self::ErrorBodyTooLarge {
-                max_bytes,
-                observed_bytes,
-            } => write!(
-                f,
-                "error response body exceeded max bytes: observed {observed_bytes}, max {max_bytes}"
-            ),
-            Self::InFlightBytesExceeded {
-                max_bytes,
-                observed_bytes,
-            } => write!(
-                f,
-                "in-flight spooled CAR bytes exceeded max bytes: observed {observed_bytes}, max {max_bytes}"
-            ),
-            Self::InFlightBytesUnavailable {
-                max_bytes,
-                requested_bytes,
-            } => write!(
-                f,
-                "in-flight spooled CAR byte budget unavailable: requested {requested_bytes}, max {max_bytes}"
-            ),
-            Self::ByteBudgetPoisoned => f.write_str("in-flight spool byte budget lock poisoned"),
-            Self::Transport {
-                message,
-                observed_bytes,
-            } => match observed_bytes {
-                Some(bytes) => write!(f, "transport error after {bytes} bytes: {message}"),
-                None => write!(f, "transport error: {message}"),
-            },
-            Self::Io { source } => write!(f, "I/O error: {source}"),
-        }
-    }
-}
-
-impl FetchError {
-    #[must_use]
-    pub const fn rate_limit(&self) -> Option<&RateLimitSnapshot> {
-        match self {
-            Self::AccountState { rate_limit, .. } | Self::HttpStatus { rate_limit, .. } => {
-                Some(rate_limit)
-            }
-            Self::InactivityTimeout { .. }
-            | Self::DownloadTimeout { .. }
-            | Self::ResponseHeaderTimeout { .. }
-            | Self::ProgressTimeout { .. }
-            | Self::MaxBytesExceeded { .. }
-            | Self::ErrorBodyTooLarge { .. }
-            | Self::InFlightBytesExceeded { .. }
-            | Self::InFlightBytesUnavailable { .. }
-            | Self::ByteBudgetPoisoned
-            | Self::Transport { .. }
-            | Self::Io { .. } => None,
-        }
-    }
-}
-
-impl Error for FetchError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Io { source } => Some(source),
-            Self::AccountState { .. }
-            | Self::HttpStatus { .. }
-            | Self::InactivityTimeout { .. }
-            | Self::DownloadTimeout { .. }
-            | Self::ResponseHeaderTimeout { .. }
-            | Self::ProgressTimeout { .. }
-            | Self::MaxBytesExceeded { .. }
-            | Self::ErrorBodyTooLarge { .. }
-            | Self::InFlightBytesExceeded { .. }
-            | Self::InFlightBytesUnavailable { .. }
-            | Self::ByteBudgetPoisoned
-            | Self::Transport { .. } => None,
-        }
-    }
-}
-
-impl From<io::Error> for FetchError {
-    fn from(source: io::Error) -> Self {
-        Self::Io { source }
-    }
-}
+mod error;
+pub use error::FetchError;
+use error::classify_http_error;
+mod spool;
+pub use spool::{FetchByteBudget, SpooledRepo};
+use spool::{FetchByteBudgetReservation, spool_path, sync_parent_dir};
 
 /// Stream `com.atproto.sync.getRepo` from `pds` into a local spool file.
 ///
@@ -800,14 +365,6 @@ fn enforce_progress(
     Ok(())
 }
 
-fn sync_parent_dir(path: &Path) -> Result<(), FetchError> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    File::open(parent)?.sync_all()?;
-    Ok(())
-}
-
 async fn collect_body_with_cap(
     body: ByteStream,
     limits: StreamLimits,
@@ -880,53 +437,6 @@ async fn collect_body_with_cap(
     Ok(bytes)
 }
 
-fn classify_http_error(
-    status: StatusCode,
-    rate_limit: RateLimitSnapshot,
-    body: &[u8],
-) -> FetchError {
-    match serde_json::from_slice::<GetRepoError>(body) {
-        Ok(GetRepoError::RepoNotFound(message)) => FetchError::AccountState {
-            state: AccountState::RepoNotFound,
-            status: status.as_u16(),
-            message: message.map(|value| value.to_string().into_boxed_str()),
-            rate_limit: Box::new(rate_limit),
-        },
-        Ok(GetRepoError::RepoTakendown(message)) => FetchError::AccountState {
-            state: AccountState::RepoTakendown,
-            status: status.as_u16(),
-            message: message.map(|value| value.to_string().into_boxed_str()),
-            rate_limit: Box::new(rate_limit),
-        },
-        Ok(GetRepoError::RepoSuspended(message)) => FetchError::AccountState {
-            state: AccountState::RepoSuspended,
-            status: status.as_u16(),
-            message: message.map(|value| value.to_string().into_boxed_str()),
-            rate_limit: Box::new(rate_limit),
-        },
-        Ok(GetRepoError::RepoDeactivated(message)) => FetchError::AccountState {
-            state: AccountState::RepoDeactivated,
-            status: status.as_u16(),
-            message: message.map(|value| value.to_string().into_boxed_str()),
-            rate_limit: Box::new(rate_limit),
-        },
-        Ok(GetRepoError::Other { error, message }) => FetchError::HttpStatus {
-            status: status.as_u16(),
-            error_code: Some(error.to_string().into_boxed_str()),
-            message: message.map(|value| value.to_string().into_boxed_str()),
-            rate_limit: Box::new(rate_limit),
-        },
-        Err(_err) => FetchError::HttpStatus {
-            status: status.as_u16(),
-            error_code: None,
-            message: String::from_utf8(body.to_vec())
-                .ok()
-                .map(String::into_boxed_str),
-            rate_limit: Box::new(rate_limit),
-        },
-    }
-}
-
 fn admission_body_bytes(
     headers: &HeaderMap,
     max_bytes: u64,
@@ -949,38 +459,6 @@ fn admission_body_bytes(
         });
     }
     Ok(bytes)
-}
-
-fn spool_path(spool_dir: &Path, did: &Did) -> PathBuf {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    let mut file_name = String::from("repo-");
-    for ch in did.as_str().chars() {
-        if ch.is_ascii_alphanumeric() {
-            file_name.push(ch);
-        } else {
-            file_name.push('_');
-        }
-    }
-    file_name.push('.');
-    file_name.push_str(&std::process::id().to_string());
-    file_name.push('.');
-    file_name.push_str(&timestamp.to_string());
-    file_name.push_str(".car");
-    spool_dir.join(file_name)
-}
-
-fn write_fetch_message(
-    f: &mut fmt::Formatter<'_>,
-    prefix: &fmt::Arguments<'_>,
-    status: u16,
-    message: Option<&str>,
-) -> fmt::Result {
-    match message {
-        Some(message) => write!(f, "{prefix} at HTTP status {status}: {message}"),
-        None => write!(f, "{prefix} at HTTP status {status}"),
-    }
 }
 
 #[cfg(test)]

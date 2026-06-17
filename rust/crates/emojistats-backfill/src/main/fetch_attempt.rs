@@ -1,36 +1,31 @@
 #![allow(clippy::redundant_pub_crate)]
 
-use jacquard_identity::resolver::IdentityResolver;
+use std::sync::Arc;
 
+use emojistats_backfill::scheduler::SharedHostPacer;
+use jacquard_identity::resolver::IdentityResolver;
+use tokio::sync::Semaphore;
+
+pub(crate) use super::attempt_runtime::{
+    AttemptRuntime, FetchOneAttemptConfig, HostOverrideCache, HostOverrideCacheEntry,
+    LocalFetchOneAttemptConfig,
+};
 use super::{
     super::{
-        Arc, ArchiveCommitContext, ArchiveStorageConfig, CRAWLER_USER_AGENT, ClaimScope,
-        DEFAULT_HOST_CONCURRENCY_CAP, Did, Digest, Duration, FETCH_TRANSPORT_ATTEMPTS,
-        FETCH_TRANSPORT_RETRY_BASE_DELAY, FETCH_TRANSPORT_RETRY_MAX_DELAY, FetchByteBudget,
-        FetchConfig, FetchError, FetchOneFailure, ForcedFetchMode, HashMap, HostConcurrencyLimiter,
-        HostConcurrencyPermit, HostOverride, HostPacer, HttpProtocol, Instant, Mutex, ParseConfig,
-        Path, PathBuf, PublicResolver, RepoLedgerEntry, Semaphore, Sha256, SharedHostPacer,
-        SmokeTelemetry, SqliteLedger, SystemTime, Uri, classify_fetch_error, current_rss_kb,
-        elapsed_ms, emit_smoke_telemetry, fetch_repo_with_rate_limit_observer, outcome_name,
-        permanent_failure, retryable_failure,
+        ArchiveCommitContext, ArchiveStorageConfig, ClaimScope, Did, Duration, FetchConfig,
+        FetchError, FetchOneFailure, ForcedFetchMode, HostOverride, Instant, ParseConfig, Path,
+        PublicResolver, SmokeTelemetry, SqliteLedger, SystemTime, Uri, classify_fetch_error,
+        current_rss_kb, elapsed_ms, emit_smoke_telemetry, outcome_name, permanent_failure,
+        retryable_failure,
     },
-    archive_host::{ArchiveClaimCheck, PreparedFetchHost, prepare_fetch_host},
+    archive_host::{ArchiveClaimCheck, prepare_fetch_host},
+    attempt_runtime::acquire_host_fetch_permit,
     host_rate_limit::{record_rate_limit_cooldown, record_rate_limit_snapshot},
     list_records_attempt::{ListRecordsStep, fetch_archive_list_records_or_emit_failure},
     parse_archive_attempt::{ParseArchiveStep, parse_archive_or_emit_failure},
-    processed_repo::{FetchedRepo, ProcessedRepo},
+    processed_repo::ProcessedRepo,
+    repo_fetch::{FetchStep, fetch_spooled_repo, repo_fetch_client},
 };
-
-pub(crate) struct LocalFetchOneAttemptConfig<'a> {
-    pub(crate) did_str: &'a str,
-    pub(crate) spool_dir: PathBuf,
-    pub(crate) max_bytes: u64,
-    pub(crate) archive_dir: PathBuf,
-    pub(crate) archive_context: ArchiveCommitContext,
-    pub(crate) archive_storage: ArchiveStorageConfig,
-    pub(crate) parse_config: ParseConfig,
-    pub(crate) http_protocol: HttpProtocol,
-}
 
 pub(crate) async fn fetch_one_attempt(
     config: LocalFetchOneAttemptConfig<'_>,
@@ -48,116 +43,6 @@ pub(crate) async fn fetch_one_attempt(
         http_protocol: config.http_protocol,
     })
     .await
-}
-
-pub(crate) struct FetchOneAttemptConfig<'a> {
-    pub(crate) did_str: &'a str,
-    pub(crate) spool_dir: PathBuf,
-    pub(crate) max_bytes: u64,
-    pub(crate) archive_dir: PathBuf,
-    pub(crate) archive_context: ArchiveCommitContext,
-    pub(crate) archive_storage: ArchiveStorageConfig,
-    pub(crate) runtime: AttemptRuntime<'a>,
-    pub(crate) parse_config: ParseConfig,
-    pub(crate) http_protocol: HttpProtocol,
-}
-
-pub(crate) enum AttemptRuntime<'a> {
-    Local {
-        claim_scope: ClaimScope,
-    },
-    Fleet {
-        host_pacer: SharedHostPacer,
-        host_limiter: HostConcurrencyLimiter,
-        parse_permits: Arc<Semaphore>,
-        byte_budget: FetchByteBudget,
-        claimed: Box<RepoLedgerEntry>,
-        claim_scope: &'a ClaimScope,
-        host_override_ledger_path: &'a Path,
-        host_override_cache: HostOverrideCache,
-    },
-}
-
-impl AttemptRuntime<'_> {
-    const fn claim_scope(&self) -> &ClaimScope {
-        match self {
-            Self::Local { claim_scope } => claim_scope,
-            Self::Fleet { claim_scope, .. } => claim_scope,
-        }
-    }
-
-    const fn host_override_ledger_path(&self) -> Option<&Path> {
-        match self {
-            Self::Local { .. } => None,
-            Self::Fleet {
-                host_override_ledger_path,
-                ..
-            } => Some(*host_override_ledger_path),
-        }
-    }
-
-    fn host_override_cache(&self) -> Option<HostOverrideCache> {
-        match self {
-            Self::Local { .. } => None,
-            Self::Fleet {
-                host_override_cache,
-                ..
-            } => Some(host_override_cache.clone()),
-        }
-    }
-
-    const fn host_pacer(&self) -> Option<&SharedHostPacer> {
-        match self {
-            Self::Local { .. } => None,
-            Self::Fleet { host_pacer, .. } => Some(host_pacer),
-        }
-    }
-
-    const fn host_limiter(&self) -> Option<&HostConcurrencyLimiter> {
-        match self {
-            Self::Local { .. } => None,
-            Self::Fleet { host_limiter, .. } => Some(host_limiter),
-        }
-    }
-
-    const fn parse_permits(&self) -> Option<&Arc<Semaphore>> {
-        match self {
-            Self::Local { .. } => None,
-            Self::Fleet { parse_permits, .. } => Some(parse_permits),
-        }
-    }
-
-    fn byte_budget(&self) -> Option<FetchByteBudget> {
-        match self {
-            Self::Local { .. } => None,
-            Self::Fleet { byte_budget, .. } => Some(byte_budget.clone()),
-        }
-    }
-
-    fn archive_claim_check(&self) -> Option<ArchiveClaimCheck> {
-        match self {
-            Self::Local { .. } => None,
-            Self::Fleet {
-                claimed,
-                host_override_ledger_path,
-                ..
-            } => Some(ArchiveClaimCheck {
-                ledger_path: (*host_override_ledger_path).to_path_buf(),
-                claimed: (**claimed).clone(),
-            }),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct HostOverrideCache {
-    pub(super) entries: Arc<Mutex<HashMap<String, HostOverrideCacheEntry>>>,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct HostOverrideCacheEntry {
-    pub(super) loaded_at: Instant,
-    pub(super) value: Option<HostOverride>,
 }
 
 pub(crate) async fn fetch_one_attempt_with_pacer(
@@ -183,8 +68,7 @@ pub(crate) async fn fetch_one_attempt_with_pacer(
         config.runtime.host_override_cache(),
     )
     .await?;
-    let _host_permit =
-        acquire_host_fetch_permit(config.runtime.host_limiter(), &prepared_host).await?;
+    let _host_permit = acquire_host_fetch_permit(&config.runtime, &prepared_host).await?;
     let host = prepared_host.host;
     let host_min_interval = prepared_host
         .host_override
@@ -256,25 +140,6 @@ pub(crate) async fn fetch_one_attempt_with_pacer(
         error: None,
     });
     Ok(())
-}
-
-async fn acquire_host_fetch_permit(
-    host_limiter: Option<&HostConcurrencyLimiter>,
-    prepared_host: &PreparedFetchHost,
-) -> Result<Option<HostConcurrencyPermit>, FetchOneFailure> {
-    let Some(limiter) = host_limiter else {
-        return Ok(None);
-    };
-    limiter
-        .acquire(
-            prepared_host.host.as_str(),
-            prepared_host
-                .host_override
-                .as_ref()
-                .and_then(|override_record| override_record.concurrency_cap)
-                .or(Some(DEFAULT_HOST_CONCURRENCY_CAP)),
-        )
-        .await
 }
 
 struct FetchModeStep<'a> {
@@ -442,81 +307,6 @@ fn persist_list_records_method_wall_override(step: &FetchModeStep<'_>, error: &F
     }
 }
 
-struct FetchStep<'a> {
-    http: &'a reqwest::Client,
-    pds: &'a Uri<String>,
-    did: &'a Did,
-    did_str: &'a str,
-    host: &'a str,
-    host_min_interval: Option<Duration>,
-    config: &'a FetchConfig,
-    host_pacer: Option<&'a SharedHostPacer>,
-}
-
-async fn fetch_spooled_repo(step: FetchStep<'_>) -> Result<FetchedRepo, FetchError> {
-    let fetch_started = Instant::now();
-    let mut attempt = 1_u8;
-    loop {
-        reserve_host_send_for_fetch(step.host_pacer, step.host, step.host_min_interval).await?;
-        match fetch_repo_with_rate_limit_observer(
-            step.http,
-            step.pds,
-            step.did,
-            step.config,
-            |rate_limit| {
-                record_rate_limit_snapshot(
-                    step.host_pacer,
-                    step.host,
-                    rate_limit,
-                    SystemTime::now(),
-                );
-            },
-        )
-        .await
-        {
-            Ok(spooled) => {
-                return Ok(FetchedRepo {
-                    spooled,
-                    fetch_ms: elapsed_ms(fetch_started),
-                });
-            }
-            Err(err)
-                if is_retryable_stream_fetch_error(&err) && attempt < FETCH_TRANSPORT_ATTEMPTS =>
-            {
-                let delay = transport_retry_delay(step.did_str, attempt);
-                eprintln!(
-                    "fetch retry {next_attempt}/{max_attempts} for {did} after {delay_ms} ms: {err}",
-                    next_attempt = attempt.saturating_add(1),
-                    max_attempts = FETCH_TRANSPORT_ATTEMPTS,
-                    did = step.did_str,
-                    delay_ms = delay.as_millis()
-                );
-                tokio::time::sleep(delay).await;
-                attempt = attempt.saturating_add(1);
-            }
-            Err(err) => {
-                return Err(err);
-            }
-        }
-    }
-}
-
-async fn reserve_host_send_for_fetch(
-    host_pacer: Option<&SharedHostPacer>,
-    host: &str,
-    min_interval: Option<Duration>,
-) -> Result<(), FetchError> {
-    let Some(pacer) = host_pacer else {
-        return Ok(());
-    };
-    HostPacer::reserve_next_request(pacer, host, min_interval)
-        .await
-        .map_err(|err| FetchError::Transport {
-            message: format!("host pacing for {host}: {err}"),
-            observed_bytes: None,
-        })
-}
-
 fn emit_fetch_failure(step: &FetchModeStep<'_>, failure: &FetchOneFailure, started: Instant) {
     emit_smoke_telemetry(&SmokeTelemetry {
         event: "smoke_repo_attempt",
@@ -572,92 +362,4 @@ fn is_get_repo_method_wall_text(value: &str) -> bool {
             | "method not implemented"
             | "method not supported"
     )
-}
-
-fn repo_fetch_client(http_protocol: HttpProtocol) -> Result<reqwest::Client, reqwest::Error> {
-    let builder = reqwest::Client::builder()
-        .user_agent(CRAWLER_USER_AGENT)
-        .tcp_keepalive(Duration::from_secs(60))
-        .connect_timeout(Duration::from_secs(30));
-    match http_protocol {
-        HttpProtocol::Http1 => builder.http1_only().build(),
-        HttpProtocol::Auto => builder.build(),
-    }
-}
-
-fn transport_retry_delay(did: &str, failed_attempt: u8) -> Duration {
-    let exponent = u32::from(failed_attempt.saturating_sub(1));
-    let multiplier = 1_u32.checked_shl(exponent).unwrap_or(u32::MAX);
-    let base = FETCH_TRANSPORT_RETRY_BASE_DELAY
-        .checked_mul(multiplier)
-        .unwrap_or(FETCH_TRANSPORT_RETRY_MAX_DELAY)
-        .min(FETCH_TRANSPORT_RETRY_MAX_DELAY);
-    base.checked_add(transport_retry_jitter(did, failed_attempt, base))
-        .unwrap_or(FETCH_TRANSPORT_RETRY_MAX_DELAY)
-        .min(FETCH_TRANSPORT_RETRY_MAX_DELAY)
-}
-
-fn transport_retry_jitter(did: &str, failed_attempt: u8, base: Duration) -> Duration {
-    let window_millis = u64::try_from(base.as_millis() / 2).unwrap_or(u64::MAX);
-    if window_millis == 0 {
-        return Duration::ZERO;
-    }
-    let modulus = window_millis.saturating_add(1);
-    let mut hasher = Sha256::new();
-    hasher.update(did.as_bytes());
-    hasher.update([failed_attempt]);
-    let digest = hasher.finalize();
-    let mut bytes = [0_u8; 8];
-    for (destination, source) in bytes.iter_mut().zip(digest) {
-        *destination = source;
-    }
-    let jitter_millis = u64::from_be_bytes(bytes).checked_rem(modulus).unwrap_or(0);
-    Duration::from_millis(jitter_millis)
-}
-
-const fn is_retryable_stream_fetch_error(error: &FetchError) -> bool {
-    matches!(
-        error,
-        FetchError::Transport { .. }
-            | FetchError::InactivityTimeout { .. }
-            | FetchError::DownloadTimeout { .. }
-            | FetchError::ResponseHeaderTimeout { .. }
-            | FetchError::ProgressTimeout { .. }
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn immediate_stream_retry_includes_timeout_categories() {
-        assert!(is_retryable_stream_fetch_error(&FetchError::Transport {
-            message: "connection reset".to_owned(),
-            observed_bytes: None,
-        }));
-        assert!(is_retryable_stream_fetch_error(
-            &FetchError::InactivityTimeout {
-                timeout: Duration::from_secs(30),
-            }
-        ));
-        assert!(is_retryable_stream_fetch_error(
-            &FetchError::DownloadTimeout {
-                timeout: Duration::from_secs(600),
-                observed_bytes: 12,
-            }
-        ));
-        assert!(is_retryable_stream_fetch_error(
-            &FetchError::ResponseHeaderTimeout {
-                timeout: Duration::from_secs(60),
-            }
-        ));
-        assert!(is_retryable_stream_fetch_error(
-            &FetchError::ProgressTimeout {
-                interval: Duration::from_secs(60),
-                min_bytes: 16_384,
-                observed_bytes: 1024,
-            }
-        ));
-    }
 }
