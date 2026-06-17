@@ -667,7 +667,7 @@ fn seed_ledger_from_file_inserts_only_missing_dids() {
     let dids_file = temp_file_path("seed-ledger");
     fs::write(
         &dids_file,
-        "\ndid:plc:existing\ndid:plc:newrepo\ndid:plc:newrepo\n",
+        "\ndid:plc:existing\ndid:plc:newrepo\nat://did:plc:newrepo\n",
     )
     .unwrap();
 

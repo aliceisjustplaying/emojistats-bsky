@@ -443,8 +443,7 @@ impl SqliteLedger {
         };
 
         let manifest_shard = manifest_sequence_shard(shard);
-        let manifest_sequence =
-            allocate_manifest_sequence(&transaction, run_id, shard, manifest_shard.as_str())?;
+        ensure_manifest_sequence(&transaction, run_id, shard, manifest_shard.as_str())?;
         let changed = transaction.execute(
             "
             UPDATE repo_ledger
@@ -455,7 +454,11 @@ impl SqliteLedger {
                 next_attempt_after_ms = NULL,
                 last_attempt_run_id = ?2,
                 last_attempt_did = did,
-                last_attempt_sequence = ?7,
+                last_attempt_sequence = (
+                    SELECT next_sequence
+                    FROM manifest_sequences
+                    WHERE run_id = ?2 AND shard = ?7
+                ),
                 last_error = NULL,
                 worker_id = ?3,
                 claimed_at_ms = ?4,
@@ -482,13 +485,14 @@ impl SqliteLedger {
                 now_ms,
                 lease_until_ms,
                 shard_bucket,
-                manifest_sequence,
+                manifest_shard.as_str(),
             ],
         )?;
         if changed == 0 {
             transaction.commit()?;
             return Ok(None);
         }
+        increment_manifest_sequence(&transaction, run_id, manifest_shard.as_str())?;
         let entry = load_entry_in_transaction(&transaction, &did)?
             .ok_or(LedgerStoreError::MissingClaimedEntry)?;
         transaction.commit()?;
@@ -920,12 +924,12 @@ impl SqliteLedger {
     }
 }
 
-fn allocate_manifest_sequence(
+fn ensure_manifest_sequence(
     transaction: &Transaction<'_>,
     run_id: &str,
     shard_filter: Option<ShardFilter>,
     shard: &str,
-) -> Result<i64, LedgerStoreError> {
+) -> Result<(), LedgerStoreError> {
     let seed_sequence = seed_manifest_sequence(transaction, run_id, shard_filter)?;
     transaction.execute(
         "
@@ -934,6 +938,14 @@ fn allocate_manifest_sequence(
         ",
         params![run_id, shard, seed_sequence],
     )?;
+    Ok(())
+}
+
+fn increment_manifest_sequence(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    shard: &str,
+) -> Result<(), LedgerStoreError> {
     let sequence = transaction.query_row(
         "
         SELECT next_sequence
@@ -957,7 +969,7 @@ fn allocate_manifest_sequence(
         ",
         params![run_id, shard, next_sequence],
     )?;
-    Ok(sequence)
+    Ok(())
 }
 
 fn seed_manifest_sequence(

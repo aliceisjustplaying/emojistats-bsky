@@ -111,9 +111,11 @@ pub fn classify_fetch_error(did: &str, error: &FetchError) -> FetchOneFailure {
                 message: message.clone(),
             }
         }
-        FetchError::HttpStatus { .. } => AttemptOutcome::PermanentFailure {
-            message: message.clone(),
-        },
+        FetchError::HttpStatus { .. } | FetchError::PermanentTransport { .. } => {
+            AttemptOutcome::PermanentFailure {
+                message: message.clone(),
+            }
+        }
     };
     FetchOneFailure {
         outcome,
@@ -414,6 +416,22 @@ mod tests {
                 retry_after: Some(BYTE_PRESSURE_RETRY_AFTER),
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn permanent_transport_is_permanent_failure() {
+        let failure = classify_fetch_error(
+            "did:plc:test",
+            &FetchError::PermanentTransport {
+                message: "dns error: failed to lookup address information".to_owned(),
+                observed_bytes: None,
+            },
+        );
+
+        assert!(matches!(
+            failure.outcome,
+            AttemptOutcome::PermanentFailure { .. }
         ));
     }
 }

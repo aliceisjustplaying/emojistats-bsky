@@ -93,6 +93,13 @@ pub enum FetchError {
         /// Bytes already written before the transport failed, when the body stream had started.
         observed_bytes: Option<u64>,
     },
+    /// A transport error that is unlikely to succeed on retry for the same host.
+    PermanentTransport {
+        /// Transport error message.
+        message: String,
+        /// Bytes already written before the transport failed, when the body stream had started.
+        observed_bytes: Option<u64>,
+    },
     /// Local filesystem I/O failed.
     Io {
         /// Underlying I/O error.
@@ -187,12 +194,25 @@ impl fmt::Display for FetchError {
             Self::Transport {
                 message,
                 observed_bytes,
-            } => match observed_bytes {
-                Some(bytes) => write!(f, "transport error after {bytes} bytes: {message}"),
-                None => write!(f, "transport error: {message}"),
-            },
+            } => write_transport_error(f, "transport error", message, *observed_bytes),
+            Self::PermanentTransport {
+                message,
+                observed_bytes,
+            } => write_transport_error(f, "permanent transport error", message, *observed_bytes),
             Self::Io { source } => write!(f, "I/O error: {source}"),
         }
+    }
+}
+
+fn write_transport_error(
+    f: &mut fmt::Formatter<'_>,
+    label: &str,
+    message: &str,
+    observed_bytes: Option<u64>,
+) -> fmt::Result {
+    match observed_bytes {
+        Some(bytes) => write!(f, "{label} after {bytes} bytes: {message}"),
+        None => write!(f, "{label}: {message}"),
     }
 }
 
@@ -213,6 +233,7 @@ impl FetchError {
             | Self::InFlightBytesUnavailable { .. }
             | Self::ByteBudgetPoisoned
             | Self::Transport { .. }
+            | Self::PermanentTransport { .. }
             | Self::Io { .. } => None,
         }
     }
@@ -233,7 +254,8 @@ impl Error for FetchError {
             | Self::InFlightBytesExceeded { .. }
             | Self::InFlightBytesUnavailable { .. }
             | Self::ByteBudgetPoisoned
-            | Self::Transport { .. } => None,
+            | Self::Transport { .. }
+            | Self::PermanentTransport { .. } => None,
         }
     }
 }

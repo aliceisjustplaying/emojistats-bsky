@@ -13,7 +13,7 @@ use jacquard_common::{stream::ByteStream, types::did::Did};
 use super::{
     AccountState, FetchByteBudget, FetchConfig, FetchError, RateLimitSnapshot, StreamLimits,
     admission_body_bytes, classify_http_error, parse_http_date_retry_after, spool_path,
-    stream_to_file,
+    stream_to_file, transport_error,
 };
 
 #[test]
@@ -93,6 +93,24 @@ fn classifies_repo_account_states() {
         }
         other => panic!("unexpected error: {other:?}"),
     }
+}
+
+#[test]
+fn transport_error_splits_permanent_dns_and_tls_failures() {
+    assert!(matches!(
+        transport_error(
+            "error sending request: dns error: failed to lookup address information".to_owned(),
+            None,
+        ),
+        FetchError::PermanentTransport { .. }
+    ));
+    assert!(matches!(
+        transport_error("connection reset by peer".to_owned(), Some(12)),
+        FetchError::Transport {
+            observed_bytes: Some(12),
+            ..
+        }
+    ));
 }
 
 #[test]

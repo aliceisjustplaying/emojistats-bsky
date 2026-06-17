@@ -9,6 +9,9 @@ const HEART: &str = "\u{2764}";
 const HEART_EMOJI_STYLE: &str = "\u{2764}\u{fe0f}";
 const NORMALIZER_NAME: &str = "emoji-normalizer";
 const EMOJI_DATA_SOURCE: &str = "emojis";
+const ZERO_WIDTH_JOINER: char = '\u{200d}';
+const COMBINING_ENCLOSING_KEYCAP: char = '\u{20e3}';
+const EMOJI_MAX_PER_POST: usize = 300;
 
 /// Version identity for emoji normalization outputs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,9 +57,36 @@ pub fn extract_emoji_sequence(text: &str) -> Vec<String> {
     if !has_emoji_candidate(text) {
         return Vec::new();
     }
-    text.graphemes(true)
-        .filter_map(normalize_emoji_glyph)
-        .collect()
+    let mut output = Vec::new();
+    for glyph in text.graphemes(true) {
+        push_normalized_glyph(&mut output, glyph);
+        if output.len() >= EMOJI_MAX_PER_POST {
+            break;
+        }
+    }
+    output
+}
+
+fn push_normalized_glyph(output: &mut Vec<String>, glyph: &str) {
+    if let Some(normalized) = normalize_emoji_glyph(glyph) {
+        output.push(normalized);
+        return;
+    }
+    for ch in glyph.chars() {
+        if output.len() >= EMOJI_MAX_PER_POST {
+            break;
+        }
+        if matches!(
+            ch,
+            ZERO_WIDTH_JOINER | TEXT_PRESENTATION_SELECTOR | EMOJI_PRESENTATION_SELECTOR
+        ) {
+            continue;
+        }
+        let scalar = ch.to_string();
+        if let Some(normalized) = normalize_emoji_glyph(&scalar) {
+            output.push(normalized);
+        }
+    }
 }
 
 fn has_emoji_candidate(text: &str) -> bool {
@@ -102,6 +132,12 @@ fn is_emoji_candidate_char(ch: char) -> bool {
 /// Normalize one already-segmented emoji glyph.
 #[must_use]
 pub fn normalize_emoji_glyph(glyph: &str) -> Option<String> {
+    if is_keycap_without_combining_mark(glyph) {
+        return None;
+    }
+    if is_emoji_modifier(glyph) {
+        return Some(glyph.to_owned());
+    }
     if let Some(heart) = normalize_heart(glyph) {
         return Some(heart);
     }
@@ -125,6 +161,18 @@ pub fn normalize_emoji_glyph(glyph: &str) -> Option<String> {
     None
 }
 
+fn is_keycap_without_combining_mark(glyph: &str) -> bool {
+    let mut chars = glyph.chars();
+    matches!(chars.next(), Some('0'..='9' | '#' | '*'))
+        && chars.next() == Some(EMOJI_PRESENTATION_SELECTOR)
+        && !glyph.contains(COMBINING_ENCLOSING_KEYCAP)
+}
+
+fn is_emoji_modifier(glyph: &str) -> bool {
+    let mut chars = glyph.chars();
+    matches!(chars.next().map(u32::from), Some(0x1f3fb..=0x1f3ff)) && chars.next().is_none()
+}
+
 fn normalize_heart(glyph: &str) -> Option<String> {
     let suffix = glyph.strip_prefix(HEART)?;
     let suffix = suffix
@@ -141,7 +189,7 @@ fn unicode_version_label(version: emojis::UnicodeVersion) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_emoji_sequence, normalize_emoji_glyph, version};
+    use super::{EMOJI_MAX_PER_POST, extract_emoji_sequence, normalize_emoji_glyph, version};
 
     #[test]
     fn extracts_a_plain_emoji() {
@@ -225,5 +273,25 @@ mod tests {
         assert_eq!(metadata.semver, "0.1.0");
         assert_eq!(metadata.unicode_version, "16.0");
         assert_eq!(metadata.emoji_data_version, "emojis-16.0");
+    }
+
+    #[test]
+    fn keeps_legacy_invalid_zwj_and_modifier_extraction_semantics() {
+        assert_eq!(extract_emoji_sequence("😀‍😀"), vec!["😀", "😀"]);
+        assert_eq!(extract_emoji_sequence("😀🏽"), vec!["😀", "🏽"]);
+        assert_eq!(extract_emoji_sequence("🏽"), vec!["🏽"]);
+    }
+
+    #[test]
+    fn rejects_digit_variation_selector_without_keycap_mark() {
+        assert_eq!(extract_emoji_sequence("1\u{fe0f}"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn caps_emoji_sequence_at_legacy_limit() {
+        assert_eq!(
+            extract_emoji_sequence(&"😀".repeat(EMOJI_MAX_PER_POST + 1)).len(),
+            EMOJI_MAX_PER_POST
+        );
     }
 }

@@ -48,9 +48,10 @@ pub(crate) async fn fetch_one_attempt_with_pacer(
     config: FetchOneAttemptConfig<'_>,
 ) -> Result<(), FetchOneFailure> {
     let attempt_started = Instant::now();
-    let did_str = config.did_str;
-    let did: Did = Did::new_owned(did_str)
-        .map_err(|err| permanent_failure(format!("invalid DID {did_str:?}: {err}")))?;
+    let input_did = config.did_str;
+    let did: Did = Did::new_owned(input_did)
+        .map_err(|err| permanent_failure(format!("invalid DID {input_did:?}: {err}")))?;
+    let did_str = did.as_str();
 
     let resolver = PublicResolver::default();
     let pds = resolver
@@ -204,8 +205,10 @@ async fn fetch_get_repo_and_archive(
         Ok(fetched) => fetched,
         Err(err) if should_fallback_get_repo_to_list_records(&err) => {
             emit_get_repo_fallback(step.did_str, step.host, step.attempt_started, &err);
-            persist_list_records_method_wall_override(&step, &err);
-            return fetch_archive_list_records_or_emit_failure(ListRecordsStep {
+            let host_override_ledger_path = step.host_override_ledger_path;
+            let host = step.host;
+            let host_min_interval = step.host_min_interval;
+            let result = fetch_archive_list_records_or_emit_failure(ListRecordsStep {
                 http: step.http,
                 pds: step.pds,
                 did: step.did,
@@ -220,6 +223,15 @@ async fn fetch_get_repo_and_archive(
                 attempt_started: step.attempt_started,
             })
             .await;
+            if result.is_ok() {
+                persist_list_records_method_wall_override(
+                    host_override_ledger_path,
+                    host,
+                    host_min_interval,
+                    &err,
+                );
+            }
+            return result;
         }
         Err(err) => {
             if let Some(rate_limit) = err.rate_limit() {
@@ -281,24 +293,27 @@ fn emit_get_repo_fallback(did_str: &str, host: &str, attempt_started: Instant, e
     });
 }
 
-fn persist_list_records_method_wall_override(step: &FetchModeStep<'_>, error: &FetchError) {
-    let Some(ledger_path) = step.host_override_ledger_path else {
+fn persist_list_records_method_wall_override(
+    host_override_ledger_path: Option<&Path>,
+    host: &str,
+    host_min_interval: Option<Duration>,
+    error: &FetchError,
+) {
+    let Some(ledger_path) = host_override_ledger_path else {
         return;
     };
     match SqliteLedger::open(ledger_path).and_then(|ledger| {
         ledger.upsert_host_override_force_mode(
-            step.host,
+            host,
             Some(ForcedFetchMode::ListRecords),
-            step.host_min_interval,
+            host_min_interval,
         )
     }) {
         Ok(()) => eprintln!(
-            "recorded listRecords host override for {} after getRepo method wall: {error}",
-            step.host
+            "recorded listRecords host override for {host} after getRepo method wall: {error}"
         ),
         Err(err) => eprintln!(
-            "failed to persist listRecords host override for {} after getRepo method wall: {err}",
-            step.host
+            "failed to persist listRecords host override for {host} after getRepo method wall: {err}"
         ),
     }
 }

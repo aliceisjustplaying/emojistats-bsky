@@ -107,11 +107,11 @@ pub fn seed_ledger_from_file(
             increment(&mut summary.blank, "blank line count")?;
             continue;
         }
-        let _parsed: Did = Did::new_owned(did).map_err(|err| {
+        let parsed: Did = Did::new_owned(did).map_err(|err| {
             anyhow::anyhow!("invalid DID {did:?} in {}: {err}", dids_file.display())
         })?;
 
-        batch.push(did.to_owned());
+        batch.push(parsed.as_str().to_owned());
         if batch.len() == SEED_BATCH_SIZE {
             flush_seed_batch(ledger, &mut summary, &batch)?;
             batch.clear();

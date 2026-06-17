@@ -128,10 +128,7 @@ where
     .map_err(|_elapsed| FetchError::ResponseHeaderTimeout {
         timeout: config.response_header_timeout,
     })?
-    .map_err(|err| FetchError::Transport {
-        message: err.to_string(),
-        observed_bytes: None,
-    })?;
+    .map_err(|err| transport_error(err.to_string(), None))?;
     let status = response.status();
     let rate_limit = RateLimitSnapshot::from_headers(response.headers());
     observe_rate_limit(&rate_limit);
@@ -268,10 +265,7 @@ async fn stream_to_temp_file(
             limits.min_progress_interval,
             limits.min_progress_bytes,
         )?;
-        let chunk = next_chunk.map_err(|err| FetchError::Transport {
-            message: err.to_string(),
-            observed_bytes: Some(bytes),
-        })?;
+        let chunk = next_chunk.map_err(|err| transport_error(err.to_string(), Some(bytes)))?;
         let chunk_len =
             u64::try_from(chunk.len()).map_err(|_err| FetchError::MaxBytesExceeded {
                 max_bytes: limits.max_bytes,
@@ -400,10 +394,7 @@ async fn collect_body_with_cap(
             limits.min_progress_interval,
             limits.min_progress_bytes,
         )?;
-        let chunk = next_chunk.map_err(|err| FetchError::Transport {
-            message: err.to_string(),
-            observed_bytes: Some(observed),
-        })?;
+        let chunk = next_chunk.map_err(|err| transport_error(err.to_string(), Some(observed)))?;
         let chunk_len =
             u64::try_from(chunk.len()).map_err(|_err| FetchError::ErrorBodyTooLarge {
                 max_bytes: limits.max_bytes,
@@ -459,6 +450,30 @@ fn admission_body_bytes(
         });
     }
     Ok(bytes)
+}
+
+fn transport_error(message: String, observed_bytes: Option<u64>) -> FetchError {
+    if is_permanent_transport_message(&message) {
+        FetchError::PermanentTransport {
+            message,
+            observed_bytes,
+        }
+    } else {
+        FetchError::Transport {
+            message,
+            observed_bytes,
+        }
+    }
+}
+
+fn is_permanent_transport_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("dns error")
+        || lower.contains("failed to lookup address information")
+        || lower.contains("invalid peer certificate")
+        || lower.contains("certificate verify failed")
+        || lower.contains("self signed certificate")
+        || lower.contains("unknown issuer")
 }
 
 #[cfg(test)]
