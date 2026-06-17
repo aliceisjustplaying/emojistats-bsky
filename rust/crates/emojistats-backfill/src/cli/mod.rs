@@ -68,6 +68,7 @@ impl CanaryThresholdArgs {
 pub enum ArchiveBackend {
     Local,
     StorageBoxSsh,
+    StorageBoxRclone,
 }
 
 #[derive(Subcommand, Debug)]
@@ -91,6 +92,15 @@ pub enum Command {
         /// Storage Box SSH destination, e.g. u123@u123.your-storagebox.de.
         #[arg(long)]
         storage_box_remote: Option<String>,
+        /// Rclone remote name for Storage Box, e.g. storagebox.
+        #[arg(long, default_value = "storagebox")]
+        storage_box_rclone_remote: String,
+        /// Rclone config path for Storage Box.
+        #[arg(long)]
+        storage_box_rclone_config: Option<PathBuf>,
+        /// Rclone program for Storage Box commands.
+        #[arg(long, default_value = "rclone")]
+        storage_box_rclone_program: PathBuf,
         /// Absolute Storage Box archive root.
         #[arg(long)]
         storage_box_root: Option<String>,
@@ -166,6 +176,15 @@ pub enum Command {
         /// Storage Box SSH destination, e.g. u123@u123.your-storagebox.de.
         #[arg(long)]
         storage_box_remote: Option<String>,
+        /// Rclone remote name for Storage Box, e.g. storagebox.
+        #[arg(long, default_value = "storagebox")]
+        storage_box_rclone_remote: String,
+        /// Rclone config path for Storage Box.
+        #[arg(long)]
+        storage_box_rclone_config: Option<PathBuf>,
+        /// Rclone program for Storage Box commands.
+        #[arg(long, default_value = "rclone")]
+        storage_box_rclone_program: PathBuf,
         /// Absolute Storage Box archive root.
         #[arg(long)]
         storage_box_root: Option<String>,

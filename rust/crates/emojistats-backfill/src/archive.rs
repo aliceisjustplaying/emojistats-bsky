@@ -219,6 +219,7 @@ pub enum ArchiveStorageConfig {
     #[default]
     Local,
     StorageBoxSsh(StorageBoxArchiveConfig),
+    StorageBoxRclone(StorageBoxRcloneArchiveConfig),
 }
 
 impl ArchiveStorageConfig {
@@ -227,6 +228,7 @@ impl ArchiveStorageConfig {
         match self {
             Self::Local => "local",
             Self::StorageBoxSsh(_) => "storage_box_ssh",
+            Self::StorageBoxRclone(_) => "storage_box_rclone",
         }
     }
 }
@@ -241,6 +243,16 @@ pub struct StorageBoxArchiveConfig {
     pub command_timeout: Duration,
 }
 
+/// Rclone/SFTP Storage Box archive backend configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageBoxRcloneArchiveConfig {
+    pub remote_root: String,
+    pub remote_name: String,
+    pub config_path: PathBuf,
+    pub rclone_program: PathBuf,
+    pub command_timeout: Duration,
+}
+
 impl StorageBoxArchiveConfig {
     #[must_use]
     pub fn new(remote_root: impl Into<String>, ssh_remote: impl Into<String>) -> Self {
@@ -249,6 +261,23 @@ impl StorageBoxArchiveConfig {
             ssh_remote: ssh_remote.into(),
             ssh_program: PathBuf::from("ssh"),
             ssh_args: Vec::new(),
+            command_timeout: Duration::from_secs(300),
+        }
+    }
+}
+
+impl StorageBoxRcloneArchiveConfig {
+    #[must_use]
+    pub fn new(
+        remote_root: impl Into<String>,
+        remote_name: impl Into<String>,
+        config_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            remote_root: remote_root.into(),
+            remote_name: remote_name.into(),
+            config_path: config_path.into(),
+            rclone_program: PathBuf::from("rclone"),
             command_timeout: Duration::from_secs(300),
         }
     }

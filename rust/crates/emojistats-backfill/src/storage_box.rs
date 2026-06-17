@@ -10,6 +10,7 @@ use serde::Serialize;
 use crate::commit::{CommitPlan, ManifestEntry, ManifestMode, Receipt, Request};
 
 mod paths;
+mod rclone;
 mod source;
 mod ssh;
 
@@ -138,6 +139,25 @@ pub struct StorageBoxSshConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshStorageBoxCommands {
     config: StorageBoxSshConfig,
+}
+
+/// Rclone-backed command configuration for a Storage Box SFTP remote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageBoxRcloneConfig {
+    /// Rclone binary to execute locally.
+    pub rclone_program: PathBuf,
+    /// Rclone config file path.
+    pub config_path: PathBuf,
+    /// Rclone remote name, for example `storagebox`.
+    pub remote_name: String,
+    /// Maximum time one rclone command may run before it is killed.
+    pub command_timeout: std::time::Duration,
+}
+
+/// Storage Box command executor backed by local `rclone` processes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RcloneStorageBoxCommands {
+    config: StorageBoxRcloneConfig,
 }
 
 /// Completed remote commit result.
@@ -290,6 +310,41 @@ impl SshStorageBoxCommands {
     /// Build an SSH-backed Storage Box command executor.
     #[must_use]
     pub const fn new(config: StorageBoxSshConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl StorageBoxRcloneConfig {
+    /// Build an rclone command config for a Storage Box remote.
+    #[must_use]
+    pub fn new(config_path: impl Into<PathBuf>, remote_name: impl Into<String>) -> Self {
+        Self {
+            rclone_program: PathBuf::from("rclone"),
+            config_path: config_path.into(),
+            remote_name: remote_name.into(),
+            command_timeout: std::time::Duration::from_secs(300),
+        }
+    }
+
+    /// Set the rclone binary path.
+    #[must_use]
+    pub fn with_rclone_program(mut self, rclone_program: impl Into<PathBuf>) -> Self {
+        self.rclone_program = rclone_program.into();
+        self
+    }
+
+    /// Set the maximum runtime for one rclone command.
+    #[must_use]
+    pub const fn with_command_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.command_timeout = timeout;
+        self
+    }
+}
+
+impl RcloneStorageBoxCommands {
+    /// Build an rclone-backed Storage Box command executor.
+    #[must_use]
+    pub const fn new(config: StorageBoxRcloneConfig) -> Self {
         Self { config }
     }
 }

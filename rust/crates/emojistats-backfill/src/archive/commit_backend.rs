@@ -1,6 +1,7 @@
 use super::{
     ArchiveCommitContext, ArchiveError, ArchiveStorageConfig, LocalStore, ManifestMode, Path,
     PathBuf, ProfileRecord, RepoReceipt, Request, StorageBoxArchiveConfig,
+    StorageBoxRcloneArchiveConfig,
     archive_io::{ProfileSidecarCommitPaths, commit_profile_sidecar, profile_sidecar_request},
     naming::{stable_artifact_stem, stable_object_receipt_path},
 };
@@ -39,6 +40,22 @@ impl<'a> ArchiveCommitBackend<'a> {
                 let mut remote_request = request.clone();
                 remote_request.manifest_mode = ManifestMode::AppendJsonl;
                 commit_file_to_storage_box(
+                    config,
+                    &remote_request,
+                    temp_path,
+                    Some(repo_receipt_path),
+                )?;
+                let store = LocalStore::new(self.output_dir);
+                let mut local_request = request.clone();
+                local_request.manifest_mode = ManifestMode::Skip;
+                store
+                    .commit_prepared_temp(&local_request, temp_path)
+                    .map_err(Into::into)
+            }
+            ArchiveStorageConfig::StorageBoxRclone(config) => {
+                let mut remote_request = request.clone();
+                remote_request.manifest_mode = ManifestMode::AppendJsonl;
+                commit_file_to_storage_box_rclone(
                     config,
                     &remote_request,
                     temp_path,
@@ -113,6 +130,30 @@ impl<'a> ArchiveCommitBackend<'a> {
                     commit_context,
                 )?
             }
+            ArchiveStorageConfig::StorageBoxRclone(config) => {
+                let mut remote_request = request;
+                remote_request.manifest_mode = ManifestMode::AppendJsonl;
+                let temp_profile =
+                    super::archive_io::write_profile_sidecar_temp(self.output_dir, profile)?;
+                commit_file_to_storage_box_rclone(
+                    config,
+                    &remote_request,
+                    temp_profile.as_ref(),
+                    None,
+                )?;
+                commit_profile_sidecar(
+                    &store,
+                    ProfileSidecarCommitPaths {
+                        object_path,
+                        receipt_path,
+                        manifest_path,
+                        manifest_mode: ManifestMode::Skip,
+                    },
+                    profile,
+                    receipt,
+                    commit_context,
+                )?
+            }
         };
         Ok(Some(committed))
     }
@@ -132,6 +173,38 @@ fn commit_file_to_storage_box(
         ssh_config = ssh_config.with_ssh_arg(arg.clone());
     }
     let commands = crate::storage_box::SshStorageBoxCommands::new(ssh_config);
+    let mut backend = crate::storage_box::StorageBoxBackend::new(storage_config, commands);
+    if let Some(repo_receipt_path) = repo_receipt_path {
+        let relative_repo_receipt_path = PathBuf::from(repo_receipt_path.file_name().ok_or(
+            ArchiveError::CountOverflow {
+                field: "repo_receipt_file_name",
+            },
+        )?);
+        backend.commit_auxiliary_file(
+            request,
+            &relative_repo_receipt_path,
+            repo_receipt_path,
+            "repo receipt",
+        )?;
+    }
+    backend.commit_file(request, object_path)?;
+    Ok(())
+}
+
+fn commit_file_to_storage_box_rclone(
+    config: &StorageBoxRcloneArchiveConfig,
+    request: &Request,
+    object_path: &Path,
+    repo_receipt_path: Option<&Path>,
+) -> Result<(), ArchiveError> {
+    let storage_config = crate::storage_box::StorageBoxConfig::new(config.remote_root.clone());
+    let rclone_config = crate::storage_box::StorageBoxRcloneConfig::new(
+        config.config_path.clone(),
+        config.remote_name.clone(),
+    )
+    .with_rclone_program(config.rclone_program.clone())
+    .with_command_timeout(config.command_timeout);
+    let commands = crate::storage_box::RcloneStorageBoxCommands::new(rclone_config);
     let mut backend = crate::storage_box::StorageBoxBackend::new(storage_config, commands);
     if let Some(repo_receipt_path) = repo_receipt_path {
         let relative_repo_receipt_path = PathBuf::from(repo_receipt_path.file_name().ok_or(

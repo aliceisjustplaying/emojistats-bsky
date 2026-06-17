@@ -14,8 +14,9 @@ use clap::Parser;
 use emojistats_backfill::{
     archive::{
         ArchiveCommitContext, ArchiveError, ArchiveStorageConfig, CompletenessClass, FetchMethod,
-        NormalizerVersion, StorageBoxArchiveConfig, StreamingArchiveSink, StreamingReceiptInput,
-        archive_row_from_owned_post_observed_at, hash_profile_record,
+        NormalizerVersion, StorageBoxArchiveConfig, StorageBoxRcloneArchiveConfig,
+        StreamingArchiveSink, StreamingReceiptInput, archive_row_from_owned_post_observed_at,
+        hash_profile_record,
     },
     clickhouse::{
         ClickHouseClientConfig, aggregate_rebuild_sql, aggregate_rebuild_statements,
@@ -152,6 +153,9 @@ async fn run_fetch_one_command(command: Command) -> anyhow::Result<()> {
         archive_dir,
         archive_backend,
         storage_box_remote,
+        storage_box_rclone_remote,
+        storage_box_rclone_config,
+        storage_box_rclone_program,
         storage_box_root,
         storage_box_ssh_program,
         storage_box_ssh_arg,
@@ -162,14 +166,17 @@ async fn run_fetch_one_command(command: Command) -> anyhow::Result<()> {
     else {
         anyhow::bail!("internal command dispatch mismatch for fetch-one");
     };
-    let archive_storage = archive_storage_config(
-        archive_backend,
+    let archive_storage = archive_storage_config(ArchiveStorageArgs {
+        backend: archive_backend,
         storage_box_remote,
+        storage_box_rclone_remote,
+        storage_box_rclone_config,
+        storage_box_rclone_program,
         storage_box_root,
         storage_box_ssh_program,
         storage_box_ssh_arg,
         storage_box_command_timeout_secs,
-    )?;
+    })?;
     fetch_one(
         &did,
         spool_dir,
@@ -197,6 +204,9 @@ async fn run_fleet_command(command: Command) -> anyhow::Result<()> {
         archive_dir,
         archive_backend,
         storage_box_remote,
+        storage_box_rclone_remote,
+        storage_box_rclone_config,
+        storage_box_rclone_program,
         storage_box_root,
         storage_box_ssh_program,
         storage_box_ssh_arg,
@@ -213,14 +223,17 @@ async fn run_fleet_command(command: Command) -> anyhow::Result<()> {
     };
     enforce_canary_gate(canary_evidence.as_deref(), bypass_canary, canary_thresholds)?;
     validate_fleet_spool_budget(max_inflight_spool_bytes, max_bytes)?;
-    let archive_storage = archive_storage_config(
-        archive_backend,
+    let archive_storage = archive_storage_config(ArchiveStorageArgs {
+        backend: archive_backend,
         storage_box_remote,
+        storage_box_rclone_remote,
+        storage_box_rclone_config,
+        storage_box_rclone_program,
         storage_box_root,
         storage_box_ssh_program,
         storage_box_ssh_arg,
         storage_box_command_timeout_secs,
-    )?;
+    })?;
     let worker_id = default_worker_id(&run_id);
     let shard_label = shard_bucket.map_or_else(
         || "all".to_owned(),
@@ -276,14 +289,30 @@ fn parse_config_for_threads(cid_verification_threads: usize) -> ParseConfig {
     }
 }
 
-fn archive_storage_config(
+struct ArchiveStorageArgs {
     backend: ArchiveBackend,
     storage_box_remote: Option<String>,
+    storage_box_rclone_remote: String,
+    storage_box_rclone_config: Option<PathBuf>,
+    storage_box_rclone_program: PathBuf,
     storage_box_root: Option<String>,
     storage_box_ssh_program: PathBuf,
     storage_box_ssh_arg: Vec<String>,
     storage_box_command_timeout_secs: u64,
-) -> anyhow::Result<ArchiveStorageConfig> {
+}
+
+fn archive_storage_config(args: ArchiveStorageArgs) -> anyhow::Result<ArchiveStorageConfig> {
+    let ArchiveStorageArgs {
+        backend,
+        storage_box_remote,
+        storage_box_rclone_remote,
+        storage_box_rclone_config,
+        storage_box_rclone_program,
+        storage_box_root,
+        storage_box_ssh_program,
+        storage_box_ssh_arg,
+        storage_box_command_timeout_secs,
+    } = args;
     match backend {
         ArchiveBackend::Local => Ok(ArchiveStorageConfig::Local),
         ArchiveBackend::StorageBoxSsh => {
@@ -296,6 +325,17 @@ fn archive_storage_config(
             config.ssh_args = storage_box_ssh_arg;
             config.command_timeout = Duration::from_secs(storage_box_command_timeout_secs);
             Ok(ArchiveStorageConfig::StorageBoxSsh(config))
+        }
+        ArchiveBackend::StorageBoxRclone => {
+            let root = storage_box_root
+                .ok_or_else(|| anyhow::anyhow!("--storage-box-root is required"))?;
+            let config_path = storage_box_rclone_config
+                .ok_or_else(|| anyhow::anyhow!("--storage-box-rclone-config is required"))?;
+            let mut config =
+                StorageBoxRcloneArchiveConfig::new(root, storage_box_rclone_remote, config_path);
+            config.rclone_program = storage_box_rclone_program;
+            config.command_timeout = Duration::from_secs(storage_box_command_timeout_secs);
+            Ok(ArchiveStorageConfig::StorageBoxRclone(config))
         }
     }
 }

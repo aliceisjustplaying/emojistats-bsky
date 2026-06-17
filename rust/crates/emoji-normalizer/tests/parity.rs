@@ -13,14 +13,14 @@ use emoji_normalizer::extract_emoji_sequence;
 
 const GOLDEN: &str = include_str!("data/emoji_parity_golden.tsv");
 
-fn codepoints_to_string(field: &str) -> String {
+fn codepoints_to_string(field: &str) -> Result<String, String> {
     field
         .split(' ')
         .filter(|token| !token.is_empty())
         .map(|hex| {
             let cp = u32::from_str_radix(hex, 16)
-                .unwrap_or_else(|_| panic!("invalid codepoint hex {hex:?}"));
-            char::from_u32(cp).unwrap_or_else(|| panic!("invalid scalar value {hex:?}"))
+                .map_err(|error| format!("invalid codepoint hex {hex:?}: {error}"))?;
+            char::from_u32(cp).ok_or_else(|| format!("invalid scalar value {hex:?}"))
         })
         .collect()
 }
@@ -34,7 +34,7 @@ fn glyph_to_hex(glyph: &str) -> String {
 }
 
 #[test]
-fn matches_typescript_oracle_golden() {
+fn matches_typescript_oracle_golden() -> Result<(), String> {
     let mut total = 0usize;
     let mut diffs: Vec<String> = Vec::new();
     for line in GOLDEN.lines() {
@@ -43,20 +43,18 @@ fn matches_typescript_oracle_golden() {
         }
         let (input_hex, expected) = line
             .split_once('\t')
-            .unwrap_or_else(|| panic!("malformed golden row: {line:?}"));
-        let input = codepoints_to_string(input_hex);
+            .ok_or_else(|| format!("malformed golden row: {line:?}"))?;
+        let input = codepoints_to_string(input_hex)?;
         let got = extract_emoji_sequence(&input)
             .iter()
             .map(|glyph| glyph_to_hex(glyph))
             .collect::<Vec<_>>()
             .join(",");
         total += 1;
-        if got != expected {
-            if diffs.len() < 25 {
-                diffs.push(format!(
-                    "  input [{input_hex}]: expected [{expected}], got [{got}]"
-                ));
-            }
+        if got != expected && diffs.len() < 25 {
+            diffs.push(format!(
+                "  input [{input_hex}]: expected [{expected}], got [{got}]"
+            ));
         }
     }
     assert!(
@@ -69,4 +67,5 @@ fn matches_typescript_oracle_golden() {
         diffs.len(),
         diffs.join("\n")
     );
+    Ok(())
 }

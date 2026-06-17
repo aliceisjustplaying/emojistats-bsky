@@ -2,7 +2,7 @@
 
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -221,6 +221,53 @@ fn parses_storage_box_archive_backend_options() {
     assert_eq!(storage_box_root.as_deref(), Some("/storage-box/emojistats"));
     assert_eq!(storage_box_ssh_program, PathBuf::from("/usr/bin/ssh"));
     assert_eq!(storage_box_ssh_arg, vec!["-p", "23"]);
+    assert_eq!(storage_box_command_timeout_secs, 42);
+}
+
+#[test]
+fn parses_storage_box_rclone_archive_backend_options() {
+    let cli = Cli::try_parse_from([
+        "emojistats-backfill",
+        "run-fleet",
+        "dids.txt",
+        "--archive-backend",
+        "storage-box-rclone",
+        "--storage-box-root",
+        "/emojistats-archive/canary",
+        "--storage-box-rclone-remote",
+        "storagebox",
+        "--storage-box-rclone-config",
+        "/run/secret/rclone.conf",
+        "--storage-box-rclone-program",
+        "/usr/bin/rclone",
+        "--storage-box-command-timeout-secs",
+        "42",
+    ])
+    .unwrap();
+    let Command::RunFleet {
+        archive_backend,
+        storage_box_root,
+        storage_box_rclone_remote,
+        storage_box_rclone_config,
+        storage_box_rclone_program,
+        storage_box_command_timeout_secs,
+        ..
+    } = cli.command
+    else {
+        unreachable!("expected run-fleet command");
+    };
+
+    assert_eq!(archive_backend, ArchiveBackend::StorageBoxRclone);
+    assert_eq!(
+        storage_box_root.as_deref(),
+        Some("/emojistats-archive/canary")
+    );
+    assert_eq!(storage_box_rclone_remote, "storagebox");
+    assert_eq!(
+        storage_box_rclone_config.as_deref(),
+        Some(Path::new("/run/secret/rclone.conf"))
+    );
+    assert_eq!(storage_box_rclone_program, PathBuf::from("/usr/bin/rclone"));
     assert_eq!(storage_box_command_timeout_secs, 42);
 }
 
