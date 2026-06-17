@@ -49,6 +49,8 @@ pub(crate) async fn fetch_archive_list_records_or_emit_failure(
     emit_list_records_running(&step);
     let host_pacer = step.host_pacer;
     let host = step.host;
+    let claim_check = step.claim_check.clone();
+    let did_for_commit_check = step.did_str.to_owned();
     match fetch_and_archive_list_records_with_precommit_check(
         step.http,
         step.pds,
@@ -66,10 +68,10 @@ pub(crate) async fn fetch_archive_list_records_or_emit_failure(
             )
         }),
         |rate_limit| record_rate_limit_snapshot(host_pacer, host, rate_limit, SystemTime::now()),
-        || {
-            if let Some(claim_check) = &step.claim_check {
+        move || {
+            if let Some(claim_check) = &claim_check {
                 claim_check
-                    .ensure_owned_before_commit(step.did_str)
+                    .ensure_owned_before_commit(&did_for_commit_check)
                     .map_err(|err| err.error.to_string())?;
             }
             Ok(())

@@ -4,7 +4,8 @@ use reqwest::{Client, Response, StatusCode};
 
 use super::{
     CLICKHOUSE_RESPONSE_SNIPPET_MAX_BYTES, ClickHouseClientConfig, ClickHouseInsertContext,
-    ClickHouseInsertError, ClickHouseInsertPayload, ClickHouseInsertReceipt,
+    ClickHouseInsertError, ClickHouseInsertPayload, ClickHouseInsertReceipt, ClickHouseSqlContext,
+    ClickHouseSqlError, ClickHouseSqlReceipt,
 };
 
 /// Execute insert payloads in order through the provided HTTP client.
@@ -22,6 +23,28 @@ pub async fn execute_insert_payloads(
 
     for payload in payloads {
         receipts.push(execute_insert_payload_with_retries(client, config, payload).await?);
+    }
+
+    Ok(receipts)
+}
+
+/// Execute SQL statements in order through the provided HTTP client.
+///
+/// # Errors
+///
+/// Returns [`ClickHouseSqlError`] when a request cannot be built, the HTTP transport fails, or
+/// `ClickHouse` returns a non-2xx status.
+pub async fn execute_sql_statements(
+    client: &Client,
+    config: &ClickHouseClientConfig,
+    statements: &[String],
+) -> Result<Vec<ClickHouseSqlReceipt>, ClickHouseSqlError> {
+    let mut receipts = Vec::with_capacity(statements.len());
+
+    for (statement_index, statement) in statements.iter().enumerate() {
+        receipts.push(
+            execute_sql_statement_with_retries(client, config, statement_index, statement).await?,
+        );
     }
 
     Ok(receipts)
@@ -105,6 +128,88 @@ fn should_retry_insert_error(error: &ClickHouseInsertError) -> bool {
     }
 }
 
+async fn execute_sql_statement_with_retries(
+    client: &Client,
+    config: &ClickHouseClientConfig,
+    statement_index: usize,
+    statement: &str,
+) -> Result<ClickHouseSqlReceipt, ClickHouseSqlError> {
+    let context = ClickHouseSqlContext {
+        statement_index,
+        statement: statement.to_owned(),
+    };
+    let mut attempt = 1_u8;
+    let mut backoff = config.retry_initial_backoff;
+    let max_attempts = cmp::max(1, config.max_insert_attempts);
+
+    loop {
+        match execute_sql_statement_once(client, config, &context).await {
+            Ok(receipt) => return Ok(receipt),
+            Err(error) if should_retry_sql_error(&error) && attempt < max_attempts => {
+                tokio::time::sleep(backoff).await;
+                attempt = attempt.checked_add(1).unwrap_or(max_attempts);
+                backoff = cmp::min(backoff.saturating_mul(2), config.retry_max_backoff);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn execute_sql_statement_once(
+    client: &Client,
+    config: &ClickHouseClientConfig,
+    context: &ClickHouseSqlContext,
+) -> Result<ClickHouseSqlReceipt, ClickHouseSqlError> {
+    let request = config
+        .sql_request_with_client(client, context.statement.as_str())
+        .map_err(|source| ClickHouseSqlError::RequestBuild {
+            statement_index: context.statement_index,
+            source,
+        })?;
+    let response =
+        client
+            .execute(request)
+            .await
+            .map_err(|source| ClickHouseSqlError::Transport {
+                context: context.clone(),
+                source,
+            })?;
+    let status = response.status();
+    let response_snippet =
+        response_snippet(response)
+            .await
+            .map_err(|source| ClickHouseSqlError::Transport {
+                context: context.clone(),
+                source,
+            })?;
+
+    if !status.is_success() {
+        return Err(classify_sql_status(
+            context.clone(),
+            status,
+            response_snippet,
+        ));
+    }
+
+    Ok(ClickHouseSqlReceipt {
+        context: context.clone(),
+        status: status.as_u16(),
+        response_snippet,
+    })
+}
+
+fn should_retry_sql_error(error: &ClickHouseSqlError) -> bool {
+    match error {
+        ClickHouseSqlError::Transport { source, .. } => {
+            source.is_timeout() || source.is_connect() || source.is_body()
+        }
+        ClickHouseSqlError::RetryableStatus { .. } => true,
+        ClickHouseSqlError::RequestBuild { .. } | ClickHouseSqlError::PermanentStatus { .. } => {
+            false
+        }
+    }
+}
+
 async fn response_snippet(mut response: Response) -> Result<Option<String>, reqwest::Error> {
     let mut bytes = Vec::with_capacity(CLICKHOUSE_RESPONSE_SNIPPET_MAX_BYTES);
     while bytes.len() < CLICKHOUSE_RESPONSE_SNIPPET_MAX_BYTES {
@@ -137,6 +242,26 @@ pub(super) fn classify_insert_status(
         }
     } else {
         ClickHouseInsertError::PermanentStatus {
+            context,
+            status: status.as_u16(),
+            response_snippet,
+        }
+    }
+}
+
+pub(super) fn classify_sql_status(
+    context: ClickHouseSqlContext,
+    status: StatusCode,
+    response_snippet: Option<String>,
+) -> ClickHouseSqlError {
+    if is_retryable_insert_status(status) {
+        ClickHouseSqlError::RetryableStatus {
+            context,
+            status: status.as_u16(),
+            response_snippet,
+        }
+    } else {
+        ClickHouseSqlError::PermanentStatus {
             context,
             status: status.as_u16(),
             response_snippet,

@@ -3,11 +3,13 @@ use super::{
     LocalStore, ManifestMode, Path, PathBuf, ProfileRecord, RepoReceipt, Request,
     archive_io::{
         ProfileSidecarCommitPaths, build_commit_metadata, commit_profile_sidecar,
-        local_manifest_from_committed, receipt_dataset, stable_artifact_stem,
-        stable_object_receipt_path, stable_repo_receipt_name, write_emoji_projection_jsonl,
-        write_json_pretty, write_posts_parquet_to_writer,
+        local_manifest_from_committed, receipt_dataset, write_emoji_projection_jsonl,
+        write_json_pretty,
     },
-    derive_emoji_projection_rows, fs, hash_serialized_json, write_temp_idempotent,
+    derive_emoji_projection_rows, fs, hash_serialized_json,
+    naming::{stable_artifact_stem, stable_object_receipt_path, stable_repo_receipt_name},
+    parquet::write_posts_parquet_to_writer,
+    write_temp_idempotent,
 };
 
 /// Write local archive artifacts for one parsed repo.

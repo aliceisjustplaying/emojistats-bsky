@@ -1,10 +1,8 @@
 use super::{
     ArchiveCommitContext, ArchiveError, ArchiveStorageConfig, LocalStore, ManifestMode, Path,
     PathBuf, ProfileRecord, RepoReceipt, Request, StorageBoxArchiveConfig,
-    archive_io::{
-        ProfileSidecarCommitPaths, commit_profile_sidecar, profile_sidecar_request,
-        stable_object_receipt_path,
-    },
+    archive_io::{ProfileSidecarCommitPaths, commit_profile_sidecar, profile_sidecar_request},
+    naming::{stable_artifact_stem, stable_object_receipt_path},
 };
 
 /// Selected archive commit backend for local staging, final exposure, and remote mirroring.
@@ -30,12 +28,30 @@ impl<'a> ArchiveCommitBackend<'a> {
         temp_path: &Path,
         repo_receipt_path: &Path,
     ) -> Result<crate::commit::Artifact, ArchiveError> {
-        let store = LocalStore::new(self.output_dir);
-        let mut local_request = request.clone();
-        local_request.manifest_mode = self.local_manifest_mode();
-        let committed = store.commit_prepared_temp(&local_request, temp_path)?;
-        self.mirror_storage_box(request, &committed, Some(repo_receipt_path))?;
-        Ok(committed)
+        match self.storage_config {
+            ArchiveStorageConfig::Local => {
+                let store = LocalStore::new(self.output_dir);
+                store
+                    .commit_prepared_temp(request, temp_path)
+                    .map_err(Into::into)
+            }
+            ArchiveStorageConfig::StorageBoxSsh(config) => {
+                let mut remote_request = request.clone();
+                remote_request.manifest_mode = ManifestMode::AppendJsonl;
+                commit_file_to_storage_box(
+                    config,
+                    &remote_request,
+                    temp_path,
+                    Some(repo_receipt_path),
+                )?;
+                let store = LocalStore::new(self.output_dir);
+                let mut local_request = request.clone();
+                local_request.manifest_mode = ManifestMode::Skip;
+                store
+                    .commit_prepared_temp(&local_request, temp_path)
+                    .map_err(Into::into)
+            }
+        }
     }
 
     pub(super) fn commit_profile(
@@ -50,7 +66,7 @@ impl<'a> ArchiveCommitBackend<'a> {
             return Ok(None);
         };
         let store = LocalStore::new(self.output_dir);
-        let profile_stem = super::archive_io::stable_artifact_stem(
+        let profile_stem = stable_artifact_stem(
             did,
             "raw_profile_sidecar",
             receipt.profile_row_hash.as_deref().unwrap_or(receipt_hash),
@@ -65,46 +81,40 @@ impl<'a> ArchiveCommitBackend<'a> {
             receipt,
             commit_context,
         )?;
-        let committed = commit_profile_sidecar(
-            &store,
-            ProfileSidecarCommitPaths {
-                object_path,
-                receipt_path,
-                manifest_path,
-                manifest_mode: self.local_manifest_mode(),
-            },
-            profile,
-            receipt,
-            commit_context,
-        )?;
-        self.mirror_storage_box(&request, &committed, None)?;
-        Ok(Some(committed))
-    }
-
-    const fn local_manifest_mode(&self) -> ManifestMode {
-        match self.storage_config {
-            ArchiveStorageConfig::Local => ManifestMode::AppendJsonl,
-            ArchiveStorageConfig::StorageBoxSsh(_) => ManifestMode::Skip,
-        }
-    }
-
-    fn mirror_storage_box(
-        &self,
-        request: &Request,
-        committed: &crate::commit::Artifact,
-        repo_receipt_path: Option<&Path>,
-    ) -> Result<(), ArchiveError> {
-        let ArchiveStorageConfig::StorageBoxSsh(config) = self.storage_config else {
-            return Ok(());
+        let committed = match self.storage_config {
+            ArchiveStorageConfig::Local => commit_profile_sidecar(
+                &store,
+                ProfileSidecarCommitPaths {
+                    object_path,
+                    receipt_path,
+                    manifest_path,
+                    manifest_mode: ManifestMode::AppendJsonl,
+                },
+                profile,
+                receipt,
+                commit_context,
+            )?,
+            ArchiveStorageConfig::StorageBoxSsh(config) => {
+                let mut remote_request = request;
+                remote_request.manifest_mode = ManifestMode::AppendJsonl;
+                let temp_profile =
+                    super::archive_io::write_profile_sidecar_temp(self.output_dir, profile)?;
+                commit_file_to_storage_box(config, &remote_request, temp_profile.as_ref(), None)?;
+                commit_profile_sidecar(
+                    &store,
+                    ProfileSidecarCommitPaths {
+                        object_path,
+                        receipt_path,
+                        manifest_path,
+                        manifest_mode: ManifestMode::Skip,
+                    },
+                    profile,
+                    receipt,
+                    commit_context,
+                )?
+            }
         };
-        let mut remote_request = request.clone();
-        remote_request.manifest_mode = ManifestMode::AppendJsonl;
-        commit_file_to_storage_box(
-            config,
-            &remote_request,
-            &committed.object_path,
-            repo_receipt_path,
-        )
+        Ok(Some(committed))
     }
 }
 

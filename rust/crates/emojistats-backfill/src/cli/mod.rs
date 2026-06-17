@@ -232,6 +232,24 @@ pub enum Command {
         #[arg(long, default_value = "emojistats")]
         clickhouse_database: String,
     },
+    /// Rebuild disposable `ClickHouse` aggregate tables from compact post-serving rows.
+    ClickhouseRebuildAggregates {
+        /// `ClickHouse` HTTP endpoint.
+        #[arg(long, default_value = "http://localhost:8123")]
+        clickhouse_url: String,
+        /// `ClickHouse` database.
+        #[arg(long, default_value = "emojistats")]
+        clickhouse_database: String,
+        /// `ClickHouse` username.
+        #[arg(long, default_value = "default")]
+        clickhouse_user: String,
+        /// `ClickHouse` password.
+        #[arg(long, default_value = "")]
+        clickhouse_password: String,
+        /// Print rebuild SQL without executing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Evaluate stratified canary evidence against the launch policy.
     Canary {
         /// JSON or JSONL canary evidence file.

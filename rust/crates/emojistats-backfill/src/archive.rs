@@ -11,17 +11,16 @@ use std::{
     time::Duration,
 };
 
-use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, builder::StringBuilder};
-use arrow_schema::{DataType, Field, Schema};
-use chrono::{DateTime, SecondsFormat, Utc};
-pub use emoji_normalizer::NormalizerVersion;
-use parquet::{
+use ::parquet::{
     arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
     basic::{Compression, ZstdLevel},
     file::properties::WriterProperties,
 };
+use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, builder::StringBuilder};
+use arrow_schema::{DataType, Field, Schema};
+use chrono::{DateTime, SecondsFormat, Utc};
+pub use emoji_normalizer::NormalizerVersion;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tempfile::{NamedTempFile, TempPath};
 
 use crate::{
@@ -55,35 +54,6 @@ pub struct ArchivePostRow {
     pub langs: Vec<String>,
     pub emoji_sequence: Vec<String>,
     pub extras_json: serde_json::Value,
-}
-
-/// Incremental hasher for canonical archive post row content.
-#[derive(Debug, Default)]
-pub struct ArchivePostRowsHasher {
-    hasher: Sha256,
-}
-
-impl ArchivePostRowsHasher {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            hasher: Sha256::new(),
-        }
-    }
-
-    /// Add one archive row to the canonical post-row hash.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ArchiveError`] if row content cannot be framed for hashing.
-    pub fn push_row(&mut self, row: &ArchivePostRow) -> Result<(), ArchiveError> {
-        archive_io::hash_post_row_into(&mut self.hasher, row)
-    }
-
-    #[must_use]
-    pub fn finish(self) -> String {
-        hex::encode(self.hasher.finalize())
-    }
 }
 
 /// Compact local serving projection row derived from an archive row.
@@ -320,7 +290,7 @@ pub struct ArchiveArtifacts {
 #[derive(Debug)]
 pub enum ArchiveError {
     Io(std_io::Error),
-    Parquet(parquet::errors::ParquetError),
+    Parquet(::parquet::errors::ParquetError),
     Arrow(arrow_schema::ArrowError),
     Json(serde_json::Error),
     Commit(crate::commit::Error),
@@ -359,6 +329,12 @@ mod archive_io;
 mod commit_backend;
 #[path = "archive/full_write.rs"]
 mod full_write;
+#[path = "archive/hash.rs"]
+mod hash;
+#[path = "archive/naming.rs"]
+mod naming;
+#[path = "archive/parquet.rs"]
+mod parquet;
 #[path = "archive/projection.rs"]
 mod projection;
 #[path = "archive/projection_writer.rs"]
@@ -367,11 +343,10 @@ mod projection_writer;
 mod row;
 mod write;
 
-pub use archive_io::{
-    archive_post_rows_from_record_batch, build_repo_receipt, hash_post_rows, hash_profile_record,
-    read_all_archive_post_rows,
-};
+pub use archive_io::{build_repo_receipt, hash_profile_record};
 pub use full_write::write_archive_artifacts;
+pub use hash::{ArchivePostRowsHasher, hash_post_rows};
+pub use parquet::{archive_post_rows_from_record_batch, read_all_archive_post_rows};
 pub use projection::{
     BorrowedEmojiProjectionRow, borrowed_emoji_projection_rows_for_post,
     derive_emoji_projection_rows, emoji_projection_rows_for_post,
@@ -599,8 +574,8 @@ impl From<std_io::Error> for ArchiveError {
     }
 }
 
-impl From<parquet::errors::ParquetError> for ArchiveError {
-    fn from(error: parquet::errors::ParquetError) -> Self {
+impl From<::parquet::errors::ParquetError> for ArchiveError {
+    fn from(error: ::parquet::errors::ParquetError) -> Self {
         Self::Parquet(error)
     }
 }

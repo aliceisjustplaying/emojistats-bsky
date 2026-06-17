@@ -1,5 +1,5 @@
 pub mod archive_host;
-pub mod attempt_runtime;
+pub mod attempt_resources;
 pub mod fetch_attempt;
 pub mod host_rate_limit;
 pub mod list_records_attempt;

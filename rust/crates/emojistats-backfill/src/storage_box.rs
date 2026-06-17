@@ -7,7 +7,7 @@ use std::{
 
 use serde::Serialize;
 
-use crate::commit::{ManifestEntry, ManifestMode, Receipt, Request};
+use crate::commit::{CommitPlan, ManifestEntry, ManifestMode, Receipt, Request};
 
 mod paths;
 mod source;
@@ -470,13 +470,12 @@ where
         readback_bytes,
     )?;
 
-    let receipt = Receipt::from_parts(
+    let plan = CommitPlan::from_digest(
         &request.metadata,
         paths.object_manifest_path.clone(),
         &object_digest,
     );
-    let entry = ManifestEntry::from_parts(&request.metadata, &receipt);
-    let receipt_bytes = json_bytes("receipt", &receipt)?;
+    let receipt_bytes = json_bytes("receipt", &plan.receipt)?;
     upload_verify_promote(
         commands,
         &paths.temp_receipt,
@@ -486,7 +485,7 @@ where
         readback_bytes,
     )?;
 
-    let manifest_line = jsonl_bytes("manifest", &entry)?;
+    let manifest_line = jsonl_bytes("manifest", &plan.entry)?;
     append_manifest_if_missing(commands, &paths.manifest, &manifest_line)?;
 
     Ok(RemoteArtifact {
@@ -495,8 +494,8 @@ where
         remote_receipt_path: paths.receipt.clone(),
         remote_temp_receipt_path: paths.temp_receipt.clone(),
         remote_manifest_path: paths.manifest.clone(),
-        entry,
-        receipt,
+        entry: plan.entry,
+        receipt: plan.receipt,
     })
 }
 

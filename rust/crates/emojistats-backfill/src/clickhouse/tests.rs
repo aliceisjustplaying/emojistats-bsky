@@ -13,8 +13,10 @@ use serde_json::Value;
 use super::{
     CLICKHOUSE_DATABASE_HEADER, CLICKHOUSE_KEY_HEADER, CLICKHOUSE_RESPONSE_SNIPPET_MAX_BYTES,
     CLICKHOUSE_USER_HEADER, ClickHouseClientConfig, ClickHouseInsertContext, ClickHouseInsertError,
-    ClickHouseSchemaError, ClickHouseTable, JSON_EACH_ROW_FORMAT, aggregate_rebuild_sql,
-    classify_insert_status, create_schema_sql, derive_insert_payloads, execute_insert_payloads,
+    ClickHouseSchemaError, ClickHouseSqlContext, ClickHouseSqlError, ClickHouseTable,
+    JSON_EACH_ROW_FORMAT, aggregate_rebuild_sql, aggregate_rebuild_statements,
+    classify_insert_status, classify_sql_status, create_schema_sql, derive_insert_payloads,
+    execute_insert_payloads, execute_sql_statements,
 };
 use crate::{
     archive::current_normalizer,
@@ -200,6 +202,37 @@ fn aggregate_rebuild_sql_uses_compact_post_rows_and_array_join() {
     assert!(sql.contains("arrayJoin(emojis) AS emoji"));
     assert!(sql.contains("INSERT INTO emojistats.v2_posts_hourly_r3"));
     assert!(sql.contains("sum(emoji_occurrences) AS emoji_occurrences"));
+}
+
+#[test]
+fn aggregate_rebuild_statements_are_ordered_truncate_then_insert() {
+    let statements = aggregate_rebuild_statements("emojistats").expect("aggregate statements");
+
+    assert_eq!(statements.len(), 8);
+    assert!(
+        statements
+            .first()
+            .expect("first")
+            .starts_with("TRUNCATE TABLE")
+    );
+    assert!(
+        statements
+            .get(1)
+            .expect("second")
+            .starts_with("INSERT INTO")
+    );
+    assert!(
+        statements
+            .get(6)
+            .expect("seventh")
+            .contains("v2_posts_hourly_r3")
+    );
+    assert!(
+        statements
+            .get(7)
+            .expect("eighth")
+            .contains("FROM emojistats.v2_post_serving_r3 FINAL")
+    );
 }
 
 #[test]
@@ -460,6 +493,75 @@ async fn execute_insert_payloads_retries_bounded_retryable_statuses() {
 
     assert_eq!(receipts.len(), 1);
     assert_eq!(requests.len(), 2);
+}
+
+#[tokio::test]
+async fn execute_sql_statements_sends_statements_in_order() {
+    let statements = vec![
+        "TRUNCATE TABLE IF EXISTS emojistats.v2_emoji_total_r3;".to_owned(),
+        "INSERT INTO emojistats.v2_emoji_total_r3 SELECT 1;".to_owned(),
+    ];
+    let (url, handle) = spawn_http_server(vec![
+        (200, "truncate-ok".to_owned()),
+        (200, "insert-ok".to_owned()),
+    ]);
+    let config = ClickHouseClientConfig::new(
+        &url,
+        "emojistats",
+        "alice",
+        "secret",
+        "emojistats-backfill-test",
+    )
+    .expect("client config")
+    .with_timeout_and_retry_policy(
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+        Duration::ZERO,
+        Duration::ZERO,
+        1,
+    );
+    let client = Client::new();
+
+    let receipts = execute_sql_statements(&client, &config, &statements)
+        .await
+        .expect("sql statements");
+    let requests = handle.join().expect("server thread");
+
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(receipts.first().expect("first").context.statement_index, 0);
+    assert_eq!(receipts.get(1).expect("second").context.statement_index, 1);
+    assert_eq!(requests.len(), 2);
+    assert!(requests.first().expect("first").target.contains("TRUNCATE"));
+    assert!(requests.get(1).expect("second").target.contains("INSERT"));
+    assert!(requests.first().expect("first").body.is_empty());
+    assert!(requests.get(1).expect("second").body.is_empty());
+}
+
+#[test]
+fn classify_sql_status_marks_server_errors_retryable() {
+    let context = ClickHouseSqlContext {
+        statement_index: 0,
+        statement: "TRUNCATE TABLE t".to_owned(),
+    };
+
+    let error = classify_sql_status(
+        context,
+        StatusCode::SERVICE_UNAVAILABLE,
+        Some("busy".to_owned()),
+    );
+
+    match error {
+        ClickHouseSqlError::RetryableStatus {
+            context,
+            status,
+            response_snippet,
+        } => {
+            assert_eq!(context.statement_index, 0);
+            assert_eq!(status, 503);
+            assert_eq!(response_snippet.as_deref(), Some("busy"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[test]

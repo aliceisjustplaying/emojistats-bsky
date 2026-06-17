@@ -24,7 +24,7 @@ use super::{
     failure::{FetchOneFailure, retryable_failure},
     increment,
     main::fetch_attempt::{
-        AttemptRuntime, FetchOneAttemptConfig, HostOverrideCache, fetch_one_attempt_with_pacer,
+        AttemptResources, FetchOneAttemptConfig, HostOverrideCache, fetch_one_attempt_with_pacer,
     },
     parse_config_for_threads,
 };
@@ -242,7 +242,7 @@ async fn run_fleet_attempt(config: FleetAttemptConfig) -> FleetAttemptResult {
                 archive_storage: config.archive_storage,
                 archive_context,
                 http_protocol: config.http_protocol,
-                runtime: AttemptRuntime::Fleet {
+                resources: AttemptResources::Fleet {
                     host_pacer: config.host_pacer,
                     host_limiter: config.host_limiter,
                     parse_permits: config.parse_permits,

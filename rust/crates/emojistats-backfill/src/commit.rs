@@ -99,6 +99,13 @@ pub struct Artifact {
     pub receipt: Receipt,
 }
 
+/// Commit-plan output shared by local and remote stores after final object bytes are known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitPlan {
+    pub entry: ManifestEntry,
+    pub receipt: Receipt,
+}
+
 /// Storage Box-shaped committed manifest entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestEntry {
@@ -248,20 +255,19 @@ impl LocalStore {
         let object_state = promote_object(&object)?;
         let digest = object_state.digest();
         let object_path = manifest_path_string("object", &request.object_path)?;
-        let receipt_doc = Receipt::from_parts(&request.metadata, object_path, &digest);
+        let plan = CommitPlan::from_digest(&request.metadata, object_path, &digest);
 
         let (entry, committed_receipt) = match object_state {
             ObjectCommitState::Promoted(_) => {
-                let entry = ManifestEntry::from_parts(&request.metadata, &receipt_doc);
-                write_json_temp_promote(&receipt, "receipt", &receipt_doc)?;
+                write_json_temp_promote(&receipt, "receipt", &plan.receipt)?;
                 if request.manifest_mode != ManifestMode::Skip {
-                    write_manifest(&manifest, request.manifest_mode, &entry)?;
+                    write_manifest(&manifest, request.manifest_mode, &plan.entry)?;
                 }
-                (entry, receipt_doc)
+                (plan.entry, plan.receipt)
             }
             ObjectCommitState::AlreadyCommitted(_) => {
                 let committed_receipt =
-                    repair_or_validate_existing_receipt(&receipt, &receipt_doc)?;
+                    repair_or_validate_existing_receipt(&receipt, &plan.receipt)?;
                 let entry = ManifestEntry::from_parts(&request.metadata, &committed_receipt);
                 if request.manifest_mode != ManifestMode::Skip {
                     write_manifest_if_missing(&manifest, request.manifest_mode, &entry)?;
@@ -308,6 +314,19 @@ impl LocalStore {
             });
         }
         Ok(self.root.join(scoped))
+    }
+}
+
+impl CommitPlan {
+    #[must_use]
+    pub(crate) fn from_digest(
+        metadata: &Metadata,
+        object_path: String,
+        digest: &DigestResult,
+    ) -> Self {
+        let receipt = Receipt::from_parts(metadata, object_path, digest);
+        let entry = ManifestEntry::from_parts(metadata, &receipt);
+        Self { entry, receipt }
     }
 }
 
@@ -364,7 +383,7 @@ impl Receipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DigestResult {
+pub struct DigestResult {
     pub(crate) bytes: u64,
     pub(crate) sha256: String,
 }

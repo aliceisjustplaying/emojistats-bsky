@@ -304,7 +304,7 @@ pub async fn fetch_and_archive_list_records_with_precommit_check(
     config: ListRecordsConfig,
     host_pacing: Option<ListRecordsHostPacing<'_>>,
     mut observe_rate_limit: impl FnMut(&RateLimitSnapshot),
-    before_commit: impl FnOnce() -> Result<(), String>,
+    before_commit: impl FnOnce() -> Result<(), String> + Send + 'static,
 ) -> Result<ListRecordsArchiveOutput, ListRecordsError> {
     let mut archiver = ListRecordsArchiver::new(
         did_str,
@@ -355,7 +355,17 @@ pub async fn fetch_and_archive_list_records_with_precommit_check(
         cursor = next_cursor;
     }
 
-    let mut output = archiver.finish(before_commit)?;
+    let mut output = tokio::task::spawn_blocking(move || archiver.finish(before_commit))
+        .await
+        .map_err(|err| {
+            ListRecordsError::Archive(ArchiveError::CountOverflow {
+                field: if err.is_panic() {
+                    "list_records_archive_task_panicked"
+                } else {
+                    "list_records_archive_task_cancelled"
+                },
+            })
+        })??;
     output.rate_limits = rate_limits;
     Ok(output)
 }
@@ -389,8 +399,8 @@ where
     archiver.finish(|| Ok(()))
 }
 
-struct ListRecordsArchiver<'a> {
-    did_str: &'a str,
+struct ListRecordsArchiver {
+    did_str: String,
     sink: StreamingArchiveSink,
     config: ListRecordsConfig,
     records: u64,
@@ -399,16 +409,16 @@ struct ListRecordsArchiver<'a> {
     seen_rkeys: HashSet<String>,
 }
 
-impl<'a> ListRecordsArchiver<'a> {
+impl ListRecordsArchiver {
     fn new(
-        did_str: &'a str,
+        did_str: &str,
         archive_dir: &Path,
         archive_context: ArchiveCommitContext,
         archive_storage: ArchiveStorageConfig,
         config: ListRecordsConfig,
     ) -> Result<Self, ListRecordsError> {
         Ok(Self {
-            did_str,
+            did_str: did_str.to_owned(),
             sink: StreamingArchiveSink::new_with_storage(
                 archive_dir,
                 did_str,
@@ -449,7 +459,7 @@ impl<'a> ListRecordsArchiver<'a> {
                     max: self.config.max_records,
                 })?;
         enforce_cap("max_records", self.records, self.config.max_records)?;
-        let rkey = rkey_from_uri(self.did_str, &record.uri).map(ToOwned::to_owned);
+        let rkey = rkey_from_uri(&self.did_str, &record.uri).map(ToOwned::to_owned);
         if let Some(rkey) = &rkey
             && !self.seen_rkeys.insert(rkey.clone())
         {
@@ -457,13 +467,13 @@ impl<'a> ListRecordsArchiver<'a> {
                 "PDS returned duplicate listRecords rkey {rkey}"
             )));
         }
-        match post_record_from_list_record(self.did_str, record) {
+        match post_record_from_list_record(&self.did_str, record) {
             Ok(decoded) => {
                 if decoded.typed_decode_failed {
                     self.increment_decode_errors()?;
                 }
                 let row = archive_row_from_post_observed_at(
-                    self.did_str,
+                    &self.did_str,
                     &decoded.post,
                     &self.sink.normalizer().clone(),
                     self.sink.observed_at(),

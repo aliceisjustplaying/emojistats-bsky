@@ -1,20 +1,24 @@
-use sha2::Digest as _;
+use sha2::{Digest as _, Sha256};
 
 use super::{
     ARCHIVE_SCHEMA_VERSION, Arc, ArchiveArtifacts, ArchiveCommitContext, ArchiveError,
     ArchivePostRow, ArchiveStorageConfig, ArrowWriter, CompletenessClass, DateTime, FetchMethod,
     File, LocalManifestEntry, ManifestMode, Metadata, NamedTempFile, NormalizerVersion,
     PARQUET_BATCH_ROWS, POST_COLLECTION, Path, PathBuf, ProfileRecord, RepoReceipt, Request,
-    Schema, Sha256, TempPath, Utc,
+    Schema, TempPath, Utc,
     archive_io::{
-        append_hash_field_frame, append_normalizer_frames, archive_schema, framed_fields,
-        hash_extras_json, hash_field, hash_optional_field, hash_post_row_into, hash_string_slice,
-        local_manifest_from_committed, parquet_writer_properties, post_record_batch,
-        receipt_dataset, stable_artifact_stem, stable_object_receipt_path,
-        stable_repo_receipt_name, update_min_max_created_at, write_json_pretty,
+        local_manifest_from_committed, receipt_dataset, update_min_max_created_at,
+        write_json_pretty,
     },
     commit_backend::ArchiveCommitBackend,
-    format_observed_at, fs, hash_serialized_json,
+    format_observed_at, fs,
+    hash::{
+        append_hash_field_frame, append_normalizer_frames, framed_fields, hash_extras_json,
+        hash_field, hash_optional_field, hash_post_row_into, hash_string_slice,
+    },
+    hash_serialized_json,
+    naming::{stable_artifact_stem, stable_object_receipt_path, stable_repo_receipt_name},
+    parquet::{archive_schema, parquet_writer_properties, post_record_batch},
     projection_writer::StreamingProjectionWriter,
     promote_temp_idempotent,
     row::current_normalizer,

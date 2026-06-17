@@ -73,8 +73,17 @@ pub fn create_schema_sql(database: &str) -> Result<String, ClickHouseSchemaError
 ///
 /// Returns [`ClickHouseSchemaError`] if the database name is not a valid `ClickHouse` identifier.
 pub fn aggregate_rebuild_sql(database: &str) -> Result<String, ClickHouseSchemaError> {
+    Ok(aggregate_rebuild_statements(database)?.join("\n\n"))
+}
+
+/// Return aggregate rebuild SQL statements in execution order.
+///
+/// # Errors
+///
+/// Returns [`ClickHouseSchemaError`] if the database name is not a valid `ClickHouse` identifier.
+pub fn aggregate_rebuild_statements(database: &str) -> Result<Vec<String>, ClickHouseSchemaError> {
     let database = ClickHouseIdentifier::new(database)?;
-    Ok([
+    Ok(vec![
         truncate_table_sql(&database, ClickHouseTable::EmojiTotal),
         rebuild_emoji_total_sql(&database),
         truncate_table_sql(&database, ClickHouseTable::EmojiTotalByLang),
@@ -83,8 +92,7 @@ pub fn aggregate_rebuild_sql(database: &str) -> Result<String, ClickHouseSchemaE
         rebuild_lang_total_sql(&database),
         truncate_table_sql(&database, ClickHouseTable::PostsHourly),
         rebuild_posts_hourly_sql(&database),
-    ]
-    .join("\n\n"))
+    ])
 }
 
 fn truncate_table_sql(database: &ClickHouseIdentifier, table: ClickHouseTable) -> String {

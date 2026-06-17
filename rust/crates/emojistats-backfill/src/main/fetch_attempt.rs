@@ -6,8 +6,8 @@ use emojistats_backfill::scheduler::SharedHostPacer;
 use jacquard_identity::resolver::IdentityResolver;
 use tokio::sync::Semaphore;
 
-pub(crate) use super::attempt_runtime::{
-    AttemptRuntime, FetchOneAttemptConfig, HostOverrideCache, HostOverrideCacheEntry,
+pub(crate) use super::attempt_resources::{
+    AttemptResources, FetchOneAttemptConfig, HostOverrideCache, HostOverrideCacheEntry,
     LocalFetchOneAttemptConfig,
 };
 use super::{
@@ -18,7 +18,7 @@ use super::{
         elapsed_ms, emit_smoke_telemetry, outcome_name, permanent_failure, retryable_failure,
     },
     archive_host::{ArchiveClaimCheck, prepare_fetch_host},
-    attempt_runtime::acquire_host_fetch_permit,
+    attempt_resources::acquire_host_fetch_permit,
     host_rate_limit::{record_rate_limit_cooldown, record_rate_limit_snapshot},
     list_records_attempt::{ListRecordsStep, fetch_archive_list_records_or_emit_failure},
     parse_archive_attempt::{ParseArchiveStep, parse_archive_or_emit_failure},
@@ -37,7 +37,7 @@ pub(crate) async fn fetch_one_attempt(
         archive_dir: config.archive_dir,
         archive_context: config.archive_context,
         archive_storage: config.archive_storage,
-        runtime: AttemptRuntime::Local { claim_scope },
+        resources: AttemptResources::Local { claim_scope },
         parse_config: config.parse_config,
         http_protocol: config.http_protocol,
     })
@@ -63,12 +63,12 @@ pub(crate) async fn fetch_one_attempt_with_pacer(
     let prepared_host = prepare_fetch_host(
         did_str,
         &pds,
-        config.runtime.claim_scope(),
-        config.runtime.host_override_ledger_path(),
-        config.runtime.host_override_cache(),
+        config.resources.claim_scope(),
+        config.resources.host_override_ledger_path(),
+        config.resources.host_override_cache(),
     )
     .await?;
-    let _host_permit = acquire_host_fetch_permit(&config.runtime, &prepared_host).await?;
+    let _host_permit = acquire_host_fetch_permit(&config.resources, &prepared_host).await?;
     let host = prepared_host.host;
     let host_min_interval = prepared_host
         .host_override
@@ -79,7 +79,7 @@ pub(crate) async fn fetch_one_attempt_with_pacer(
     })?;
     let mut fetch_config = FetchConfig::new(config.spool_dir);
     fetch_config.max_bytes = config.max_bytes;
-    fetch_config.byte_budget = config.runtime.byte_budget();
+    fetch_config.byte_budget = config.resources.byte_budget();
 
     let processed = fetch_prepared_repo(
         FetchModeStep {
@@ -93,10 +93,10 @@ pub(crate) async fn fetch_one_attempt_with_pacer(
             archive_dir: &config.archive_dir,
             archive_context: config.archive_context,
             archive_storage: config.archive_storage,
-            host_pacer: config.runtime.host_pacer(),
-            host_override_ledger_path: config.runtime.host_override_ledger_path(),
-            parse_permits: config.runtime.parse_permits(),
-            claim_check: config.runtime.archive_claim_check(),
+            host_pacer: config.resources.host_pacer(),
+            host_override_ledger_path: config.resources.host_override_ledger_path(),
+            parse_permits: config.resources.parse_permits(),
+            claim_check: config.resources.archive_claim_check(),
             parse_config: config.parse_config,
             attempt_started,
         },
@@ -229,7 +229,8 @@ async fn fetch_get_repo_and_archive(
                     host,
                     host_min_interval,
                     &err,
-                );
+                )
+                .await;
             }
             return result;
         }
@@ -293,7 +294,7 @@ fn emit_get_repo_fallback(did_str: &str, host: &str, attempt_started: Instant, e
     });
 }
 
-fn persist_list_records_method_wall_override(
+async fn persist_list_records_method_wall_override(
     host_override_ledger_path: Option<&Path>,
     host: &str,
     host_min_interval: Option<Duration>,
@@ -302,13 +303,21 @@ fn persist_list_records_method_wall_override(
     let Some(ledger_path) = host_override_ledger_path else {
         return;
     };
-    match SqliteLedger::open(ledger_path).and_then(|ledger| {
-        ledger.upsert_host_override_force_mode(
-            host,
-            Some(ForcedFetchMode::ListRecords),
-            host_min_interval,
-        )
-    }) {
+    let ledger_path = ledger_path.to_path_buf();
+    let host_owned = host.to_owned();
+    let result = tokio::task::spawn_blocking(move || {
+        SqliteLedger::open(&ledger_path).and_then(|ledger| {
+            ledger.upsert_host_override_force_mode(
+                &host_owned,
+                Some(ForcedFetchMode::ListRecords),
+                host_min_interval,
+            )
+        })
+    })
+    .await
+    .map_err(|err| anyhow::anyhow!("host override task failed for {host}: {err}"))
+    .and_then(|result| result.map_err(Into::into));
+    match result {
         Ok(()) => eprintln!(
             "recorded listRecords host override for {host} after getRepo method wall: {error}"
         ),

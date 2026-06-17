@@ -341,6 +341,62 @@ fn parses_clickhouse_schema_database() {
 }
 
 #[test]
+fn parses_clickhouse_rebuild_aggregates_defaults() {
+    let cli = Cli::try_parse_from(["emojistats-backfill", "clickhouse-rebuild-aggregates"])
+        .expect("parse command");
+    let Command::ClickhouseRebuildAggregates {
+        clickhouse_url,
+        clickhouse_database,
+        clickhouse_user,
+        clickhouse_password,
+        dry_run,
+    } = cli.command
+    else {
+        unreachable!("expected clickhouse-rebuild-aggregates command");
+    };
+
+    assert_eq!(clickhouse_url, "http://localhost:8123");
+    assert_eq!(clickhouse_database, "emojistats");
+    assert_eq!(clickhouse_user, "default");
+    assert_eq!(clickhouse_password, "");
+    assert!(!dry_run);
+}
+
+#[test]
+fn parses_clickhouse_rebuild_aggregates_options() {
+    let cli = Cli::try_parse_from([
+        "emojistats-backfill",
+        "clickhouse-rebuild-aggregates",
+        "--clickhouse-url",
+        "http://127.0.0.1:8123",
+        "--clickhouse-database",
+        "analytics",
+        "--clickhouse-user",
+        "writer",
+        "--clickhouse-password",
+        "secret",
+        "--dry-run",
+    ])
+    .expect("parse command");
+    let Command::ClickhouseRebuildAggregates {
+        clickhouse_url,
+        clickhouse_database,
+        clickhouse_user,
+        clickhouse_password,
+        dry_run,
+    } = cli.command
+    else {
+        unreachable!("expected clickhouse-rebuild-aggregates command");
+    };
+
+    assert_eq!(clickhouse_url, "http://127.0.0.1:8123");
+    assert_eq!(clickhouse_database, "analytics");
+    assert_eq!(clickhouse_user, "writer");
+    assert_eq!(clickhouse_password, "secret");
+    assert!(dry_run);
+}
+
+#[test]
 fn run_fleet_rejects_out_of_range_shard_bucket() {
     assert!(
         Cli::try_parse_from([

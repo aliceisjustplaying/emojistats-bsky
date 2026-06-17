@@ -38,12 +38,12 @@ pub struct FetchOneAttemptConfig<'a> {
     pub(crate) archive_dir: PathBuf,
     pub(crate) archive_context: ArchiveCommitContext,
     pub(crate) archive_storage: ArchiveStorageConfig,
-    pub(crate) runtime: AttemptRuntime<'a>,
+    pub(crate) resources: AttemptResources<'a>,
     pub(crate) parse_config: ParseConfig,
     pub(crate) http_protocol: HttpProtocol,
 }
 
-pub enum AttemptRuntime<'a> {
+pub enum AttemptResources<'a> {
     Local {
         claim_scope: ClaimScope,
     },
@@ -59,7 +59,7 @@ pub enum AttemptRuntime<'a> {
     },
 }
 
-impl AttemptRuntime<'_> {
+impl AttemptResources<'_> {
     pub(crate) const fn claim_scope(&self) -> &ClaimScope {
         match self {
             Self::Local { claim_scope } => claim_scope,
@@ -144,10 +144,10 @@ pub struct HostOverrideCacheEntry {
 }
 
 pub async fn acquire_host_fetch_permit(
-    runtime: &AttemptRuntime<'_>,
+    resources: &AttemptResources<'_>,
     prepared_host: &PreparedFetchHost,
 ) -> Result<Option<HostConcurrencyPermit>, crate::failure::FetchOneFailure> {
-    let Some(limiter) = runtime.host_limiter() else {
+    let Some(limiter) = resources.host_limiter() else {
         return Ok(None);
     };
     limiter

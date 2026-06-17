@@ -26,7 +26,7 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
 - **Committed-object path partially wired:** `write_archive_artifacts` now writes the
   Parquet object and profile sidecar through the local committed-artifact protocol,
   producing object receipts and append-only manifest entries after final object promotion.
-  `storage_box.rs` adds the remote backend skeleton plus `ssh` command binding with temp
+  `storage_box.rs` adds the remote backend plus `ssh` command binding with temp
   upload, size/hash/readback verification, rename, and manifest append ordering behind a
   command trait.
 - `fetch-one` wraps the vertical slice in a local ledger attempt and maps transport,
@@ -51,15 +51,20 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   `ClickHouse` with chunk-stable dedupe tokens. `--dry-run` validates and counts payloads
   without sending inserts.
 - `clickhouse-schema --clickhouse-database <db>` prints the v2 `ClickHouse` schema SQL.
-  Smoke bootstrap on this host created `emojistats_smoke` through `clickhouse-smoke.service`
-  (`HTTP 18123`, native `19000`) and verified the then-current smoke tables exist. The
-  active incompatible schema names are `v2_post_serving_r3`, `v2_total_post_counters_r3`,
+  `clickhouse-rebuild-aggregates` truncates and rebuilds the disposable aggregate cache
+  tables from `v2_post_serving_r3`; `--dry-run` prints the exact statements. Smoke bootstrap
+  on this host created `emojistats_smoke` through `clickhouse-smoke.service` (`HTTP 18123`,
+  native `19000`) and verified the then-current smoke tables exist. The active incompatible
+  schema names are `v2_post_serving_r3`, `v2_total_post_counters_r3`,
   `v2_emoji_total_r3`, `v2_emoji_total_by_lang_r3`, `v2_lang_total_r3`, and
   `v2_posts_hourly_r3`.
 - The v2 serving projection is intentionally compact and no-delete. Storage Box `Parquet`
   remains the full observed corpus; `ClickHouse` stores one compact post row per
   `(dataset, fetch_method, completeness_class, did, rkey)` with emoji arrays and aggregate
   rebuild SQL based on `arrayJoin`.
+- Archive implementation is now split by ownership: `archive/parquet.rs` owns Arrow/Parquet
+  schema and batch conversion, `archive/hash.rs` owns row-hash framing, and
+  `archive/naming.rs` owns stable artifact names.
 - Serving r3 dry-run derive smoke against `rust/data/metrics-smoke-20260617/` validated
   30,048 archive rows and formatted five dry-run payloads / 30,049 insert rows: compact post
   chunks plus one total counter. `clickhouse-schema` emitted `v2_post_serving_r3`,

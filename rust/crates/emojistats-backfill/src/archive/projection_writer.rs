@@ -1,9 +1,8 @@
-use sha2::Digest as _;
+use sha2::{Digest as _, Sha256};
 
 use super::{
-    ArchiveError, ArchivePostRow, File, Sha256, Write,
-    archive_io::{hash_field_bytes, json_bytes},
-    borrowed_emoji_projection_rows_for_post,
+    ArchiveError, ArchivePostRow, File, Write, archive_io::json_bytes,
+    borrowed_emoji_projection_rows_for_post, hash::hash_field_bytes,
 };
 
 pub(super) struct StreamingProjectionWriter {

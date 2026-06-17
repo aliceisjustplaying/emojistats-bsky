@@ -12,10 +12,12 @@ mod execute;
 mod schema;
 
 #[cfg(test)]
-use execute::classify_insert_status;
-pub use execute::execute_insert_payloads;
+use execute::{classify_insert_status, classify_sql_status};
+pub use execute::{execute_insert_payloads, execute_sql_statements};
 use schema::ClickHouseIdentifier;
-pub use schema::{ClickHouseTable, aggregate_rebuild_sql, create_schema_sql};
+pub use schema::{
+    ClickHouseTable, aggregate_rebuild_sql, aggregate_rebuild_statements, create_schema_sql,
+};
 
 use crate::derive::{
     BACKFILL_DERIVE_SOURCE, ClickHouseDeriveBatch, DeriveCheckpointKey, DeriveManifestIdentity,
@@ -197,6 +199,30 @@ impl ClickHouseClientConfig {
         Ok(request)
     }
 
+    /// Build a `ClickHouse` SQL request using the caller's client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClickHouseSchemaError`] if a header value cannot be represented or request
+    /// construction fails.
+    pub fn sql_request_with_client(
+        &self,
+        client: &Client,
+        query: &str,
+    ) -> Result<Request, ClickHouseSchemaError> {
+        client
+            .request(Method::POST, self.url.clone())
+            .headers(self.headers()?)
+            .query(&[
+                ("database", self.database.as_str()),
+                ("query", query),
+                (DATE_TIME_INPUT_FORMAT_SETTING, "best_effort"),
+            ])
+            .timeout(self.request_timeout)
+            .build()
+            .map_err(ClickHouseSchemaError::Request)
+    }
+
     /// Execute a batch of insert payloads in the order they were built.
     ///
     /// # Errors
@@ -209,6 +235,20 @@ impl ClickHouseClientConfig {
         payloads: &[ClickHouseInsertPayload],
     ) -> Result<Vec<ClickHouseInsertReceipt>, ClickHouseInsertError> {
         execute_insert_payloads(client, self, payloads).await
+    }
+
+    /// Execute SQL statements in order through the configured `ClickHouse` client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClickHouseSqlError`] when request construction, transport, or `ClickHouse`
+    /// execution fails.
+    pub async fn execute_sql_statements(
+        &self,
+        client: &Client,
+        statements: &[String],
+    ) -> Result<Vec<ClickHouseSqlReceipt>, ClickHouseSqlError> {
+        execute_sql_statements(client, self, statements).await
     }
 
     fn headers(&self) -> Result<HeaderMap, ClickHouseSchemaError> {
@@ -297,6 +337,26 @@ pub struct ClickHouseInsertReceipt {
     pub response_snippet: Option<String>,
 }
 
+/// SQL statement metadata retained on success and failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClickHouseSqlContext {
+    /// Zero-based statement position in the executed command.
+    pub statement_index: usize,
+    /// SQL statement sent to `ClickHouse`.
+    pub statement: String,
+}
+
+/// Successful `ClickHouse` SQL execution receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClickHouseSqlReceipt {
+    /// Statement metadata needed for replay/debugging.
+    pub context: ClickHouseSqlContext,
+    /// HTTP status returned by `ClickHouse`.
+    pub status: u16,
+    /// Capped response body snippet, if `ClickHouse` returned one.
+    pub response_snippet: Option<String>,
+}
+
 /// Runtime failures from executing `ClickHouse` insert payloads.
 #[derive(Debug, thiserror::Error)]
 pub enum ClickHouseInsertError {
@@ -333,6 +393,49 @@ pub enum ClickHouseInsertError {
     PermanentStatus {
         /// Insert metadata needed for replay/debugging.
         context: ClickHouseInsertContext,
+        /// HTTP status returned by `ClickHouse`.
+        status: u16,
+        /// Capped response body snippet.
+        response_snippet: Option<String>,
+    },
+}
+
+/// Runtime failures from executing `ClickHouse` SQL statements.
+#[derive(Debug, thiserror::Error)]
+pub enum ClickHouseSqlError {
+    /// Request construction failed before the HTTP call.
+    #[error("failed to build ClickHouse SQL request for statement {statement_index}")]
+    RequestBuild {
+        /// Statement position in the executed command.
+        statement_index: usize,
+        /// Underlying request-build failure.
+        #[source]
+        source: ClickHouseSchemaError,
+    },
+    /// Transport failed while sending a request or reading a response body.
+    #[error("ClickHouse SQL transport failed for {context:?}")]
+    Transport {
+        /// Statement metadata needed for replay/debugging.
+        context: ClickHouseSqlContext,
+        /// Underlying transport failure.
+        #[source]
+        source: reqwest::Error,
+    },
+    /// `ClickHouse` returned a retryable non-2xx status.
+    #[error("retryable ClickHouse SQL status {status} for {context:?}: {response_snippet:?}")]
+    RetryableStatus {
+        /// Statement metadata needed for replay/debugging.
+        context: ClickHouseSqlContext,
+        /// HTTP status returned by `ClickHouse`.
+        status: u16,
+        /// Capped response body snippet.
+        response_snippet: Option<String>,
+    },
+    /// `ClickHouse` returned a permanent non-2xx status.
+    #[error("permanent ClickHouse SQL status {status} for {context:?}: {response_snippet:?}")]
+    PermanentStatus {
+        /// Statement metadata needed for replay/debugging.
+        context: ClickHouseSqlContext,
         /// HTTP status returned by `ClickHouse`.
         status: u16,
         /// Capped response body snippet.

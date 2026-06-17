@@ -237,7 +237,8 @@ pub async fn prepare_fetch_host(
     let host = pds_host_key(pds);
     let now = SystemTime::now();
     let host_override =
-        load_host_override(host_override_ledger_path, host_override_cache, &host, now)?;
+        load_host_override_async(host_override_ledger_path, host_override_cache, &host, now)
+            .await?;
     let fetch_mode = fetch_mode_for_host(&host, host_override.as_ref(), now)?;
     Ok(PreparedFetchHost {
         host,
@@ -282,6 +283,34 @@ pub fn load_host_override(
         .map_err(|err| retryable_failure(format!("load host override for {host}: {err}")))?
         .map(|record| normalize_host_override(&ledger, host, record, now))
         .transpose()?;
+    if let Some(cache) = cache {
+        store_cached_host_override(&cache, host, override_record.clone())?;
+    }
+    Ok(override_record)
+}
+
+async fn load_host_override_async(
+    ledger_path: Option<&Path>,
+    cache: Option<HostOverrideCache>,
+    host: &str,
+    now: SystemTime,
+) -> Result<Option<HostOverride>, FetchOneFailure> {
+    let Some(ledger_path) = ledger_path else {
+        return Ok(None);
+    };
+    if let Some(ref cache) = cache {
+        match load_cached_host_override(cache, host)? {
+            CachedHostOverride::Hit(cached) => return Ok(cached),
+            CachedHostOverride::Miss => {}
+        }
+    }
+    let ledger_path = ledger_path.to_path_buf();
+    let host_owned = host.to_owned();
+    let override_record = tokio::task::spawn_blocking(move || {
+        load_host_override(Some(&ledger_path), None, &host_owned, now)
+    })
+    .await
+    .map_err(|err| retryable_failure(format!("host override task failed for {host}: {err}")))??;
     if let Some(cache) = cache {
         store_cached_host_override(&cache, host, override_record.clone())?;
     }

@@ -17,7 +17,10 @@ use emojistats_backfill::{
         NormalizerVersion, StorageBoxArchiveConfig, StreamingArchiveSink, StreamingReceiptInput,
         archive_row_from_owned_post_observed_at, hash_profile_record,
     },
-    clickhouse::create_schema_sql,
+    clickhouse::{
+        ClickHouseClientConfig, aggregate_rebuild_sql, aggregate_rebuild_statements,
+        create_schema_sql,
+    },
     ledger::{
         AttemptId, AttemptOutcome, DEFAULT_CLAIM_LEASE_DURATION, ForcedFetchMode, HostOverride,
         RepoLedgerEntry, RetryPolicy, SqliteLedger, claim_repo, complete_attempt,
@@ -114,6 +117,22 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
         } => {
             println!("{}", create_schema_sql(&clickhouse_database)?);
             Ok(())
+        }
+        Command::ClickhouseRebuildAggregates {
+            clickhouse_url,
+            clickhouse_database,
+            clickhouse_user,
+            clickhouse_password,
+            dry_run,
+        } => {
+            run_clickhouse_rebuild_aggregates_command(
+                &clickhouse_url,
+                &clickhouse_database,
+                &clickhouse_user,
+                &clickhouse_password,
+                dry_run,
+            )
+            .await
         }
         Command::Canary {
             evidence_path,
@@ -290,6 +309,35 @@ fn validate_fleet_spool_budget(
             "--max-inflight-spool-bytes ({max_inflight_spool_bytes}) must be at least --max-bytes ({max_bytes}) so one repo cannot exceed the fleet byte budget"
         );
     }
+    Ok(())
+}
+
+async fn run_clickhouse_rebuild_aggregates_command(
+    clickhouse_url: &str,
+    clickhouse_database: &str,
+    clickhouse_user: &str,
+    clickhouse_password: &str,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    if dry_run {
+        println!("{}", aggregate_rebuild_sql(clickhouse_database)?);
+        return Ok(());
+    }
+
+    let config = ClickHouseClientConfig::new(
+        clickhouse_url,
+        clickhouse_database,
+        clickhouse_user,
+        clickhouse_password,
+        "emojistats-backfill-aggregate-rebuild",
+    )?;
+    let client = config.http_client()?;
+    let statements = aggregate_rebuild_statements(clickhouse_database)?;
+    let receipts = config.execute_sql_statements(&client, &statements).await?;
+    println!(
+        "rebuilt ClickHouse aggregates with {} statement(s)",
+        receipts.len()
+    );
     Ok(())
 }
 

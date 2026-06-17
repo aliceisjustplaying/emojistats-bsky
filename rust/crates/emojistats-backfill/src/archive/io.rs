@@ -1,49 +1,13 @@
-use sha2::Digest as _;
+use sha2::{Digest as _, Sha256};
 
 use super::{
-    ARCHIVE_SCHEMA_VERSION, Arc, ArchiveCommitContext, ArchiveError, ArchivePostRow, Array,
-    ArrayRef, ArrowWriter, CompletenessClass, Compression, Cow, CreatedAtParseStatus, DataType,
-    EmojiProjectionRow, FetchMethod, Field, File, LocalManifestEntry, LocalStore, ManifestMode,
-    Metadata, NONCANONICAL_POSTS_DATASET, NormalizerVersion, PARQUET_BATCH_ROWS, POST_COLLECTION,
-    ParquetRecordBatchReaderBuilder, Path, PathBuf, PostDataset, ProfileRecord, ProfileSidecarRow,
-    RecordBatch, RepoReceipt, RepoReceiptInput, Request, Schema, Serialize, Sha256, StringArray,
-    StringBuilder, Write, WriterProperties, ZstdLevel, derive_emoji_projection_rows,
-    format_observed_at, hash_serialized_json,
+    ARCHIVE_SCHEMA_VERSION, ArchiveCommitContext, ArchiveError, ArchivePostRow, CompletenessClass,
+    EmojiProjectionRow, FetchMethod, File, LocalManifestEntry, LocalStore, ManifestMode, Metadata,
+    NONCANONICAL_POSTS_DATASET, NamedTempFile, Path, PathBuf, PostDataset, ProfileRecord,
+    ProfileSidecarRow, RepoReceipt, RepoReceiptInput, Request, Serialize, TempPath, Write,
+    derive_emoji_projection_rows, format_observed_at, hash::hash_field_bytes, hash_post_rows,
+    hash_serialized_json,
 };
-
-/// Read raw archive post rows from the Stage D Parquet shape.
-///
-/// # Errors
-///
-/// Returns [`ArchiveError`] when the file cannot be read as the expected archive schema,
-/// or when JSON-encoded row fields fail to decode.
-/// Read every archive post row into memory.
-///
-/// This is intended for tests and explicitly capped full-load verification paths. Whale-scale
-/// derive code should use `ParquetRecordBatchReaderBuilder` directly and stream batches.
-pub fn read_all_archive_post_rows(path: &Path) -> Result<Vec<ArchivePostRow>, ArchiveError> {
-    let file = File::open(path)?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
-    let mut rows = Vec::new();
-    for batch in reader {
-        append_archive_rows_from_batch(&mut rows, &batch?)?;
-    }
-    Ok(rows)
-}
-
-/// Decode one `Parquet` record batch into archive rows.
-///
-/// # Errors
-///
-/// Returns [`ArchiveError`] when the batch does not match the archive schema or JSON fields
-/// cannot be decoded.
-pub fn archive_post_rows_from_record_batch(
-    batch: &RecordBatch,
-) -> Result<Vec<ArchivePostRow>, ArchiveError> {
-    let mut rows = Vec::with_capacity(batch.num_rows());
-    append_archive_rows_from_batch(&mut rows, batch)?;
-    Ok(rows)
-}
 
 /// Build a content receipt from already-normalized post rows.
 ///
@@ -82,40 +46,6 @@ pub fn build_repo_receipt(input: RepoReceiptInput<'_>) -> Result<RepoReceipt, Ar
     })
 }
 
-/// Hash the canonical row content named in `docs/backfill-v2-design.md`.
-///
-/// # Errors
-///
-/// Returns [`ArchiveError`] if any hashed string length cannot fit the stable hash framing.
-pub fn hash_post_rows(rows: &[ArchivePostRow]) -> Result<String, ArchiveError> {
-    let mut hasher = Sha256::new();
-    for row in rows {
-        hash_post_row_into(&mut hasher, row)?;
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
-
-pub(super) fn hash_post_row_into(
-    hasher: &mut Sha256,
-    row: &ArchivePostRow,
-) -> Result<(), ArchiveError> {
-    hash_field(hasher, POST_COLLECTION)?;
-    hash_field(hasher, &row.did)?;
-    hash_field(hasher, &row.rkey)?;
-    hash_field(hasher, &row.cid)?;
-    hash_normalizer(hasher, &row.normalizer)?;
-    hash_optional_field(hasher, row.account_status.as_deref())?;
-    hash_optional_field(hasher, row.record_status.as_deref())?;
-    hash_optional_field(hasher, row.public_content_label.as_deref())?;
-    hash_optional_field(hasher, row.created_at_raw.as_deref())?;
-    hash_optional_field(hasher, row.created_at_normalized.as_deref())?;
-    hash_field(hasher, row.created_at_parse_status.as_str())?;
-    hash_field(hasher, &row.text)?;
-    hash_string_slice(hasher, &row.langs)?;
-    hash_string_slice(hasher, &row.emoji_sequence)?;
-    hash_extras_json(hasher, &row.extras_json)
-}
-
 /// Hash a profile sidecar row when Stage C extracted one.
 ///
 /// # Errors
@@ -139,246 +69,6 @@ fn hash_emoji_projection_rows(rows: &[EmojiProjectionRow]) -> Result<String, Arc
         hash_field_bytes(&mut hasher, &json_bytes(row)?)?;
     }
     Ok(hex::encode(hasher.finalize()))
-}
-
-pub(super) fn write_posts_parquet_to_writer<W>(
-    writer: W,
-    rows: &[ArchivePostRow],
-) -> Result<(), ArchiveError>
-where
-    W: Write + Send,
-{
-    let schema = archive_schema();
-    let mut writer = ArrowWriter::try_new(
-        writer,
-        Arc::clone(&schema),
-        Some(parquet_writer_properties()?),
-    )?;
-    for chunk in rows.chunks(PARQUET_BATCH_ROWS) {
-        let batch = post_record_batch(&schema, chunk)?;
-        writer.write(&batch)?;
-    }
-    writer.close()?;
-    Ok(())
-}
-
-pub(super) fn archive_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("did", DataType::Utf8, false),
-        Field::new("rkey", DataType::Utf8, false),
-        Field::new("cid", DataType::Utf8, false),
-        Field::new("normalizer_name", DataType::Utf8, false),
-        Field::new("normalizer_semver", DataType::Utf8, false),
-        Field::new("normalizer_git_rev", DataType::Utf8, false),
-        Field::new("normalizer_unicode_version", DataType::Utf8, false),
-        Field::new("normalizer_emoji_data_version", DataType::Utf8, false),
-        Field::new("account_status", DataType::Utf8, true),
-        Field::new("record_status", DataType::Utf8, true),
-        Field::new("public_content_label", DataType::Utf8, true),
-        Field::new("created_at_raw", DataType::Utf8, true),
-        Field::new("created_at_normalized", DataType::Utf8, true),
-        Field::new("created_at_parse_status", DataType::Utf8, false),
-        Field::new("text", DataType::Utf8, false),
-        Field::new("langs_json", DataType::Utf8, false),
-        Field::new("emoji_sequence_json", DataType::Utf8, false),
-        Field::new("extras_json", DataType::Utf8, false),
-    ]))
-}
-
-pub(super) fn parquet_writer_properties() -> Result<WriterProperties, ArchiveError> {
-    Ok(WriterProperties::builder()
-        .set_compression(Compression::ZSTD(
-            ZstdLevel::try_new(1)
-                .map_err(|error| ArchiveError::InvalidCompression(error.to_string()))?,
-        ))
-        .build())
-}
-
-pub(super) fn post_record_batch(
-    schema: &Arc<Schema>,
-    rows: &[ArchivePostRow],
-) -> Result<RecordBatch, ArchiveError> {
-    Ok(RecordBatch::try_new(
-        Arc::clone(schema),
-        vec![
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|row| row.did.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|row| row.rkey.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|row| row.cid.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|row| row.normalizer.name.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|row| row.normalizer.semver.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|row| row.normalizer.git_rev.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter()
-                    .map(|row| row.normalizer.unicode_version.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter()
-                    .map(|row| row.normalizer.emoji_data_version.as_str()),
-            )),
-            Arc::new(StringArray::from_iter(
-                rows.iter().map(|row| row.account_status.as_deref()),
-            )),
-            Arc::new(StringArray::from_iter(
-                rows.iter().map(|row| row.record_status.as_deref()),
-            )),
-            Arc::new(StringArray::from_iter(
-                rows.iter().map(|row| row.public_content_label.as_deref()),
-            )),
-            Arc::new(StringArray::from_iter(
-                rows.iter().map(|row| row.created_at_raw.as_deref()),
-            )),
-            Arc::new(StringArray::from_iter(
-                rows.iter().map(|row| row.created_at_normalized.as_deref()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|row| row.created_at_parse_status.as_str()),
-            )),
-            Arc::new(StringArray::from_iter_values(
-                rows.iter().map(|row| row.text.as_str()),
-            )),
-            json_string_array(rows.iter().map(|row| json_string_slice(&row.langs)))?,
-            json_string_array(
-                rows.iter()
-                    .map(|row| json_string_slice(&row.emoji_sequence)),
-            )?,
-            json_string_array(rows.iter().map(|row| extras_json_string(&row.extras_json)))?,
-        ],
-    )?)
-}
-
-fn append_archive_rows_from_batch(
-    rows: &mut Vec<ArchivePostRow>,
-    batch: &RecordBatch,
-) -> Result<(), ArchiveError> {
-    let did = string_column(batch, "did")?;
-    let rkey = string_column(batch, "rkey")?;
-    let cid = string_column(batch, "cid")?;
-    let normalizer_name = string_column(batch, "normalizer_name")?;
-    let normalizer_semver = string_column(batch, "normalizer_semver")?;
-    let normalizer_git_rev = string_column(batch, "normalizer_git_rev")?;
-    let normalizer_unicode_version = string_column(batch, "normalizer_unicode_version")?;
-    let normalizer_emoji_data_version = string_column(batch, "normalizer_emoji_data_version")?;
-    let account_status = string_column(batch, "account_status")?;
-    let record_status = string_column(batch, "record_status")?;
-    let public_content_label = string_column(batch, "public_content_label")?;
-    let created_at_raw = string_column(batch, "created_at_raw")?;
-    let created_at_normalized = string_column(batch, "created_at_normalized")?;
-    let created_at_parse_status = string_column(batch, "created_at_parse_status")?;
-    let text = string_column(batch, "text")?;
-    let langs_json = string_column(batch, "langs_json")?;
-    let emoji_sequence_json = string_column(batch, "emoji_sequence_json")?;
-    let extras_json = string_column(batch, "extras_json")?;
-
-    for row_index in 0..batch.num_rows() {
-        rows.push(ArchivePostRow {
-            did: required_string(did, row_index, "did")?.to_owned(),
-            rkey: required_string(rkey, row_index, "rkey")?.to_owned(),
-            cid: required_string(cid, row_index, "cid")?.to_owned(),
-            normalizer: NormalizerVersion {
-                name: required_string(normalizer_name, row_index, "normalizer_name")?.to_owned(),
-                semver: required_string(normalizer_semver, row_index, "normalizer_semver")?
-                    .to_owned(),
-                git_rev: required_string(normalizer_git_rev, row_index, "normalizer_git_rev")?
-                    .to_owned(),
-                unicode_version: required_string(
-                    normalizer_unicode_version,
-                    row_index,
-                    "normalizer_unicode_version",
-                )?
-                .to_owned(),
-                emoji_data_version: required_string(
-                    normalizer_emoji_data_version,
-                    row_index,
-                    "normalizer_emoji_data_version",
-                )?
-                .to_owned(),
-            },
-            account_status: optional_string(account_status, row_index),
-            record_status: optional_string(record_status, row_index),
-            public_content_label: optional_string(public_content_label, row_index),
-            created_at_raw: optional_string(created_at_raw, row_index),
-            created_at_normalized: optional_string(created_at_normalized, row_index),
-            created_at_parse_status: parse_created_at_parse_status(required_string(
-                created_at_parse_status,
-                row_index,
-                "created_at_parse_status",
-            )?)?,
-            text: required_string(text, row_index, "text")?.to_owned(),
-            langs: serde_json::from_str(required_string(langs_json, row_index, "langs_json")?)?,
-            emoji_sequence: serde_json::from_str(required_string(
-                emoji_sequence_json,
-                row_index,
-                "emoji_sequence_json",
-            )?)?,
-            extras_json: serde_json::from_str(required_string(
-                extras_json,
-                row_index,
-                "extras_json",
-            )?)?,
-        });
-    }
-
-    Ok(())
-}
-
-fn string_column<'a>(
-    batch: &'a RecordBatch,
-    column: &'static str,
-) -> Result<&'a StringArray, ArchiveError> {
-    let index = batch
-        .schema()
-        .index_of(column)
-        .map_err(|_error| ArchiveError::InvalidParquetColumn { column })?;
-    batch
-        .column(index)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or(ArchiveError::InvalidParquetColumn { column })
-}
-
-fn required_string<'a>(
-    array: &'a StringArray,
-    row_index: usize,
-    column: &'static str,
-) -> Result<&'a str, ArchiveError> {
-    if array.is_null(row_index) {
-        Err(ArchiveError::UnexpectedParquetNull { column })
-    } else {
-        Ok(array.value(row_index))
-    }
-}
-
-fn optional_string(array: &StringArray, row_index: usize) -> Option<String> {
-    if array.is_null(row_index) {
-        None
-    } else {
-        Some(array.value(row_index).to_owned())
-    }
-}
-
-fn parse_created_at_parse_status(value: &str) -> Result<CreatedAtParseStatus, ArchiveError> {
-    match value {
-        "valid" => Ok(CreatedAtParseStatus::Valid),
-        "missing" => Ok(CreatedAtParseStatus::Missing),
-        "invalid" => Ok(CreatedAtParseStatus::Invalid),
-        "future" => Ok(CreatedAtParseStatus::Future),
-        _ => Err(ArchiveError::InvalidParquetValue {
-            column: "created_at_parse_status",
-            value: value.to_owned(),
-        }),
-    }
 }
 
 pub(super) fn build_commit_metadata(
@@ -466,6 +156,16 @@ pub(super) fn commit_profile_sidecar(
             crate::commit::Error::writer(format!("write profile sidecar JSON: {error}"))
         })
     })?)
+}
+
+pub(super) fn write_profile_sidecar_temp(
+    output_dir: &Path,
+    profile: &ProfileRecord,
+) -> Result<TempPath, ArchiveError> {
+    let mut temp = NamedTempFile::new_in(output_dir)?;
+    write_profile_sidecar_json_to_writer(temp.as_file_mut(), profile)?;
+    temp.as_file().sync_all()?;
+    Ok(temp.into_temp_path())
 }
 
 pub(super) fn profile_sidecar_request(
@@ -574,36 +274,8 @@ fn count_emoji_occurrences(rows: &[ArchivePostRow]) -> Result<u64, ArchiveError>
     })
 }
 
-fn json_string_array(
-    values: impl Iterator<Item = Result<Cow<'static, str>, ArchiveError>>,
-) -> Result<ArrayRef, ArchiveError> {
-    let mut builder = StringBuilder::new();
-    for value in values {
-        builder.append_value(value?.as_ref());
-    }
-    Ok(Arc::new(builder.finish()))
-}
-
 pub(super) fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, ArchiveError> {
     Ok(serde_json::to_vec(value)?)
-}
-
-fn json_string<T: Serialize>(value: &T) -> Result<String, ArchiveError> {
-    Ok(serde_json::to_string(value)?)
-}
-
-fn json_string_slice(value: &[String]) -> Result<Cow<'static, str>, ArchiveError> {
-    if value.is_empty() {
-        return Ok(Cow::Borrowed("[]"));
-    }
-    Ok(Cow::Owned(json_string(&value)?))
-}
-
-fn extras_json_string(value: &serde_json::Value) -> Result<Cow<'static, str>, ArchiveError> {
-    if matches!(value, serde_json::Value::Object(fields) if fields.is_empty()) {
-        return Ok(Cow::Borrowed("{}"));
-    }
-    Ok(Cow::Owned(stable_rust_json(value)?))
 }
 
 pub(super) fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), ArchiveError> {
@@ -677,161 +349,6 @@ fn max_created_at(rows: &[ArchivePostRow]) -> Option<String> {
         .filter_map(|row| row.created_at_normalized.as_deref())
         .max()
         .map(ToOwned::to_owned)
-}
-
-const ARCHIVE_OBJECT_ENCODING_ID: &str = "archive_object_v2";
-
-pub(super) fn stable_artifact_stem(did: &str, dataset: &str, content_hash: &str) -> String {
-    format!(
-        "{}.{}.{}.{}",
-        safe_file_component(did),
-        safe_file_component(dataset),
-        ARCHIVE_OBJECT_ENCODING_ID,
-        content_hash
-    )
-}
-
-pub(super) fn stable_repo_receipt_name(did: &str, receipt_hash: &str) -> String {
-    format!("{}.{}.receipt.json", safe_file_component(did), receipt_hash)
-}
-
-pub(super) fn stable_object_receipt_path(
-    artifact_stem: &str,
-    receipt_hash: &str,
-    suffix: &str,
-) -> PathBuf {
-    PathBuf::from(format!(
-        "{artifact_stem}.receipts/{receipt_hash}.{suffix}.object-receipt.json"
-    ))
-}
-
-fn safe_file_component(value: &str) -> String {
-    let mut safe = String::new();
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() {
-            safe.push(ch);
-        } else {
-            safe.push('_');
-        }
-    }
-    let mut hasher = Sha256::new();
-    hasher.update(value.as_bytes());
-    let digest = hex::encode(hasher.finalize());
-    safe.push_str("__");
-    safe.extend(digest.chars().take(16));
-    safe
-}
-
-pub(super) fn hash_string_slice(
-    hasher: &mut Sha256,
-    values: &[String],
-) -> Result<(), ArchiveError> {
-    for value in values {
-        hash_field(hasher, value)?;
-    }
-    hash_field(hasher, "")
-}
-
-pub(super) fn hash_optional_field(
-    hasher: &mut Sha256,
-    value: Option<&str>,
-) -> Result<(), ArchiveError> {
-    match value {
-        Some(value) => {
-            hash_field(hasher, "some")?;
-            hash_field(hasher, value)
-        }
-        None => hash_field(hasher, "none"),
-    }
-}
-
-fn hash_normalizer(
-    hasher: &mut Sha256,
-    normalizer: &NormalizerVersion,
-) -> Result<(), ArchiveError> {
-    hash_field(hasher, &normalizer.name)?;
-    hash_field(hasher, &normalizer.semver)?;
-    hash_field(hasher, &normalizer.git_rev)?;
-    hash_field(hasher, &normalizer.unicode_version)?;
-    hash_field(hasher, &normalizer.emoji_data_version)
-}
-
-pub(super) fn append_normalizer_frames(
-    target: &mut Vec<u8>,
-    normalizer: &NormalizerVersion,
-) -> Result<(), ArchiveError> {
-    append_hash_field_frame(target, &normalizer.name)?;
-    append_hash_field_frame(target, &normalizer.semver)?;
-    append_hash_field_frame(target, &normalizer.git_rev)?;
-    append_hash_field_frame(target, &normalizer.unicode_version)?;
-    append_hash_field_frame(target, &normalizer.emoji_data_version)
-}
-
-pub(super) fn framed_fields<const N: usize>(values: [&str; N]) -> Result<Vec<u8>, ArchiveError> {
-    let mut framed = Vec::new();
-    for value in values {
-        append_hash_field_frame(&mut framed, value)?;
-    }
-    Ok(framed)
-}
-
-pub(super) fn append_hash_field_frame(
-    target: &mut Vec<u8>,
-    value: &str,
-) -> Result<(), ArchiveError> {
-    let len = u64::try_from(value.len()).map_err(|_error| ArchiveError::CountOverflow {
-        field: "hash_field_length",
-    })?;
-    target.extend_from_slice(&len.to_be_bytes());
-    target.extend_from_slice(value.as_bytes());
-    Ok(())
-}
-
-pub(super) fn hash_field(hasher: &mut Sha256, value: &str) -> Result<(), ArchiveError> {
-    hash_field_bytes(hasher, value.as_bytes())
-}
-
-pub(super) fn hash_field_bytes(hasher: &mut Sha256, value: &[u8]) -> Result<(), ArchiveError> {
-    let len = u64::try_from(value.len()).map_err(|_error| ArchiveError::CountOverflow {
-        field: "hash_field_length",
-    })?;
-    hasher.update(len.to_be_bytes());
-    hasher.update(value);
-    Ok(())
-}
-
-pub(super) fn hash_extras_json(
-    hasher: &mut Sha256,
-    value: &serde_json::Value,
-) -> Result<(), ArchiveError> {
-    if matches!(value, serde_json::Value::Object(fields) if fields.is_empty()) {
-        return hash_field(hasher, "{}");
-    }
-    hash_field_bytes(hasher, &json_bytes(&canonical_json_value(value))?)
-}
-
-fn stable_rust_json(value: &serde_json::Value) -> Result<String, ArchiveError> {
-    Ok(serde_json::to_string(&canonical_json_value(value))?)
-}
-
-fn canonical_json_value(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Array(values) => {
-            serde_json::Value::Array(values.iter().map(canonical_json_value).collect::<Vec<_>>())
-        }
-        serde_json::Value::Object(fields) => {
-            let mut sorted = serde_json::Map::new();
-            let mut keys = fields.keys().collect::<Vec<_>>();
-            keys.sort();
-            for key in keys {
-                if let Some(value) = fields.get(key) {
-                    sorted.insert(key.clone(), canonical_json_value(value));
-                }
-            }
-            serde_json::Value::Object(sorted)
-        }
-        other => other.clone(),
-    }
 }
 
 pub(super) fn record_extras_json(

@@ -10,11 +10,6 @@ readme = "README.md"
 keywords = ["bluesky", "atproto", "backfill", "emoji"]
 categories = ["command-line-utilities"]
 
-[features]
-default = []
-experimental-canary = []
-experimental-storage-box = []
-
 [[bin]]
 name = "emojistats-backfill"
 path = "src/main.rs"
