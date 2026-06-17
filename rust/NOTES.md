@@ -115,6 +115,17 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   vs prior 79.4s. ClickHouse derive over the 19 raw manifests inserted 81 payloads and 499,568
   rows into `emojistats_smoke` in 2:39.37 with max RSS 72,028 KiB. Counter sums matched archive
   receipts exactly: 16,646,652 posts, 374,988 posts with emoji, 539,713 emoji occurrences.
+- Post-split full smoke, release binary at git `24c9549`, same 24-DID fixture and full-whale
+  settings, output under `rust/data/scale-smoke-post-split-20260617T002407Z/`: 24 claimed,
+  19 succeeded, 5 expected loud failures (3 terminal account states, 1 retryable dead host,
+  1 malformed `CAR`). Archive wrote 12,435,983,444 fetched bytes, 16,871,328 reachable records,
+  16,652,368 post rows, 4,987 decode diagnostics, and 499,557 emoji projection rows. Wall time
+  was 19:59.06; process max RSS was 3,251,220 KiB; spool cleanup left 0 files. The extra wall
+  time was dominated by host queue/fetch timing in this live smoke; parse/archive stayed in the
+  expected range. ClickHouse derive over the 19 raw manifests inserted 81 payloads and 499,576
+  rows into `emojistats_smoke` in 2:53.52 with max RSS 71,632 KiB. Counter sums matched archive
+  receipts: 16,652,368 posts, 374,996 posts with emoji, 539,721 emoji occurrences. Serving rows
+  carried one normalizer identity: `emoji-normalizer 0.1.0 24c9549 16.0 emojis-16.0`.
 - Whale transport hardening: repo fetches default to HTTP/1 with an explicit
   `--http-protocol auto` escape hatch, TCP keepalive, and 30s connect timeout, and retry
   retryable body-stream transport/idle failures up to 3 full download attempts. Transport
