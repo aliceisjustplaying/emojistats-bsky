@@ -33,6 +33,8 @@ use sha2::{Digest, Sha256};
 use super::{add_count, count_len, increment, payload_row_count};
 
 const DERIVE_EMOJI_CHUNK_ROWS: usize = 10_000;
+// Canonical streaming derive tokens are lane/chunk-framed and use the same stable manifest
+// identity fields as full-batch derive tokens: dataset, DID, proof hashes, schema, and normalizer.
 const STREAMING_DEDUPE_TOKEN_DOMAIN: &str = "emojistats-backfill-streaming-derive-token-v1";
 
 #[derive(Debug)]
@@ -200,7 +202,7 @@ pub async fn run(config: DeriveManifestConfig) -> anyhow::Result<()> {
         match item? {
             ManifestReadItem::Input(input) => {
                 increment(&mut summary.manifest_entries, "manifest entry count")?;
-                derive_loader_input_streaming(
+                derive_loader_input_canonical_streaming(
                     &config.archive_root,
                     &input,
                     &http,
@@ -224,7 +226,7 @@ pub async fn run(config: DeriveManifestConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn derive_loader_input_streaming(
+async fn derive_loader_input_canonical_streaming(
     archive_root: &Path,
     input: &LoaderInput,
     http: &reqwest::Client,
@@ -234,11 +236,18 @@ async fn derive_loader_input_streaming(
     summary: &mut DeriveManifestSummary,
 ) -> anyhow::Result<()> {
     let verified = verify_loader_input_for_streaming(archive_root, input)?;
-    derive_verified_input_streaming(&verified, http, clickhouse, dry_run, derive_ledger, summary)
-        .await
+    derive_verified_input_canonical_streaming(
+        &verified,
+        http,
+        clickhouse,
+        dry_run,
+        derive_ledger,
+        summary,
+    )
+    .await
 }
 
-async fn derive_verified_input_streaming(
+async fn derive_verified_input_canonical_streaming(
     verified: &VerifiedLoaderInput,
     http: &reqwest::Client,
     clickhouse: &ClickHouseClientConfig,
@@ -246,16 +255,23 @@ async fn derive_verified_input_streaming(
     derive_ledger: &mut DeriveLedger,
     summary: &mut DeriveManifestSummary,
 ) -> anyhow::Result<()> {
-    validate_verified_input_streaming(verified)?;
-    insert_verified_input_streaming(verified, http, clickhouse, dry_run, derive_ledger, summary)
-        .await?;
+    validate_canonical_streaming_proof(verified)?;
+    insert_verified_input_canonical_streaming(
+        verified,
+        http,
+        clickhouse,
+        dry_run,
+        derive_ledger,
+        summary,
+    )
+    .await?;
     increment(&mut summary.archive_files, "derive archive file count")
 }
 
-fn validate_verified_input_streaming(verified: &VerifiedLoaderInput) -> anyhow::Result<()> {
+fn validate_canonical_streaming_proof(verified: &VerifiedLoaderInput) -> anyhow::Result<()> {
     let file = File::open(&verified.object_path)?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
-    let mut state = StreamingValidationState::new(verified);
+    let mut state = CanonicalStreamingValidationState::new(verified);
 
     for batch in reader {
         let rows = archive_post_rows_from_record_batch(&batch?)?;
@@ -265,7 +281,7 @@ fn validate_verified_input_streaming(verified: &VerifiedLoaderInput) -> anyhow::
     state.finish()
 }
 
-async fn insert_verified_input_streaming(
+async fn insert_verified_input_canonical_streaming(
     verified: &VerifiedLoaderInput,
     http: &reqwest::Client,
     clickhouse: &ClickHouseClientConfig,
@@ -275,7 +291,7 @@ async fn insert_verified_input_streaming(
 ) -> anyhow::Result<()> {
     let file = File::open(&verified.object_path)?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
-    let mut state = StreamingPayloadState::new(verified);
+    let mut state = CanonicalStreamingPayloadState::new(verified);
 
     for batch in reader {
         let rows = archive_post_rows_from_record_batch(&batch?)?;
@@ -372,13 +388,13 @@ async fn apply_derive_payloads(
     Ok(())
 }
 
-struct StreamingValidationState<'a> {
+struct CanonicalStreamingValidationState<'a> {
     verified: &'a VerifiedLoaderInput,
     row_hasher: ArchivePostRowsHasher,
     rows: u64,
 }
 
-impl<'a> StreamingValidationState<'a> {
+impl<'a> CanonicalStreamingValidationState<'a> {
     fn new(verified: &'a VerifiedLoaderInput) -> Self {
         Self {
             verified,
@@ -446,7 +462,7 @@ impl<'a> StreamingValidationState<'a> {
     }
 }
 
-struct StreamingPayloadState<'a> {
+struct CanonicalStreamingPayloadState<'a> {
     verified: &'a VerifiedLoaderInput,
     rows: u64,
     posts_with_emojis: u64,
@@ -456,7 +472,7 @@ struct StreamingPayloadState<'a> {
     emoji_chunk_index: u64,
 }
 
-impl<'a> StreamingPayloadState<'a> {
+impl<'a> CanonicalStreamingPayloadState<'a> {
     fn new(verified: &'a VerifiedLoaderInput) -> Self {
         Self {
             verified,
@@ -551,7 +567,7 @@ impl<'a> StreamingPayloadState<'a> {
             min_created_at_normalized: self.verified.manifest.min_created_at_normalized.clone(),
             max_created_at_normalized: self.verified.manifest.max_created_at_normalized.clone(),
         };
-        let token = streaming_counter_dedupe_token(&self.verified.identity, &counter)?;
+        let token = canonical_streaming_counter_dedupe_token(&self.verified.identity, &counter)?;
         payloads.push(total_post_counter_insert_payload_for_counter(
             &counter, token,
         )?);
@@ -560,8 +576,11 @@ impl<'a> StreamingPayloadState<'a> {
 
     fn flush_emoji_chunk(&mut self) -> anyhow::Result<ClickHouseInsertPayload> {
         let rows = std::mem::take(&mut self.emoji_chunk_rows);
-        let token =
-            streaming_emoji_dedupe_token(&self.verified.identity, self.emoji_chunk_index, &rows)?;
+        let token = canonical_streaming_emoji_dedupe_token(
+            &self.verified.identity,
+            self.emoji_chunk_index,
+            &rows,
+        )?;
         increment(
             &mut self.emoji_chunk_index,
             "streaming derive emoji chunk index",
@@ -609,13 +628,13 @@ impl StreamingDedupeLane {
     }
 }
 
-fn streaming_emoji_dedupe_token(
+fn canonical_streaming_emoji_dedupe_token(
     identity: &DeriveManifestIdentity,
     chunk_index: u64,
     rows: &[EmojiProjectionRow],
 ) -> anyhow::Result<String> {
     let mut hasher =
-        streaming_dedupe_hasher(identity, StreamingDedupeLane::Emoji, Some(chunk_index))?;
+        canonical_streaming_dedupe_hasher(identity, StreamingDedupeLane::Emoji, Some(chunk_index))?;
     hash_str_frame(&mut hasher, "payload.kind", "emoji_rows")?;
     hash_u64_frame(
         &mut hasher,
@@ -633,17 +652,18 @@ fn streaming_emoji_dedupe_token(
     Ok(streaming_dedupe_token(StreamingDedupeLane::Emoji, hasher))
 }
 
-fn streaming_counter_dedupe_token(
+fn canonical_streaming_counter_dedupe_token(
     identity: &DeriveManifestIdentity,
     counter: &TotalPostCounterInput,
 ) -> anyhow::Result<String> {
-    let mut hasher = streaming_dedupe_hasher(identity, StreamingDedupeLane::Counter, None)?;
+    let mut hasher =
+        canonical_streaming_dedupe_hasher(identity, StreamingDedupeLane::Counter, None)?;
     hash_str_frame(&mut hasher, "payload.kind", "total_post_counter")?;
     hash_counter_frames(&mut hasher, counter)?;
     Ok(streaming_dedupe_token(StreamingDedupeLane::Counter, hasher))
 }
 
-fn streaming_dedupe_hasher(
+fn canonical_streaming_dedupe_hasher(
     identity: &DeriveManifestIdentity,
     lane: StreamingDedupeLane,
     chunk_index: Option<u64>,

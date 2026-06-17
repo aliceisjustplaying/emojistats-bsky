@@ -12,8 +12,8 @@ use super::{
         hash_optional_field, hash_post_row_into, hash_string_slice, json_bytes,
         local_manifest_from_committed, parquet_writer_properties, post_record_batch,
         profile_sidecar_request, receipt_dataset, record_extras_json, stable_artifact_stem,
-        stable_repo_receipt_name, update_min_max_created_at, write_emoji_projection_jsonl,
-        write_json_pretty, write_posts_parquet_to_writer,
+        stable_object_receipt_path, stable_repo_receipt_name, update_min_max_created_at,
+        write_emoji_projection_jsonl, write_json_pretty, write_posts_parquet_to_writer,
     },
     borrowed_emoji_projection_rows_for_post, classify_created_at_observed_at,
     derive_emoji_projection_rows, format_observed_at, fs, hash_serialized_json,
@@ -231,9 +231,8 @@ pub fn write_archive_artifacts(
         stable_artifact_stem(did, receipt_dataset(receipt), &receipt.post_rows_hash);
     let parquet_object_path = PathBuf::from(format!("{artifact_stem}.posts.parquet"));
     let receipt_path = output_dir.join(stable_repo_receipt_name(did, &receipt_hash));
-    let object_receipt_object_path = PathBuf::from(format!(
-        "{artifact_stem}.{receipt_hash}.object-receipt.json"
-    ));
+    let object_receipt_object_path =
+        stable_object_receipt_path(&artifact_stem, &receipt_hash, "posts");
     let manifest_object_path = PathBuf::from(format!("{artifact_stem}.manifest.jsonl"));
     let emoji_projection_stem =
         stable_artifact_stem(did, "emoji_projection", &receipt.emoji_projection_hash);
@@ -244,9 +243,8 @@ pub fn write_archive_artifacts(
         receipt.profile_row_hash.as_deref().unwrap_or(&receipt_hash),
     );
     let profile_sidecar_object_path = PathBuf::from(format!("{profile_stem}.profile.json"));
-    let profile_sidecar_receipt_object_path = PathBuf::from(format!(
-        "{profile_stem}.{receipt_hash}.profile.object-receipt.json"
-    ));
+    let profile_sidecar_receipt_object_path =
+        stable_object_receipt_path(&profile_stem, &receipt_hash, "profile");
     let profile_sidecar_manifest_object_path =
         PathBuf::from(format!("{profile_stem}.profile.manifest.jsonl"));
 
@@ -632,9 +630,7 @@ impl StreamingArchiveSink {
         let store = LocalStore::new(&self.output_dir);
         let request = Request {
             object_path: PathBuf::from(format!("{artifact_stem}.posts.parquet")),
-            receipt_path: PathBuf::from(format!(
-                "{artifact_stem}.{receipt_hash}.object-receipt.json"
-            )),
+            receipt_path: stable_object_receipt_path(artifact_stem, receipt_hash, "posts"),
             manifest_path: PathBuf::from(format!("{artifact_stem}.manifest.jsonl")),
             manifest_mode: self.local_manifest_mode(),
             metadata: self.streaming_posts_metadata(receipt_hash, dataset, repo_receipt_path)?,
@@ -690,9 +686,7 @@ impl StreamingArchiveSink {
             return Ok(None);
         };
         let object_path = PathBuf::from(format!("{profile_stem}.profile.json"));
-        let receipt_path = PathBuf::from(format!(
-            "{profile_stem}.{receipt_hash}.profile.object-receipt.json"
-        ));
+        let receipt_path = stable_object_receipt_path(&profile_stem, receipt_hash, "profile");
         let manifest_path = PathBuf::from(format!("{profile_stem}.profile.manifest.jsonl"));
         let request = profile_sidecar_request(
             object_path.clone(),

@@ -24,7 +24,6 @@ use emojistats_backfill::{
         AttemptId, AttemptOutcome, DEFAULT_CLAIM_LEASE_DURATION, ForcedFetchMode, HostOverride,
         RepoLedgerEntry, RetryPolicy, SqliteLedger, claim_repo, complete_attempt,
     },
-    list_records::{ListRecordsConfig, fetch_and_archive_list_records_with_precommit_check},
     parse::{ParseConfig, ParseVisitError, ParsedRepoSummary, parse_repo_for_did_with_state},
     scheduler::{ClaimScope, HostPacer, SharedHostPacer},
     transport::{FetchByteBudget, FetchConfig, FetchError, fetch_repo_with_rate_limit_observer},
@@ -47,8 +46,8 @@ use cli::{ArchiveBackend, Cli, Command, HttpProtocol};
 use derive_manifest_cmd::DeriveManifestConfig;
 use failure::{
     FetchOneFailure, SmokeTelemetry, classify_archive_error, classify_fetch_error,
-    classify_list_records_error, classify_parse_error, current_rss_kb, elapsed_ms,
-    emit_smoke_telemetry, outcome_name, permanent_failure, retryable_failure,
+    classify_parse_error, current_rss_kb, elapsed_ms, emit_smoke_telemetry, outcome_name,
+    permanent_failure, retryable_failure,
 };
 use fleet::{
     DEFAULT_HOST_CONCURRENCY_CAP, FleetConfig, HostConcurrencyLimiter, HostConcurrencyPermit,

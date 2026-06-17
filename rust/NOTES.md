@@ -142,6 +142,21 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   Serving rows and counters carried the raw/getRepo/content-addressed proof fields.
   Current code preserves `dataset`, `fetch_method`, `completeness_class`, and `did` in
   serving rows/counters, and archive post schema is version `2`.
+- Post-architecture full smoke, release binary from the current working tree with `GIT_REV`
+  set to `787eb49`, same 24-DID fixture and full-whale settings, output under
+  `rust/data/scale-smoke-architecture-20260617T144516Z/`: 24 claimed, 19 succeeded, 5 expected
+  loud failures (3 terminal account states, 1 retryable dead host, 1 malformed `CAR`). Archive
+  wrote 12,456,982,194 fetched bytes, 16,914,025 reachable records, 16,697,088 post rows,
+  4,983 receipt post-decode diagnostics, and 499,593 emoji projection rows. Wall time was
+  19:34.79; process max RSS was 2,925,820 KiB; spool cleanup left 0 files. `ndj` fetched
+  4,795,566,231 bytes and parsed 2,258,662 posts in 316.3s; `o6g` fetched 3,972,658,343
+  bytes and parsed 5,062,053 posts in 406.6s; `4hm` retried once after a body decode
+  transport error, then fetched 1,424,463,806 bytes and parsed 2,598,565 posts in 85.7s.
+  Streaming derive over the 19 raw manifests inserted 81 payloads and 499,612 rows into
+  `emojistats_smoke_architecture_20260617T150518` in 2:57.23 with max RSS 73,168 KiB.
+  Counter sums matched archive receipts: 16,697,088 posts, 375,030 posts with emoji,
+  539,764 emoji occurrences. Serving rows and counters carried only the
+  `raw_archive_posts` / `get_repo` / `content_addressed_snapshot` lane.
 - Whale transport hardening: repo fetches default to HTTP/1 with an explicit
   `--http-protocol auto` escape hatch, TCP keepalive, and 30s connect timeout, and retry
   retryable body-stream transport/idle failures up to 3 full download attempts. Transport

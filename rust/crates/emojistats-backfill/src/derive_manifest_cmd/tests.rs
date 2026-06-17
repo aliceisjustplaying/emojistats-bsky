@@ -257,8 +257,8 @@ fn verified_input() -> VerifiedLoaderInput {
 }
 
 #[test]
-fn streaming_emoji_dedupe_token_is_stable_and_framed() {
-    let token = streaming_emoji_dedupe_token(&identity(), 0, &emoji_rows()).unwrap();
+fn canonical_streaming_emoji_dedupe_token_is_stable_and_framed() {
+    let token = canonical_streaming_emoji_dedupe_token(&identity(), 0, &emoji_rows()).unwrap();
 
     assert_eq!(
         token,
@@ -267,8 +267,8 @@ fn streaming_emoji_dedupe_token_is_stable_and_framed() {
 }
 
 #[test]
-fn streaming_counter_dedupe_token_is_stable_and_framed() {
-    let token = streaming_counter_dedupe_token(&identity(), &counter()).unwrap();
+fn canonical_streaming_counter_dedupe_token_is_stable_and_framed() {
+    let token = canonical_streaming_counter_dedupe_token(&identity(), &counter()).unwrap();
 
     assert_eq!(
         token,
@@ -277,11 +277,11 @@ fn streaming_counter_dedupe_token_is_stable_and_framed() {
 }
 
 #[test]
-fn streaming_dedupe_tokens_include_lane_and_chunk() {
+fn canonical_streaming_dedupe_tokens_include_lane_and_chunk() {
     let rows = emoji_rows();
-    let first = streaming_emoji_dedupe_token(&identity(), 0, &rows).unwrap();
-    let second = streaming_emoji_dedupe_token(&identity(), 1, &rows).unwrap();
-    let counter = streaming_counter_dedupe_token(&identity(), &counter()).unwrap();
+    let first = canonical_streaming_emoji_dedupe_token(&identity(), 0, &rows).unwrap();
+    let second = canonical_streaming_emoji_dedupe_token(&identity(), 1, &rows).unwrap();
+    let counter = canonical_streaming_counter_dedupe_token(&identity(), &counter()).unwrap();
 
     assert_ne!(first, second);
     assert!(first.starts_with("derive:emoji:"));
@@ -289,7 +289,7 @@ fn streaming_dedupe_tokens_include_lane_and_chunk() {
 }
 
 #[test]
-fn streaming_dedupe_tokens_are_stable_across_replay_manifest_sequence() {
+fn canonical_streaming_dedupe_tokens_are_stable_across_replay_manifest_sequence() {
     let mut replay_identity = identity();
     replay_identity.run_id = "run-2".to_owned();
     replay_identity.shard = "shard9".to_owned();
@@ -300,21 +300,21 @@ fn streaming_dedupe_tokens_are_stable_across_replay_manifest_sequence() {
     replay_counter.file_sequence = 99;
 
     assert_eq!(
-        streaming_emoji_dedupe_token(&identity(), 0, &emoji_rows()).unwrap(),
-        streaming_emoji_dedupe_token(&replay_identity, 0, &emoji_rows()).unwrap()
+        canonical_streaming_emoji_dedupe_token(&identity(), 0, &emoji_rows()).unwrap(),
+        canonical_streaming_emoji_dedupe_token(&replay_identity, 0, &emoji_rows()).unwrap()
     );
     assert_eq!(
-        streaming_counter_dedupe_token(&identity(), &counter()).unwrap(),
-        streaming_counter_dedupe_token(&replay_identity, &replay_counter).unwrap()
+        canonical_streaming_counter_dedupe_token(&identity(), &counter()).unwrap(),
+        canonical_streaming_counter_dedupe_token(&replay_identity, &replay_counter).unwrap()
     );
 }
 
 #[test]
-fn streaming_payload_rejects_single_emoji_row_over_payload_cap() {
+fn canonical_streaming_payload_rejects_single_emoji_row_over_payload_cap() {
     let verified = verified_input();
     let mut row = archive_row("oversized", "hello ✅", &["✅"]);
     row.langs = vec!["x".repeat(DEFAULT_EMOJI_SERVING_PAYLOAD_MAX_BYTES)];
-    let mut state = StreamingPayloadState::new(&verified);
+    let mut state = CanonicalStreamingPayloadState::new(&verified);
 
     let error = state
         .consume_rows(&[row])
@@ -350,7 +350,7 @@ async fn dry_run_missing_repo_receipt_attempts_zero_payloads() {
     let mut derive_ledger = DeriveLedger::new(None).expect("derive ledger");
     let mut summary = DeriveManifestSummary::default();
 
-    let error = derive_loader_input_streaming(
+    let error = derive_loader_input_canonical_streaming(
         &output_dir,
         &input,
         &http,
@@ -398,7 +398,7 @@ async fn dry_run_corrupt_repo_receipt_attempts_zero_payloads() {
     let mut derive_ledger = DeriveLedger::new(None).expect("derive ledger");
     let mut summary = DeriveManifestSummary::default();
 
-    let error = derive_loader_input_streaming(
+    let error = derive_loader_input_canonical_streaming(
         &output_dir,
         &input,
         &http,

@@ -8,20 +8,23 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
+#[cfg(any(test, debug_assertions))]
+use crate::archive::hash_post_rows;
+#[cfg(any(test, debug_assertions))]
 use crate::{
-    archive::{
-        ARCHIVE_SCHEMA_VERSION, ArchiveError, LocalManifestEntry, PostDataset, RepoReceipt,
-        hash_post_rows, read_all_archive_post_rows,
-    },
+    archive::read_all_archive_post_rows,
+    derive::{ClickHouseDeriveBatch, DeriveBatchInput, derive_clickhouse_batch},
+};
+use crate::{
+    archive::{ARCHIVE_SCHEMA_VERSION, ArchiveError, LocalManifestEntry, PostDataset, RepoReceipt},
     commit::{ManifestEntry, Receipt},
-    derive::{
-        ClickHouseDeriveBatch, DeriveBatchInput, DeriveError, DeriveManifestIdentity,
-        derive_clickhouse_batch, manifest_identity,
-    },
+    derive::{DeriveError, DeriveManifestIdentity, manifest_identity},
     hash::hash_serialized_json,
 };
 
+#[cfg(any(test, debug_assertions))]
 const DEFAULT_MAX_FULL_DERIVE_ROWS: u64 = 50_000;
+#[cfg(any(test, debug_assertions))]
 const DEFAULT_MAX_FULL_DERIVE_BYTES: u64 = 536_870_912;
 
 /// A committed post-archive manifest prepared for the derive loader.
@@ -40,14 +43,16 @@ pub struct VerifiedLoaderInput {
     pub repo_receipt: RepoReceipt,
 }
 
-/// Explicit caps for helpers that materialize a whole archive object.
+/// Explicit caps for debug/test helpers that materialize a whole archive object.
+#[cfg(any(test, debug_assertions))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FullLoadCaps {
+pub struct DebugFullLoadCaps {
     pub max_rows: u64,
     pub max_bytes: u64,
 }
 
-impl Default for FullLoadCaps {
+#[cfg(any(test, debug_assertions))]
+impl Default for DebugFullLoadCaps {
     fn default() -> Self {
         Self {
             max_rows: DEFAULT_MAX_FULL_DERIVE_ROWS,
@@ -295,63 +300,54 @@ where
     }
 }
 
-/// Verify a parsed committed manifest entry and build the `ClickHouse` derive batch it names.
+/// Debug/test helper that materializes a full archive object and builds the `ClickHouse` batch.
 ///
-/// The object path is resolved under `archive_root`. The object bytes, SHA-256, and adjacent
-/// repo receipt are always verified against the manifest. Adjacent object receipts are validated
-/// when their current local artifact filenames are present.
+/// Runtime derive uses [`verify_loader_input_for_streaming`] plus streaming payload generation.
+/// This helper exists for capped fixture/debug checks that compare against the canonical stream.
 ///
 /// # Errors
 ///
-/// Returns [`Error`] when the object is missing, any available receipt disagrees with the
-/// manifest or recomputed row hashes, or the verified rows cannot form a derive batch.
-pub fn load_verified_clickhouse_batch(
+/// Returns [`Error`] when the object is missing, exceeds a full-load cap, any available receipt
+/// disagrees with the manifest or recomputed row hashes, or the rows cannot form a derive batch.
+#[cfg(any(test, debug_assertions))]
+pub fn debug_load_verified_clickhouse_batch(
     archive_root: &Path,
     input: &LoaderInput,
 ) -> Result<ClickHouseDeriveBatch, Error> {
-    load_verified_clickhouse_batch_with_caps(archive_root, input, FullLoadCaps::default())
+    debug_load_verified_clickhouse_batch_with_caps(
+        archive_root,
+        input,
+        DebugFullLoadCaps::default(),
+    )
 }
 
-/// Verify a parsed committed manifest entry and build its `ClickHouse` derive batch with
-/// caller-supplied full-object load caps.
+/// Debug/test helper that materializes a full archive object with caller-supplied caps.
 ///
 /// # Errors
 ///
 /// Returns [`Error`] when the artifact exceeds a cap, is missing, any available receipt
 /// disagrees, or the verified rows cannot form a derive batch.
-pub fn load_verified_clickhouse_batch_with_caps(
+#[cfg(any(test, debug_assertions))]
+pub fn debug_load_verified_clickhouse_batch_with_caps(
     archive_root: &Path,
     input: &LoaderInput,
-    caps: FullLoadCaps,
+    caps: DebugFullLoadCaps,
 ) -> Result<ClickHouseDeriveBatch, Error> {
-    let object_path = resolve_local_path(archive_root, &input.manifest.local_path)?;
-    validate_full_load_caps(&object_path, &input.manifest, caps)?;
-    let digest = hash_file(&object_path)?;
-    validate_object_digest(&object_path, &input.manifest, &digest)?;
-
-    if let Some(receipt_path) =
-        first_existing_path(object_receipt_candidates(&object_path, &input.manifest))?
-    {
-        let receipt = read_receipt::<Receipt>(&receipt_path)?;
-        validate_object_receipt(&receipt_path, &input.manifest, &receipt)?;
-    }
+    let proof = verify_committed_artifact_proof(archive_root, input)?;
+    validate_full_load_caps(&proof.object_path, &input.manifest, caps)?;
 
     let archive_rows =
-        read_all_archive_post_rows(&object_path).map_err(|source| Error::Archive {
-            path: object_path.clone(),
+        read_all_archive_post_rows(&proof.object_path).map_err(|source| Error::Archive {
+            path: proof.object_path.clone(),
             source,
         })?;
 
-    let Some(receipt_path) = first_existing_path(repo_receipt_candidates(
-        archive_root,
-        &object_path,
+    validate_repo_receipt(
+        &proof.repo_receipt_path,
         &input.manifest,
-    )?)?
-    else {
-        return Err(Error::MissingRepoReceipt { path: object_path });
-    };
-    let receipt = read_receipt::<RepoReceipt>(&receipt_path)?;
-    validate_repo_receipt(&receipt_path, &input.manifest, &archive_rows, &receipt)?;
+        &archive_rows,
+        &proof.repo_receipt,
+    )?;
 
     Ok(derive_clickhouse_batch(DeriveBatchInput {
         manifest: &input.manifest,
@@ -372,48 +368,29 @@ pub fn verify_loader_input_for_streaming(
     archive_root: &Path,
     input: &LoaderInput,
 ) -> Result<VerifiedLoaderInput, Error> {
-    let object_path = resolve_local_path(archive_root, &input.manifest.local_path)?;
-    let digest = hash_file(&object_path)?;
-    validate_object_digest(&object_path, &input.manifest, &digest)?;
-
-    if let Some(receipt_path) =
-        first_existing_path(object_receipt_candidates(&object_path, &input.manifest))?
-    {
-        let receipt = read_receipt::<Receipt>(&receipt_path)?;
-        validate_object_receipt(&receipt_path, &input.manifest, &receipt)?;
-    }
-
-    let Some(repo_receipt_path) = first_existing_path(repo_receipt_candidates(
-        archive_root,
-        &object_path,
-        &input.manifest,
-    )?)?
-    else {
-        return Err(Error::MissingRepoReceipt { path: object_path });
-    };
-    let repo_receipt = read_receipt::<RepoReceipt>(&repo_receipt_path)?;
-    validate_repo_receipt_metadata(&repo_receipt_path, &input.manifest, &repo_receipt)?;
+    let proof = verify_committed_artifact_proof(archive_root, input)?;
 
     Ok(VerifiedLoaderInput {
         manifest: input.manifest.clone(),
         identity: input.identity.clone(),
-        object_path,
-        repo_receipt,
+        object_path: proof.object_path,
+        repo_receipt: proof.repo_receipt,
     })
 }
 
-/// Verify every loader input and build its `ClickHouse` derive batch.
+/// Debug/test helper that materializes every loader input and builds its `ClickHouse` batch.
 ///
 /// # Errors
 ///
 /// Returns [`Error`] on the first failed artifact verification or derive failure.
-pub fn load_verified_clickhouse_batches(
+#[cfg(any(test, debug_assertions))]
+pub fn debug_load_verified_clickhouse_batches(
     archive_root: &Path,
     inputs: &[LoaderInput],
 ) -> Result<Vec<ClickHouseDeriveBatch>, Error> {
     inputs
         .iter()
-        .map(|input| load_verified_clickhouse_batch(archive_root, input))
+        .map(|input| debug_load_verified_clickhouse_batch(archive_root, input))
         .collect()
 }
 
@@ -528,6 +505,48 @@ struct DigestResult {
     sha256: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifiedArtifactProof {
+    object_path: PathBuf,
+    #[cfg(any(test, debug_assertions))]
+    repo_receipt_path: PathBuf,
+    repo_receipt: RepoReceipt,
+}
+
+fn verify_committed_artifact_proof(
+    archive_root: &Path,
+    input: &LoaderInput,
+) -> Result<VerifiedArtifactProof, Error> {
+    let object_path = resolve_local_path(archive_root, &input.manifest.local_path)?;
+    let digest = hash_file(&object_path)?;
+    validate_object_digest(&object_path, &input.manifest, &digest)?;
+
+    if let Some(receipt_path) =
+        first_existing_path(object_receipt_candidates(&object_path, &input.manifest))?
+    {
+        let receipt = read_receipt::<Receipt>(&receipt_path)?;
+        validate_object_receipt(&receipt_path, &input.manifest, &receipt)?;
+    }
+
+    let Some(repo_receipt_path) = first_existing_path(repo_receipt_candidates(
+        archive_root,
+        &object_path,
+        &input.manifest,
+    )?)?
+    else {
+        return Err(Error::MissingRepoReceipt { path: object_path });
+    };
+    let repo_receipt = read_receipt::<RepoReceipt>(&repo_receipt_path)?;
+    validate_repo_receipt_metadata(&repo_receipt_path, &input.manifest, &repo_receipt)?;
+
+    Ok(VerifiedArtifactProof {
+        object_path,
+        #[cfg(any(test, debug_assertions))]
+        repo_receipt_path,
+        repo_receipt,
+    })
+}
+
 fn resolve_local_path(root: &Path, path: &Path) -> Result<PathBuf, Error> {
     let mut scoped = PathBuf::new();
     for component in path.components() {
@@ -617,10 +636,11 @@ fn validate_object_digest(
     Ok(())
 }
 
+#[cfg(any(test, debug_assertions))]
 fn validate_full_load_caps(
     path: &Path,
     manifest: &LocalManifestEntry,
-    caps: FullLoadCaps,
+    caps: DebugFullLoadCaps,
 ) -> Result<(), Error> {
     if manifest.row_count > caps.max_rows {
         return Err(Error::FullLoadRowCapExceeded {
@@ -705,6 +725,7 @@ fn validate_object_receipt(
     )
 }
 
+#[cfg(any(test, debug_assertions))]
 fn validate_repo_receipt(
     path: &Path,
     manifest: &LocalManifestEntry,
@@ -813,13 +834,16 @@ fn first_existing_path(paths: Vec<PathBuf>) -> Result<Option<PathBuf>, Error> {
 }
 
 fn object_receipt_candidates(object_path: &Path, manifest: &LocalManifestEntry) -> Vec<PathBuf> {
-    replace_file_suffix(
+    let mut candidates = Vec::new();
+    if let Some(path) = object_receipt_directory_path(object_path, &manifest.receipt_hash) {
+        candidates.push(path);
+    }
+    candidates.extend(replace_file_suffix(
         object_path,
         ".posts.parquet",
         &format!(".{}.object-receipt.json", manifest.receipt_hash),
-    )
-    .into_iter()
-    .collect()
+    ));
+    candidates
 }
 
 fn repo_receipt_candidates(
@@ -855,6 +879,17 @@ fn archive_stem_receipt_path(object_path: &Path, receipt_hash: &str) -> Option<P
         .or_else(|| file_name.find(&collection_marker))?;
     let artifact_stem = file_name.get(..marker_start)?;
     Some(object_path.with_file_name(format!("{artifact_stem}.{receipt_hash}.receipt.json")))
+}
+
+fn object_receipt_directory_path(object_path: &Path, receipt_hash: &str) -> Option<PathBuf> {
+    let file_name = object_path.file_name()?.to_str()?;
+    let prefix = file_name.strip_suffix(".posts.parquet")?;
+    let parent = object_path.parent().unwrap_or_else(|| Path::new(""));
+    Some(
+        parent
+            .join(format!("{prefix}.receipts"))
+            .join(format!("{receipt_hash}.posts.object-receipt.json")),
+    )
 }
 
 fn replace_file_suffix(path: &Path, suffix: &str, replacement: &str) -> Option<PathBuf> {

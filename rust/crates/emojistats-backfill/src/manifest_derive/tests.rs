@@ -8,8 +8,8 @@ use std::{
 };
 
 use super::{
-    Error, FullLoadCaps, ManifestReadItem, load_verified_clickhouse_batch,
-    load_verified_clickhouse_batch_with_caps, read_committed_jsonl, stream_committed_jsonl,
+    DebugFullLoadCaps, Error, ManifestReadItem, debug_load_verified_clickhouse_batch,
+    debug_load_verified_clickhouse_batch_with_caps, read_committed_jsonl, stream_committed_jsonl,
     verify_loader_input_for_streaming,
 };
 use crate::{
@@ -248,8 +248,8 @@ fn verified_manifest_entry_loads_clickhouse_batch() {
     let plan = read_plan_from_path(&artifacts.manifest_path);
     let input = plan.inputs.first().expect("loader input");
 
-    let batch =
-        load_verified_clickhouse_batch(&output_dir, input).expect("verified batch should load");
+    let batch = debug_load_verified_clickhouse_batch(&output_dir, input)
+        .expect("verified batch should load");
 
     assert_eq!(batch.manifest_identity, input.identity);
     assert_eq!(batch.emoji_rows.len(), 2);
@@ -321,6 +321,16 @@ fn streaming_verifier_rejects_raw_manifest_with_collection_paginated_receipt() {
             ..
         }
     ));
+
+    let full_load_error = debug_load_verified_clickhouse_batch(&output_dir, input)
+        .expect_err("debug full-load verifier should reject same proof mismatch");
+    assert!(matches!(
+        full_load_error,
+        Error::ReceiptFieldMismatch {
+            field: "fetch_method",
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -341,9 +351,11 @@ fn verified_manifest_entry_rejects_missing_parquet() {
     let plan = read_plan_from_path(&artifacts.manifest_path);
     fs::remove_file(&artifacts.parquet_path).expect("parquet should be removable");
 
-    let error =
-        load_verified_clickhouse_batch(&output_dir, plan.inputs.first().expect("loader input"))
-            .expect_err("missing parquet should fail");
+    let error = debug_load_verified_clickhouse_batch(
+        &output_dir,
+        plan.inputs.first().expect("loader input"),
+    )
+    .expect_err("missing parquet should fail");
 
     assert!(matches!(error, Error::MissingArtifact { .. }));
 }
@@ -366,9 +378,11 @@ fn verified_manifest_entry_rejects_missing_repo_receipt() {
     let plan = read_plan_from_path(&artifacts.manifest_path);
     fs::remove_file(&artifacts.receipt_path).expect("repo receipt should be removable");
 
-    let error =
-        load_verified_clickhouse_batch(&output_dir, plan.inputs.first().expect("loader input"))
-            .expect_err("missing repo receipt should fail");
+    let error = debug_load_verified_clickhouse_batch(
+        &output_dir,
+        plan.inputs.first().expect("loader input"),
+    )
+    .expect_err("missing repo receipt should fail");
 
     assert!(matches!(error, Error::MissingRepoReceipt { .. }));
 }
@@ -391,9 +405,11 @@ fn verified_manifest_entry_rejects_parquet_hash_mismatch() {
     let plan = read_plan_from_path(&artifacts.manifest_path);
     fs::write(&artifacts.parquet_path, b"corrupt").expect("parquet should be mutable");
 
-    let error =
-        load_verified_clickhouse_batch(&output_dir, plan.inputs.first().expect("loader input"))
-            .expect_err("hash mismatch should fail");
+    let error = debug_load_verified_clickhouse_batch(
+        &output_dir,
+        plan.inputs.first().expect("loader input"),
+    )
+    .expect_err("hash mismatch should fail");
 
     assert!(matches!(
         error,
@@ -419,10 +435,10 @@ fn full_batch_load_rejects_manifest_above_explicit_caps_before_reading_rows() {
     let plan = read_plan_from_path(&artifacts.manifest_path);
     let input = plan.inputs.first().expect("loader input");
 
-    let error = load_verified_clickhouse_batch_with_caps(
+    let error = debug_load_verified_clickhouse_batch_with_caps(
         &output_dir,
         input,
-        FullLoadCaps {
+        DebugFullLoadCaps {
             max_rows: 0,
             max_bytes: u64::MAX,
         },

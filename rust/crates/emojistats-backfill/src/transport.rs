@@ -28,6 +28,7 @@ const DEFAULT_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 #[allow(clippy::duration_suboptimal_units)]
 const DEFAULT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const DEFAULT_MAX_BYTES: u64 = 2_147_483_648;
+const DEFAULT_UNKNOWN_BODY_RESERVATION_BYTES: u64 = 268_435_456;
 const DEFAULT_MIN_PROGRESS_BYTES: u64 = 16_384;
 const DEFAULT_MIN_PROGRESS_INTERVAL: Duration = Duration::from_secs(60);
 const ERROR_BODY_MAX_BYTES: u64 = 65_536;
@@ -49,6 +50,8 @@ pub struct FetchConfig {
     pub min_progress_interval: Duration,
     /// Loud single-repo byte cap for the spooled `CAR`.
     pub max_bytes: u64,
+    /// Admission reservation for successful bodies without a usable `Content-Length`.
+    pub unknown_body_reservation_bytes: u64,
     /// Optional fleet-wide byte budget for in-flight spooled `CAR` bytes.
     pub byte_budget: Option<FetchByteBudget>,
 }
@@ -65,6 +68,7 @@ impl FetchConfig {
             min_progress_bytes: DEFAULT_MIN_PROGRESS_BYTES,
             min_progress_interval: DEFAULT_MIN_PROGRESS_INTERVAL,
             max_bytes: DEFAULT_MAX_BYTES,
+            unknown_body_reservation_bytes: DEFAULT_UNKNOWN_BODY_RESERVATION_BYTES,
             byte_budget: None,
         }
     }
@@ -168,6 +172,51 @@ impl FetchByteBudgetReservation {
             },
         )?;
         self.budget.reserve_charged_delta(delta).await?;
+        self.charged_bytes = charged_target;
+        Ok(())
+    }
+
+    fn try_reserve_capacity(&mut self, bytes: u64) -> Result<(), FetchError> {
+        if bytes > self.budget.inner.max_bytes {
+            return Err(FetchError::InFlightBytesExceeded {
+                max_bytes: self.budget.inner.max_bytes,
+                observed_bytes: bytes,
+            });
+        }
+        if bytes <= self.charged_bytes {
+            return Ok(());
+        }
+        let charged_target = bytes;
+        let delta = charged_target.checked_sub(self.charged_bytes).ok_or(
+            FetchError::InFlightBytesExceeded {
+                max_bytes: self.budget.inner.max_bytes,
+                observed_bytes: bytes,
+            },
+        )?;
+        if delta == 0 || self.budget.inner.max_bytes == 0 {
+            self.charged_bytes = charged_target;
+            return Ok(());
+        }
+        let mut charged = self
+            .budget
+            .inner
+            .charged_bytes
+            .lock()
+            .map_err(|_error| FetchError::ByteBudgetPoisoned)?;
+        let next = charged
+            .checked_add(delta)
+            .ok_or(FetchError::InFlightBytesExceeded {
+                max_bytes: self.budget.inner.max_bytes,
+                observed_bytes: u64::MAX,
+            })?;
+        if next > self.budget.inner.max_bytes {
+            return Err(FetchError::InFlightBytesUnavailable {
+                max_bytes: self.budget.inner.max_bytes,
+                requested_bytes: charged_target,
+            });
+        }
+        *charged = next;
+        drop(charged);
         self.charged_bytes = charged_target;
         Ok(())
     }
@@ -522,7 +571,11 @@ where
     let rate_limit = RateLimitSnapshot::from_headers(response.headers());
     observe_rate_limit(&rate_limit);
     let admission_body_bytes = if status.is_success() {
-        Some(admission_body_bytes(response.headers(), config.max_bytes)?)
+        Some(admission_body_bytes(
+            response.headers(),
+            config.max_bytes,
+            config.unknown_body_reservation_bytes,
+        )?)
     } else {
         None
     };
@@ -672,7 +725,7 @@ async fn stream_to_temp_file(
             });
         }
         if let Some(reservation) = byte_budget_reservation.as_mut() {
-            reservation.reserve_capacity(observed_bytes).await?;
+            reservation.try_reserve_capacity(observed_bytes)?;
         }
         file.write_all(chunk.as_ref()).await?;
         bytes = observed_bytes;
@@ -874,15 +927,20 @@ fn classify_http_error(
     }
 }
 
-fn admission_body_bytes(headers: &HeaderMap, max_bytes: u64) -> Result<u64, FetchError> {
+fn admission_body_bytes(
+    headers: &HeaderMap,
+    max_bytes: u64,
+    unknown_body_reservation_bytes: u64,
+) -> Result<u64, FetchError> {
+    let unknown_body_reservation_bytes = unknown_body_reservation_bytes.min(max_bytes);
     let Some(value) = headers.get(http::header::CONTENT_LENGTH) else {
-        return Ok(max_bytes);
+        return Ok(unknown_body_reservation_bytes);
     };
     let Ok(value) = value.to_str() else {
-        return Ok(max_bytes);
+        return Ok(unknown_body_reservation_bytes);
     };
     let Ok(bytes) = value.parse::<u64>() else {
-        return Ok(max_bytes);
+        return Ok(unknown_body_reservation_bytes);
     };
     if bytes > max_bytes {
         return Err(FetchError::MaxBytesExceeded {

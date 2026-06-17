@@ -8,9 +8,10 @@ use super::{
         archive_row_from_owned_post_observed_at, classify_archive_error, classify_parse_error,
         elapsed_ms, hash_profile_record, parse_repo_for_did_with_state, retryable_failure,
     },
-    fetch_attempt::{
-        GetRepoProcessed, GetRepoTimings, HostOverrideCache, HostOverrideCacheEntry, ProcessedRepo,
-        ProcessedRepoArtifacts, ProcessedRepoCounts,
+    fetch_attempt::{HostOverrideCache, HostOverrideCacheEntry},
+    processed_repo::{
+        GetRepoProcessed, GetRepoTimings, ProcessedRepo, ProcessedRepoArtifacts,
+        ProcessedRepoCounts,
     },
 };
 

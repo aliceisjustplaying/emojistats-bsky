@@ -127,24 +127,34 @@ fn default_config_sets_spool_dir_and_limits() {
     assert_eq!(config.spool_dir, PathBuf::from("/tmp/spool"));
     assert_eq!(config.chunk_idle_timeout, Duration::from_secs(30));
     assert_eq!(config.max_bytes, 2_147_483_648);
+    assert_eq!(config.unknown_body_reservation_bytes, 268_435_456);
     assert!(config.byte_budget.is_none());
 }
 
 #[test]
-fn unknown_content_length_admits_full_repo_cap() {
+fn unknown_content_length_admits_unknown_body_reservation() {
     let headers = HeaderMap::new();
 
-    let bytes = admission_body_bytes(&headers, 10).unwrap();
+    let bytes = admission_body_bytes(&headers, 10, 3).unwrap();
 
-    assert_eq!(bytes, 10);
+    assert_eq!(bytes, 3);
 }
 
 #[test]
-fn malformed_content_length_admits_full_repo_cap() {
+fn malformed_content_length_admits_unknown_body_reservation() {
     let mut headers = HeaderMap::new();
     headers.insert(http::header::CONTENT_LENGTH, "wat".parse().unwrap());
 
-    let bytes = admission_body_bytes(&headers, 10).unwrap();
+    let bytes = admission_body_bytes(&headers, 10, 3).unwrap();
+
+    assert_eq!(bytes, 3);
+}
+
+#[test]
+fn unknown_body_reservation_is_capped_by_repo_limit() {
+    let headers = HeaderMap::new();
+
+    let bytes = admission_body_bytes(&headers, 10, 30).unwrap();
 
     assert_eq!(bytes, 10);
 }
@@ -265,6 +275,50 @@ async fn byte_budget_shrinks_admission_reservation_to_actual_bytes() {
     assert_eq!(bytes, 3);
     assert_eq!(reservation.unwrap().charged_bytes(), 3);
     std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn byte_budget_growth_defers_instead_of_waiting_while_partially_charged() {
+    let budget = FetchByteBudget::new(10);
+    let mut first = budget.reservation();
+    first.reserve_capacity(8).await.unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "emojistats-byte-budget-growth-{}-{}.car",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let body = ByteStream::new(futures_util::stream::iter([Ok(Bytes::from_static(b"abc"))]));
+
+    let error = stream_to_file(
+        body,
+        &path,
+        StreamLimits {
+            chunk_idle_timeout: Duration::from_secs(1),
+            download_timeout: Duration::from_secs(10),
+            min_progress_bytes: 0,
+            min_progress_interval: Duration::from_secs(1),
+            max_bytes: 3,
+        },
+        2,
+        Some(&budget),
+    )
+    .await
+    .unwrap_err();
+
+    match error {
+        FetchError::InFlightBytesUnavailable {
+            max_bytes,
+            requested_bytes,
+        } => {
+            assert_eq!(max_bytes, 10);
+            assert_eq!(requested_bytes, 3);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert!(!path.exists());
 }
 
 #[tokio::test]

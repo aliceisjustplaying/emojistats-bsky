@@ -711,6 +711,16 @@ pub(super) fn stable_repo_receipt_name(did: &str, receipt_hash: &str) -> String 
     format!("{}.{}.receipt.json", safe_file_component(did), receipt_hash)
 }
 
+pub(super) fn stable_object_receipt_path(
+    artifact_stem: &str,
+    receipt_hash: &str,
+    suffix: &str,
+) -> PathBuf {
+    PathBuf::from(format!(
+        "{artifact_stem}.receipts/{receipt_hash}.{suffix}.object-receipt.json"
+    ))
+}
+
 fn safe_file_component(value: &str) -> String {
     let mut safe = String::new();
     for ch in value.chars() {

@@ -64,10 +64,13 @@ fn profile_sidecar_is_written_as_committed_artifact() {
     assert_eq!(profile_path.parent(), Some(output_dir.as_path()));
     assert_path_name_shape(&profile_path, "did_plc_fixture123__", ".profile.json");
     assert_path_name_shape(
-        &profile_receipt_path,
+        profile_receipt_path
+            .parent()
+            .expect("profile receipt should have parent directory"),
         "did_plc_fixture123__",
-        ".profile.object-receipt.json",
+        ".receipts",
     );
+    assert_path_name_shape(&profile_receipt_path, "", ".profile.object-receipt.json");
     assert_path_name_shape(
         &profile_manifest_path,
         "did_plc_fixture123__",
