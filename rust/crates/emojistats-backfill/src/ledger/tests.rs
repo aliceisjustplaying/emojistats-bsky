@@ -630,6 +630,19 @@ fn sqlite_migrates_missing_shard_bucket_column() {
 }
 
 #[test]
+fn sqlite_schema_migration_sets_user_version() {
+    let store = SqliteLedger::open_in_memory().unwrap();
+
+    assert_eq!(
+        store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
 fn sqlite_host_overrides_round_trip() {
     let store = SqliteLedger::open_in_memory().unwrap();
     let override_record = HostOverride {

@@ -468,5 +468,5 @@ pub(super) fn remote_parent(path: &str) -> Result<String, CommandError> {
 }
 
 pub(super) fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', r"'\''"))
+    shell_words::quote(value).into_owned()
 }

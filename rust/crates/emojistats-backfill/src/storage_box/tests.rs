@@ -564,7 +564,7 @@ fn ssh_manifest_append_command_uses_flock() {
         .expect("ssh script should be the final argument");
 
     assert!(command.stdin);
-    assert!(script.contains("flock -- '/storage-box/emojistats/manifests/raw.jsonl.lock'"));
+    assert!(script.contains("flock -- /storage-box/emojistats/manifests/raw.jsonl.lock"));
     assert!(script.contains("if [ -e \"$1\" ] && grep -Fqx -- \"$record\" \"$1\""));
     assert!(script.contains("printf \"%s\\n\" \"$record\" >> \"$1\""));
     assert!(!script.contains("cat >> '/storage-box/emojistats/manifests/raw.jsonl'"));
@@ -581,7 +581,7 @@ fn ssh_remove_command_uses_rm_force_for_temp_cleanup() {
             .args
             .last()
             .expect("ssh script should be the final argument"),
-        "rm -f -- '/storage-box/emojistats/.tmp/run-1/shard0/42.parquet.tmp'"
+        "rm -f -- /storage-box/emojistats/.tmp/run-1/shard0/42.parquet.tmp"
     );
 }
 
@@ -597,7 +597,15 @@ fn ssh_read_prefix_command_marks_absent_and_present_outputs() {
             .args
             .last()
             .expect("ssh script should be the final argument"),
-        "if [ -e '/storage-box/emojistats/objects/run-1/42.parquet' ]; then printf 'present\\n'; head -c 8 -- '/storage-box/emojistats/objects/run-1/42.parquet'; else printf 'absent\\n'; fi"
+        "if [ -e /storage-box/emojistats/objects/run-1/42.parquet ]; then printf 'present\\n'; head -c 8 -- /storage-box/emojistats/objects/run-1/42.parquet; else printf 'absent\\n'; fi"
+    );
+}
+
+#[test]
+fn ssh_shell_quote_handles_shell_metacharacters() {
+    assert_eq!(
+        super::ssh::shell_quote("/storage-box/emojistats/path with 'quote'"),
+        "'/storage-box/emojistats/path with '\\''quote'\\'''"
     );
 }
 

@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use fs4::{FileExt, TryLockError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
@@ -19,8 +20,6 @@ const HASH_BUFFER_BYTES: usize = 65_536;
 pub(crate) const PROTOCOL_VERSION: u16 = 1;
 const MANIFEST_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MANIFEST_LOCK_MAX_WAIT: Duration = Duration::from_secs(60);
-#[allow(clippy::duration_suboptimal_units)]
-const MANIFEST_LOCK_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
 
 /// Local filesystem implementation of the committed artifact protocol.
 #[derive(Debug, Clone)]
@@ -629,54 +628,58 @@ fn append_manifest_jsonl_unlocked(path: &Path, entry: &ManifestEntry) -> Result<
 }
 
 struct ManifestAppendLock {
-    path: PathBuf,
+    file: File,
 }
 
 impl ManifestAppendLock {
     fn acquire(path: &Path) -> Result<Self, Error> {
         let lock_path = manifest_lock_path(path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|source| Error::Io {
+                operation: "open manifest append lock",
+                path: lock_path.clone(),
+                source,
+            })?;
         let started = Instant::now();
         loop {
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-            {
-                Ok(mut file) => {
-                    if let Err(source) = writeln!(file, "{}", std::process::id()) {
-                        let _ignored = fs::remove_file(&lock_path);
-                        return Err(Error::Io {
-                            operation: "write manifest append lock",
-                            path: lock_path,
-                            source,
-                        });
-                    }
-                    if let Err(source) = file.sync_all() {
-                        let _ignored = fs::remove_file(&lock_path);
-                        return Err(Error::Io {
-                            operation: "fsync manifest append lock",
-                            path: lock_path,
-                            source,
-                        });
-                    }
-                    drop(file);
+            match FileExt::try_lock(&file) {
+                Ok(()) => {
+                    file.set_len(0).map_err(|source| Error::Io {
+                        operation: "truncate manifest append lock",
+                        path: lock_path.clone(),
+                        source,
+                    })?;
+                    writeln!(&file, "{}", std::process::id()).map_err(|source| Error::Io {
+                        operation: "write manifest append lock",
+                        path: lock_path.clone(),
+                        source,
+                    })?;
+                    file.sync_all().map_err(|source| Error::Io {
+                        operation: "fsync manifest append lock",
+                        path: lock_path.clone(),
+                        source,
+                    })?;
                     sync_parent_dir(&lock_path, "manifest append lock")?;
-                    return Ok(Self { path: lock_path });
+                    return Ok(Self { file });
                 }
-                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
-                    if remove_stale_manifest_lock(&lock_path)? {
-                        continue;
-                    }
+                Err(TryLockError::WouldBlock) => {
                     if started.elapsed() >= MANIFEST_LOCK_MAX_WAIT {
                         return Err(Error::Io {
                             operation: "acquire manifest append lock",
                             path: lock_path,
-                            source,
+                            source: io::Error::new(
+                                io::ErrorKind::WouldBlock,
+                                "manifest append lock timed out",
+                            ),
                         });
                     }
                     thread::sleep(MANIFEST_LOCK_POLL_INTERVAL);
                 }
-                Err(source) => {
+                Err(TryLockError::Error(source)) => {
                     return Err(Error::Io {
                         operation: "acquire manifest append lock",
                         path: lock_path,
@@ -690,7 +693,7 @@ impl ManifestAppendLock {
 
 impl Drop for ManifestAppendLock {
     fn drop(&mut self) {
-        let _ignored = fs::remove_file(&self.path);
+        let _ignored = FileExt::unlock(&self.file);
     }
 }
 
@@ -703,41 +706,6 @@ fn manifest_lock_path(path: &Path) -> Result<PathBuf, Error> {
                 path: path.to_path_buf(),
             })?;
     Ok(path.with_file_name(format!(".{file_name}.lock")))
-}
-
-fn remove_stale_manifest_lock(path: &Path) -> Result<bool, Error> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(true),
-        Err(source) => {
-            return Err(Error::Io {
-                operation: "stat manifest append lock",
-                path: path.to_path_buf(),
-                source,
-            });
-        }
-    };
-    let Ok(modified) = metadata.modified() else {
-        return Ok(false);
-    };
-    let Ok(age) = modified.elapsed() else {
-        return Ok(false);
-    };
-    if age < MANIFEST_LOCK_STALE_AFTER {
-        return Ok(false);
-    }
-    match fs::remove_file(path) {
-        Ok(()) => {
-            sync_parent_dir(path, "manifest append lock")?;
-            Ok(true)
-        }
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(true),
-        Err(source) => Err(Error::Io {
-            operation: "remove stale manifest append lock",
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
 }
 
 fn repair_or_validate_existing_receipt(path: &Path, expected: &Receipt) -> Result<Receipt, Error> {

@@ -436,6 +436,8 @@ pub enum LedgerError {
 pub enum LedgerStoreError {
     #[error("sqlite ledger error")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("sqlite ledger migration error")]
+    Migration(#[from] rusqlite_migration::Error),
     #[error("ledger time is before unix epoch")]
     TimeBeforeUnixEpoch,
     #[error("ledger integer overflow")]

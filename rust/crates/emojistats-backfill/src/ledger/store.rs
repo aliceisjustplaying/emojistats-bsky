@@ -4,6 +4,7 @@ use std::{
 };
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite_migration::{M, Migrations};
 
 use super::{
     AttemptOutcome, HostOverride, LedgerSeedBatchSummary, LedgerStoreError, RepoLedgerEntry,
@@ -74,54 +75,9 @@ fn select_claimable_did(
         .optional()
 }
 
-impl SqliteLedger {
-    /// Open a SQLite ledger and create its schema when it does not exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LedgerStoreError`] when SQLite cannot open the database or create the schema.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, LedgerStoreError> {
-        Self::from_connection(Connection::open(path)?)
-    }
-
-    /// Open an in-memory SQLite ledger.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LedgerStoreError`] when SQLite cannot create the in-memory database or schema.
-    pub fn open_in_memory() -> Result<Self, LedgerStoreError> {
-        Self::from_connection(Connection::open_in_memory()?)
-    }
-
-    /// Wrap an existing SQLite connection and create the ledger schema.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LedgerStoreError`] when schema creation fails.
-    pub fn from_connection(mut connection: Connection) -> Result<Self, LedgerStoreError> {
-        connection.set_transaction_behavior(TransactionBehavior::Immediate);
-        let ledger = Self { connection };
-        ledger.configure_connection()?;
-        ledger.create_schema()?;
-        Ok(ledger)
-    }
-
-    fn configure_connection(&self) -> Result<(), LedgerStoreError> {
-        self.connection.busy_timeout(Duration::from_secs(30))?;
-        self.connection.pragma_update(None, "journal_mode", "WAL")?;
-        self.connection
-            .pragma_update(None, "synchronous", "NORMAL")?;
-        Ok(())
-    }
-
-    /// Create the ledger schema if it does not already exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LedgerStoreError`] when SQLite rejects the schema statement.
-    pub fn create_schema(&self) -> Result<(), LedgerStoreError> {
-        self.connection.execute_batch(
-            "
+fn ledger_migrations() -> Migrations<'static> {
+    Migrations::new(vec![M::up_with_hook(
+        "
             CREATE TABLE IF NOT EXISTS repo_ledger (
                 did TEXT PRIMARY KEY NOT NULL,
                 shard_bucket INTEGER NOT NULL CHECK (shard_bucket >= 0),
@@ -164,12 +120,76 @@ impl SqliteLedger {
                 next_sequence INTEGER NOT NULL CHECK (next_sequence > 0),
                 PRIMARY KEY (run_id, shard)
             );
-            ",
+        ",
+        migrate_legacy_schema,
+    )])
+}
+
+fn migrate_legacy_schema(transaction: &Transaction<'_>) -> rusqlite_migration::HookResult {
+    ensure_repo_ledger_columns(transaction)?;
+    ensure_host_override_columns(transaction)?;
+    backfill_missing_shard_buckets(transaction)?;
+    ensure_indexes(transaction)?;
+    Ok(())
+}
+
+fn ensure_repo_ledger_columns(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
+    if !table_has_column(transaction, "repo_ledger", "shard_bucket")? {
+        transaction.execute(
+            "ALTER TABLE repo_ledger ADD COLUMN shard_bucket INTEGER",
+            [],
         )?;
-        self.ensure_repo_ledger_columns()?;
-        self.ensure_host_override_columns()?;
-        self.connection.execute_batch(
-            "
+    }
+    if !table_has_column(transaction, "repo_ledger", "worker_id")? {
+        transaction.execute("ALTER TABLE repo_ledger ADD COLUMN worker_id TEXT", [])?;
+    }
+    if !table_has_column(transaction, "repo_ledger", "claimed_at_ms")? {
+        transaction.execute(
+            "ALTER TABLE repo_ledger ADD COLUMN claimed_at_ms INTEGER",
+            [],
+        )?;
+    }
+    if !table_has_column(transaction, "repo_ledger", "lease_until_ms")? {
+        transaction.execute(
+            "ALTER TABLE repo_ledger ADD COLUMN lease_until_ms INTEGER",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_host_override_columns(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
+    if !table_has_column(transaction, "host_overrides", "min_interval_ms")? {
+        transaction.execute(
+            "ALTER TABLE host_overrides ADD COLUMN min_interval_ms INTEGER CHECK (min_interval_ms IS NULL OR min_interval_ms > 0)",
+            [],
+        )?;
+    }
+    if !table_has_column(transaction, "host_overrides", "never_diff")? {
+        transaction.execute(
+            "ALTER TABLE host_overrides ADD COLUMN never_diff INTEGER NOT NULL DEFAULT 0 CHECK (never_diff IN (0, 1))",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn table_has_column(
+    transaction: &Transaction<'_>,
+    table: &str,
+    column: &str,
+) -> rusqlite::Result<bool> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut statement = transaction.prepare(&pragma)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(columns.iter().any(|existing| existing == column))
+}
+
+fn ensure_indexes(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
+    transaction.execute_batch(
+        "
             CREATE INDEX IF NOT EXISTS idx_repo_ledger_claim
                 ON repo_ledger (status, shard_bucket, did);
             CREATE INDEX IF NOT EXISTS idx_repo_ledger_retry
@@ -178,8 +198,88 @@ impl SqliteLedger {
                 ON repo_ledger (status, shard_bucket, next_attempt_after_ms, did);
             CREATE INDEX IF NOT EXISTS idx_repo_ledger_lease_v2
                 ON repo_ledger (status, lease_until_ms);
-            ",
-        )?;
+        ",
+    )
+}
+
+fn backfill_missing_shard_buckets(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
+    loop {
+        let dids = {
+            let mut statement = transaction.prepare(
+                "
+                    SELECT did
+                    FROM repo_ledger
+                    WHERE shard_bucket IS NULL
+                    ORDER BY did
+                    LIMIT ?1
+                    ",
+            )?;
+            let rows = statement.query_map(params![SHARD_BUCKET_MIGRATION_BATCH_SIZE], |row| {
+                row.get::<_, String>(0)
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if dids.is_empty() {
+            return Ok(());
+        }
+        for did in dids {
+            let bucket = shard_bucket_to_i64(did_shard_bucket(&did))
+                .map_err(|_err| rusqlite::Error::IntegralValueOutOfRange(0, 0))?;
+            transaction.execute(
+                "UPDATE repo_ledger SET shard_bucket = ?2 WHERE did = ?1",
+                params![did, bucket],
+            )?;
+        }
+    }
+}
+
+impl SqliteLedger {
+    /// Open a SQLite ledger and create its schema when it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerStoreError`] when SQLite cannot open the database or create the schema.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, LedgerStoreError> {
+        Self::from_connection(Connection::open(path)?)
+    }
+
+    /// Open an in-memory SQLite ledger.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerStoreError`] when SQLite cannot create the in-memory database or schema.
+    pub fn open_in_memory() -> Result<Self, LedgerStoreError> {
+        Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    /// Wrap an existing SQLite connection and create the ledger schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerStoreError`] when schema creation fails.
+    pub fn from_connection(mut connection: Connection) -> Result<Self, LedgerStoreError> {
+        connection.set_transaction_behavior(TransactionBehavior::Immediate);
+        let mut ledger = Self { connection };
+        ledger.configure_connection()?;
+        ledger.create_schema()?;
+        Ok(ledger)
+    }
+
+    fn configure_connection(&self) -> Result<(), LedgerStoreError> {
+        self.connection.busy_timeout(Duration::from_secs(30))?;
+        self.connection.pragma_update(None, "journal_mode", "WAL")?;
+        self.connection
+            .pragma_update(None, "synchronous", "NORMAL")?;
+        Ok(())
+    }
+
+    /// Run ledger schema migrations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerStoreError`] when SQLite rejects a schema migration.
+    pub fn create_schema(&mut self) -> Result<(), LedgerStoreError> {
+        ledger_migrations().to_latest(&mut self.connection)?;
         Ok(())
     }
 
@@ -776,95 +876,6 @@ impl SqliteLedger {
         let rows = statement.query_map(params![now_ms, limit, shard_bucket], row_to_entry)?;
         let entries = rows.collect::<Result<Vec<_>, _>>()?;
         entries.into_iter().collect()
-    }
-
-    fn ensure_repo_ledger_columns(&self) -> Result<(), LedgerStoreError> {
-        let mut statement = self.connection.prepare("PRAGMA table_info(repo_ledger)")?;
-        let columns = statement
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<Result<Vec<_>, _>>()?;
-        if !columns.iter().any(|column| column == "shard_bucket") {
-            self.connection.execute(
-                "ALTER TABLE repo_ledger ADD COLUMN shard_bucket INTEGER",
-                [],
-            )?;
-        }
-        if !columns.iter().any(|column| column == "worker_id") {
-            self.connection
-                .execute("ALTER TABLE repo_ledger ADD COLUMN worker_id TEXT", [])?;
-        }
-        if !columns.iter().any(|column| column == "claimed_at_ms") {
-            self.connection.execute(
-                "ALTER TABLE repo_ledger ADD COLUMN claimed_at_ms INTEGER",
-                [],
-            )?;
-        }
-        if !columns.iter().any(|column| column == "lease_until_ms") {
-            self.connection.execute(
-                "ALTER TABLE repo_ledger ADD COLUMN lease_until_ms INTEGER",
-                [],
-            )?;
-        }
-        self.backfill_missing_shard_buckets()
-    }
-
-    fn ensure_host_override_columns(&self) -> Result<(), LedgerStoreError> {
-        let mut statement = self
-            .connection
-            .prepare("PRAGMA table_info(host_overrides)")?;
-        let columns = statement
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<Result<Vec<_>, _>>()?;
-        if !columns.iter().any(|column| column == "min_interval_ms") {
-            self.connection.execute(
-                "ALTER TABLE host_overrides ADD COLUMN min_interval_ms INTEGER CHECK (min_interval_ms IS NULL OR min_interval_ms > 0)",
-                [],
-            )?;
-        }
-        if !columns.iter().any(|column| column == "never_diff") {
-            self.connection.execute(
-                "ALTER TABLE host_overrides ADD COLUMN never_diff INTEGER NOT NULL DEFAULT 0 CHECK (never_diff IN (0, 1))",
-                [],
-            )?;
-        }
-        Ok(())
-    }
-
-    fn backfill_missing_shard_buckets(&self) -> Result<(), LedgerStoreError> {
-        loop {
-            let dids = {
-                let mut statement = self.connection.prepare(
-                    "
-                    SELECT did
-                    FROM repo_ledger
-                    WHERE shard_bucket IS NULL
-                    ORDER BY did
-                    LIMIT ?1
-                    ",
-                )?;
-                statement
-                    .query_map(params![SHARD_BUCKET_MIGRATION_BATCH_SIZE], |row| {
-                        row.get::<_, String>(0)
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?
-            };
-            if dids.is_empty() {
-                break;
-            }
-            let transaction = self.connection.unchecked_transaction()?;
-            {
-                let mut statement = transaction
-                    .prepare("UPDATE repo_ledger SET shard_bucket = ?1 WHERE did = ?2")?;
-                for did in &dids {
-                    statement.execute(params![
-                        shard_bucket_to_i64(did_shard_bucket(did))?,
-                        did.as_str(),
-                    ])?;
-                }
-            }
-            transaction.commit()?;
-        }
-        Ok(())
     }
 }
 
