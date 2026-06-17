@@ -10,6 +10,8 @@
 > log, and the backfill runbook. Where memory and evidence disagreed, evidence won — a
 > couple of places where the folklore was already drifting are called out explicitly.
 
+## Part 1: the v1 TypeScript backfill
+
 ## TL;DR
 
 In one ~19-hour session on 2026-06-11 we designed, built, reviewed and launched a
@@ -1986,6 +1988,306 @@ Three other fixes landed in the same session:
   reliable ETA yet, but the static bottleneck that was causing the >24h estimate is gone. Nothing
   has converged to closure.
 
+## The ETA honesty record
+
+The full table lives in the launch log ("Running ETA honesty table"). The shape:
+pre-launch capacity napkin said 1–1.5 days; the night said 70 days (frozen fleet);
+the morning said 3 weeks, then 10–20 days — every one an extrapolation of a
+differently-broken system. The first number computed from *sustained measured
+throughput on healthy software* was ~31 hours, and reality has oscillated around
+26h–3.8 days since, governed by host diversity and the spam tail, not by capacity.
+
+Alice's "how were you off by almost an order of magnitude?" produced the standing
+rule: **ETAs come from sustained measured throughput only; extrapolations get labeled
+as extrapolations, out loud.** Her follow-up — "my friends do not use 6 boxes" — was
+an external benchmark that proved the gap was self-inflicted, and found bottleneck #7
+within the hour. *(Open: record the final actual duration and cost next to the
+original napkin when the crawl completes.)*
+
+## Process retro: how the humans and agents actually worked
+
+### What the human did that the agents couldn't
+
+- **Held ground truth**: prod was off, the code had drifted, the Redis gaps were
+  years old, network stats, rate-limit confirmations from Bluesky people, "PDSes are
+  fast", stock outages, prices.
+- **Set bars instead of asking for properties.** "If someone yanks the power cable,
+  we lose ~nothing" produced specific mechanisms (crash-reconcile pass, cursor rewind
+  vs fsync, dirty-start audits) where "make it robust" would have produced nodding.
+  Same with "zero lint errors", "100% accurate status counts", "under 1 day".
+- **Asked the short skeptical questions**: the two best questions; "wait, you
+  underestimated the storage?"; "are rkeys actually unique?" (they're not, in general
+  — the spec dive pinned why we're safe and where the landmine is); "which sops key,
+  and where's the cleartext?" (exposed that seven hosts couldn't decrypt secrets);
+  "982 divided by 2 equals exactly 491, that's too much of a coincidence" (Nov 2025,
+  beat the generic theory list). And the November "i'm starting to think you're
+  hallucinating" that snapped a degraded loop straight into the root cause.
+- **Corrected over-politeness three times** (mushroom concurrency, PLC pacing, NIC
+  math). Model defaults skew timid on rate limits; operator field experience beat
+  model priors every time, and the correction was generalized: protocol signals
+  govern, defaults err assertive, the operator holds the dial.
+- **Made the owner's calls** with money on the table: the storage split, the rescale,
+  "crank it", the goal downgrade to "stable under 4 days" when the marginal euro of
+  more tuning stopped paying.
+
+### Agent failure modes observed (both agents, candidly)
+
+- Narrative optimism between measurements (the four "should recover within minutes").
+- Extrapolation under pressure (the disk napkin) and inherited inertia in delegated
+  work (an agent still writing Debian docs as NixOS was decided, because the Debian
+  assumption had been baked into its spec hours earlier: "inertia, mine" — when the
+  human changes course, in-flight subagent specs need explicit re-review).
+- Momentum past approval boundaries (`--apply`), fire-and-forget monitoring, scope
+  creep mid-incident (a toolchain migration during a fleet outage).
+- Tool friction: edit-before-read streaks, tsx-in-/tmp module resolution (≥3×),
+  rsync-cwd bugs (2×), `pkill -f` self-match (3× and counting).
+- **Operational re-derivation:** the agent composes multi-parameter SSH launch commands
+  from scratch every time instead of calling a script. A simple concurrency change
+  (512→384) produced three cascading mistakes in five minutes: `pkill` self-match (again),
+  wrong env file path (`emojistats-env` vs `emojistats-crawl-env`), and missing
+  `CRAWL_SHARD_INDEX` / `CRAWL_SHARDS`. Each fix introduced the next bug. A human who'd
+  done this once would have a launch script; the agent has no persistent operational
+  memory between commands and re-derives (and re-breaks) the same invocation every time.
+  Code reviews can't catch this because the bugs are in the *execution*, not the *code*.
+  The fix is the same as write-time receipts: don't trust the operator to remember — make
+  the system enforce it. Operations that are repeated more than once belong in a script,
+  not in an agent's ad-hoc SSH composition.
+- Degradation in long incident loops (the Nov 2025 hallucination call-out) — blunt
+  human check-ins reset it.
+- Reviewer fallibility both directions: a round-5 "native ABI mismatch" was actually
+  a deliberately-orphaned dev ledger (reproduce before accepting a diagnosis); and
+  reviews find *instances*, not *classes* — the fixed `unreachable`-counted-as-resolved
+  bug had an unflagged twin in the adjacent query, found only by grepping for the
+  pattern.
+
+### What made the collaboration work anyway
+
+- **Verify-then-trust at every seam**: review findings checked against HEAD before
+  agreeing (one finding had already been fixed; the review raced the fix); credentials
+  verified at intake (fingerprints vs activation emails); subagent claims re-tested by
+  the integrator; cross-system invariants proven on tiny literals first (the JS↔CH
+  digest, including the `hex()` zero-padding trap).
+- **Contracts pinned before fan-out**; disjoint agent territories; required
+  self-verification protocols and explicit "Deviations" sections in agent reports.
+- **Durable state over conversation**: plan files, runbook, launch log, memory files
+  refreshed *before* compaction; the GO order written into memory executed correctly
+  by the post-compaction self. Counterexample that proves the rule: the move to pix2
+  silently dropped all agent memory (host-local), and the session rebuilt context from
+  in-repo docs — the one thing it couldn't reconstruct was the SSH key location, and
+  the disk-wide key grep it attempted was rightly interrupted. Write host-local memory
+  early; keep operational truth in the repo.
+- **Two agents on one repo** worked with explicit rules: reviewer warned about the
+  moving tree; collision on the same hot bug resolved by Alice's "whatever fix is the
+  most thorough gets pushed" (the agents diffed and merged each other's fixes); evening
+  cross-review of the other agent's uncommitted work caught a restart-spin regression,
+  a missing index and a 5xx-deadness bug before commit.
+- **Memory is a lead, not a fact.** This retro's own planning tripped on it: the
+  agent's memory had absorbed a wrong Nexus framing, and only Alice's veto at plan
+  review caught it. Memories written in the heat of an incident inherit its
+  misconceptions; cite evidence, re-verify before reuse.
+
+## Lessons: transferable to any project
+
+Each of these earned its place in this run; origin in parentheses.
+
+- Profile before fixing; one measurement beats four plausible theories
+  (bottlenecks #5, #11, #12 — three for three).
+- Anything periodic or per-work-item that scans state must be O(LIMIT) or
+  off-thread; O(n)-on-growing-n detonates exactly after your dry run (claim scan,
+  telemetry tick).
+- Decompose before extrapolating; "disk grew X%/hour" is not "data grew X%/hour"
+  (parts storm napkin).
+- Group before you blame (the morel wall's false accusation of the indie caps).
+- ETAs from sustained measured throughput only; label extrapolations out loud
+  (the honesty table).
+- Your tuning loop is production load; price the ramp time or your measurements are
+  noise (109 restarts).
+- Reporting must never share a thread with the work; and freshness is part of
+  accuracy — stale numbers impersonating live ones are the dashboard lie operators
+  actually fall for (telemetry tick, frozen-shard totals).
+- Re-derive configuration constants after architecture changes; they encode
+  assumptions about the code around them (GLOBAL_CONCURRENCY=128).
+- Recovery paths need failure-injection tests; comments describing guarantees are
+  where correctness goes to die (the at-most-once accident, SIGKILL crash tests).
+- A concrete adversarial scenario ("yank the power cable") audits better than any
+  "is it robust?" — and an external benchmark ("my friends do it in 3–4 days")
+  debugs better than any internal monitor.
+- Fix-now vs fix-later should weigh cost asymmetry across the deploy boundary, not
+  just severity (the DateTime64 swap: one table swap pre-deploy vs a 40 GB migration
+  post).
+- Deploys need an identity (a commit hash), and "did it land" must be one command
+  (the rsync drift).
+- Verify your alerts against ground truth before trusting them; a monitor you just
+  wrote is unverified code (the FATAL false alarms).
+- Process state is not progress: "active" services hang, `exitCode`-without-`exit`
+  makes zombies, deliberate stops read "failed", and event loops deadlock with
+  nothing to throw — four distinct silent failures, all caught only by a monitor
+  keyed on whether work counters still advance, not on unit/process state. And make
+  that monitor *active* (auto-heal), not just an alerter, so it works when the
+  human and the observation loop are both asleep.
+- In a one-shot pipeline, schema scope is now-or-never — what you don't write down
+  is a future full re-fetch; measure bytes/row from real output before answering
+  "will it fit" (the archive widening at 17%).
+- Distinguish "stopped wasting" from "got faster" when reporting a win; commit to a
+  falsifiable post-change measurement (the spam-kill victory lap).
+- Write down negative results where the next operator will look ("settings tried
+  that should not repeat" in the runbook — Alice asked for it explicitly: document
+  what was tried and didn't work, so it doesn't get retried later).
+- Census external work queues against ground truth; junk is a scheduling problem
+  (PLC spam, listrepos-diff).
+- Read prior art at the moment of pain — futur.blue reshaped the Nov design in an
+  hour; microcosm's repos deleted the largest ETA unknown in five minutes of agent
+  time. But evaluate borrowed tools by pipeline position and timing, not quality
+  (hydrant, evaluated and rejected with a bookmark).
+- Salvage irreplaceable data and prove byte-identical equivalence *before* deleting
+  the duplicate (Nov-2025 parquet, aggregate SQL).
+- When you abandon a project, write the one-paragraph epitaph (the Nexus mystery).
+- For human-AI teams specifically: pin contracts before fan-out; re-review in-flight
+  delegated work when decisions change; treat agent memory as a lead, not a fact;
+  keep operational truth in the repo where any session on any host can find it; and
+  let the human's short skeptical questions interrupt anything.
+
+## If I did this again — the second-time playbook
+
+The honest thesis of the whole run: **the data was never the hard part.** Roughly a day
+and a half of *healthy* throughput moved ~2.6B posts; the calendar cost was several days,
+and the overwhelming majority of the hard hours went to two things — telling a *stuck*
+system from a *slow* one, and discovering, reactively, the caps and detectors we should
+have built up front. A second run isn't faster because the crawler is faster. It's faster
+because you stop fighting your own instrumentation. Below, ranked by the time it would
+actually save. (The verify/cutover items are still provisional — those phases were unfinished
+when this was written.)
+
+**The five that would save the most time, in order:**
+
+1. **Build the progress-gated watchdog first.** This is the spine of the entire run — the
+   liveness detector went alert-only → auto-restart → CPU-gated → log-freshness →
+   progress-gated, and *nearly every crawler incident was a referendum on which signal tells
+   the truth*. A 0-CPU hang, an exit-1 crash, and a chatty-but-wedged box look identical from
+   the outside; CPU and log-freshness both lie (the wedge kept logging stats while `loaded`
+   sat frozen). Define liveness as **work advancing** (`loaded`/`resolved` climbing) from day
+   one and most of the firefight never happens.
+
+2. **Parse rate-limit headers and pace proactively — from line one.** The single biggest tail
+   bottleneck (and the thing that ate a whole overnight) was reactive AIMD back-off: slam a
+   host until it 429s, halve, cool, repeat — so you only ever *learn* the limit by tripping it.
+   The mushroom hosts advertise `ratelimit-limit/remaining/reset` on **every** response; the
+   crawler read it on none. Read the headers, space to the advertised budget, and from the
+   start keep **"is this host claimable" separate from "should this request wait"** — conflating
+   pacing with host-deadness in the claim scan is exactly what starved the scheduler in the tail.
+
+3. **No silent caps. Ever.** The worst bug of the run — every repo over a 1 GiB CAR cap was
+   *wholly dropped*, posts and all, for the entire backfill, filed under a "quarantined" status
+   nobody was reading — was a cap doing its job silently. Every limit that can reject data (CAR
+   size, fetch timeout, attempt budget, claim-scan depth) must be **loud, generous by default,
+   and paired with something that re-examines what it rejected.** And raising one cap reveals the
+   next (the 1 GiB cap hid a 300 s fetch-timeout cap behind it) — so audit for the *pattern*, not
+   the instance. A rejection status that no process reads again is data loss with a friendly label.
+
+4. **Design verification into the write path, and make it scale, before you need it.** Verify
+   was still failing to run at the very end (ClickHouse parameter-length limits on inline DID
+   lists), and even when it runs, an O(1) `(count, XOR-digest)` receipt *cannot prove set-subset*
+   once a live firehose keeps growing the table. Decide what "verified" means on day one; write
+   the per-repo receipts at load time; build the convergence loop (re-fetch only the LOOSE tail)
+   and the *scaling* verify (a temp DID table joined per shard, never DID lists shipped as query
+   params) before the end-game, not during it.
+
+5. **Classify the spam / PLC-only tail early and delete that work.** A large share of the
+   "failed/unresolved" millions is not lost data — it's `listRepos` returning DIDs that PLC knows
+   about but the host doesn't actually serve, plus bulk spam DIDs. `listrepos-diff` classification
+   cleared *more* backlog in a night than crawling did. The tail is **politeness-bound, not
+   capacity-bound**, so the lever is deleting work, not adding boxes — measure `GROUP BY pds_host`
+   on the remaining pending before you provision anything.
+
+**Build-in-from-day-one checklist** (the cheap insurance):
+
+- progress-gated watchdog + per-shard freshness, not CPU/log-liveness
+- header-driven host pacing, with the claimable-vs-should-wait split
+- a dead-host registry **with its inverse** (`--revive-host`) shipped together — blacklisting
+  without an un-blacklist means "park" silently becomes "abandon"
+- generous, loud caps + a re-examination pass over anything rejected
+- write-time verify receipts + a verify that scales; and put `src`/source **in** the
+  `ReplacingMergeTree` sort key (or split backfill and live into separate tables) so
+  verification can actually isolate backfilled rows — the `(did, rkey)`-with-`src`-outside
+  sort key is precisely what made the digest unable to prove zero-loss
+- everything load-bearing in the nix flake / IaC; no ad-hoc host scripts or `/run`-only drop-ins
+  that the next rebuild silently erases
+- **scriptable fleet operations**: a `scripts/fleet-crawl.sh` (or equivalent) that takes
+  concurrency, shard index, run ID, and DID file as arguments, handles env file sourcing, shard
+  labels, process management (kill-without-self-match), and health verification. The agent (or
+  human) calls one command instead of composing 6-parameter SSH invocations from memory — the
+  same principle as write-time receipts: don't trust the operator to remember, make the system
+  enforce it. Every operational mistake in the late-night sessions (wrong env path, missing shard
+  index, pkill self-match) would have been prevented by a script that encodes the right parameters
+  once
+- the dashboard scoped to **project lifetime, not the latest `run_id`**, and its numbers
+  data-backed (aggregate tables), never hardcoded and never raw-`posts` scans at live cadence
+- quote an ETA only from **sustained measured throughput on healthy software**, and report
+  posts/min next to repos/min so "stopped wasting" and "got faster" stay distinguishable
+
+**Keep doing (these earned their place):**
+
+- the adversarial **second-agent review rounds** — they caught real pre-launch defects that would
+  have been 3am outages (the seq-reuse parquet overwrite, a dead ExecStart)
+- the core architecture — sharded crawlers → ClickHouse + per-repo SQLite ledger + zstd-parquet
+  archive — largely held under 2.6B posts; the changes above are refinements, not a redesign
+- naming bottlenecks out loud, the ETA honesty table, atomic commits, the runbook of
+  settings-not-to-repeat
+- the human's short skeptical questions as the highest-leverage tool in the kit — *"how were you
+  off by almost an order of magnitude?"*, *"are we not also missing posts?"*, *"they literally
+  give you headers"* each turned a stuck path
+
+**What would still be slow (the irreducible floor):** you cannot crawl faster than the hosts
+permit, dead hosts and PLC/host disagreement never become posts, and multi-GB repos take real
+time even with the caps raised. So the honest second-time estimate is that the *data* moves in
+roughly a day or two of wall-clock — the savings aren't in the crawl, they're in the days you'd
+no longer lose to instrumentation you built right the first time.
+
+## Open: to revisit when the crawl completes
+
+- Final wall-clock duration and total cost vs the original napkin (1–1.5 days;
+  fleet ~€13/day ≈ €0.54/h, rising to €0.57/h by Alice's evening figure) — close the
+  honesty table.
+- Final-sweep results: how many of the parked ~29M unreachable resolve with a real
+  DID document; whether the microcosm-style 6h/24h/24h-then-stop retry ladder gets
+  adopted.
+- Verify pass outcome at full scale (EXACT/LOOSE/FAILED distribution) — the number
+  that decides whether "correctness must be checkable per repo" was achieved.
+- Cutover: flip the public site to ClickHouse, decommission the old prod path,
+  re-seed semantics; analytics UI (the actual product of all this).
+- Teardown economics: auction boxes bill hourly — shut down promptly; the serve box's
+  one-way disk means downsizing is a migrate-to-new-box (~€15/mo target).
+- The pix2 audit's publication blockers before the blogpost: launch log leaks real
+  server IPs (scrub), `bun test` is broken at root, three READMEs are
+  boilerplate-false, backend package is the quality outlier.
+- Bake the runtime drop-ins that won (concurrency values, heap sizes) into the nix
+  modules everywhere; confirm nothing load-bearing still lives only in /run.
+- The CDP profiler script "deserves a home in the repo" (it has one now —
+  `scripts/cpu-profile.ts`); confirm the healthcheck/final-sweep operator loop is
+  documented in the runbook.
+- Jetstream watchdog (45s) soak: the half-open failure it guards against killed the
+  ingest twice on day 2, pre-watchdog; check whether it has fired after a quiet week.
+- Before teardown, put a number on the all-NVMe hindsight if cheap: compare
+  ledger-maintenance op timings (index builds, bulk parks, WAL checkpoints) between
+  the NVMe boxes (crawl0/1) and the SATA boxes (crawl2–5) from their journals.
+- Post-sweep restart: compute the first honest post-sweep ETA (the ~10–14h figure
+  was a projection), run the parked 6144 canary fairly, and report posts/min next to
+  repos/min so "stopped wasting" vs "got faster" is answerable.
+- The un-widened archive slice: repos loaded before `archive_extras_since` lack
+  facets/replies/embeds/labels — decide whether/when to re-fetch them (possibly as
+  part of the final sweep).
+- Once the listrepos sweep completes: decide whether adding boxes truly cuts time.
+  Decision rule: measure first — `GROUP BY pds_host` over remaining pending plus
+  per-shard slot utilization. Politeness-bound (boxes part-idle, hosts at their AIMD
+  ceilings) → more boxes add cost, not speed; the lever is deleting work
+  (listrepos-diff on the next hosts). Capacity-bound (slots pinned, many hosts
+  queuing deep) AND >~2 days of ETA at stake → reshard and scale out — remembering
+  the shard count lives in the ledgers' persisted bucket column, so this is a
+  migration against verified claim-path machinery, not a config flip.
+- The blogpost itself, drawn from this doc + the launch log.
+
+## Part 2: the v2 Rust rewrite
+
 ### 2026-06-15 afternoon (~11:30–16:07 UTC) — the Rust rewrite is back on, and the retro becomes the spec
 
 Alice reversed the "no Rust rewrite" decision from the previous evening. The catalyst wasn't
@@ -2525,304 +2827,6 @@ full-load path, which may now be vestigial), and commit pipeline duplication in 
 remain over 1,000 lines: `fetch_attempt.rs` (1,096) and `storage_box.rs` (1,084). Both
 commits pushed to origin: `097020d` (proof and derive hardening, 2,324 insertions across
 40 files) and `787eb49` (crate plumbing, 251 insertions across 9 files).
-
-## The ETA honesty record
-
-The full table lives in the launch log ("Running ETA honesty table"). The shape:
-pre-launch capacity napkin said 1–1.5 days; the night said 70 days (frozen fleet);
-the morning said 3 weeks, then 10–20 days — every one an extrapolation of a
-differently-broken system. The first number computed from *sustained measured
-throughput on healthy software* was ~31 hours, and reality has oscillated around
-26h–3.8 days since, governed by host diversity and the spam tail, not by capacity.
-
-Alice's "how were you off by almost an order of magnitude?" produced the standing
-rule: **ETAs come from sustained measured throughput only; extrapolations get labeled
-as extrapolations, out loud.** Her follow-up — "my friends do not use 6 boxes" — was
-an external benchmark that proved the gap was self-inflicted, and found bottleneck #7
-within the hour. *(Open: record the final actual duration and cost next to the
-original napkin when the crawl completes.)*
-
-## Process retro: how the humans and agents actually worked
-
-### What the human did that the agents couldn't
-
-- **Held ground truth**: prod was off, the code had drifted, the Redis gaps were
-  years old, network stats, rate-limit confirmations from Bluesky people, "PDSes are
-  fast", stock outages, prices.
-- **Set bars instead of asking for properties.** "If someone yanks the power cable,
-  we lose ~nothing" produced specific mechanisms (crash-reconcile pass, cursor rewind
-  vs fsync, dirty-start audits) where "make it robust" would have produced nodding.
-  Same with "zero lint errors", "100% accurate status counts", "under 1 day".
-- **Asked the short skeptical questions**: the two best questions; "wait, you
-  underestimated the storage?"; "are rkeys actually unique?" (they're not, in general
-  — the spec dive pinned why we're safe and where the landmine is); "which sops key,
-  and where's the cleartext?" (exposed that seven hosts couldn't decrypt secrets);
-  "982 divided by 2 equals exactly 491, that's too much of a coincidence" (Nov 2025,
-  beat the generic theory list). And the November "i'm starting to think you're
-  hallucinating" that snapped a degraded loop straight into the root cause.
-- **Corrected over-politeness three times** (mushroom concurrency, PLC pacing, NIC
-  math). Model defaults skew timid on rate limits; operator field experience beat
-  model priors every time, and the correction was generalized: protocol signals
-  govern, defaults err assertive, the operator holds the dial.
-- **Made the owner's calls** with money on the table: the storage split, the rescale,
-  "crank it", the goal downgrade to "stable under 4 days" when the marginal euro of
-  more tuning stopped paying.
-
-### Agent failure modes observed (both agents, candidly)
-
-- Narrative optimism between measurements (the four "should recover within minutes").
-- Extrapolation under pressure (the disk napkin) and inherited inertia in delegated
-  work (an agent still writing Debian docs as NixOS was decided, because the Debian
-  assumption had been baked into its spec hours earlier: "inertia, mine" — when the
-  human changes course, in-flight subagent specs need explicit re-review).
-- Momentum past approval boundaries (`--apply`), fire-and-forget monitoring, scope
-  creep mid-incident (a toolchain migration during a fleet outage).
-- Tool friction: edit-before-read streaks, tsx-in-/tmp module resolution (≥3×),
-  rsync-cwd bugs (2×), `pkill -f` self-match (3× and counting).
-- **Operational re-derivation:** the agent composes multi-parameter SSH launch commands
-  from scratch every time instead of calling a script. A simple concurrency change
-  (512→384) produced three cascading mistakes in five minutes: `pkill` self-match (again),
-  wrong env file path (`emojistats-env` vs `emojistats-crawl-env`), and missing
-  `CRAWL_SHARD_INDEX` / `CRAWL_SHARDS`. Each fix introduced the next bug. A human who'd
-  done this once would have a launch script; the agent has no persistent operational
-  memory between commands and re-derives (and re-breaks) the same invocation every time.
-  Code reviews can't catch this because the bugs are in the *execution*, not the *code*.
-  The fix is the same as write-time receipts: don't trust the operator to remember — make
-  the system enforce it. Operations that are repeated more than once belong in a script,
-  not in an agent's ad-hoc SSH composition.
-- Degradation in long incident loops (the Nov 2025 hallucination call-out) — blunt
-  human check-ins reset it.
-- Reviewer fallibility both directions: a round-5 "native ABI mismatch" was actually
-  a deliberately-orphaned dev ledger (reproduce before accepting a diagnosis); and
-  reviews find *instances*, not *classes* — the fixed `unreachable`-counted-as-resolved
-  bug had an unflagged twin in the adjacent query, found only by grepping for the
-  pattern.
-
-### What made the collaboration work anyway
-
-- **Verify-then-trust at every seam**: review findings checked against HEAD before
-  agreeing (one finding had already been fixed; the review raced the fix); credentials
-  verified at intake (fingerprints vs activation emails); subagent claims re-tested by
-  the integrator; cross-system invariants proven on tiny literals first (the JS↔CH
-  digest, including the `hex()` zero-padding trap).
-- **Contracts pinned before fan-out**; disjoint agent territories; required
-  self-verification protocols and explicit "Deviations" sections in agent reports.
-- **Durable state over conversation**: plan files, runbook, launch log, memory files
-  refreshed *before* compaction; the GO order written into memory executed correctly
-  by the post-compaction self. Counterexample that proves the rule: the move to pix2
-  silently dropped all agent memory (host-local), and the session rebuilt context from
-  in-repo docs — the one thing it couldn't reconstruct was the SSH key location, and
-  the disk-wide key grep it attempted was rightly interrupted. Write host-local memory
-  early; keep operational truth in the repo.
-- **Two agents on one repo** worked with explicit rules: reviewer warned about the
-  moving tree; collision on the same hot bug resolved by Alice's "whatever fix is the
-  most thorough gets pushed" (the agents diffed and merged each other's fixes); evening
-  cross-review of the other agent's uncommitted work caught a restart-spin regression,
-  a missing index and a 5xx-deadness bug before commit.
-- **Memory is a lead, not a fact.** This retro's own planning tripped on it: the
-  agent's memory had absorbed a wrong Nexus framing, and only Alice's veto at plan
-  review caught it. Memories written in the heat of an incident inherit its
-  misconceptions; cite evidence, re-verify before reuse.
-
-## Lessons: transferable to any project
-
-Each of these earned its place in this run; origin in parentheses.
-
-- Profile before fixing; one measurement beats four plausible theories
-  (bottlenecks #5, #11, #12 — three for three).
-- Anything periodic or per-work-item that scans state must be O(LIMIT) or
-  off-thread; O(n)-on-growing-n detonates exactly after your dry run (claim scan,
-  telemetry tick).
-- Decompose before extrapolating; "disk grew X%/hour" is not "data grew X%/hour"
-  (parts storm napkin).
-- Group before you blame (the morel wall's false accusation of the indie caps).
-- ETAs from sustained measured throughput only; label extrapolations out loud
-  (the honesty table).
-- Your tuning loop is production load; price the ramp time or your measurements are
-  noise (109 restarts).
-- Reporting must never share a thread with the work; and freshness is part of
-  accuracy — stale numbers impersonating live ones are the dashboard lie operators
-  actually fall for (telemetry tick, frozen-shard totals).
-- Re-derive configuration constants after architecture changes; they encode
-  assumptions about the code around them (GLOBAL_CONCURRENCY=128).
-- Recovery paths need failure-injection tests; comments describing guarantees are
-  where correctness goes to die (the at-most-once accident, SIGKILL crash tests).
-- A concrete adversarial scenario ("yank the power cable") audits better than any
-  "is it robust?" — and an external benchmark ("my friends do it in 3–4 days")
-  debugs better than any internal monitor.
-- Fix-now vs fix-later should weigh cost asymmetry across the deploy boundary, not
-  just severity (the DateTime64 swap: one table swap pre-deploy vs a 40 GB migration
-  post).
-- Deploys need an identity (a commit hash), and "did it land" must be one command
-  (the rsync drift).
-- Verify your alerts against ground truth before trusting them; a monitor you just
-  wrote is unverified code (the FATAL false alarms).
-- Process state is not progress: "active" services hang, `exitCode`-without-`exit`
-  makes zombies, deliberate stops read "failed", and event loops deadlock with
-  nothing to throw — four distinct silent failures, all caught only by a monitor
-  keyed on whether work counters still advance, not on unit/process state. And make
-  that monitor *active* (auto-heal), not just an alerter, so it works when the
-  human and the observation loop are both asleep.
-- In a one-shot pipeline, schema scope is now-or-never — what you don't write down
-  is a future full re-fetch; measure bytes/row from real output before answering
-  "will it fit" (the archive widening at 17%).
-- Distinguish "stopped wasting" from "got faster" when reporting a win; commit to a
-  falsifiable post-change measurement (the spam-kill victory lap).
-- Write down negative results where the next operator will look ("settings tried
-  that should not repeat" in the runbook — Alice asked for it explicitly: document
-  what was tried and didn't work, so it doesn't get retried later).
-- Census external work queues against ground truth; junk is a scheduling problem
-  (PLC spam, listrepos-diff).
-- Read prior art at the moment of pain — futur.blue reshaped the Nov design in an
-  hour; microcosm's repos deleted the largest ETA unknown in five minutes of agent
-  time. But evaluate borrowed tools by pipeline position and timing, not quality
-  (hydrant, evaluated and rejected with a bookmark).
-- Salvage irreplaceable data and prove byte-identical equivalence *before* deleting
-  the duplicate (Nov-2025 parquet, aggregate SQL).
-- When you abandon a project, write the one-paragraph epitaph (the Nexus mystery).
-- For human-AI teams specifically: pin contracts before fan-out; re-review in-flight
-  delegated work when decisions change; treat agent memory as a lead, not a fact;
-  keep operational truth in the repo where any session on any host can find it; and
-  let the human's short skeptical questions interrupt anything.
-
-## If I did this again — the second-time playbook
-
-The honest thesis of the whole run: **the data was never the hard part.** Roughly a day
-and a half of *healthy* throughput moved ~2.6B posts; the calendar cost was several days,
-and the overwhelming majority of the hard hours went to two things — telling a *stuck*
-system from a *slow* one, and discovering, reactively, the caps and detectors we should
-have built up front. A second run isn't faster because the crawler is faster. It's faster
-because you stop fighting your own instrumentation. Below, ranked by the time it would
-actually save. (The verify/cutover items are still provisional — those phases were unfinished
-when this was written.)
-
-**The five that would save the most time, in order:**
-
-1. **Build the progress-gated watchdog first.** This is the spine of the entire run — the
-   liveness detector went alert-only → auto-restart → CPU-gated → log-freshness →
-   progress-gated, and *nearly every crawler incident was a referendum on which signal tells
-   the truth*. A 0-CPU hang, an exit-1 crash, and a chatty-but-wedged box look identical from
-   the outside; CPU and log-freshness both lie (the wedge kept logging stats while `loaded`
-   sat frozen). Define liveness as **work advancing** (`loaded`/`resolved` climbing) from day
-   one and most of the firefight never happens.
-
-2. **Parse rate-limit headers and pace proactively — from line one.** The single biggest tail
-   bottleneck (and the thing that ate a whole overnight) was reactive AIMD back-off: slam a
-   host until it 429s, halve, cool, repeat — so you only ever *learn* the limit by tripping it.
-   The mushroom hosts advertise `ratelimit-limit/remaining/reset` on **every** response; the
-   crawler read it on none. Read the headers, space to the advertised budget, and from the
-   start keep **"is this host claimable" separate from "should this request wait"** — conflating
-   pacing with host-deadness in the claim scan is exactly what starved the scheduler in the tail.
-
-3. **No silent caps. Ever.** The worst bug of the run — every repo over a 1 GiB CAR cap was
-   *wholly dropped*, posts and all, for the entire backfill, filed under a "quarantined" status
-   nobody was reading — was a cap doing its job silently. Every limit that can reject data (CAR
-   size, fetch timeout, attempt budget, claim-scan depth) must be **loud, generous by default,
-   and paired with something that re-examines what it rejected.** And raising one cap reveals the
-   next (the 1 GiB cap hid a 300 s fetch-timeout cap behind it) — so audit for the *pattern*, not
-   the instance. A rejection status that no process reads again is data loss with a friendly label.
-
-4. **Design verification into the write path, and make it scale, before you need it.** Verify
-   was still failing to run at the very end (ClickHouse parameter-length limits on inline DID
-   lists), and even when it runs, an O(1) `(count, XOR-digest)` receipt *cannot prove set-subset*
-   once a live firehose keeps growing the table. Decide what "verified" means on day one; write
-   the per-repo receipts at load time; build the convergence loop (re-fetch only the LOOSE tail)
-   and the *scaling* verify (a temp DID table joined per shard, never DID lists shipped as query
-   params) before the end-game, not during it.
-
-5. **Classify the spam / PLC-only tail early and delete that work.** A large share of the
-   "failed/unresolved" millions is not lost data — it's `listRepos` returning DIDs that PLC knows
-   about but the host doesn't actually serve, plus bulk spam DIDs. `listrepos-diff` classification
-   cleared *more* backlog in a night than crawling did. The tail is **politeness-bound, not
-   capacity-bound**, so the lever is deleting work, not adding boxes — measure `GROUP BY pds_host`
-   on the remaining pending before you provision anything.
-
-**Build-in-from-day-one checklist** (the cheap insurance):
-
-- progress-gated watchdog + per-shard freshness, not CPU/log-liveness
-- header-driven host pacing, with the claimable-vs-should-wait split
-- a dead-host registry **with its inverse** (`--revive-host`) shipped together — blacklisting
-  without an un-blacklist means "park" silently becomes "abandon"
-- generous, loud caps + a re-examination pass over anything rejected
-- write-time verify receipts + a verify that scales; and put `src`/source **in** the
-  `ReplacingMergeTree` sort key (or split backfill and live into separate tables) so
-  verification can actually isolate backfilled rows — the `(did, rkey)`-with-`src`-outside
-  sort key is precisely what made the digest unable to prove zero-loss
-- everything load-bearing in the nix flake / IaC; no ad-hoc host scripts or `/run`-only drop-ins
-  that the next rebuild silently erases
-- **scriptable fleet operations**: a `scripts/fleet-crawl.sh` (or equivalent) that takes
-  concurrency, shard index, run ID, and DID file as arguments, handles env file sourcing, shard
-  labels, process management (kill-without-self-match), and health verification. The agent (or
-  human) calls one command instead of composing 6-parameter SSH invocations from memory — the
-  same principle as write-time receipts: don't trust the operator to remember, make the system
-  enforce it. Every operational mistake in the late-night sessions (wrong env path, missing shard
-  index, pkill self-match) would have been prevented by a script that encodes the right parameters
-  once
-- the dashboard scoped to **project lifetime, not the latest `run_id`**, and its numbers
-  data-backed (aggregate tables), never hardcoded and never raw-`posts` scans at live cadence
-- quote an ETA only from **sustained measured throughput on healthy software**, and report
-  posts/min next to repos/min so "stopped wasting" and "got faster" stay distinguishable
-
-**Keep doing (these earned their place):**
-
-- the adversarial **second-agent review rounds** — they caught real pre-launch defects that would
-  have been 3am outages (the seq-reuse parquet overwrite, a dead ExecStart)
-- the core architecture — sharded crawlers → ClickHouse + per-repo SQLite ledger + zstd-parquet
-  archive — largely held under 2.6B posts; the changes above are refinements, not a redesign
-- naming bottlenecks out loud, the ETA honesty table, atomic commits, the runbook of
-  settings-not-to-repeat
-- the human's short skeptical questions as the highest-leverage tool in the kit — *"how were you
-  off by almost an order of magnitude?"*, *"are we not also missing posts?"*, *"they literally
-  give you headers"* each turned a stuck path
-
-**What would still be slow (the irreducible floor):** you cannot crawl faster than the hosts
-permit, dead hosts and PLC/host disagreement never become posts, and multi-GB repos take real
-time even with the caps raised. So the honest second-time estimate is that the *data* moves in
-roughly a day or two of wall-clock — the savings aren't in the crawl, they're in the days you'd
-no longer lose to instrumentation you built right the first time.
-
-## Open: to revisit when the crawl completes
-
-- Final wall-clock duration and total cost vs the original napkin (1–1.5 days;
-  fleet ~€13/day ≈ €0.54/h, rising to €0.57/h by Alice's evening figure) — close the
-  honesty table.
-- Final-sweep results: how many of the parked ~29M unreachable resolve with a real
-  DID document; whether the microcosm-style 6h/24h/24h-then-stop retry ladder gets
-  adopted.
-- Verify pass outcome at full scale (EXACT/LOOSE/FAILED distribution) — the number
-  that decides whether "correctness must be checkable per repo" was achieved.
-- Cutover: flip the public site to ClickHouse, decommission the old prod path,
-  re-seed semantics; analytics UI (the actual product of all this).
-- Teardown economics: auction boxes bill hourly — shut down promptly; the serve box's
-  one-way disk means downsizing is a migrate-to-new-box (~€15/mo target).
-- The pix2 audit's publication blockers before the blogpost: launch log leaks real
-  server IPs (scrub), `bun test` is broken at root, three READMEs are
-  boilerplate-false, backend package is the quality outlier.
-- Bake the runtime drop-ins that won (concurrency values, heap sizes) into the nix
-  modules everywhere; confirm nothing load-bearing still lives only in /run.
-- The CDP profiler script "deserves a home in the repo" (it has one now —
-  `scripts/cpu-profile.ts`); confirm the healthcheck/final-sweep operator loop is
-  documented in the runbook.
-- Jetstream watchdog (45s) soak: the half-open failure it guards against killed the
-  ingest twice on day 2, pre-watchdog; check whether it has fired after a quiet week.
-- Before teardown, put a number on the all-NVMe hindsight if cheap: compare
-  ledger-maintenance op timings (index builds, bulk parks, WAL checkpoints) between
-  the NVMe boxes (crawl0/1) and the SATA boxes (crawl2–5) from their journals.
-- Post-sweep restart: compute the first honest post-sweep ETA (the ~10–14h figure
-  was a projection), run the parked 6144 canary fairly, and report posts/min next to
-  repos/min so "stopped wasting" vs "got faster" is answerable.
-- The un-widened archive slice: repos loaded before `archive_extras_since` lack
-  facets/replies/embeds/labels — decide whether/when to re-fetch them (possibly as
-  part of the final sweep).
-- Once the listrepos sweep completes: decide whether adding boxes truly cuts time.
-  Decision rule: measure first — `GROUP BY pds_host` over remaining pending plus
-  per-shard slot utilization. Politeness-bound (boxes part-idle, hosts at their AIMD
-  ceilings) → more boxes add cost, not speed; the lever is deleting work
-  (listrepos-diff on the next hosts). Capacity-bound (slots pinned, many hosts
-  queuing deep) AND >~2 days of ETA at stake → reshard and scale out — remembering
-  the shard count lives in the ledgers' persisted bucket column, so this is a
-  migration against verified claim-path machinery, not a config flip.
-- The blogpost itself, drawn from this doc + the launch log.
 
 ## Provenance
 
