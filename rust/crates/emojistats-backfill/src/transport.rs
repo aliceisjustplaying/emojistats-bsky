@@ -1,6 +1,7 @@
 //! Stage B `getRepo` transport.
 
 use std::{
+    error::Error,
     fs, io,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -128,7 +129,7 @@ where
     .map_err(|_elapsed| FetchError::ResponseHeaderTimeout {
         timeout: config.response_header_timeout,
     })?
-    .map_err(|err| transport_error(err.to_string(), None))?;
+    .map_err(|err| transport_error(err, None))?;
     let status = response.status();
     let rate_limit = RateLimitSnapshot::from_headers(response.headers());
     observe_rate_limit(&rate_limit);
@@ -265,7 +266,7 @@ async fn stream_to_temp_file(
             limits.min_progress_interval,
             limits.min_progress_bytes,
         )?;
-        let chunk = next_chunk.map_err(|err| transport_error(err.to_string(), Some(bytes)))?;
+        let chunk = next_chunk.map_err(|err| transport_error(err, Some(bytes)))?;
         let chunk_len =
             u64::try_from(chunk.len()).map_err(|_err| FetchError::MaxBytesExceeded {
                 max_bytes: limits.max_bytes,
@@ -394,7 +395,7 @@ async fn collect_body_with_cap(
             limits.min_progress_interval,
             limits.min_progress_bytes,
         )?;
-        let chunk = next_chunk.map_err(|err| transport_error(err.to_string(), Some(observed)))?;
+        let chunk = next_chunk.map_err(|err| transport_error(err, Some(observed)))?;
         let chunk_len =
             u64::try_from(chunk.len()).map_err(|_err| FetchError::ErrorBodyTooLarge {
                 max_bytes: limits.max_bytes,
@@ -452,28 +453,58 @@ fn admission_body_bytes(
     Ok(bytes)
 }
 
-fn transport_error(message: String, observed_bytes: Option<u64>) -> FetchError {
-    if is_permanent_transport_message(&message) {
+fn transport_error<E>(error: E, observed_bytes: Option<u64>) -> FetchError
+where
+    E: Error + Send + Sync + 'static,
+{
+    let message = error_chain_message(&error);
+    if is_permanent_transport_error(&error) {
         FetchError::PermanentTransport {
             message,
             observed_bytes,
+            source: Box::new(error),
         }
     } else {
         FetchError::Transport {
             message,
             observed_bytes,
+            source: Box::new(error),
         }
     }
 }
 
-fn is_permanent_transport_message(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("dns error")
-        || lower.contains("failed to lookup address information")
-        || lower.contains("invalid peer certificate")
-        || lower.contains("certificate verify failed")
-        || lower.contains("self signed certificate")
-        || lower.contains("unknown issuer")
+fn is_permanent_transport_error(error: &(dyn Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(reqwest_error) = error.downcast_ref::<reqwest::Error>()
+            && reqwest_error.is_builder()
+        {
+            return true;
+        }
+        let text = error.to_string().to_ascii_lowercase();
+        if text.contains("dns error")
+            || text.contains("failed to lookup address information")
+            || text.contains("invalid peer certificate")
+            || text.contains("certificate verify failed")
+            || text.contains("self signed certificate")
+            || text.contains("unknown issuer")
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+fn error_chain_message(error: &(dyn Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut current = error.source();
+    while let Some(source) = current {
+        message.push_str(": ");
+        message.push_str(&source.to_string());
+        current = source.source();
+    }
+    message
 }
 
 #[cfg(test)]

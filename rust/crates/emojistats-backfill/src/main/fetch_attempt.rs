@@ -26,6 +26,8 @@ use super::{
     repo_fetch::{FetchStep, fetch_spooled_repo, repo_fetch_client},
 };
 
+const METHOD_WALL_FORCE_MODE_TTL: Duration = Duration::from_hours(24);
+
 pub(crate) async fn fetch_one_attempt(
     config: LocalFetchOneAttemptConfig<'_>,
 ) -> Result<(), FetchOneFailure> {
@@ -303,6 +305,11 @@ async fn persist_list_records_method_wall_override(
     let Some(ledger_path) = host_override_ledger_path else {
         return;
     };
+    let Some(force_mode_revive_after) = SystemTime::now().checked_add(METHOD_WALL_FORCE_MODE_TTL)
+    else {
+        eprintln!("failed to persist listRecords host override for {host}: expiry overflow");
+        return;
+    };
     let ledger_path = ledger_path.to_path_buf();
     let host_owned = host.to_owned();
     let result = tokio::task::spawn_blocking(move || {
@@ -311,6 +318,7 @@ async fn persist_list_records_method_wall_override(
                 &host_owned,
                 Some(ForcedFetchMode::ListRecords),
                 host_min_interval,
+                Some(force_mode_revive_after),
             )
         })
     })

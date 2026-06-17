@@ -257,56 +257,71 @@ pub(super) fn row_to_host_override(
     let min_interval_ms: Option<i64> = row.get(3)?;
     let revive_after_ms: Option<i64> = row.get(4)?;
     let force_mode: Option<String> = row.get(5)?;
-    let never_diff: i64 = row.get(6)?;
+    let force_mode_revive_after_ms: Option<i64> = row.get(6)?;
+    let never_diff: i64 = row.get(7)?;
 
-    Ok(build_host_override(
+    Ok(build_host_override(HostOverrideRow {
         host,
         disabled,
         concurrency_cap,
         min_interval_ms,
         revive_after_ms,
         force_mode,
+        force_mode_revive_after_ms,
         never_diff,
-    ))
+    }))
 }
 
-fn build_host_override(
+struct HostOverrideRow {
     host: String,
     disabled: i64,
     concurrency_cap: Option<i64>,
     min_interval_ms: Option<i64>,
     revive_after_ms: Option<i64>,
     force_mode: Option<String>,
+    force_mode_revive_after_ms: Option<i64>,
     never_diff: i64,
-) -> Result<HostOverride, LedgerStoreError> {
-    let disabled = match disabled {
+}
+
+fn build_host_override(row: HostOverrideRow) -> Result<HostOverride, LedgerStoreError> {
+    let disabled = match row.disabled {
         0 => false,
         1 => true,
         value => return Err(LedgerStoreError::InvalidHostOverrideDisabled { value }),
     };
-    let never_diff = match never_diff {
+    let never_diff = match row.never_diff {
         0 => false,
         1 => true,
         value => return Err(LedgerStoreError::InvalidHostOverrideDisabled { value }),
     };
-    let concurrency_cap = concurrency_cap
+    let concurrency_cap = row
+        .concurrency_cap
         .map(u32::try_from)
         .transpose()
         .map_err(|_err| LedgerStoreError::IntegerOverflow)?;
-    let min_interval = min_interval_ms
+    let min_interval = row
+        .min_interval_ms
         .map(u64::try_from)
         .transpose()
         .map_err(|_err| LedgerStoreError::IntegerOverflow)?
         .map(Duration::from_millis);
-    let revive_after = revive_after_ms.map(time_from_millis).transpose()?;
-    let force_mode = force_mode.map(|mode| parse_force_mode(&mode)).transpose()?;
+    let revive_after = row.revive_after_ms.map(time_from_millis).transpose()?;
+    let force_mode = row
+        .force_mode
+        .map(|mode| parse_force_mode(&mode))
+        .transpose()?;
+    let force_mode_revive_after = row
+        .force_mode_revive_after_ms
+        .map(time_from_millis)
+        .transpose()?;
     let record = HostOverride {
-        host,
+        host: row.host,
         disabled,
         concurrency_cap,
         min_interval,
         revive_after,
         force_mode,
+        force_mode_revive_after,
         never_diff,
     };
     validate_host_override(&record)?;
@@ -436,6 +451,11 @@ pub(super) fn validate_host_override(record: &HostOverride) -> Result<(), Ledger
     if record.min_interval == Some(Duration::ZERO) {
         return Err(LedgerStoreError::InvalidHostOverride {
             message: "min interval must be greater than zero".to_owned(),
+        });
+    }
+    if record.force_mode.is_none() && record.force_mode_revive_after.is_some() {
+        return Err(LedgerStoreError::InvalidHostOverride {
+            message: "force mode expiry requires a force mode".to_owned(),
         });
     }
     Ok(())

@@ -504,6 +504,7 @@ fn persisted_host_override_loads_by_resolved_pds_host() {
         min_interval: None,
         revive_after: None,
         force_mode: Some(ForcedFetchMode::ListRecords),
+        force_mode_revive_after: None,
         never_diff: false,
     };
     store.upsert_host_override(&override_record).unwrap();
@@ -530,6 +531,7 @@ fn host_override_cache_reuses_loaded_rows_and_clears_expired_disable() {
             min_interval: None,
             revive_after: Some(now - Duration::from_secs(1)),
             force_mode: Some(ForcedFetchMode::ListRecords),
+            force_mode_revive_after: None,
             never_diff: false,
         })
         .unwrap();
@@ -551,6 +553,7 @@ fn host_override_cache_reuses_loaded_rows_and_clears_expired_disable() {
             min_interval: None,
             revive_after: None,
             force_mode: Some(ForcedFetchMode::GetRepo),
+            force_mode_revive_after: None,
             never_diff: false,
         })
         .unwrap();
@@ -561,6 +564,37 @@ fn host_override_cache_reuses_loaded_rows_and_clears_expired_disable() {
         .unwrap();
     assert_eq!(cached.concurrency_cap, Some(1));
     assert_eq!(cached.force_mode, Some(ForcedFetchMode::ListRecords));
+    fs::remove_file(db_path).unwrap();
+}
+
+#[test]
+fn host_override_cache_clears_expired_force_mode() {
+    let db_path = temp_file_path("host-overrides-force-mode-expiry").with_extension("sqlite");
+    let store = SqliteLedger::open(&db_path).unwrap();
+    let now = UNIX_EPOCH + Duration::from_secs(1_000);
+    store
+        .upsert_host_override(&HostOverride {
+            host: "pds.example.com".to_owned(),
+            disabled: false,
+            concurrency_cap: Some(4),
+            min_interval: Some(Duration::from_millis(500)),
+            revive_after: None,
+            force_mode: Some(ForcedFetchMode::ListRecords),
+            force_mode_revive_after: Some(now - Duration::from_secs(1)),
+            never_diff: true,
+        })
+        .unwrap();
+    drop(store);
+
+    let loaded = load_host_override(Some(&db_path), None, "pds.example.com", now)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(loaded.force_mode, None);
+    assert_eq!(loaded.force_mode_revive_after, None);
+    assert_eq!(loaded.concurrency_cap, Some(4));
+    assert_eq!(loaded.min_interval, Some(Duration::from_millis(500)));
+    assert!(loaded.never_diff);
     fs::remove_file(db_path).unwrap();
 }
 
@@ -576,6 +610,7 @@ async fn forced_list_records_host_preparation_is_allowed() {
             min_interval: None,
             revive_after: None,
             force_mode: Some(ForcedFetchMode::ListRecords),
+            force_mode_revive_after: None,
             never_diff: false,
         })
         .unwrap();
@@ -606,6 +641,7 @@ fn host_override_force_mode_and_disable_are_applied() {
         min_interval: None,
         revive_after: None,
         force_mode: Some(ForcedFetchMode::ListRecords),
+        force_mode_revive_after: None,
         never_diff: false,
     };
     let disabled = HostOverride {
@@ -615,6 +651,7 @@ fn host_override_force_mode_and_disable_are_applied() {
         min_interval: None,
         revive_after: Some(now + Duration::from_secs(30)),
         force_mode: Some(ForcedFetchMode::GetRepo),
+        force_mode_revive_after: None,
         never_diff: false,
     };
 
@@ -641,6 +678,7 @@ fn host_override_force_mode_and_disable_are_applied() {
         min_interval: None,
         revive_after: None,
         force_mode: Some(ForcedFetchMode::GetRepo),
+        force_mode_revive_after: None,
         never_diff: false,
     };
     let failure = fetch_mode_for_host("pds.example.com", Some(&parked), now).unwrap_err();

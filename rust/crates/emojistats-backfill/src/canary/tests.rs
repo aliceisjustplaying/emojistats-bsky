@@ -224,6 +224,31 @@ fn numeric_gate_measurement_nan_fails() {
     );
 }
 
+#[test]
+fn failure_injection_wire_names_match_report_names() {
+    for injection in required_failure_injections() {
+        let serialized = serde_json::to_value(injection).expect("serialize injection");
+        assert_eq!(
+            serialized.as_str(),
+            Some(injection.as_str()),
+            "{injection:?}"
+        );
+        let decoded: CanaryFailureInjection =
+            serde_json::from_value(serialized).expect("deserialize injection");
+        assert_eq!(decoded, injection);
+    }
+}
+
+#[test]
+fn hard_gate_wire_names_match_report_names() {
+    for gate in required_hard_gates() {
+        let serialized = serde_json::to_value(gate).expect("serialize gate");
+        assert_eq!(serialized.as_str(), Some(gate.as_str()), "{gate:?}");
+        let decoded: CanaryHardGate = serde_json::from_value(serialized).expect("deserialize gate");
+        assert_eq!(decoded, gate);
+    }
+}
+
 fn assert_gate(observation: &CanaryGateObservation, gate: CanaryHardGate, status: CanaryStatus) {
     assert_eq!(observation.gate, gate);
     assert_eq!(observation.status, status);

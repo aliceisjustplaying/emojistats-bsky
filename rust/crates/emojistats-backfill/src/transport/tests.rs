@@ -1,6 +1,8 @@
 #![allow(clippy::indexing_slicing)]
 
 use std::{
+    error::Error,
+    fmt,
     path::PathBuf,
     time::{Duration, UNIX_EPOCH},
 };
@@ -99,17 +101,47 @@ fn classifies_repo_account_states() {
 fn transport_error_splits_permanent_dns_and_tls_failures() {
     assert!(matches!(
         transport_error(
-            "error sending request: dns error: failed to lookup address information".to_owned(),
+            std::io::Error::other(
+                "error sending request: dns error: failed to lookup address information",
+            ),
             None,
         ),
         FetchError::PermanentTransport { .. }
     ));
     assert!(matches!(
-        transport_error("connection reset by peer".to_owned(), Some(12)),
+        transport_error(std::io::Error::other("connection reset by peer"), Some(12)),
         FetchError::Transport {
             observed_bytes: Some(12),
             ..
         }
+    ));
+}
+
+#[derive(Debug)]
+struct WrappedTransportError(std::io::Error);
+
+impl fmt::Display for WrappedTransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("request failed")
+    }
+}
+
+impl Error for WrappedTransportError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+#[test]
+fn transport_error_classification_walks_source_chain() {
+    assert!(matches!(
+        transport_error(
+            WrappedTransportError(std::io::Error::other(
+                "dns error: failed to lookup address information",
+            )),
+            None,
+        ),
+        FetchError::PermanentTransport { .. }
     ));
 }
 

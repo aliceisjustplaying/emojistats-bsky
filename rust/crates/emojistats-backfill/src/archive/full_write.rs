@@ -12,13 +12,13 @@ use super::{
     write_temp_idempotent,
 };
 
-/// Write local archive artifacts for one parsed repo.
+/// Write local fixture archive artifacts for one parsed repo.
 ///
 /// # Errors
 ///
 /// Returns [`ArchiveError`] if local filesystem, `Parquet`, `Arrow`, serialization, or
 /// resource-count work fails.
-pub fn write_archive_artifacts(
+pub fn write_local_archive_artifacts(
     output_dir: &Path,
     did: &str,
     commit_context: &ArchiveCommitContext,

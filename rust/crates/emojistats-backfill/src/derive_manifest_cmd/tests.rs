@@ -11,7 +11,7 @@ use emojistats_backfill::{
     archive::{
         ArchiveCommitContext, ArchivePostRow, CompletenessClass, CreatedAtParseStatus, FetchMethod,
         LocalManifestEntry, NormalizerVersion, RepoReceipt, RepoReceiptInput, build_repo_receipt,
-        current_normalizer, write_archive_artifacts,
+        current_normalizer, write_local_archive_artifacts,
     },
     clickhouse::{ClickHouseInsertPayload, ClickHouseTable, JSON_EACH_ROW_FORMAT},
     derive::{BACKFILL_DERIVE_SOURCE, DeriveCheckpointKey},
@@ -45,7 +45,7 @@ fn identity() -> DeriveManifestIdentity {
         content_hash: "content-hash".to_owned(),
         receipt_hash: "receipt-hash".to_owned(),
         observed_at: "2026-06-15T00:00:00Z".to_owned(),
-        schema_version: 2,
+        schema_version: 3,
         normalizer: test_normalizer(),
     }
 }
@@ -251,6 +251,7 @@ fn verified_input() -> VerifiedLoaderInput {
     let identity = identity();
     VerifiedLoaderInput {
         manifest: LocalManifestEntry {
+            manifest_format_version: 1,
             run_id: identity.run_id.clone(),
             shard: identity.shard.clone(),
             file_sequence: identity.file_sequence,
@@ -279,7 +280,7 @@ fn canonical_streaming_post_dedupe_token_is_stable_and_framed() {
 
     assert_eq!(
         token,
-        "derive:post:ff84475ac048b15d8703b8daab1ba57cc404c9a7037b89de1a7477a824cc0906"
+        "derive:post:e654ed062a13b9fe3d0657068cda0317190b5f0bb4e09bbb573598dfc5cbf824"
     );
 }
 
@@ -289,7 +290,7 @@ fn canonical_streaming_counter_dedupe_token_is_stable_and_framed() {
 
     assert_eq!(
         token,
-        "derive:counter:7c858ca5d61a5d2d0732c9c04d79f1497f636ca9420e2b32d7f1ccd044d2a274"
+        "derive:counter:bc1257aa7446bb23c64f383dcb0898740bfebebc06aabb49186d401bd787ac14"
     );
 }
 
@@ -306,7 +307,7 @@ fn canonical_streaming_dedupe_tokens_include_lane_and_chunk() {
 }
 
 #[test]
-fn canonical_streaming_dedupe_tokens_are_stable_across_replay_manifest_sequence() {
+fn canonical_streaming_dedupe_tokens_change_across_manifest_identity() {
     let mut replay_identity = identity();
     replay_identity.run_id = "run-2".to_owned();
     replay_identity.shard = "shard9".to_owned();
@@ -316,11 +317,11 @@ fn canonical_streaming_dedupe_tokens_are_stable_across_replay_manifest_sequence(
     replay_counter.shard = "shard9".to_owned();
     replay_counter.file_sequence = 99;
 
-    assert_eq!(
+    assert_ne!(
         canonical_streaming_post_dedupe_token(&identity(), 0, &post_rows()).unwrap(),
         canonical_streaming_post_dedupe_token(&replay_identity, 0, &post_rows()).unwrap()
     );
-    assert_eq!(
+    assert_ne!(
         canonical_streaming_counter_dedupe_token(&identity(), &counter()).unwrap(),
         canonical_streaming_counter_dedupe_token(&replay_identity, &replay_counter).unwrap()
     );
@@ -349,7 +350,7 @@ async fn dry_run_missing_repo_receipt_attempts_zero_payloads() {
     let output_dir = temp.path.join("archive");
     let rows = vec![archive_row("a", "hello ✅", &["✅"])];
     let receipt = repo_receipt(&rows);
-    let artifacts = write_archive_artifacts(
+    let artifacts = write_local_archive_artifacts(
         &output_dir,
         "did:plc:fixture123",
         &ArchiveCommitContext::fetch_one_local(),
@@ -392,7 +393,7 @@ async fn dry_run_corrupt_repo_receipt_attempts_zero_payloads() {
     let output_dir = temp.path.join("archive");
     let rows = vec![archive_row("a", "hello ✅", &["✅"])];
     let receipt = repo_receipt(&rows);
-    let artifacts = write_archive_artifacts(
+    let artifacts = write_local_archive_artifacts(
         &output_dir,
         "did:plc:fixture123",
         &ArchiveCommitContext::fetch_one_local(),

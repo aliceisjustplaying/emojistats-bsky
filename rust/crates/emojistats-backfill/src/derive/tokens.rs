@@ -92,6 +92,9 @@ fn hash_identity_frames(
     hasher: &mut Sha256,
     identity: &DeriveManifestIdentity,
 ) -> anyhow::Result<()> {
+    hash_str_frame(hasher, "identity.run_id", &identity.run_id)?;
+    hash_str_frame(hasher, "identity.shard", &identity.shard)?;
+    hash_u64_frame(hasher, "identity.file_sequence", identity.file_sequence)?;
     hash_str_frame(hasher, "identity.dataset", &identity.dataset)?;
     hash_str_frame(hasher, "identity.did", &identity.did)?;
     hash_str_frame(hasher, "identity.fetch_method", &identity.fetch_method)?;
@@ -151,6 +154,9 @@ fn hash_post_row_frames(hasher: &mut Sha256, row: &PostServingRow) -> anyhow::Re
 
 fn hash_counter_frames(hasher: &mut Sha256, counter: &TotalPostCounterInput) -> anyhow::Result<()> {
     hash_str_frame(hasher, "counter.source", &counter.source)?;
+    hash_str_frame(hasher, "counter.run_id", &counter.run_id)?;
+    hash_str_frame(hasher, "counter.shard", &counter.shard)?;
+    hash_u64_frame(hasher, "counter.file_sequence", counter.file_sequence)?;
     hash_str_frame(hasher, "counter.did", &counter.did)?;
     hash_str_frame(hasher, "counter.dataset", &counter.dataset)?;
     hash_str_frame(hasher, "counter.fetch_method", &counter.fetch_method)?;

@@ -33,7 +33,7 @@ fn metadata(file_sequence: u64) -> Metadata {
         receipt_hash: "repo-receipt-hash".to_owned(),
         repo_receipt_path: None,
         normalizer: normalizer(),
-        schema_version: 2,
+        schema_version: 3,
     }
 }
 
@@ -274,6 +274,53 @@ fn retry_with_existing_jsonl_manifest_does_not_duplicate_entry() {
     let manifest =
         fs::read_to_string(&artifact.manifest_path).expect("manifest should be readable");
     assert_eq!(manifest.lines().count(), 1);
+
+    fs::remove_dir_all(root).expect("test temp dir should be removed");
+}
+
+#[test]
+fn retry_repairs_truncated_jsonl_manifest_tail() {
+    let root = temp_dir("repair-truncated-manifest-tail");
+    let store = LocalStore::new(&root);
+    let request = request(8, ManifestMode::AppendJsonl);
+    let artifact = store
+        .commit(&request, |file| {
+            file.write_all(b"retryable").map_err(|source| Error::Io {
+                operation: "test write",
+                path: PathBuf::from("test"),
+                source,
+            })
+        })
+        .expect("initial commit should succeed");
+    {
+        let mut manifest = fs::OpenOptions::new()
+            .append(true)
+            .open(&artifact.manifest_path)
+            .expect("manifest should open");
+        manifest
+            .write_all(b"{\"truncated\"")
+            .expect("truncated tail should write");
+    }
+
+    let repaired = store
+        .commit(&request, |file| {
+            file.write_all(b"retryable").map_err(|source| Error::Io {
+                operation: "test write",
+                path: PathBuf::from("test"),
+                source,
+            })
+        })
+        .expect("retry should repair truncated manifest tail");
+
+    assert_eq!(repaired.entry, artifact.entry);
+    let manifest =
+        fs::read_to_string(&artifact.manifest_path).expect("manifest should be readable");
+    let entries = manifest.lines().collect::<Vec<_>>();
+    assert_eq!(entries.len(), 1);
+    let manifest_entry: ManifestEntry =
+        serde_json::from_str(entries.first().expect("manifest should contain entry"))
+            .expect("manifest entry should decode");
+    assert_eq!(manifest_entry, artifact.entry);
 
     fs::remove_dir_all(root).expect("test temp dir should be removed");
 }

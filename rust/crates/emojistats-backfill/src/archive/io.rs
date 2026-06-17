@@ -189,6 +189,7 @@ pub(super) fn local_manifest_from_committed(
     receipt: &RepoReceipt,
 ) -> LocalManifestEntry {
     LocalManifestEntry {
+        manifest_format_version: committed.entry.manifest_format_version,
         run_id: committed.entry.run_id.clone(),
         shard: committed.entry.shard.clone(),
         file_sequence: committed.entry.file_sequence,
@@ -275,7 +276,7 @@ fn count_emoji_occurrences(rows: &[ArchivePostRow]) -> Result<u64, ArchiveError>
 }
 
 pub(super) fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, ArchiveError> {
-    Ok(serde_json::to_vec(value)?)
+    super::json::json_bytes(value)
 }
 
 pub(super) fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<(), ArchiveError> {

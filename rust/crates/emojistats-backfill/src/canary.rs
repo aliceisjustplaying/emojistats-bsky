@@ -32,6 +32,7 @@ pub enum CanaryFailureInjection {
     SinglePostDrop,
     PartialRemoteUpload,
     ManifestCorruption,
+    #[serde(rename = "clickhouse_duplicate_insert")]
     ClickHouseDuplicateInsert,
 }
 
@@ -40,6 +41,7 @@ pub enum CanaryFailureInjection {
 #[serde(rename_all = "snake_case")]
 pub enum CanaryHardGate {
     ArchiveFitsStorageBox,
+    #[serde(rename = "clickhouse_fits_serving_box")]
     ClickHouseFitsServingBox,
     DeriveKeepsPaceWithCrawl,
     ReceiptRecomputationDetectsCorruption,

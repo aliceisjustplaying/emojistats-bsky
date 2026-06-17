@@ -2,8 +2,7 @@
 
 use std::{
     borrow::Cow,
-    error::Error,
-    fmt, fs,
+    fs,
     fs::File,
     io::{self as std_io, Write},
     path::{Path, PathBuf},
@@ -16,7 +15,7 @@ use ::parquet::{
     basic::{Compression, ZstdLevel},
     file::properties::WriterProperties,
 };
-use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, builder::StringBuilder};
+use arrow_array::{Array, ArrayRef, LargeStringArray, RecordBatch, builder::LargeStringBuilder};
 use arrow_schema::{DataType, Field, Schema};
 use chrono::{DateTime, SecondsFormat, Utc};
 pub use emoji_normalizer::NormalizerVersion;
@@ -34,7 +33,7 @@ const PARTIAL_RECORD_STATUS: &str = "typed_decode_failed";
 pub const RAW_ARCHIVE_POSTS_DATASET: &str = "raw_archive_posts";
 pub const COLLECTION_PAGINATED_POSTS_DATASET: &str = "collection_paginated_posts";
 pub const NONCANONICAL_POSTS_DATASET: &str = "noncanonical_posts";
-pub const ARCHIVE_SCHEMA_VERSION: u16 = 2;
+pub const ARCHIVE_SCHEMA_VERSION: u16 = 3;
 const PARQUET_BATCH_ROWS: usize = 65_536;
 
 /// Data-model-lossless post row before `Parquet` encoding.
@@ -187,6 +186,7 @@ impl PostDataset {
 /// Manifest entry projected into local paths for smoke/derive compatibility.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalManifestEntry {
+    pub manifest_format_version: u16,
     pub run_id: String,
     pub shard: String,
     pub file_sequence: u64,
@@ -287,35 +287,37 @@ pub struct ArchiveArtifacts {
 }
 
 /// Stage D archive/derive failures.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ArchiveError {
-    Io(std_io::Error),
-    Parquet(::parquet::errors::ParquetError),
-    Arrow(arrow_schema::ArrowError),
-    Json(serde_json::Error),
-    Commit(crate::commit::Error),
-    StorageBox(crate::storage_box::Error),
-    CountOverflow {
-        field: &'static str,
-    },
+    #[error("I/O error: {0}")]
+    Io(#[from] std_io::Error),
+    #[error("Parquet error: {0}")]
+    Parquet(#[from] ::parquet::errors::ParquetError),
+    #[error("Arrow error: {0}")]
+    Arrow(#[from] arrow_schema::ArrowError),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("commit protocol error: {0}")]
+    Commit(#[from] crate::commit::Error),
+    #[error("Storage Box commit error: {0}")]
+    StorageBox(#[from] crate::storage_box::Error),
+    #[error("count overflow for {field}")]
+    CountOverflow { field: &'static str },
+    #[error("invalid compression level: {0}")]
     InvalidCompression(String),
-    InvalidPath {
-        path: PathBuf,
-    },
+    #[error("invalid archive path: {}", path.display())]
+    InvalidPath { path: PathBuf },
+    #[error("post record serialized to non-object JSON")]
     InvalidRecordJson,
-    InvalidParquetColumn {
-        column: &'static str,
-    },
-    InvalidParquetValue {
-        column: &'static str,
-        value: String,
-    },
-    UnexpectedParquetNull {
-        column: &'static str,
-    },
-    FinalPathExists {
-        path: PathBuf,
-    },
+    #[error("invalid archive Parquet column: {column}")]
+    InvalidParquetColumn { column: &'static str },
+    #[error("invalid archive Parquet value for {column}: {value}")]
+    InvalidParquetValue { column: &'static str, value: String },
+    #[error("unexpected null in archive Parquet column: {column}")]
+    UnexpectedParquetNull { column: &'static str },
+    #[error("archive final path already exists: {}", path.display())]
+    FinalPathExists { path: PathBuf },
+    #[error("archive final hash mismatch for {}: expected {expected}, observed {observed}", path.display())]
     FinalHashMismatch {
         path: PathBuf,
         expected: String,
@@ -331,6 +333,8 @@ mod commit_backend;
 mod full_write;
 #[path = "archive/hash.rs"]
 mod hash;
+#[path = "archive/json.rs"]
+mod json;
 #[path = "archive/naming.rs"]
 mod naming;
 #[path = "archive/parquet.rs"]
@@ -344,7 +348,7 @@ mod row;
 mod write;
 
 pub use archive_io::{build_repo_receipt, hash_profile_record};
-pub use full_write::write_archive_artifacts;
+pub use full_write::write_local_archive_artifacts;
 pub use hash::{ArchivePostRowsHasher, hash_post_rows};
 pub use parquet::{archive_post_rows_from_record_batch, read_all_archive_post_rows};
 pub use projection::{
@@ -505,102 +509,6 @@ impl CreatedAtParseStatus {
             Self::Invalid => "invalid",
             Self::Future => "future",
         }
-    }
-}
-
-impl fmt::Display for ArchiveError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(error) => write!(f, "I/O error: {error}"),
-            Self::Parquet(error) => write!(f, "Parquet error: {error}"),
-            Self::Arrow(error) => write!(f, "Arrow error: {error}"),
-            Self::Json(error) => write!(f, "JSON error: {error}"),
-            Self::Commit(error) => write!(f, "commit protocol error: {error}"),
-            Self::StorageBox(error) => write!(f, "Storage Box commit error: {error}"),
-            Self::CountOverflow { field } => write!(f, "count overflow for {field}"),
-            Self::InvalidCompression(error) => write!(f, "invalid compression level: {error}"),
-            Self::InvalidPath { path } => write!(f, "invalid archive path: {}", path.display()),
-            Self::InvalidRecordJson => f.write_str("post record serialized to non-object JSON"),
-            Self::InvalidParquetColumn { column } => {
-                write!(f, "invalid archive Parquet column: {column}")
-            }
-            Self::InvalidParquetValue { column, value } => {
-                write!(f, "invalid archive Parquet value for {column}: {value}")
-            }
-            Self::UnexpectedParquetNull { column } => {
-                write!(f, "unexpected null in archive Parquet column: {column}")
-            }
-            Self::FinalPathExists { path } => {
-                write!(f, "archive final path already exists: {}", path.display())
-            }
-            Self::FinalHashMismatch {
-                path,
-                expected,
-                observed,
-            } => write!(
-                f,
-                "archive final hash mismatch for {}: expected {expected}, observed {observed}",
-                path.display()
-            ),
-        }
-    }
-}
-
-impl Error for ArchiveError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            Self::Parquet(error) => Some(error),
-            Self::Arrow(error) => Some(error),
-            Self::Json(error) => Some(error),
-            Self::Commit(error) => Some(error),
-            Self::StorageBox(error) => Some(error),
-            Self::CountOverflow { .. }
-            | Self::InvalidCompression(_)
-            | Self::InvalidPath { .. }
-            | Self::InvalidRecordJson
-            | Self::InvalidParquetColumn { .. }
-            | Self::InvalidParquetValue { .. }
-            | Self::UnexpectedParquetNull { .. }
-            | Self::FinalPathExists { .. }
-            | Self::FinalHashMismatch { .. } => None,
-        }
-    }
-}
-
-impl From<std_io::Error> for ArchiveError {
-    fn from(error: std_io::Error) -> Self {
-        Self::Io(error)
-    }
-}
-
-impl From<::parquet::errors::ParquetError> for ArchiveError {
-    fn from(error: ::parquet::errors::ParquetError) -> Self {
-        Self::Parquet(error)
-    }
-}
-
-impl From<arrow_schema::ArrowError> for ArchiveError {
-    fn from(error: arrow_schema::ArrowError) -> Self {
-        Self::Arrow(error)
-    }
-}
-
-impl From<serde_json::Error> for ArchiveError {
-    fn from(error: serde_json::Error) -> Self {
-        Self::Json(error)
-    }
-}
-
-impl From<crate::commit::Error> for ArchiveError {
-    fn from(error: crate::commit::Error) -> Self {
-        Self::Commit(error)
-    }
-}
-
-impl From<crate::storage_box::Error> for ArchiveError {
-    fn from(error: crate::storage_box::Error) -> Self {
-        Self::StorageBox(error)
     }
 }
 

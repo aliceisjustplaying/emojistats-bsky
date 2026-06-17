@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, io, time::Duration};
+use std::{error::Error, io, time::Duration};
 
 use http::StatusCode;
 use jacquard_api::com_atproto::sync::get_repo::GetRepoError;
@@ -6,9 +6,10 @@ use jacquard_api::com_atproto::sync::get_repo::GetRepoError;
 use super::{AccountState, RateLimitSnapshot};
 
 /// Stage B fetch failures, split into account-state, HTTP, timeout, cap, stream, and I/O buckets.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum FetchError {
     /// The PDS returned a terminal account-state error.
+    #[error("account state {state} ({status}){message}", message = display_optional_message(message.as_deref()))]
     AccountState {
         /// Account-state code from the XRPC body.
         state: AccountState,
@@ -20,6 +21,7 @@ pub enum FetchError {
         rate_limit: Box<RateLimitSnapshot>,
     },
     /// The PDS returned a non-success HTTP status that was not a terminal account state.
+    #[error("HTTP status {status}{error_code}{message}", error_code = display_optional_error_code(error_code.as_deref()), message = display_optional_message(message.as_deref()))]
     HttpStatus {
         /// HTTP status returned by the PDS.
         status: u16,
@@ -31,11 +33,13 @@ pub enum FetchError {
         rate_limit: Box<RateLimitSnapshot>,
     },
     /// No body chunk arrived inside the configured idle timeout.
+    #[error("no body chunk within {timeout:?}")]
     InactivityTimeout {
         /// Timeout used for each chunk read.
         timeout: Duration,
     },
     /// The body download exceeded the configured wall-clock timeout.
+    #[error("body download exceeded {timeout:?} after {observed_bytes} bytes")]
     DownloadTimeout {
         /// Timeout used for the whole body download.
         timeout: Duration,
@@ -43,11 +47,15 @@ pub enum FetchError {
         observed_bytes: u64,
     },
     /// The PDS did not return response headers inside the configured timeout.
+    #[error("response headers did not arrive within {timeout:?}")]
     ResponseHeaderTimeout {
         /// Timeout used while waiting for response headers.
         timeout: Duration,
     },
     /// The body trickled below the configured progress floor.
+    #[error(
+        "body download made {observed_bytes} bytes progress in {interval:?}, below minimum {min_bytes}"
+    )]
     ProgressTimeout {
         /// Progress window.
         interval: Duration,
@@ -57,6 +65,7 @@ pub enum FetchError {
         observed_bytes: u64,
     },
     /// The streamed body exceeded the configured single-repo byte cap.
+    #[error("spooled CAR exceeded max bytes: observed {observed_bytes}, max {max_bytes}")]
     MaxBytesExceeded {
         /// Configured cap.
         max_bytes: u64,
@@ -64,6 +73,7 @@ pub enum FetchError {
         observed_bytes: u64,
     },
     /// The PDS response body used for error classification exceeded its safety cap.
+    #[error("error response body exceeded max bytes: observed {observed_bytes}, max {max_bytes}")]
     ErrorBodyTooLarge {
         /// Configured cap.
         max_bytes: u64,
@@ -71,6 +81,9 @@ pub enum FetchError {
         observed_bytes: u64,
     },
     /// The fleet-wide in-flight spool byte budget was exceeded.
+    #[error(
+        "in-flight spooled CAR bytes exceeded max bytes: observed {observed_bytes}, max {max_bytes}"
+    )]
     InFlightBytesExceeded {
         /// Configured cap.
         max_bytes: u64,
@@ -78,6 +91,9 @@ pub enum FetchError {
         observed_bytes: u64,
     },
     /// The fleet-wide in-flight spool byte budget is temporarily occupied by other downloads.
+    #[error(
+        "in-flight spooled CAR byte budget unavailable: requested {requested_bytes}, max {max_bytes}"
+    )]
     InFlightBytesUnavailable {
         /// Configured cap.
         max_bytes: u64,
@@ -85,135 +101,36 @@ pub enum FetchError {
         requested_bytes: u64,
     },
     /// The in-flight byte budget lock was poisoned.
+    #[error("in-flight spool byte budget lock poisoned")]
     ByteBudgetPoisoned,
     /// A streaming transport error occurred before or during body download.
+    #[error("transport error{observed}: {message}", observed = display_observed_bytes(*observed_bytes))]
     Transport {
         /// Transport error message.
         message: String,
         /// Bytes already written before the transport failed, when the body stream had started.
         observed_bytes: Option<u64>,
+        /// Original transport error.
+        #[source]
+        source: Box<dyn Error + Send + Sync>,
     },
     /// A transport error that is unlikely to succeed on retry for the same host.
+    #[error("permanent transport error{observed}: {message}", observed = display_observed_bytes(*observed_bytes))]
     PermanentTransport {
         /// Transport error message.
         message: String,
         /// Bytes already written before the transport failed, when the body stream had started.
         observed_bytes: Option<u64>,
+        /// Original transport error.
+        #[source]
+        source: Box<dyn Error + Send + Sync>,
     },
     /// Local filesystem I/O failed.
+    #[error("I/O error: {source}")]
     Io {
         /// Underlying I/O error.
         source: io::Error,
     },
-}
-
-impl fmt::Display for FetchError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::AccountState {
-                state,
-                status,
-                message,
-                rate_limit: _,
-            } => write_fetch_message(
-                f,
-                &format_args!("account state {state}"),
-                *status,
-                message.as_deref(),
-            ),
-            Self::HttpStatus {
-                status,
-                error_code,
-                message,
-                rate_limit: _,
-            } => match error_code {
-                Some(code) => write_fetch_message(
-                    f,
-                    &format_args!("HTTP status {status} with XRPC error {code}"),
-                    *status,
-                    message.as_deref(),
-                ),
-                None => write!(f, "HTTP status {status}"),
-            },
-            Self::InactivityTimeout { timeout } => {
-                write!(f, "no body chunk within {}", timeout.as_secs())
-            }
-            Self::DownloadTimeout {
-                timeout,
-                observed_bytes,
-            } => write!(
-                f,
-                "body download exceeded {} seconds after {observed_bytes} bytes",
-                timeout.as_secs()
-            ),
-            Self::ResponseHeaderTimeout { timeout } => {
-                write!(
-                    f,
-                    "response headers did not arrive within {} seconds",
-                    timeout.as_secs()
-                )
-            }
-            Self::ProgressTimeout {
-                interval,
-                min_bytes,
-                observed_bytes,
-            } => write!(
-                f,
-                "body download made {observed_bytes} bytes progress in {} seconds, below minimum {min_bytes}",
-                interval.as_secs()
-            ),
-            Self::MaxBytesExceeded {
-                max_bytes,
-                observed_bytes,
-            } => write!(
-                f,
-                "spooled CAR exceeded max bytes: observed {observed_bytes}, max {max_bytes}"
-            ),
-            Self::ErrorBodyTooLarge {
-                max_bytes,
-                observed_bytes,
-            } => write!(
-                f,
-                "error response body exceeded max bytes: observed {observed_bytes}, max {max_bytes}"
-            ),
-            Self::InFlightBytesExceeded {
-                max_bytes,
-                observed_bytes,
-            } => write!(
-                f,
-                "in-flight spooled CAR bytes exceeded max bytes: observed {observed_bytes}, max {max_bytes}"
-            ),
-            Self::InFlightBytesUnavailable {
-                max_bytes,
-                requested_bytes,
-            } => write!(
-                f,
-                "in-flight spooled CAR byte budget unavailable: requested {requested_bytes}, max {max_bytes}"
-            ),
-            Self::ByteBudgetPoisoned => f.write_str("in-flight spool byte budget lock poisoned"),
-            Self::Transport {
-                message,
-                observed_bytes,
-            } => write_transport_error(f, "transport error", message, *observed_bytes),
-            Self::PermanentTransport {
-                message,
-                observed_bytes,
-            } => write_transport_error(f, "permanent transport error", message, *observed_bytes),
-            Self::Io { source } => write!(f, "I/O error: {source}"),
-        }
-    }
-}
-
-fn write_transport_error(
-    f: &mut fmt::Formatter<'_>,
-    label: &str,
-    message: &str,
-    observed_bytes: Option<u64>,
-) -> fmt::Result {
-    match observed_bytes {
-        Some(bytes) => write!(f, "{label} after {bytes} bytes: {message}"),
-        None => write!(f, "{label}: {message}"),
-    }
 }
 
 impl FetchError {
@@ -235,27 +152,6 @@ impl FetchError {
             | Self::Transport { .. }
             | Self::PermanentTransport { .. }
             | Self::Io { .. } => None,
-        }
-    }
-}
-
-impl Error for FetchError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Io { source } => Some(source),
-            Self::AccountState { .. }
-            | Self::HttpStatus { .. }
-            | Self::InactivityTimeout { .. }
-            | Self::DownloadTimeout { .. }
-            | Self::ResponseHeaderTimeout { .. }
-            | Self::ProgressTimeout { .. }
-            | Self::MaxBytesExceeded { .. }
-            | Self::ErrorBodyTooLarge { .. }
-            | Self::InFlightBytesExceeded { .. }
-            | Self::InFlightBytesUnavailable { .. }
-            | Self::ByteBudgetPoisoned
-            | Self::Transport { .. }
-            | Self::PermanentTransport { .. } => None,
         }
     }
 }
@@ -313,14 +209,16 @@ pub(super) fn classify_http_error(
     }
 }
 
-fn write_fetch_message(
-    f: &mut fmt::Formatter<'_>,
-    prefix: &fmt::Arguments<'_>,
-    status: u16,
-    message: Option<&str>,
-) -> fmt::Result {
-    match message {
-        Some(message) => write!(f, "{prefix} ({status}): {message}"),
-        None => write!(f, "{prefix} ({status})"),
-    }
+fn display_optional_message(message: Option<&str>) -> String {
+    message.map_or_else(String::new, |message| format!(": {message}"))
+}
+
+fn display_optional_error_code(error_code: Option<&str>) -> String {
+    error_code.map_or_else(String::new, |error_code| {
+        format!(" with XRPC error {error_code}")
+    })
+}
+
+fn display_observed_bytes(observed_bytes: Option<u64>) -> String {
+    observed_bytes.map_or_else(String::new, |bytes| format!(" after {bytes} bytes"))
 }

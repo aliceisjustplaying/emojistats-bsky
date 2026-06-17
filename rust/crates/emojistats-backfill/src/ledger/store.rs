@@ -111,6 +111,7 @@ fn ledger_migrations() -> Migrations<'static> {
                 force_mode TEXT CHECK (
                     force_mode IS NULL OR force_mode IN ('get_repo', 'list_records')
                 ),
+                force_mode_revive_after_ms INTEGER,
                 never_diff INTEGER NOT NULL DEFAULT 0 CHECK (never_diff IN (0, 1))
             );
 
@@ -168,6 +169,12 @@ fn ensure_host_override_columns(transaction: &Transaction<'_>) -> rusqlite::Resu
     if !table_has_column(transaction, "host_overrides", "never_diff")? {
         transaction.execute(
             "ALTER TABLE host_overrides ADD COLUMN never_diff INTEGER NOT NULL DEFAULT 0 CHECK (never_diff IN (0, 1))",
+            [],
+        )?;
+    }
+    if !table_has_column(transaction, "host_overrides", "force_mode_revive_after_ms")? {
+        transaction.execute(
+            "ALTER TABLE host_overrides ADD COLUMN force_mode_revive_after_ms INTEGER",
             [],
         )?;
     }
@@ -780,6 +787,7 @@ impl SqliteLedger {
         let concurrency_cap = record.concurrency_cap.map(i64::from);
         let min_interval_ms = optional_duration_to_millis(record.min_interval)?;
         let revive_after_ms = optional_time_to_millis(record.revive_after)?;
+        let force_mode_revive_after_ms = optional_time_to_millis(record.force_mode_revive_after)?;
         self.connection.execute(
             "
             INSERT INTO host_overrides (
@@ -789,14 +797,16 @@ impl SqliteLedger {
                 min_interval_ms,
                 revive_after_ms,
                 force_mode,
+                force_mode_revive_after_ms,
                 never_diff
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             ON CONFLICT(host) DO UPDATE SET
                 disabled = excluded.disabled,
                 concurrency_cap = excluded.concurrency_cap,
                 min_interval_ms = excluded.min_interval_ms,
                 revive_after_ms = excluded.revive_after_ms,
                 force_mode = excluded.force_mode,
+                force_mode_revive_after_ms = excluded.force_mode_revive_after_ms,
                 never_diff = excluded.never_diff
             ",
             params![
@@ -806,6 +816,7 @@ impl SqliteLedger {
                 min_interval_ms,
                 revive_after_ms,
                 record.force_mode.map(force_mode_name),
+                force_mode_revive_after_ms,
                 bool_to_i64(record.never_diff),
             ],
         )?;
@@ -822,6 +833,7 @@ impl SqliteLedger {
         host: &str,
         force_mode: Option<ForcedFetchMode>,
         default_min_interval: Option<Duration>,
+        force_mode_revive_after: Option<SystemTime>,
     ) -> Result<(), LedgerStoreError> {
         let default_record = HostOverride {
             host: host.to_owned(),
@@ -830,10 +842,12 @@ impl SqliteLedger {
             min_interval: default_min_interval,
             revive_after: None,
             force_mode,
+            force_mode_revive_after,
             never_diff: false,
         };
         validate_host_override(&default_record)?;
         let min_interval_ms = optional_duration_to_millis(default_min_interval)?;
+        let force_mode_revive_after_ms = optional_time_to_millis(force_mode_revive_after)?;
         self.connection.execute(
             "
             INSERT INTO host_overrides (
@@ -843,12 +857,19 @@ impl SqliteLedger {
                 min_interval_ms,
                 revive_after_ms,
                 force_mode,
+                force_mode_revive_after_ms,
                 never_diff
-            ) VALUES (?1, 0, NULL, ?2, NULL, ?3, 0)
+            ) VALUES (?1, 0, NULL, ?2, NULL, ?3, ?4, 0)
             ON CONFLICT(host) DO UPDATE SET
-                force_mode = excluded.force_mode
+                force_mode = excluded.force_mode,
+                force_mode_revive_after_ms = excluded.force_mode_revive_after_ms
             ",
-            params![host, min_interval_ms, force_mode.map(force_mode_name)],
+            params![
+                host,
+                min_interval_ms,
+                force_mode.map(force_mode_name),
+                force_mode_revive_after_ms,
+            ],
         )?;
         Ok(())
     }
@@ -862,7 +883,7 @@ impl SqliteLedger {
         self.connection
             .query_row(
                 "
-                SELECT host, disabled, concurrency_cap, min_interval_ms, revive_after_ms, force_mode, never_diff
+                SELECT host, disabled, concurrency_cap, min_interval_ms, revive_after_ms, force_mode, force_mode_revive_after_ms, never_diff
                 FROM host_overrides
                 WHERE host = ?1
                 ",

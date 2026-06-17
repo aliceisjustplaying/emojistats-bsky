@@ -17,7 +17,7 @@ use crate::{
 };
 use crate::{
     archive::{ARCHIVE_SCHEMA_VERSION, ArchiveError, LocalManifestEntry, PostDataset, RepoReceipt},
-    commit::{ManifestEntry, Receipt},
+    commit::{MANIFEST_FORMAT_VERSION, ManifestEntry, Receipt},
     derive::{
         DeriveError, DeriveManifestIdentity, manifest_identity, manifest_identity_with_observed_at,
     },
@@ -118,6 +118,14 @@ pub enum Error {
     #[error("unsupported post dataset in committed manifest: {dataset}")]
     UnsupportedDataset { dataset: String },
     #[error(
+        "committed manifest line {line_number} has manifest_format_version {actual}, expected {expected}"
+    )]
+    UnsupportedManifestFormatVersion {
+        line_number: usize,
+        actual: u16,
+        expected: u16,
+    },
+    #[error(
         "committed raw archive manifest line {line_number} has schema_version {actual}, expected {expected}"
     )]
     UnsupportedSchemaVersion {
@@ -136,6 +144,8 @@ pub enum Error {
     LocalPathEscapesRoot { path: PathBuf },
     #[error("committed artifact is missing: {}", path.display())]
     MissingArtifact { path: PathBuf },
+    #[error("object receipt is missing for committed artifact: {}", path.display())]
+    MissingObjectReceipt { path: PathBuf },
     #[error("repo receipt is missing for committed artifact: {}", path.display())]
     MissingRepoReceipt { path: PathBuf },
     #[error("hash {} failed for {}: {source}", operation, path.display())]
@@ -427,6 +437,13 @@ fn loader_input_from_entry(
 }
 
 fn validate_required_fields(entry: &ManifestEntry, line_number: usize) -> Result<(), Error> {
+    if entry.manifest_format_version != MANIFEST_FORMAT_VERSION {
+        return Err(Error::UnsupportedManifestFormatVersion {
+            line_number,
+            actual: entry.manifest_format_version,
+            expected: MANIFEST_FORMAT_VERSION,
+        });
+    }
     validate_non_empty(&entry.dataset, "dataset", line_number)?;
     validate_non_empty(&entry.run_id, "run_id", line_number)?;
     validate_non_empty(&entry.shard, "shard", line_number)?;
@@ -485,6 +502,7 @@ fn validate_scoped_object_path(object_path: &str, line_number: usize) -> Result<
 
 fn local_manifest_from_entry(entry: ManifestEntry) -> LocalManifestEntry {
     LocalManifestEntry {
+        manifest_format_version: entry.manifest_format_version,
         run_id: entry.run_id,
         shard: entry.shard,
         file_sequence: entry.file_sequence,
@@ -525,12 +543,13 @@ fn verify_committed_artifact_proof(
     let digest = hash_file(&object_path)?;
     validate_object_digest(&object_path, &input.manifest, &digest)?;
 
-    if let Some(receipt_path) =
+    let Some(receipt_path) =
         first_existing_path(object_receipt_candidates(&object_path, &input.manifest))?
-    {
-        let receipt = read_receipt::<Receipt>(&receipt_path)?;
-        validate_object_receipt(&receipt_path, &input.manifest, &receipt)?;
-    }
+    else {
+        return Err(Error::MissingObjectReceipt { path: object_path });
+    };
+    let receipt = read_receipt::<Receipt>(&receipt_path)?;
+    validate_object_receipt(&receipt_path, &input.manifest, &receipt)?;
 
     let Some(repo_receipt_path) = first_existing_path(repo_receipt_candidates(
         archive_root,

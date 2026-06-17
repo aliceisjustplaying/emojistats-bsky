@@ -187,7 +187,7 @@ fn total_post_counter_table_sql(database: &ClickHouseIdentifier) -> String {
   max_created_at Nullable(DateTime64(6, 'UTC')) CODEC(Delta(8), ZSTD(1)),
   inserted_at DateTime64(6, 'UTC') DEFAULT now64(6)
 ) ENGINE = ReplacingMergeTree(inserted_at)
-ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, did)
+ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, run_id, shard, file_sequence, receipt_hash, did)
 SETTINGS non_replicated_deduplication_window = 10000;"
     )
 }

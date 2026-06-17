@@ -1,8 +1,8 @@
 use super::{
     Arc, ArchiveError, ArchivePostRow, Array, ArrayRef, ArrowWriter, Compression, Cow,
-    CreatedAtParseStatus, DataType, Field, File, NormalizerVersion, PARQUET_BATCH_ROWS,
-    ParquetRecordBatchReaderBuilder, Path, RecordBatch, Schema, Serialize, StringArray,
-    StringBuilder, Write, WriterProperties, ZstdLevel,
+    CreatedAtParseStatus, DataType, Field, File, LargeStringArray, LargeStringBuilder,
+    NormalizerVersion, PARQUET_BATCH_ROWS, ParquetRecordBatchReaderBuilder, Path, RecordBatch,
+    Schema, Serialize, Write, WriterProperties, ZstdLevel,
 };
 
 /// Read every archive post row into memory.
@@ -61,24 +61,24 @@ where
 
 pub(super) fn archive_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
-        Field::new("did", DataType::Utf8, false),
-        Field::new("rkey", DataType::Utf8, false),
-        Field::new("cid", DataType::Utf8, false),
-        Field::new("normalizer_name", DataType::Utf8, false),
-        Field::new("normalizer_semver", DataType::Utf8, false),
-        Field::new("normalizer_git_rev", DataType::Utf8, false),
-        Field::new("normalizer_unicode_version", DataType::Utf8, false),
-        Field::new("normalizer_emoji_data_version", DataType::Utf8, false),
-        Field::new("account_status", DataType::Utf8, true),
-        Field::new("record_status", DataType::Utf8, true),
-        Field::new("public_content_label", DataType::Utf8, true),
-        Field::new("created_at_raw", DataType::Utf8, true),
-        Field::new("created_at_normalized", DataType::Utf8, true),
-        Field::new("created_at_parse_status", DataType::Utf8, false),
-        Field::new("text", DataType::Utf8, false),
-        Field::new("langs_json", DataType::Utf8, false),
-        Field::new("emoji_sequence_json", DataType::Utf8, false),
-        Field::new("extras_json", DataType::Utf8, false),
+        Field::new("did", DataType::LargeUtf8, false),
+        Field::new("rkey", DataType::LargeUtf8, false),
+        Field::new("cid", DataType::LargeUtf8, false),
+        Field::new("normalizer_name", DataType::LargeUtf8, false),
+        Field::new("normalizer_semver", DataType::LargeUtf8, false),
+        Field::new("normalizer_git_rev", DataType::LargeUtf8, false),
+        Field::new("normalizer_unicode_version", DataType::LargeUtf8, false),
+        Field::new("normalizer_emoji_data_version", DataType::LargeUtf8, false),
+        Field::new("account_status", DataType::LargeUtf8, true),
+        Field::new("record_status", DataType::LargeUtf8, true),
+        Field::new("public_content_label", DataType::LargeUtf8, true),
+        Field::new("created_at_raw", DataType::LargeUtf8, true),
+        Field::new("created_at_normalized", DataType::LargeUtf8, true),
+        Field::new("created_at_parse_status", DataType::LargeUtf8, false),
+        Field::new("text", DataType::LargeUtf8, false),
+        Field::new("langs_json", DataType::LargeUtf8, false),
+        Field::new("emoji_sequence_json", DataType::LargeUtf8, false),
+        Field::new("extras_json", DataType::LargeUtf8, false),
     ]))
 }
 
@@ -98,51 +98,51 @@ pub(super) fn post_record_batch(
     Ok(RecordBatch::try_new(
         Arc::clone(schema),
         vec![
-            Arc::new(StringArray::from_iter_values(
+            Arc::new(LargeStringArray::from_iter_values(
                 rows.iter().map(|row| row.did.as_str()),
             )),
-            Arc::new(StringArray::from_iter_values(
+            Arc::new(LargeStringArray::from_iter_values(
                 rows.iter().map(|row| row.rkey.as_str()),
             )),
-            Arc::new(StringArray::from_iter_values(
+            Arc::new(LargeStringArray::from_iter_values(
                 rows.iter().map(|row| row.cid.as_str()),
             )),
-            Arc::new(StringArray::from_iter_values(
+            Arc::new(LargeStringArray::from_iter_values(
                 rows.iter().map(|row| row.normalizer.name.as_str()),
             )),
-            Arc::new(StringArray::from_iter_values(
+            Arc::new(LargeStringArray::from_iter_values(
                 rows.iter().map(|row| row.normalizer.semver.as_str()),
             )),
-            Arc::new(StringArray::from_iter_values(
+            Arc::new(LargeStringArray::from_iter_values(
                 rows.iter().map(|row| row.normalizer.git_rev.as_str()),
             )),
-            Arc::new(StringArray::from_iter_values(
+            Arc::new(LargeStringArray::from_iter_values(
                 rows.iter()
                     .map(|row| row.normalizer.unicode_version.as_str()),
             )),
-            Arc::new(StringArray::from_iter_values(
+            Arc::new(LargeStringArray::from_iter_values(
                 rows.iter()
                     .map(|row| row.normalizer.emoji_data_version.as_str()),
             )),
-            Arc::new(StringArray::from_iter(
+            Arc::new(LargeStringArray::from_iter(
                 rows.iter().map(|row| row.account_status.as_deref()),
             )),
-            Arc::new(StringArray::from_iter(
+            Arc::new(LargeStringArray::from_iter(
                 rows.iter().map(|row| row.record_status.as_deref()),
             )),
-            Arc::new(StringArray::from_iter(
+            Arc::new(LargeStringArray::from_iter(
                 rows.iter().map(|row| row.public_content_label.as_deref()),
             )),
-            Arc::new(StringArray::from_iter(
+            Arc::new(LargeStringArray::from_iter(
                 rows.iter().map(|row| row.created_at_raw.as_deref()),
             )),
-            Arc::new(StringArray::from_iter(
+            Arc::new(LargeStringArray::from_iter(
                 rows.iter().map(|row| row.created_at_normalized.as_deref()),
             )),
-            Arc::new(StringArray::from_iter_values(
+            Arc::new(LargeStringArray::from_iter_values(
                 rows.iter().map(|row| row.created_at_parse_status.as_str()),
             )),
-            Arc::new(StringArray::from_iter_values(
+            Arc::new(LargeStringArray::from_iter_values(
                 rows.iter().map(|row| row.text.as_str()),
             )),
             json_string_array(rows.iter().map(|row| json_string_slice(&row.langs)))?,
@@ -233,7 +233,7 @@ fn append_archive_rows_from_batch(
 fn string_column<'a>(
     batch: &'a RecordBatch,
     column: &'static str,
-) -> Result<&'a StringArray, ArchiveError> {
+) -> Result<&'a LargeStringArray, ArchiveError> {
     let index = batch
         .schema()
         .index_of(column)
@@ -241,12 +241,12 @@ fn string_column<'a>(
     batch
         .column(index)
         .as_any()
-        .downcast_ref::<StringArray>()
+        .downcast_ref::<LargeStringArray>()
         .ok_or(ArchiveError::InvalidParquetColumn { column })
 }
 
 fn required_string<'a>(
-    array: &'a StringArray,
+    array: &'a LargeStringArray,
     row_index: usize,
     column: &'static str,
 ) -> Result<&'a str, ArchiveError> {
@@ -257,7 +257,7 @@ fn required_string<'a>(
     }
 }
 
-fn optional_string(array: &StringArray, row_index: usize) -> Option<String> {
+fn optional_string(array: &LargeStringArray, row_index: usize) -> Option<String> {
     if array.is_null(row_index) {
         None
     } else {
@@ -281,7 +281,7 @@ fn parse_created_at_parse_status(value: &str) -> Result<CreatedAtParseStatus, Ar
 fn json_string_array(
     values: impl Iterator<Item = Result<Cow<'static, str>, ArchiveError>>,
 ) -> Result<ArrayRef, ArchiveError> {
-    let mut builder = StringBuilder::new();
+    let mut builder = LargeStringBuilder::new();
     for value in values {
         builder.append_value(value?.as_ref());
     }
@@ -289,7 +289,7 @@ fn json_string_array(
 }
 
 fn json_string<T: Serialize>(value: &T) -> Result<String, ArchiveError> {
-    Ok(serde_json::to_string(value)?)
+    super::json::json_string(value)
 }
 
 fn json_string_slice(value: &[String]) -> Result<Cow<'static, str>, ArchiveError> {
@@ -303,29 +303,5 @@ fn extras_json_string(value: &serde_json::Value) -> Result<Cow<'static, str>, Ar
     if matches!(value, serde_json::Value::Object(fields) if fields.is_empty()) {
         return Ok(Cow::Borrowed("{}"));
     }
-    Ok(Cow::Owned(stable_rust_json(value)?))
-}
-
-fn stable_rust_json(value: &serde_json::Value) -> Result<String, ArchiveError> {
-    Ok(serde_json::to_string(&canonical_json_value(value))?)
-}
-
-fn canonical_json_value(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Array(values) => {
-            serde_json::Value::Array(values.iter().map(canonical_json_value).collect::<Vec<_>>())
-        }
-        serde_json::Value::Object(fields) => {
-            let mut sorted = serde_json::Map::new();
-            let mut keys = fields.keys().collect::<Vec<_>>();
-            keys.sort();
-            for key in keys {
-                if let Some(value) = fields.get(key) {
-                    sorted.insert(key.clone(), canonical_json_value(value));
-                }
-            }
-            serde_json::Value::Object(sorted)
-        }
-        other => other.clone(),
-    }
+    Ok(Cow::Owned(super::json::canonical_json_string(value)?))
 }

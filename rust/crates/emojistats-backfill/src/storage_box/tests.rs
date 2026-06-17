@@ -16,7 +16,7 @@ use crate::{
     archive::{
         ArchiveCommitContext, ArchivePostRow, CompletenessClass, CreatedAtParseStatus, FetchMethod,
         NormalizerVersion, RepoReceipt, RepoReceiptInput, build_repo_receipt, current_normalizer,
-        write_archive_artifacts,
+        write_local_archive_artifacts,
     },
     commit::{ManifestEntry, ManifestMode, Metadata, Request},
     manifest_derive::{
@@ -347,7 +347,7 @@ fn metadata() -> Metadata {
         receipt_hash: "repo-receipt-hash".to_owned(),
         repo_receipt_path: Some("did.repo-receipt-hash.receipt.json".to_owned()),
         normalizer: normalizer(),
-        schema_version: 2,
+        schema_version: 3,
     }
 }
 
@@ -460,7 +460,7 @@ fn remote_only_derive_canary_commits_storage_box_artifacts() {
         canary_archive_row("b", "fire 🔥🔥", &["🔥", "🔥"]),
     ];
     let repo_receipt = canary_repo_receipt(&rows, &context);
-    let artifacts = write_archive_artifacts(
+    let artifacts = write_local_archive_artifacts(
         &local_archive_root,
         CANARY_DID,
         &context,

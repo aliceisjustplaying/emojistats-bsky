@@ -205,6 +205,10 @@ impl IndexedCarBlockStore {
             .map(Some)
             .map_err(RepoError::io)
     }
+
+    pub(super) fn has_verified_block(&self, cid: &IpldCid) -> bool {
+        self.index.contains_key(cid)
+    }
 }
 
 #[allow(clippy::unused_async_trait_impl)]

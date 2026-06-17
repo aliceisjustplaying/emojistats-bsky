@@ -82,6 +82,9 @@ pub struct PostServingRow {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct DeriveCheckpointKey {
     pub source: String,
+    pub run_id: String,
+    pub shard: String,
+    pub file_sequence: u64,
     pub receipt_hash: String,
     pub lane: DeriveCheckpointLane,
     pub chunk_index: Option<u64>,
@@ -126,6 +129,9 @@ impl DeriveCheckpointKey {
     pub fn post_serving(identity: &DeriveManifestIdentity, chunk_index: u64) -> Self {
         Self {
             source: BACKFILL_DERIVE_SOURCE.to_owned(),
+            run_id: identity.run_id.clone(),
+            shard: identity.shard.clone(),
+            file_sequence: identity.file_sequence,
             receipt_hash: identity.receipt_hash.clone(),
             lane: DeriveCheckpointLane::PostServing,
             chunk_index: Some(chunk_index),
@@ -137,6 +143,9 @@ impl DeriveCheckpointKey {
     pub fn total_post_counter(identity: &DeriveManifestIdentity) -> Self {
         Self {
             source: BACKFILL_DERIVE_SOURCE.to_owned(),
+            run_id: identity.run_id.clone(),
+            shard: identity.shard.clone(),
+            file_sequence: identity.file_sequence,
             receipt_hash: identity.receipt_hash.clone(),
             lane: DeriveCheckpointLane::TotalPostCounter,
             chunk_index: None,
@@ -367,6 +376,9 @@ fn hash_manifest_identity(
     hasher: &mut Sha256,
     identity: &DeriveManifestIdentity,
 ) -> Result<(), DeriveError> {
+    hash_field(hasher, &identity.run_id)?;
+    hash_field(hasher, &identity.shard)?;
+    hash_u64(hasher, identity.file_sequence);
     hash_field(hasher, &identity.did)?;
     hash_field(hasher, &identity.dataset)?;
     hash_field(hasher, &identity.fetch_method)?;
@@ -399,6 +411,9 @@ fn hash_total_post_counter(
     counter: &TotalPostCounterInput,
 ) -> Result<(), DeriveError> {
     hash_field(hasher, &counter.source)?;
+    hash_field(hasher, &counter.run_id)?;
+    hash_field(hasher, &counter.shard)?;
+    hash_u64(hasher, counter.file_sequence);
     hash_field(hasher, &counter.did)?;
     hash_field(hasher, &counter.dataset)?;
     hash_field(hasher, &counter.fetch_method)?;
@@ -497,6 +512,7 @@ mod tests {
 
     fn manifest(row_count: u64) -> LocalManifestEntry {
         LocalManifestEntry {
+            manifest_format_version: 1,
             run_id: "run-1".to_owned(),
             shard: "shard0".to_owned(),
             file_sequence: 7,
@@ -510,7 +526,7 @@ mod tests {
             max_created_at_normalized: Some("2026-06-15T01:00:00Z".to_owned()),
             receipt_hash: "receipt-hash".to_owned(),
             repo_receipt_path: None,
-            schema_version: 2,
+            schema_version: 3,
             normalizer: normalizer(),
         }
     }
@@ -571,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_token_is_stable_across_replay_manifest_sequence() {
+    fn dedupe_token_changes_across_manifest_identity() {
         let rows = [row("a", &["✅"])];
         let first = derive_clickhouse_batch(DeriveBatchInput {
             manifest: &manifest(1),
@@ -590,7 +606,7 @@ mod tests {
         })
         .expect("replay derive batch");
 
-        assert_eq!(first.dedupe_token, replay.dedupe_token);
+        assert_ne!(first.dedupe_token, replay.dedupe_token);
     }
 
     #[test]
@@ -623,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_keys_are_stable_across_replay_manifest_sequence() {
+    fn checkpoint_keys_change_across_manifest_identity() {
         let first = manifest_identity(&manifest(1)).expect("manifest identity");
         let mut replay_manifest = manifest(1);
         replay_manifest.run_id = "run-2".to_owned();
@@ -631,11 +647,11 @@ mod tests {
         replay_manifest.file_sequence = 99;
         let replay = manifest_identity(&replay_manifest).expect("manifest identity");
 
-        assert_eq!(
+        assert_ne!(
             DeriveCheckpointKey::post_serving(&first, 2),
             DeriveCheckpointKey::post_serving(&replay, 2)
         );
-        assert_eq!(
+        assert_ne!(
             DeriveCheckpointKey::total_post_counter(&first),
             DeriveCheckpointKey::total_post_counter(&replay)
         );
@@ -645,6 +661,9 @@ mod tests {
     fn checkpoint_record_hashes_payload_body() {
         let key = DeriveCheckpointKey {
             source: BACKFILL_DERIVE_SOURCE.to_owned(),
+            run_id: "run-1".to_owned(),
+            shard: "shard0".to_owned(),
+            file_sequence: 7,
             receipt_hash: "receipt-hash".to_owned(),
             lane: DeriveCheckpointLane::TotalPostCounter,
             chunk_index: None,

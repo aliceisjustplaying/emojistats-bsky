@@ -16,7 +16,7 @@ use crate::{
     archive::{
         ArchiveCommitContext, ArchivePostRow, CompletenessClass, CreatedAtParseStatus, FetchMethod,
         NormalizerVersion, RepoReceipt, RepoReceiptInput, build_repo_receipt, current_normalizer,
-        write_archive_artifacts,
+        write_local_archive_artifacts,
     },
     commit::ManifestEntry,
 };
@@ -35,6 +35,7 @@ fn normalizer() -> NormalizerVersion {
 
 fn entry(dataset: &str) -> ManifestEntry {
     ManifestEntry {
+        manifest_format_version: 1,
         run_id: "run-1".to_owned(),
         shard: "shard3".to_owned(),
         file_sequence: 42,
@@ -49,7 +50,7 @@ fn entry(dataset: &str) -> ManifestEntry {
         receipt_hash: "receipt-hash".to_owned(),
         repo_receipt_path: None,
         normalizer: normalizer(),
-        schema_version: 2,
+        schema_version: 3,
     }
 }
 
@@ -197,7 +198,25 @@ fn rejects_raw_archive_schema_mismatch() {
         Error::UnsupportedSchemaVersion {
             line_number: 1,
             actual: 1,
-            expected: 2
+            expected: 3
+        }
+    ));
+}
+
+#[test]
+fn rejects_manifest_format_version_mismatch() {
+    let mut bad = entry("raw_archive_posts");
+    bad.manifest_format_version = 99;
+
+    let error = debug_read_committed_jsonl(Cursor::new(jsonl(&[bad])))
+        .expect_err("bad manifest format should be rejected");
+
+    assert!(matches!(
+        error,
+        Error::UnsupportedManifestFormatVersion {
+            line_number: 1,
+            actual: 99,
+            expected: 1
         }
     ));
 }
@@ -226,7 +245,7 @@ fn stable_identity_fields_come_from_committed_manifest() {
     assert_eq!(first_identity.dataset, "raw_archive_posts");
     assert_eq!(first_identity.content_hash, "content-hash");
     assert_eq!(first_identity.receipt_hash, "receipt-hash");
-    assert_eq!(first_identity.schema_version, 2);
+    assert_eq!(first_identity.schema_version, 3);
 }
 
 #[test]
@@ -238,7 +257,7 @@ fn verified_manifest_entry_loads_clickhouse_batch() {
         archive_row("b", "fire 🔥🔥", &["🔥", "🔥"]),
     ];
     let receipt = repo_receipt(&rows);
-    let artifacts = write_archive_artifacts(
+    let artifacts = write_local_archive_artifacts(
         &output_dir,
         "did:plc:fixture123",
         &ArchiveCommitContext::fetch_one_local(),
@@ -267,7 +286,7 @@ fn streaming_verifier_finds_content_stem_repo_receipt() {
     let output_dir = temp.path.join("archive");
     let rows = vec![archive_row("a", "hello ✅", &["✅"])];
     let receipt = repo_receipt(&rows);
-    let artifacts = write_archive_artifacts(
+    let artifacts = write_local_archive_artifacts(
         &output_dir,
         "did:plc:fixture123",
         &ArchiveCommitContext::fetch_one_local(),
@@ -295,7 +314,7 @@ fn streaming_verifier_rejects_raw_manifest_with_collection_paginated_receipt() {
     let output_dir = temp.path.join("archive");
     let rows = vec![archive_row("a", "hello ✅", &["✅"])];
     let receipt = repo_receipt(&rows);
-    let artifacts = write_archive_artifacts(
+    let artifacts = write_local_archive_artifacts(
         &output_dir,
         "did:plc:fixture123",
         &ArchiveCommitContext::fetch_one_local(),
@@ -343,7 +362,7 @@ fn verified_manifest_entry_rejects_missing_parquet() {
     let output_dir = temp.path.join("archive");
     let rows = vec![archive_row("a", "hello ✅", &["✅"])];
     let receipt = repo_receipt(&rows);
-    let artifacts = write_archive_artifacts(
+    let artifacts = write_local_archive_artifacts(
         &output_dir,
         "did:plc:fixture123",
         &ArchiveCommitContext::fetch_one_local(),
@@ -368,7 +387,7 @@ fn verified_manifest_entry_rejects_missing_repo_receipt() {
     let output_dir = temp.path.join("archive");
     let rows = vec![archive_row("a", "hello ✅", &["✅"])];
     let receipt = repo_receipt(&rows);
-    let artifacts = write_archive_artifacts(
+    let artifacts = write_local_archive_artifacts(
         &output_dir,
         "did:plc:fixture123",
         &ArchiveCommitContext::fetch_one_local(),
@@ -388,12 +407,37 @@ fn verified_manifest_entry_rejects_missing_repo_receipt() {
 }
 
 #[test]
+fn verified_manifest_entry_rejects_missing_object_receipt() {
+    let temp = TempDir::new("missing-object-receipt");
+    let output_dir = temp.path.join("archive");
+    let rows = vec![archive_row("a", "hello ✅", &["✅"])];
+    let receipt = repo_receipt(&rows);
+    let artifacts = write_local_archive_artifacts(
+        &output_dir,
+        "did:plc:fixture123",
+        &ArchiveCommitContext::fetch_one_local(),
+        &rows,
+        None,
+        &receipt,
+    )
+    .expect("archive artifacts should write");
+    let plan = read_plan_from_path(&artifacts.manifest_path);
+    fs::remove_file(&artifacts.object_receipt_path).expect("object receipt should be removable");
+
+    let error =
+        debug_materialize_clickhouse_batch(&output_dir, plan.inputs.first().expect("loader input"))
+            .expect_err("missing object receipt should fail");
+
+    assert!(matches!(error, Error::MissingObjectReceipt { .. }));
+}
+
+#[test]
 fn verified_manifest_entry_rejects_parquet_hash_mismatch() {
     let temp = TempDir::new("hash-mismatch");
     let output_dir = temp.path.join("archive");
     let rows = vec![archive_row("a", "hello ✅", &["✅"])];
     let receipt = repo_receipt(&rows);
-    let artifacts = write_archive_artifacts(
+    let artifacts = write_local_archive_artifacts(
         &output_dir,
         "did:plc:fixture123",
         &ArchiveCommitContext::fetch_one_local(),
@@ -421,7 +465,7 @@ fn full_batch_load_rejects_manifest_above_explicit_caps_before_reading_rows() {
     let output_dir = temp.path.join("archive");
     let rows = vec![archive_row("a", "hello ✅", &["✅"])];
     let receipt = repo_receipt(&rows);
-    let artifacts = write_archive_artifacts(
+    let artifacts = write_local_archive_artifacts(
         &output_dir,
         "did:plc:fixture123",
         &ArchiveCommitContext::fetch_one_local(),

@@ -117,6 +117,16 @@ impl<'a> StreamingMstCursor<'a> {
                 "MST node CID visited more than once: {cid}"
             )));
         }
+        ensure_u64_at_most(
+            u64::try_from(self.visited_nodes.len()).map_err(|_err| {
+                ParseError::CarLengthOverflow {
+                    field: "visited_mst_nodes",
+                }
+            })?,
+            config.max_car_blocks,
+            "visited_mst_nodes",
+            "raise parser max_car_blocks only after inspecting the repo MST",
+        )?;
         let depth = checked_increment(
             u64::try_from(self.stack.len()).map_err(|_err| ParseError::CarLengthOverflow {
                 field: "MST stack depth",

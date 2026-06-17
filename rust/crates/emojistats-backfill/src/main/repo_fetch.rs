@@ -98,6 +98,7 @@ async fn reserve_host_send_for_fetch(
         .map_err(|err| FetchError::Transport {
             message: format!("host pacing for {host}: {err}"),
             observed_bytes: None,
+            source: Box::new(err),
         })
 }
 
@@ -151,6 +152,7 @@ mod tests {
         assert!(is_retryable_stream_fetch_error(&FetchError::Transport {
             message: "connection reset".to_owned(),
             observed_bytes: None,
+            source: Box::new(std::io::Error::other("connection reset")),
         }));
         assert!(is_retryable_stream_fetch_error(
             &FetchError::InactivityTimeout {

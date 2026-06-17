@@ -10,7 +10,7 @@ use emojistats_backfill::{
     archive::{
         ArchiveCommitContext, ArchivePostRow, CompletenessClass, CreatedAtParseStatus, FetchMethod,
         RepoReceipt, RepoReceiptInput, build_repo_receipt, current_normalizer, hash_profile_record,
-        write_archive_artifacts,
+        write_local_archive_artifacts,
     },
     commit::{ManifestEntry, Receipt},
     parse::ProfileRecord,
@@ -30,7 +30,7 @@ fn profile_sidecar_is_written_as_committed_artifact() {
     let profile = profile_record();
     let receipt = receipt_for(&rows, &profile);
 
-    let artifacts = write_archive_artifacts(
+    let artifacts = write_local_archive_artifacts(
         &output_dir,
         "did:plc:fixture123",
         &ArchiveCommitContext::new("run-test", "shard3", 9),

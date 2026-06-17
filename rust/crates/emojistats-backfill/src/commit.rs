@@ -14,6 +14,7 @@ use crate::archive::NormalizerVersion;
 
 const HASH_BUFFER_BYTES: usize = 65_536;
 pub(crate) const PROTOCOL_VERSION: u16 = 1;
+pub(crate) const MANIFEST_FORMAT_VERSION: u16 = 1;
 
 mod manifest;
 use manifest::{write_manifest, write_manifest_if_missing};
@@ -109,6 +110,7 @@ pub struct CommitPlan {
 /// Storage Box-shaped committed manifest entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestEntry {
+    pub manifest_format_version: u16,
     pub run_id: String,
     pub shard: String,
     pub file_sequence: u64,
@@ -341,6 +343,7 @@ impl Error {
 impl ManifestEntry {
     pub(crate) fn from_parts(metadata: &Metadata, receipt: &Receipt) -> Self {
         Self {
+            manifest_format_version: MANIFEST_FORMAT_VERSION,
             run_id: receipt.run_id.clone(),
             shard: receipt.shard.clone(),
             file_sequence: receipt.file_sequence,

@@ -53,19 +53,6 @@ pub fn recover_stale_claimed_entries(
     )
 }
 
-pub fn recover_stale_claimed_entries_for_scope(
-    ledger: &SqliteLedger,
-    now: SystemTime,
-    claim_scope: &ClaimScope,
-) -> anyhow::Result<u64> {
-    recover_stale_claimed_entries_for_scope_with_message(
-        ledger,
-        now,
-        claim_scope,
-        "expired claimed lease during fleet run",
-    )
-}
-
 pub(super) fn recover_stale_claimed_entries_for_scope_with_message(
     ledger: &SqliteLedger,
     now: SystemTime,

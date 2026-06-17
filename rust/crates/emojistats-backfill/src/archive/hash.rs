@@ -99,37 +99,6 @@ fn hash_normalizer(
     hash_field(hasher, &normalizer.emoji_data_version)
 }
 
-pub(super) fn append_normalizer_frames(
-    target: &mut Vec<u8>,
-    normalizer: &NormalizerVersion,
-) -> Result<(), ArchiveError> {
-    append_hash_field_frame(target, &normalizer.name)?;
-    append_hash_field_frame(target, &normalizer.semver)?;
-    append_hash_field_frame(target, &normalizer.git_rev)?;
-    append_hash_field_frame(target, &normalizer.unicode_version)?;
-    append_hash_field_frame(target, &normalizer.emoji_data_version)
-}
-
-pub(super) fn framed_fields<const N: usize>(values: [&str; N]) -> Result<Vec<u8>, ArchiveError> {
-    let mut framed = Vec::new();
-    for value in values {
-        append_hash_field_frame(&mut framed, value)?;
-    }
-    Ok(framed)
-}
-
-pub(super) fn append_hash_field_frame(
-    target: &mut Vec<u8>,
-    value: &str,
-) -> Result<(), ArchiveError> {
-    let len = u64::try_from(value.len()).map_err(|_error| ArchiveError::CountOverflow {
-        field: "hash_field_length",
-    })?;
-    target.extend_from_slice(&len.to_be_bytes());
-    target.extend_from_slice(value.as_bytes());
-    Ok(())
-}
-
 pub(super) fn hash_field(hasher: &mut Sha256, value: &str) -> Result<(), ArchiveError> {
     hash_field_bytes(hasher, value.as_bytes())
 }
@@ -150,28 +119,5 @@ pub(super) fn hash_extras_json(
     if matches!(value, serde_json::Value::Object(fields) if fields.is_empty()) {
         return hash_field(hasher, "{}");
     }
-    hash_field_bytes(
-        hasher,
-        &super::archive_io::json_bytes(&canonical_json_value(value))?,
-    )
-}
-
-fn canonical_json_value(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Array(values) => {
-            serde_json::Value::Array(values.iter().map(canonical_json_value).collect::<Vec<_>>())
-        }
-        serde_json::Value::Object(fields) => {
-            let mut sorted = serde_json::Map::new();
-            let mut keys = fields.keys().collect::<Vec<_>>();
-            keys.sort();
-            for key in keys {
-                if let Some(value) = fields.get(key) {
-                    sorted.insert(key.clone(), canonical_json_value(value));
-                }
-            }
-            serde_json::Value::Object(sorted)
-        }
-        other => other.clone(),
-    }
+    hash_field_bytes(hasher, &super::json::canonical_json_bytes(value)?)
 }

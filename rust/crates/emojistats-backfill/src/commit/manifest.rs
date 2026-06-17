@@ -1,7 +1,7 @@
 use std::{
     ffi::OsStr,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, Seek, Write},
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
@@ -89,15 +89,85 @@ fn manifest_contains_entry(
 
 fn append_manifest_jsonl(path: &Path, entry: &ManifestEntry) -> Result<(), Error> {
     let _lock = ManifestAppendLock::acquire(path)?;
+    repair_jsonl_tail_unlocked(path)?;
     append_manifest_jsonl_unlocked(path, entry)
 }
 
 fn append_manifest_jsonl_if_missing(path: &Path, entry: &ManifestEntry) -> Result<(), Error> {
     let _lock = ManifestAppendLock::acquire(path)?;
+    repair_jsonl_tail_unlocked(path)?;
     if manifest_contains_entry(path, ManifestMode::AppendJsonl, entry)? {
         return Ok(());
     }
     append_manifest_jsonl_unlocked(path, entry)
+}
+
+fn repair_jsonl_tail_unlocked(path: &Path) -> Result<(), Error> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(Error::Io {
+                operation: "read manifest for tail repair",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if bytes.is_empty() || bytes.ends_with(b"\n") {
+        return Ok(());
+    }
+
+    let tail_start = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .and_then(|index| index.checked_add(1))
+        .unwrap_or(0);
+    let tail = bytes
+        .get(tail_start..)
+        .ok_or_else(|| Error::ByteCountOverflow {
+            path: path.to_path_buf(),
+        })?;
+    let tail_is_valid_manifest_entry = serde_json::from_slice::<ManifestEntry>(tail).is_ok();
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|source| Error::Io {
+            operation: "open manifest for tail repair",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if tail_is_valid_manifest_entry {
+        file.seek(io::SeekFrom::End(0))
+            .map_err(|source| Error::Io {
+                operation: "seek manifest for tail repair",
+                path: path.to_path_buf(),
+                source,
+            })?;
+        file.write_all(b"\n").map_err(|source| Error::Io {
+            operation: "terminate manifest tail",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    } else {
+        file.set_len(
+            u64::try_from(tail_start).map_err(|_source| Error::ByteCountOverflow {
+                path: path.to_path_buf(),
+            })?,
+        )
+        .map_err(|source| Error::Io {
+            operation: "truncate malformed manifest tail",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+    file.sync_all().map_err(|source| Error::Io {
+        operation: "fsync manifest tail repair",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    drop(file);
+    sync_parent_dir(path, "manifest tail repair")
 }
 
 fn append_manifest_jsonl_unlocked(path: &Path, entry: &ManifestEntry) -> Result<(), Error> {

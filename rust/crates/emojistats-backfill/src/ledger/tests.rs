@@ -652,6 +652,7 @@ fn sqlite_host_overrides_round_trip() {
         min_interval: None,
         revive_after: Some(UNIX_EPOCH + Duration::from_secs(60)),
         force_mode: Some(ForcedFetchMode::ListRecords),
+        force_mode_revive_after: None,
         never_diff: false,
     };
 
@@ -673,6 +674,7 @@ fn sqlite_host_override_force_mode_update_preserves_operator_fields() {
         min_interval: Some(Duration::from_millis(250)),
         revive_after: Some(UNIX_EPOCH + Duration::from_secs(60)),
         force_mode: Some(ForcedFetchMode::GetRepo),
+        force_mode_revive_after: None,
         never_diff: true,
     };
     store.upsert_host_override(&original).unwrap();
@@ -682,6 +684,7 @@ fn sqlite_host_override_force_mode_update_preserves_operator_fields() {
             "pds.example.com",
             Some(ForcedFetchMode::ListRecords),
             Some(Duration::from_secs(1)),
+            Some(UNIX_EPOCH + Duration::from_secs(120)),
         )
         .unwrap();
 
@@ -689,6 +692,7 @@ fn sqlite_host_override_force_mode_update_preserves_operator_fields() {
         store.load_host_override("pds.example.com").unwrap(),
         Some(HostOverride {
             force_mode: Some(ForcedFetchMode::ListRecords),
+            force_mode_revive_after: Some(UNIX_EPOCH + Duration::from_secs(120)),
             ..original
         })
     );
@@ -704,6 +708,7 @@ fn sqlite_host_overrides_reject_blank_hosts_and_zero_caps() {
         min_interval: None,
         revive_after: None,
         force_mode: None,
+        force_mode_revive_after: None,
         never_diff: false,
     };
     let zero_cap = HostOverride {
@@ -713,6 +718,7 @@ fn sqlite_host_overrides_reject_blank_hosts_and_zero_caps() {
         min_interval: None,
         revive_after: None,
         force_mode: Some(ForcedFetchMode::GetRepo),
+        force_mode_revive_after: None,
         never_diff: false,
     };
 

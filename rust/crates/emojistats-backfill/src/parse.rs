@@ -160,11 +160,11 @@ pub struct CompletenessProof {
     pub duplicate_block_cid_count: u64,
     /// Number of reachable `MST` leaves whose record block resolved by `CID`.
     pub reachable_record_count: u64,
-    /// Whether the commit's `data` root block was present, traversed, and content-address verified.
+    /// Whether the commit's `data` root block was present and content-address verified.
     ///
     /// This does not recompute a new root from decoded `MST` nodes; it proves that the root block
-    /// named by the commit exists in the `CAR`, its bytes match its `CID`, and traversal reached
-    /// records through verified child links.
+    /// named by the commit exists in the `CAR` and its bytes match its `CID`. Traversal from that
+    /// root still fails loudly if any child or record link is missing.
     pub mst_root_cid_verified: bool,
     /// Commit signature verification is deliberately out of scope for Stage C.
     pub repo_commit_signature_verified: bool,
@@ -312,14 +312,6 @@ pub enum ParseError {
         /// Underlying DAG-CBOR decode error.
         #[source]
         source: Box<serde_ipld_dagcbor::DecodeError<std::convert::Infallible>>,
-    },
-    /// The `MST` root reached from the commit did not match `commit.data`.
-    #[error("MST root mismatch: commit data={commit_data}, traversed root={traversed_root}")]
-    MstRootMismatch {
-        /// Commit `data` root.
-        commit_data: String,
-        /// Traversed `MST` root.
-        traversed_root: String,
     },
     /// Integer overflow while counting parser resources.
     #[error("resource counter overflow: {field}")]
@@ -520,6 +512,7 @@ where
     assert_requested_did(requested_did, commit.did().as_str())?;
     let commit_ms = elapsed_millis(commit_started);
     let walk_started = Instant::now();
+    let mst_root_cid_verified = store.has_verified_block(&commit.data);
     let (profile, profile_decode_error, decode_digest, rkey_digest) = walk_mst_records_visit(
         commit.data,
         &store,
@@ -540,7 +533,7 @@ where
         verified_block_count: stream_summary.verified_block_count,
         duplicate_block_cid_count: stream_summary.duplicate_block_cid_count,
         reachable_record_count: rkey_digest.all_records_count,
-        mst_root_cid_verified: true,
+        mst_root_cid_verified,
         repo_commit_signature_verified: false,
         identity_verified: false,
     };

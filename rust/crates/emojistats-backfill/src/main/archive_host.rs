@@ -376,6 +376,16 @@ fn normalize_host_override(
             ))
         })?;
     }
+    if record
+        .force_mode_revive_after
+        .is_some_and(|revive_after| revive_after <= now)
+    {
+        record.force_mode = None;
+        record.force_mode_revive_after = None;
+        ledger.upsert_host_override(&record).map_err(|err| {
+            retryable_failure(format!("clear expired forced fetch mode for {host}: {err}"))
+        })?;
+    }
     Ok(record)
 }
 

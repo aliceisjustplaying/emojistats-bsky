@@ -4,18 +4,14 @@ use super::{
     ARCHIVE_SCHEMA_VERSION, Arc, ArchiveArtifacts, ArchiveCommitContext, ArchiveError,
     ArchivePostRow, ArchiveStorageConfig, ArrowWriter, CompletenessClass, DateTime, FetchMethod,
     File, LocalManifestEntry, ManifestMode, Metadata, NamedTempFile, NormalizerVersion,
-    PARQUET_BATCH_ROWS, POST_COLLECTION, Path, PathBuf, ProfileRecord, RepoReceipt, Request,
-    Schema, TempPath, Utc,
+    PARQUET_BATCH_ROWS, Path, PathBuf, ProfileRecord, RepoReceipt, Request, Schema, TempPath, Utc,
     archive_io::{
         local_manifest_from_committed, receipt_dataset, update_min_max_created_at,
         write_json_pretty,
     },
     commit_backend::ArchiveCommitBackend,
     format_observed_at, fs,
-    hash::{
-        append_hash_field_frame, append_normalizer_frames, framed_fields, hash_extras_json,
-        hash_field, hash_optional_field, hash_post_row_into, hash_string_slice,
-    },
+    hash::hash_post_row_into,
     hash_serialized_json,
     naming::{stable_artifact_stem, stable_object_receipt_path, stable_repo_receipt_name},
     parquet::{archive_schema, parquet_writer_properties, post_record_batch},
@@ -45,9 +41,6 @@ pub struct StreamingArchiveSink {
     storage_config: ArchiveStorageConfig,
     observed_at: DateTime<Utc>,
     did: String,
-    hash_prefix: Vec<u8>,
-    hash_after_cid: Vec<u8>,
-    hash_public_none: Vec<u8>,
 }
 
 /// Summary fields needed to finish a streaming repo receipt.
@@ -102,11 +95,6 @@ impl StreamingArchiveSink {
             Arc::clone(&schema),
             Some(parquet_writer_properties()?),
         )?;
-        let hash_prefix = framed_fields([POST_COLLECTION, did])?;
-        let mut hash_after_cid = Vec::new();
-        append_normalizer_frames(&mut hash_after_cid, &normalizer)?;
-        append_hash_field_frame(&mut hash_after_cid, "none")?;
-        let hash_public_none = framed_fields(["none"])?;
         Ok(Self {
             output_dir: output_dir.to_path_buf(),
             parquet_temp_path,
@@ -126,9 +114,6 @@ impl StreamingArchiveSink {
             commit_context,
             storage_config,
             did: did.to_owned(),
-            hash_prefix,
-            hash_after_cid,
-            hash_public_none,
         })
     }
 
@@ -202,26 +187,7 @@ impl StreamingArchiveSink {
     }
 
     fn hash_streaming_row(&mut self, row: &ArchivePostRow) -> Result<(), ArchiveError> {
-        if row.did != self.did
-            || row.normalizer != self.normalizer
-            || row.account_status.is_some()
-            || row.public_content_label.is_some()
-        {
-            return hash_post_row_into(&mut self.rows_hash, row);
-        }
-        self.rows_hash.update(&self.hash_prefix);
-        hash_field(&mut self.rows_hash, &row.rkey)?;
-        hash_field(&mut self.rows_hash, &row.cid)?;
-        self.rows_hash.update(&self.hash_after_cid);
-        hash_optional_field(&mut self.rows_hash, row.record_status.as_deref())?;
-        self.rows_hash.update(&self.hash_public_none);
-        hash_optional_field(&mut self.rows_hash, row.created_at_raw.as_deref())?;
-        hash_optional_field(&mut self.rows_hash, row.created_at_normalized.as_deref())?;
-        hash_field(&mut self.rows_hash, row.created_at_parse_status.as_str())?;
-        hash_field(&mut self.rows_hash, &row.text)?;
-        hash_string_slice(&mut self.rows_hash, &row.langs)?;
-        hash_string_slice(&mut self.rows_hash, &row.emoji_sequence)?;
-        hash_extras_json(&mut self.rows_hash, &row.extras_json)
+        hash_post_row_into(&mut self.rows_hash, row)
     }
 
     /// Finish all artifacts and return the receipt plus artifact paths.

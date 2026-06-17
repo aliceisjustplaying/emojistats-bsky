@@ -35,10 +35,11 @@ const STALE_RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
 pub const DEFAULT_HOST_CONCURRENCY_CAP: u32 = 2;
 
 mod host_limiter;
+mod ledger_async;
 mod ledger_io;
 
 pub use host_limiter::{HostConcurrencyLimiter, HostConcurrencyPermit};
-pub use ledger_io::{SeedSummary, recover_stale_claimed_entries_for_scope, seed_ledger_from_file};
+pub use ledger_io::{SeedSummary, seed_ledger_from_file};
 #[cfg(test)]
 pub use ledger_io::{claimable_entries_for_scope, recover_stale_claimed_entries};
 
@@ -105,11 +106,13 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
     loop {
         let now = Instant::now();
         if now >= next_stale_recovery {
-            let recovered = recover_stale_claimed_entries_for_scope(
-                &ledger,
+            let recovered = ledger_async::recover_stale_claimed_entries_for_scope(
+                config.ledger_path.clone(),
                 SystemTime::now(),
-                &config.claim_scope,
-            )?;
+                config.claim_scope.clone(),
+                "expired claimed lease during fleet run",
+            )
+            .await?;
             if recovered > 0 {
                 config.metrics.increment_counter(
                     MetricName::FleetStaleClaimsRecoveredTotal,
@@ -138,13 +141,15 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
             if remaining == 0 {
                 break;
             }
-            let claimed = ledger.try_claim_next(
+            let claimed = ledger_async::try_claim_next(
+                config.ledger_path.clone(),
                 SystemTime::now(),
-                &config.run_id,
-                &config.worker_id,
+                config.run_id.clone(),
+                config.worker_id.clone(),
                 DEFAULT_CLAIM_LEASE_DURATION,
-                config.claim_scope.shard_filter(),
-            )?;
+                config.claim_scope.clone(),
+            )
+            .await?;
             let Some(claimed) = claimed else {
                 break;
             };
@@ -184,7 +189,7 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
         let Some(attempt_result) = active.next().await else {
             break;
         };
-        complete_fleet_attempt(&ledger, &mut summary, &config, attempt_result)?;
+        complete_fleet_attempt(&mut summary, &config, attempt_result).await?;
         record_active_attempts(&config, active.len());
     }
 
@@ -273,9 +278,14 @@ fn spawn_claim_heartbeat(ledger_path: PathBuf, claimed: RepoLedgerEntry) -> Join
         loop {
             tokio::time::sleep(CLAIM_HEARTBEAT_INTERVAL).await;
             let now = SystemTime::now();
-            match SqliteLedger::open(&ledger_path).and_then(|ledger| {
-                ledger.extend_owned_claim_lease(&claimed, now, DEFAULT_CLAIM_LEASE_DURATION)
-            }) {
+            match ledger_async::extend_owned_claim_lease(
+                ledger_path.clone(),
+                claimed.clone(),
+                now,
+                DEFAULT_CLAIM_LEASE_DURATION,
+            )
+            .await
+            {
                 Ok(Some(_entry)) => {}
                 Ok(None) => {
                     eprintln!(
@@ -316,8 +326,7 @@ fn archive_shard_label(claim_scope: &ClaimScope) -> String {
     )
 }
 
-fn complete_fleet_attempt(
-    ledger: &SqliteLedger,
+async fn complete_fleet_attempt(
     summary: &mut FleetSummary,
     config: &FleetConfig,
     attempt_result: FleetAttemptResult,
@@ -326,12 +335,14 @@ fn complete_fleet_attempt(
         |failure| failure.outcome.clone(),
         |_success| AttemptOutcome::Succeeded,
     );
-    let completed = ledger.complete_owned_claim(
-        &attempt_result.claimed,
+    let completed = ledger_async::complete_owned_claim(
+        config.ledger_path.clone(),
+        attempt_result.claimed.clone(),
         outcome,
         SystemTime::now(),
         RetryPolicy::default(),
-    )?;
+    )
+    .await?;
     let Some(completed) = completed else {
         eprintln!(
             "skipping completion for {} because this worker no longer owns the claim",

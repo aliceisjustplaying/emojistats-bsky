@@ -38,7 +38,7 @@ fn batch() -> ClickHouseDeriveBatch {
             content_hash: "content-hash".to_owned(),
             receipt_hash: "receipt-hash".to_owned(),
             observed_at: "2026-06-15T00:00:00Z".to_owned(),
-            schema_version: 2,
+            schema_version: 3,
             normalizer: current_normalizer(),
         },
         dedupe_token: "derive:test-token".to_owned(),
@@ -185,7 +185,7 @@ fn schema_sql_contains_typed_table_names_and_engines() {
         "ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, did, rkey)"
     ));
     assert!(sql.contains(
-        "ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, did)"
+        "ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, run_id, shard, file_sequence, receipt_hash, did)"
     ));
 }
 

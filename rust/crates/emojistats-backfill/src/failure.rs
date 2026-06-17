@@ -60,7 +60,7 @@ pub const fn outcome_name(outcome: &AttemptOutcome) -> &'static str {
         AttemptOutcome::RateLimited { .. } => "rate_limited",
         AttemptOutcome::OperatorDeferred { .. } => "operator_deferred",
         AttemptOutcome::RetryableFailure { .. } => "retryable_failure",
-        AttemptOutcome::ResourceLimitExceeded { .. } => "resource_limit_exceeded",
+        AttemptOutcome::ResourceLimitExceeded { .. } => "resource_limited",
         AttemptOutcome::PermanentFailure { .. } => "permanent_failure",
     }
 }
@@ -197,7 +197,6 @@ pub fn classify_parse_error(did: &str, error: &ParseError) -> FetchOneFailure {
         | ParseError::CommitDidMismatch { .. }
         | ParseError::MissingBlock { .. }
         | ParseError::RecordDecode { .. }
-        | ParseError::MstRootMismatch { .. }
         | ParseError::Unsupported { .. }
         | ParseError::NotYetImplemented { .. }
         | ParseError::RuntimeThreadTerminated
@@ -426,6 +425,9 @@ mod tests {
             &FetchError::PermanentTransport {
                 message: "dns error: failed to lookup address information".to_owned(),
                 observed_bytes: None,
+                source: Box::new(io::Error::other(
+                    "dns error: failed to lookup address information",
+                )),
             },
         );
 

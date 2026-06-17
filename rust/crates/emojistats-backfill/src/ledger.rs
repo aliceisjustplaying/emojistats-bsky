@@ -206,6 +206,7 @@ pub struct HostOverride {
     pub min_interval: Option<Duration>,
     pub revive_after: Option<SystemTime>,
     pub force_mode: Option<ForcedFetchMode>,
+    pub force_mode_revive_after: Option<SystemTime>,
     pub never_diff: bool,
 }
 
