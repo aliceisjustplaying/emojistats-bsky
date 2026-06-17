@@ -2466,6 +2466,66 @@ PLC mirror, cross-box host pacing, shard workers, Jetstream catch-up spooler, pr
 observability (OTEL + Prometheus, which Alice asked about — "wait whats the difference between
 otel and prometheus actually"), and the canary protocol before 8-box fan-out.
 
+### 2026-06-17 (midday) — the review gauntlet, schema v2, and still not approved
+
+Three more code review rounds ran against the Rust rewrite between the overnight sprint and
+midday Jun 17. Each followed the same cycle: static review → autonomous fix sprint (sometimes
+with parallel subagent pairs) → cargo test + clippy → full 24-DID whale smoke → ClickHouse
+derive verification → zip evidence for Alice.
+
+**Round 1 (30 findings).** Blockers: in-flight byte budget deadlock on concurrent unknown-size
+downloads, Storage Box exposing local manifest before remote object commits, listRecords
+pagination not paced through the shared per-host scheduler. All three fixed. Unknown-size
+downloads now reserve the full per-repo cap up front. Storage Box manifest exposure deferred
+to after remote commit. listRecords wired through shared host pacing. Parallel subagent workers
+split the fix list: one handled derive/manifest, the other listRecords/scheduler. Both hit the
+now-familiar cross-module compile barrier from concurrent edits but respected their ownership
+boundaries.
+
+**Round 2 (24 findings).** Focus shifted to proof-boundary drift and serving-table semantics. Key
+fix: CID removed from ClickHouse serving ORDER BY — the review correctly identified it would
+cause double-counting on re-fetch, contradicting the design doc. Proof metadata (dataset,
+proof class) added to derived rows and counters so `collection_paginated_posts` (listRecords
+fallback data) can't silently mix with root-proofed `raw_archive_posts`. Storage Box now uploads
+the repo receipt alongside the archive, making remote derive self-sufficient.
+
+**Round 3 (19 findings).** Alice asked: "how much of the previous rounds' findings were nit vs
+real?" Agent estimated 70-80% real, 20-30% nit. Alice set the threshold: "once reviews get into
+at least 50-60% nit territory we can continue with arch." This round was still above that bar.
+Key fixes: streaming derive proof validation, archive schema bumped to v2, ClickHouse tables
+rotated to `_r2`, DID added to counters/receipts/manifests, receipt-hash-scoped object receipts.
+Alice on backwards compatibility: "given that this is a de-facto blank slate we do not give any
+fucks about backwards compatibility."
+
+**Smoke results held stable across all three rounds:** 24 claimed / 19 succeeded / 5 expected
+failures. Derive consistently produced ~499,600 emoji rows from ~16.7M archived posts. Max RSS
+peaked at 3.05 GiB — still well under the 64 GB crawler target. Derive wall time stable at
+~2:56, RSS ~72 MB.
+
+**Crate cleanup.** Alice asked about reinventing-the-wheel opportunities. Three crate adoptions
+landed in `787eb49`: `fs4` for manifest file locking (replacing custom flock), `shell-words` for
+SSH argument quoting (replacing hand-rolled escaping), `rusqlite_migration` for SQLite schema
+versioning (replacing ad-hoc CREATE TABLE checks). The official `clickhouse` crate was evaluated
+but deferred — viable for later but not a drop-in replacement yet.
+
+**The latest thermo-nuclear review (Jun 17 13:29) still did not approve.** Two blockers remain:
+
+1. `fetch_attempt.rs` at 1,096 lines is the new orchestration sink — runtime mode selection,
+   host override persistence, retries, fallback, parse/archive spawning, telemetry, DTOs all
+   crammed in. The earlier `main.rs` split helped but just moved the complexity.
+2. Run identity/dedupe key conflict — ClickHouse stores run identity columns but excludes them
+   from the table replacement key; derive omits run identity from dedupe tokens. Content
+   idempotence and run-scoped publication are mixed in the same token boundary.
+
+Three major findings on top: storage backend branching leaking through the archive writer,
+two divergent derive paths (the streaming path added by subagent work alongside the original
+full-load path, which may now be vestigial), and commit pipeline duplication in Storage Box.
+
+**Rust codebase at 25,082 LOC** (18,789 non-test, 6,293 test) across 52 files. Two files
+remain over 1,000 lines: `fetch_attempt.rs` (1,096) and `storage_box.rs` (1,084). Both
+commits pushed to origin: `097020d` (proof and derive hardening, 2,324 insertions across
+40 files) and `787eb49` (crate plumbing, 251 insertions across 9 files).
+
 ## The ETA honesty record
 
 The full table lives in the launch log ("Running ETA honesty table"). The shape:
