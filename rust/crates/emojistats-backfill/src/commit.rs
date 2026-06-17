@@ -241,26 +241,30 @@ impl LocalStore {
         let object_state = promote_object(&object)?;
         let digest = object_state.digest();
         let object_path = manifest_path_string("object", &request.object_path)?;
-        let entry = ManifestEntry::from_parts(&request.metadata, object_path.clone(), &digest);
         let receipt_doc = Receipt::from_parts(&request.metadata, object_path, &digest);
 
-        match object_state {
+        let (entry, committed_receipt) = match object_state {
             ObjectCommitState::Promoted(_) => {
+                let entry = ManifestEntry::from_parts(&request.metadata, &receipt_doc);
                 write_json_temp_promote(&receipt, "receipt", &receipt_doc)?;
                 write_manifest(&manifest, request.manifest_mode, &entry)?;
+                (entry, receipt_doc)
             }
             ObjectCommitState::AlreadyCommitted(_) => {
-                repair_or_validate_existing_receipt(&receipt, &receipt_doc)?;
+                let committed_receipt =
+                    repair_or_validate_existing_receipt(&receipt, &receipt_doc)?;
+                let entry = ManifestEntry::from_parts(&request.metadata, &committed_receipt);
                 write_manifest_if_missing(&manifest, request.manifest_mode, &entry)?;
+                (entry, committed_receipt)
             }
-        }
+        };
 
         Ok(Artifact {
             object_path: object,
             receipt_path: receipt,
             manifest_path: manifest,
             entry,
-            receipt: receipt_doc,
+            receipt: committed_receipt,
         })
     }
 
@@ -305,25 +309,21 @@ impl Error {
 }
 
 impl ManifestEntry {
-    pub(crate) fn from_parts(
-        metadata: &Metadata,
-        object_path: String,
-        digest: &DigestResult,
-    ) -> Self {
+    pub(crate) fn from_parts(metadata: &Metadata, receipt: &Receipt) -> Self {
         Self {
-            run_id: metadata.run_id.clone(),
-            shard: metadata.shard.clone(),
-            file_sequence: metadata.file_sequence,
-            dataset: metadata.dataset.clone(),
-            object_path,
-            row_count: metadata.row_count,
-            bytes: digest.bytes,
-            content_hash: digest.sha256.clone(),
+            run_id: receipt.run_id.clone(),
+            shard: receipt.shard.clone(),
+            file_sequence: receipt.file_sequence,
+            dataset: receipt.dataset.clone(),
+            object_path: receipt.object_path.clone(),
+            row_count: receipt.row_count,
+            bytes: receipt.bytes,
+            content_hash: receipt.content_hash.clone(),
             min_created_at_normalized: metadata.min_created_at_normalized.clone(),
             max_created_at_normalized: metadata.max_created_at_normalized.clone(),
-            receipt_hash: metadata.receipt_hash.clone(),
+            receipt_hash: receipt.receipt_hash.clone(),
             normalizer: metadata.normalizer.clone(),
-            schema_version: metadata.schema_version,
+            schema_version: receipt.schema_version,
         }
     }
 }
@@ -512,10 +512,14 @@ fn write_manifest_if_missing(
     mode: ManifestMode,
     entry: &ManifestEntry,
 ) -> Result<(), Error> {
-    if manifest_contains_entry(path, mode, entry)? {
-        return Ok(());
+    if mode == ManifestMode::AppendJsonl {
+        return append_manifest_jsonl_if_missing(path, entry);
     }
-    write_manifest(path, mode, entry)
+    if manifest_contains_entry(path, mode, entry)? {
+        Ok(())
+    } else {
+        write_manifest(path, mode, entry)
+    }
 }
 
 fn manifest_contains_entry(
@@ -562,6 +566,18 @@ fn manifest_contains_entry(
 
 fn append_manifest_jsonl(path: &Path, entry: &ManifestEntry) -> Result<(), Error> {
     let _lock = ManifestAppendLock::acquire(path)?;
+    append_manifest_jsonl_unlocked(path, entry)
+}
+
+fn append_manifest_jsonl_if_missing(path: &Path, entry: &ManifestEntry) -> Result<(), Error> {
+    let _lock = ManifestAppendLock::acquire(path)?;
+    if manifest_contains_entry(path, ManifestMode::AppendJsonl, entry)? {
+        return Ok(());
+    }
+    append_manifest_jsonl_unlocked(path, entry)
+}
+
+fn append_manifest_jsonl_unlocked(path: &Path, entry: &ManifestEntry) -> Result<(), Error> {
     let mut line = serde_json::to_vec(entry).map_err(|source| Error::Json {
         path: path.to_path_buf(),
         source,
@@ -605,16 +621,22 @@ impl ManifestAppendLock {
                 .open(&lock_path)
             {
                 Ok(mut file) => {
-                    writeln!(file, "{}", std::process::id()).map_err(|source| Error::Io {
-                        operation: "write manifest append lock",
-                        path: lock_path.clone(),
-                        source,
-                    })?;
-                    file.sync_all().map_err(|source| Error::Io {
-                        operation: "fsync manifest append lock",
-                        path: lock_path.clone(),
-                        source,
-                    })?;
+                    if let Err(source) = writeln!(file, "{}", std::process::id()) {
+                        let _ignored = fs::remove_file(&lock_path);
+                        return Err(Error::Io {
+                            operation: "write manifest append lock",
+                            path: lock_path,
+                            source,
+                        });
+                    }
+                    if let Err(source) = file.sync_all() {
+                        let _ignored = fs::remove_file(&lock_path);
+                        return Err(Error::Io {
+                            operation: "fsync manifest append lock",
+                            path: lock_path,
+                            source,
+                        });
+                    }
                     drop(file);
                     sync_parent_dir(&lock_path, "manifest append lock")?;
                     return Ok(Self { path: lock_path });
@@ -696,12 +718,12 @@ fn remove_stale_manifest_lock(path: &Path) -> Result<bool, Error> {
     }
 }
 
-fn repair_or_validate_existing_receipt(path: &Path, expected: &Receipt) -> Result<(), Error> {
+fn repair_or_validate_existing_receipt(path: &Path, expected: &Receipt) -> Result<Receipt, Error> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
             write_json_temp_promote(path, "receipt", expected)?;
-            return Ok(());
+            return Ok(expected.clone());
         }
         Err(source) => {
             return Err(Error::Io {
@@ -715,13 +737,23 @@ fn repair_or_validate_existing_receipt(path: &Path, expected: &Receipt) -> Resul
         path: path.to_path_buf(),
         source,
     })?;
-    if actual == *expected {
-        Ok(())
+    if actual == *expected || receipts_are_content_compatible(&actual, expected) {
+        Ok(actual)
     } else {
         Err(Error::ExistingReceiptMismatch {
             path: path.to_path_buf(),
         })
     }
+}
+
+fn receipts_are_content_compatible(actual: &Receipt, expected: &Receipt) -> bool {
+    actual.protocol_version == expected.protocol_version
+        && actual.dataset == expected.dataset
+        && actual.object_path == expected.object_path
+        && actual.row_count == expected.row_count
+        && actual.bytes == expected.bytes
+        && actual.content_hash == expected.content_hash
+        && actual.schema_version == expected.schema_version
 }
 
 fn promote_no_overwrite(temp_path: &Path, path: &Path, kind: &'static str) -> Result<(), Error> {

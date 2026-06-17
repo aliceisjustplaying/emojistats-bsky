@@ -3,9 +3,13 @@ use std::{
     path::PathBuf,
     process::{Command as ProcessCommand, Stdio},
     thread,
+    time::{Duration, Instant},
 };
 
 use super::{CommandError, SshStorageBoxCommands, StorageBoxCommands, StorageBoxSshConfig};
+
+const COMMAND_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+const COMMAND_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CommandSpec {
@@ -13,6 +17,7 @@ pub(super) struct CommandSpec {
     pub(super) program: PathBuf,
     pub(super) args: Vec<String>,
     pub(super) stdin: bool,
+    pub(super) timeout: Duration,
 }
 
 impl StorageBoxSshConfig {
@@ -31,6 +36,7 @@ impl StorageBoxSshConfig {
             program: self.ssh_program.clone(),
             args,
             stdin,
+            timeout: self.command_timeout,
         })
     }
 }
@@ -73,6 +79,12 @@ impl SshStorageBoxCommands {
         self.config.ssh_command("read_prefix", script, false)
     }
 
+    pub(super) fn remove_command(&self, remote_path: &str) -> Result<CommandSpec, CommandError> {
+        validate_remote_path(remote_path)?;
+        let script = format!("rm -f -- {}", shell_quote(remote_path));
+        self.config.ssh_command("remove", script, false)
+    }
+
     pub(super) fn rename_command(&self, from: &str, to: &str) -> Result<CommandSpec, CommandError> {
         validate_remote_path(from)?;
         let parent = remote_parent(to)?;
@@ -89,17 +101,21 @@ impl SshStorageBoxCommands {
         self.config.ssh_command("rename", script, false)
     }
 
-    pub(super) fn append_command(&self, remote_path: &str) -> Result<CommandSpec, CommandError> {
+    pub(super) fn append_manifest_record_if_missing_command(
+        &self,
+        remote_path: &str,
+    ) -> Result<CommandSpec, CommandError> {
         let parent = remote_parent(remote_path)?;
         let lock_path = format!("{remote_path}.lock");
         let script = format!(
-            "umask 077; mkdir -p -- {}; touch -- {}; flock -- {} sh -c 'cat >> \"$1\"' sh {}",
+            "umask 077; mkdir -p -- {}; touch -- {}; flock -- {} sh -c 'record=$(cat); if [ -e \"$1\" ] && grep -Fqx -- \"$record\" \"$1\"; then exit 0; fi; printf \"%s\\n\" \"$record\" >> \"$1\"' sh {}",
             shell_quote(&parent),
             shell_quote(&lock_path),
             shell_quote(&lock_path),
             shell_quote(remote_path)
         );
-        self.config.ssh_command("append", script, true)
+        self.config
+            .ssh_command("append_manifest_record_if_missing", script, true)
     }
 
     fn contains_manifest_record_command(
@@ -126,7 +142,7 @@ impl StorageBoxCommands for SshStorageBoxCommands {
     fn upload_reader(
         &mut self,
         remote_path: &str,
-        reader: &mut dyn Read,
+        reader: &mut (dyn Read + Send),
     ) -> Result<(), CommandError> {
         let command = self.upload_command(remote_path)?;
         run_command(&command, Some(reader)).map(|_stdout| ())
@@ -185,9 +201,18 @@ impl StorageBoxCommands for SshStorageBoxCommands {
         run_command(&command, None).map(|_stdout| ())
     }
 
-    fn append(&mut self, remote_path: &str, bytes: &[u8]) -> Result<(), CommandError> {
-        let command = self.append_command(remote_path)?;
-        let mut reader = Cursor::new(bytes);
+    fn remove(&mut self, remote_path: &str) -> Result<(), CommandError> {
+        let command = self.remove_command(remote_path)?;
+        run_command(&command, None).map(|_stdout| ())
+    }
+
+    fn append_manifest_record_if_missing(
+        &mut self,
+        remote_path: &str,
+        record_without_newline: &[u8],
+    ) -> Result<(), CommandError> {
+        let command = self.append_manifest_record_if_missing_command(remote_path)?;
+        let mut reader = Cursor::new(record_without_newline);
         run_command(&command, Some(&mut reader)).map(|_stdout| ())
     }
 
@@ -211,7 +236,7 @@ impl StorageBoxCommands for SshStorageBoxCommands {
 
 pub(super) fn run_command(
     spec: &CommandSpec,
-    stdin_reader: Option<&mut dyn Read>,
+    stdin_reader: Option<&mut (dyn Read + Send)>,
 ) -> Result<Vec<u8>, CommandError> {
     let mut command = ProcessCommand::new(&spec.program);
     command.args(&spec.args);
@@ -234,37 +259,112 @@ pub(super) fn run_command(
     let stdout_reader = read_pipe(spec.operation, "stdout", stdout);
     let stderr_reader = read_pipe(spec.operation, "stderr", stderr);
 
-    let stdin_error = if let Some(reader) = stdin_reader {
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            CommandError::new(format!("{} stdin was not available", spec.operation))
-        })?;
-        let result = io::copy(reader, &mut stdin);
-        drop(stdin);
-        result.map(|_bytes| ()).err()
-    } else {
-        None
-    };
+    thread::scope(|scope| {
+        let stdin_writer = if let Some(reader) = stdin_reader {
+            let mut stdin = child.stdin.take().ok_or_else(|| {
+                CommandError::new(format!("{} stdin was not available", spec.operation))
+            })?;
+            Some(scope.spawn(move || {
+                let result = io::copy(reader, &mut stdin);
+                drop(stdin);
+                result.map(|_bytes| ()).map_err(|error| {
+                    CommandError::new(format!("{} stdin write failed: {error}", spec.operation))
+                })
+            }))
+        } else {
+            None
+        };
 
-    let status = child
-        .wait()
-        .map_err(|error| CommandError::new(format!("{} wait failed: {error}", spec.operation)))?;
-    let stdout = join_pipe_reader(spec.operation, "stdout", stdout_reader)?;
-    let stderr = join_pipe_reader(spec.operation, "stderr", stderr_reader)?;
-    if status.success() {
-        stdin_error.map_or(Ok(stdout), |error| {
-            Err(CommandError::new(format!(
-                "{} stdin write failed: {error}",
-                spec.operation
-            )))
-        })
+        let status = wait_with_timeout(spec, &mut child);
+        let stdout = join_pipe_reader(spec.operation, "stdout", stdout_reader)?;
+        let stderr = join_pipe_reader(spec.operation, "stderr", stderr_reader)?;
+        let stdin_result = stdin_writer.map_or(Ok(()), |handle| {
+            handle.join().unwrap_or_else(|_panic| {
+                Err(CommandError::new(format!(
+                    "{} stdin writer panicked",
+                    spec.operation
+                )))
+            })
+        });
+
+        match status {
+            Ok(CommandStatus::Exited(status)) if status.success() => {
+                stdin_result?;
+                if stdout.truncated {
+                    Err(CommandError::new(format!(
+                        "{} stdout exceeded {} bytes",
+                        spec.operation, COMMAND_OUTPUT_MAX_BYTES
+                    )))
+                } else {
+                    Ok(stdout.bytes)
+                }
+            }
+            Ok(CommandStatus::Exited(status)) => Err(CommandError::new(format!(
+                "{} exited with {}: stdout={} stderr={}",
+                spec.operation,
+                status,
+                format_pipe_output(&stdout),
+                format_pipe_output(&stderr)
+            ))),
+            Ok(CommandStatus::TimedOut) => Err(CommandError::new(format!(
+                "{} timed out after {:?} and was killed: stdout={} stderr={}",
+                spec.operation,
+                spec.timeout,
+                format_pipe_output(&stdout),
+                format_pipe_output(&stderr)
+            ))),
+            Err(error) => Err(error),
+        }
+    })
+}
+
+enum CommandStatus {
+    Exited(std::process::ExitStatus),
+    TimedOut,
+}
+
+fn wait_with_timeout(
+    spec: &CommandSpec,
+    child: &mut std::process::Child,
+) -> Result<CommandStatus, CommandError> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().map_err(|error| {
+            CommandError::new(format!("{} wait failed: {error}", spec.operation))
+        })? {
+            return Ok(CommandStatus::Exited(status));
+        }
+        if started.elapsed() >= spec.timeout {
+            child.kill().map_err(|error| {
+                CommandError::new(format!(
+                    "{} kill after timeout failed: {error}",
+                    spec.operation
+                ))
+            })?;
+            child.wait().map_err(|error| {
+                CommandError::new(format!(
+                    "{} wait after kill failed: {error}",
+                    spec.operation
+                ))
+            })?;
+            return Ok(CommandStatus::TimedOut);
+        }
+        thread::sleep(COMMAND_WAIT_POLL_INTERVAL.min(spec.timeout));
+    }
+}
+
+#[derive(Debug)]
+struct PipeOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn format_pipe_output(output: &PipeOutput) -> String {
+    let text = String::from_utf8_lossy(&output.bytes);
+    if output.truncated {
+        format!("{}...[truncated]", text.trim())
     } else {
-        let stderr = String::from_utf8_lossy(&stderr);
-        Err(CommandError::new(format!(
-            "{} exited with {}: {}",
-            spec.operation,
-            status,
-            stderr.trim()
-        )))
+        text.trim().to_owned()
     }
 }
 
@@ -272,24 +372,44 @@ fn read_pipe<R>(
     operation: &'static str,
     stream_name: &'static str,
     mut reader: R,
-) -> thread::JoinHandle<Result<Vec<u8>, CommandError>>
+) -> thread::JoinHandle<Result<PipeOutput, CommandError>>
 where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
         let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes).map_err(|error| {
-            CommandError::new(format!("{operation} {stream_name} read failed: {error}"))
-        })?;
-        Ok(bytes)
+        let mut truncated = false;
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let read = reader.read(&mut buffer).map_err(|error| {
+                CommandError::new(format!("{operation} {stream_name} read failed: {error}"))
+            })?;
+            if read == 0 {
+                break;
+            }
+            let remaining = COMMAND_OUTPUT_MAX_BYTES.saturating_sub(bytes.len());
+            if remaining > 0 {
+                let keep = remaining.min(read);
+                let chunk = buffer.get(..keep).ok_or_else(|| {
+                    CommandError::new(format!(
+                        "{operation} {stream_name} read buffer slice out of bounds"
+                    ))
+                })?;
+                bytes.extend_from_slice(chunk);
+            }
+            if read > remaining {
+                truncated = true;
+            }
+        }
+        Ok(PipeOutput { bytes, truncated })
     })
 }
 
 fn join_pipe_reader(
     operation: &'static str,
     stream_name: &'static str,
-    handle: thread::JoinHandle<Result<Vec<u8>, CommandError>>,
-) -> Result<Vec<u8>, CommandError> {
+    handle: thread::JoinHandle<Result<PipeOutput, CommandError>>,
+) -> Result<PipeOutput, CommandError> {
     handle.join().unwrap_or_else(|_panic| {
         Err(CommandError::new(format!(
             "{operation} {stream_name} reader panicked"

@@ -173,11 +173,11 @@ pub(crate) async fn fetch_one_attempt_with_pacer(
         config.runtime.claim_scope(),
         config.runtime.host_override_ledger_path(),
         config.runtime.host_override_cache(),
-        config.runtime.host_pacer(),
     )
     .await?;
     let _host_permit =
         acquire_host_fetch_permit(config.runtime.host_limiter(), &prepared_host).await?;
+    reserve_host_send(config.runtime.host_pacer(), &prepared_host).await?;
     let host = prepared_host.host;
     let http = repo_fetch_client(config.http_protocol).map_err(|err| {
         retryable_failure(format!("build repo fetch HTTP client for {did_str}: {err}"))
@@ -261,6 +261,22 @@ async fn acquire_host_fetch_permit(
                 .or(Some(DEFAULT_HOST_CONCURRENCY_CAP)),
         )
         .await
+}
+
+async fn reserve_host_send(
+    host_pacer: Option<&SharedHostPacer>,
+    prepared_host: &PreparedFetchHost,
+) -> Result<(), FetchOneFailure> {
+    let Some(pacer) = host_pacer else {
+        return Ok(());
+    };
+    let min_interval = prepared_host
+        .host_override
+        .as_ref()
+        .and_then(|override_record| override_record.min_interval);
+    HostPacer::reserve_next_request(pacer, &prepared_host.host, min_interval)
+        .await
+        .map_err(|err| retryable_failure(format!("host pacing for {}: {err}", prepared_host.host)))
 }
 
 struct FetchModeStep<'a> {
@@ -488,13 +504,17 @@ pub(crate) fn should_fallback_get_repo_to_list_records(error: &FetchError) -> bo
 
 fn is_get_repo_method_wall_text(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
-    lower.contains("methodnotimplemented")
-        || lower.contains("method not implemented")
-        || lower.contains("not implemented")
-        || lower.contains("not supported")
-        || lower.contains("unsupported")
-        || (lower.contains("getrepo") && lower.contains("disabled"))
-        || (lower.contains("sync") && lower.contains("disabled"))
+    matches!(
+        lower.as_str(),
+        "methodnotimplemented"
+            | "methodnotsupported"
+            | "getrepodisabled"
+            | "syncdisabled"
+            | "getrepo disabled"
+            | "sync disabled"
+            | "method not implemented"
+            | "method not supported"
+    )
 }
 
 fn repo_fetch_client(http_protocol: HttpProtocol) -> Result<reqwest::Client, reqwest::Error> {

@@ -640,11 +640,14 @@ fn max_created_at(rows: &[ArchivePostRow]) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+const ARCHIVE_OBJECT_ENCODING_ID: &str = "archive_object_v2";
+
 pub(super) fn stable_artifact_stem(did: &str, dataset: &str, content_hash: &str) -> String {
     format!(
-        "{}.{}.{}",
+        "{}.{}.{}.{}",
         safe_file_component(did),
         safe_file_component(dataset),
+        ARCHIVE_OBJECT_ENCODING_ID,
         content_hash
     )
 }
@@ -755,11 +758,31 @@ pub(super) fn hash_extras_json(
     if matches!(value, serde_json::Value::Object(fields) if fields.is_empty()) {
         return hash_field(hasher, "{}");
     }
-    hash_field_bytes(hasher, &json_bytes(value)?)
+    hash_field_bytes(hasher, &json_bytes(&canonical_json_value(value))?)
 }
 
 fn stable_rust_json(value: &serde_json::Value) -> Result<String, ArchiveError> {
-    Ok(serde_json::to_string(value)?)
+    Ok(serde_json::to_string(&canonical_json_value(value))?)
+}
+
+fn canonical_json_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(canonical_json_value).collect::<Vec<_>>())
+        }
+        serde_json::Value::Object(fields) => {
+            let mut sorted = serde_json::Map::new();
+            let mut keys = fields.keys().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys {
+                if let Some(value) = fields.get(key) {
+                    sorted.insert(key.clone(), canonical_json_value(value));
+                }
+            }
+            serde_json::Value::Object(sorted)
+        }
+        other => other.clone(),
+    }
 }
 
 pub(super) fn record_extras_json(

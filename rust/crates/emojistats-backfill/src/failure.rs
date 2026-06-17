@@ -87,16 +87,20 @@ pub fn classify_fetch_error(did: &str, error: &FetchError) -> FetchOneFailure {
             }
         }
         FetchError::InactivityTimeout { .. }
+        | FetchError::DownloadTimeout { .. }
+        | FetchError::ProgressTimeout { .. }
         | FetchError::Transport { .. }
         | FetchError::Io { .. }
+        | FetchError::ErrorBodyTooLarge { .. }
+        | FetchError::InFlightBytesUnavailable { .. }
         | FetchError::ByteBudgetPoisoned => AttemptOutcome::RetryableFailure {
             message: message.clone(),
         },
-        FetchError::MaxBytesExceeded { .. }
-        | FetchError::ErrorBodyTooLarge { .. }
-        | FetchError::InFlightBytesExceeded { .. } => AttemptOutcome::ResourceLimitExceeded {
-            message: message.clone(),
-        },
+        FetchError::MaxBytesExceeded { .. } | FetchError::InFlightBytesExceeded { .. } => {
+            AttemptOutcome::ResourceLimitExceeded {
+                message: message.clone(),
+            }
+        }
         FetchError::HttpStatus { .. } => AttemptOutcome::PermanentFailure {
             message: message.clone(),
         },
@@ -130,11 +134,12 @@ pub fn classify_list_records_error(did: &str, error: &ListRecordsError) -> Fetch
                 message: message.clone(),
             }
         }
-        ListRecordsError::Transport(_) | ListRecordsError::InactivityTimeout { .. } => {
-            AttemptOutcome::RetryableFailure {
-                message: message.clone(),
-            }
-        }
+        ListRecordsError::Transport(_)
+        | ListRecordsError::InactivityTimeout { .. }
+        | ListRecordsError::DownloadTimeout { .. }
+        | ListRecordsError::ProgressTimeout { .. } => AttemptOutcome::RetryableFailure {
+            message: message.clone(),
+        },
         ListRecordsError::ResourceLimitExceeded { .. } => AttemptOutcome::ResourceLimitExceeded {
             message: message.clone(),
         },
@@ -196,7 +201,8 @@ pub fn classify_archive_error(context: &str, error: &ArchiveError) -> FetchOneFa
     let message = format!("{context}: {error}");
     let outcome = match error {
         ArchiveError::Io(source) if is_operator_io_error(source) => {
-            AttemptOutcome::PermanentFailure {
+            AttemptOutcome::OperatorDeferred {
+                retry_after: None,
                 message: message.clone(),
             }
         }

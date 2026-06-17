@@ -133,10 +133,18 @@ impl ParallelCidVerifier {
 
     fn join_workers(&mut self) -> Result<(), ParseError> {
         self.senders.clear();
+        let mut first_error: Option<ParseError> = None;
         for worker in self.workers.drain(..) {
-            worker
+            let result = worker
                 .join()
-                .map_err(|_error| ParseError::MalformedCar("CID verifier panicked".to_owned()))??;
+                .map_err(|_error| ParseError::MalformedCar("CID verifier panicked".to_owned()))
+                .and_then(std::convert::identity);
+            if first_error.is_none() {
+                first_error = result.err();
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(())
     }

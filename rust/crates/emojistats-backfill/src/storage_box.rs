@@ -44,7 +44,7 @@ pub trait StorageBoxCommands {
     fn upload_reader(
         &mut self,
         remote_path: &str,
-        reader: &mut dyn Read,
+        reader: &mut (dyn Read + Send),
     ) -> Result<(), CommandError>;
 
     /// Return the remote file length, or `None` when the path is absent.
@@ -72,6 +72,13 @@ pub trait StorageBoxCommands {
         max_bytes: usize,
     ) -> Result<Option<Vec<u8>>, CommandError>;
 
+    /// Remove a remote path if it exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandError`] when the underlying remote remove command fails.
+    fn remove(&mut self, remote_path: &str) -> Result<(), CommandError>;
+
     /// Atomically promote a verified temp file to its final path without overwriting a final file.
     ///
     /// # Errors
@@ -79,12 +86,16 @@ pub trait StorageBoxCommands {
     /// Returns [`CommandError`] when the underlying remote rename command fails.
     fn rename(&mut self, from: &str, to: &str) -> Result<(), CommandError>;
 
-    /// Append bytes to the manifest.
+    /// Append a manifest record only if it is absent, with the check and append under one lock.
     ///
     /// # Errors
     ///
     /// Returns [`CommandError`] when the underlying remote append command fails.
-    fn append(&mut self, remote_path: &str, bytes: &[u8]) -> Result<(), CommandError>;
+    fn append_manifest_record_if_missing(
+        &mut self,
+        remote_path: &str,
+        record_without_newline: &[u8],
+    ) -> Result<(), CommandError>;
 
     /// Return whether a manifest already contains an exact JSONL record.
     ///
@@ -114,6 +125,8 @@ pub struct StorageBoxSshConfig {
     pub remote: String,
     /// Extra SSH arguments, such as `-p`, `23`, or `-i`, `/path/to/key`.
     pub ssh_args: Vec<String>,
+    /// Maximum time one SSH command may run before it is killed.
+    pub command_timeout: std::time::Duration,
 }
 
 /// Storage Box command executor backed by local `ssh` processes.
@@ -242,6 +255,7 @@ impl StorageBoxSshConfig {
             ssh_program: PathBuf::from("ssh"),
             remote: remote.into(),
             ssh_args: Vec::new(),
+            command_timeout: std::time::Duration::from_secs(300),
         }
     }
 
@@ -256,6 +270,13 @@ impl StorageBoxSshConfig {
     #[must_use]
     pub fn with_ssh_arg(mut self, arg: impl Into<String>) -> Self {
         self.ssh_args.push(arg.into());
+        self
+    }
+
+    /// Set the maximum runtime for one SSH command.
+    #[must_use]
+    pub const fn with_command_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.command_timeout = timeout;
         self
     }
 }
@@ -344,13 +365,12 @@ where
             "object",
         )?;
 
-        let entry = ManifestEntry::from_parts(
+        let receipt = Receipt::from_parts(
             &request.metadata,
             paths.object_manifest_path,
             &object_digest,
         );
-        let receipt =
-            Receipt::from_parts(&request.metadata, entry.object_path.clone(), &object_digest);
+        let entry = ManifestEntry::from_parts(&request.metadata, &receipt);
         let receipt_bytes = json_bytes("receipt", &receipt)?;
         let receipt_digest = digest_bytes("receipt", &receipt_bytes)?;
         let receipt_prefix = prefix_bytes(&receipt_bytes, self.config.readback_bytes)?;
@@ -434,16 +454,12 @@ where
             "object",
         )?;
 
-        let entry = ManifestEntry::from_parts(
+        let receipt = Receipt::from_parts(
             &request.metadata,
             paths.object_manifest_path,
             &object_source.digest,
         );
-        let receipt = Receipt::from_parts(
-            &request.metadata,
-            entry.object_path.clone(),
-            &object_source.digest,
-        );
+        let entry = ManifestEntry::from_parts(&request.metadata, &receipt);
         let receipt_bytes = json_bytes("receipt", &receipt)?;
         let receipt_digest = digest_bytes("receipt", &receipt_bytes)?;
         let receipt_prefix = prefix_bytes(&receipt_bytes, self.config.readback_bytes)?;
@@ -493,20 +509,10 @@ where
     C: StorageBoxCommands,
 {
     let record = manifest_record_without_newline(manifest_line);
-    if commands
-        .contains_manifest_record(manifest_path, record)
-        .map_err(|source| Error::Command {
-            operation: "check manifest entry",
-            path: manifest_path.to_owned(),
-            source,
-        })?
-    {
-        return Ok(());
-    }
     commands
-        .append(manifest_path, manifest_line)
+        .append_manifest_record_if_missing(manifest_path, record)
         .map_err(|source| Error::Command {
-            operation: "append manifest",
+            operation: "append manifest if missing",
             path: manifest_path.to_owned(),
             source,
         })?;
@@ -593,6 +599,13 @@ fn normalize_root(root: &str) -> Result<String, Error> {
     if trimmed.is_empty() || !trimmed.starts_with('/') {
         return Err(Error::InvalidRemoteRoot(root.to_owned()));
     }
+    if trimmed.chars().any(char::is_control)
+        || trimmed
+            .split('/')
+            .any(|component| component == "." || component == "..")
+    {
+        return Err(Error::InvalidRemoteRoot(root.to_owned()));
+    }
     Ok(trimmed.to_owned())
 }
 
@@ -609,6 +622,19 @@ fn manifest_path_string(kind: &'static str, path: &Path) -> Result<String, Error
 }
 
 fn relative_path_string(kind: &'static str, path: &Path) -> Result<String, Error> {
+    let raw = path.to_str().ok_or_else(|| Error::NonUtf8Path {
+        kind,
+        path: path.to_path_buf(),
+    })?;
+    if raw
+        .split('/')
+        .any(|component| component == "." || component == "..")
+    {
+        return Err(Error::PathEscapesRoot {
+            kind,
+            path: path.to_path_buf(),
+        });
+    }
     let mut parts = Vec::new();
     for component in path.components() {
         match component {
@@ -619,8 +645,10 @@ fn relative_path_string(kind: &'static str, path: &Path) -> Result<String, Error
                 })?;
                 parts.push(part);
             }
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
                 return Err(Error::PathEscapesRoot {
                     kind,
                     path: path.to_path_buf(),
@@ -839,9 +867,12 @@ where
 {
     let rename_result = commands.rename(temp_path, final_path);
     match rename_result {
-        Ok(()) => verify_remote_final(commands, final_path, expected_digest),
+        Ok(()) => {
+            verify_remote_final(commands, final_path, expected_digest)?;
+            cleanup_remote_temp(commands, temp_path, artifact_kind)
+        }
         Err(source) => match check_final_state(commands, final_path, expected_digest)? {
-            FinalState::Exact => Ok(()),
+            FinalState::Exact => cleanup_remote_temp(commands, temp_path, artifact_kind),
             FinalState::Absent => Err(Error::Command {
                 operation: match artifact_kind {
                     "object" => "promote object temp",
@@ -853,6 +884,25 @@ where
             }),
         },
     }
+}
+
+fn cleanup_remote_temp<C>(
+    commands: &mut C,
+    temp_path: &str,
+    artifact_kind: &'static str,
+) -> Result<(), Error>
+where
+    C: StorageBoxCommands,
+{
+    commands.remove(temp_path).map_err(|source| Error::Command {
+        operation: match artifact_kind {
+            "object" => "cleanup object temp",
+            "receipt" => "cleanup receipt temp",
+            _ => "cleanup temp",
+        },
+        path: temp_path.to_owned(),
+        source,
+    })
 }
 
 fn check_final_state<C>(

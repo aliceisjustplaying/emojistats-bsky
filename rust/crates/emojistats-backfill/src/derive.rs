@@ -2,7 +2,7 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::archive::{ArchivePostRow, EmojiProjectionRow, LocalManifestEntry};
+use crate::archive::{ArchivePostRow, EmojiProjectionRow, LocalManifestEntry, NormalizerVersion};
 
 /// Source marker for rows produced by the v2 backfill derive lane.
 pub const BACKFILL_DERIVE_SOURCE: &str = "backfill-v2-derive";
@@ -17,6 +17,7 @@ pub struct DeriveManifestIdentity {
     pub content_hash: String,
     pub receipt_hash: String,
     pub schema_version: u16,
+    pub normalizer: NormalizerVersion,
 }
 
 /// Counter input for the total-post path that cannot be reconstructed from emoji rows.
@@ -27,6 +28,7 @@ pub struct TotalPostCounterInput {
     pub shard: String,
     pub file_sequence: u64,
     pub receipt_hash: String,
+    pub normalizer: NormalizerVersion,
     pub posts_processed: u64,
     pub posts_with_emojis: u64,
     pub emoji_occurrences: u64,
@@ -183,6 +185,7 @@ pub fn manifest_identity(manifest: &LocalManifestEntry) -> DeriveManifestIdentit
         content_hash: manifest.content_hash.clone(),
         receipt_hash: manifest.receipt_hash.clone(),
         schema_version: manifest.schema_version,
+        normalizer: manifest.normalizer.clone(),
     }
 }
 
@@ -221,6 +224,7 @@ pub fn total_post_counter_input(
         shard: manifest.shard.clone(),
         file_sequence: manifest.file_sequence,
         receipt_hash: manifest.receipt_hash.clone(),
+        normalizer: manifest.normalizer.clone(),
         posts_processed: count_rows(rows)?,
         posts_with_emojis: count_posts_with_emojis(rows)?,
         emoji_occurrences: count_emoji_occurrences(rows)?,
@@ -352,13 +356,11 @@ fn hash_manifest_identity(
     hasher: &mut Sha256,
     identity: &DeriveManifestIdentity,
 ) -> Result<(), DeriveError> {
-    hash_field(hasher, &identity.run_id)?;
-    hash_field(hasher, &identity.shard)?;
-    hash_u64(hasher, identity.file_sequence);
     hash_field(hasher, &identity.dataset)?;
     hash_field(hasher, &identity.content_hash)?;
     hash_field(hasher, &identity.receipt_hash)?;
     hash_u16(hasher, identity.schema_version);
+    hash_normalizer(hasher, &identity.normalizer)?;
     Ok(())
 }
 
@@ -380,11 +382,20 @@ fn hash_total_post_counter(
 ) -> Result<(), DeriveError> {
     hash_field(hasher, &counter.source)?;
     hash_field(hasher, &counter.receipt_hash)?;
+    hash_normalizer(hasher, &counter.normalizer)?;
     hash_u64(hasher, counter.posts_processed);
     hash_u64(hasher, counter.posts_with_emojis);
     hash_u64(hasher, counter.emoji_occurrences);
     hash_optional_field(hasher, counter.min_created_at_normalized.as_deref())?;
     hash_optional_field(hasher, counter.max_created_at_normalized.as_deref())
+}
+
+fn hash_normalizer(hasher: &mut Sha256, normalizer: &NormalizerVersion) -> Result<(), DeriveError> {
+    hash_field(hasher, &normalizer.name)?;
+    hash_field(hasher, &normalizer.semver)?;
+    hash_field(hasher, &normalizer.git_rev)?;
+    hash_field(hasher, &normalizer.unicode_version)?;
+    hash_field(hasher, &normalizer.emoji_data_version)
 }
 
 fn hash_optional_field(hasher: &mut Sha256, value: Option<&str>) -> Result<(), DeriveError> {
@@ -533,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_token_changes_across_replay_manifest_sequence() {
+    fn dedupe_token_is_stable_across_replay_manifest_sequence() {
         let rows = [row("a", &["✅"])];
         let first = derive_clickhouse_batch(DeriveBatchInput {
             manifest: &manifest(1),
@@ -550,7 +561,7 @@ mod tests {
         })
         .expect("replay derive batch");
 
-        assert_ne!(first.dedupe_token, replay.dedupe_token);
+        assert_eq!(first.dedupe_token, replay.dedupe_token);
     }
 
     #[test]

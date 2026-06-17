@@ -258,6 +258,31 @@ fn verified_manifest_entry_rejects_missing_parquet() {
 }
 
 #[test]
+fn verified_manifest_entry_rejects_missing_repo_receipt() {
+    let temp = TempDir::new("missing-receipt");
+    let output_dir = temp.path.join("archive");
+    let rows = vec![archive_row("a", "hello ✅", &["✅"])];
+    let receipt = repo_receipt(&rows);
+    let artifacts = write_archive_artifacts(
+        &output_dir,
+        "did:plc:fixture123",
+        &ArchiveCommitContext::fetch_one_local(),
+        &rows,
+        None,
+        &receipt,
+    )
+    .expect("archive artifacts should write");
+    let plan = read_plan_from_path(&artifacts.manifest_path);
+    fs::remove_file(&artifacts.receipt_path).expect("repo receipt should be removable");
+
+    let error =
+        load_verified_clickhouse_batch(&output_dir, plan.inputs.first().expect("loader input"))
+            .expect_err("missing repo receipt should fail");
+
+    assert!(matches!(error, Error::MissingRepoReceipt { .. }));
+}
+
+#[test]
 fn verified_manifest_entry_rejects_parquet_hash_mismatch() {
     let temp = TempDir::new("hash-mismatch");
     let output_dir = temp.path.join("archive");

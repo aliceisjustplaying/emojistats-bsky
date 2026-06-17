@@ -489,7 +489,6 @@ async fn forced_list_records_host_preparation_is_allowed() {
         &ClaimScope::default(),
         Some(&db_path),
         None,
-        None,
     )
     .await
     .unwrap();
@@ -557,7 +556,7 @@ fn host_override_force_mode_and_disable_are_applied() {
 
 #[test]
 fn get_repo_method_wall_uses_list_records_fallback() {
-    assert!(should_fallback_get_repo_to_list_records(
+    assert!(!should_fallback_get_repo_to_list_records(
         &FetchError::HttpStatus {
             status: 429,
             error_code: None,

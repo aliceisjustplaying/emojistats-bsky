@@ -8,7 +8,10 @@ use std::{
 };
 
 use futures_util::StreamExt as _;
-use jacquard_common::{deps::fluent_uri::Uri, types::did::Did};
+use jacquard_common::{
+    deps::fluent_uri::Uri,
+    types::{did::Did, recordkey::Rkey},
+};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use tokio::time;
@@ -32,6 +35,10 @@ const DEFAULT_MAX_PAGES: u64 = 100_000;
 const DEFAULT_MAX_RECORDS: u64 = 10_000_000;
 const DEFAULT_MAX_PAGE_BYTES: u64 = 8_388_608;
 const DEFAULT_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+#[allow(clippy::duration_suboptimal_units)]
+const DEFAULT_PAGE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const DEFAULT_MIN_PROGRESS_BYTES: u64 = 16_384;
+const DEFAULT_MIN_PROGRESS_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Pagination and response-size caps for `listRecords`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +48,9 @@ pub struct ListRecordsConfig {
     pub max_records: u64,
     pub max_page_bytes: u64,
     pub chunk_idle_timeout: Duration,
+    pub page_download_timeout: Duration,
+    pub min_progress_bytes: u64,
+    pub min_progress_interval: Duration,
 }
 
 impl Default for ListRecordsConfig {
@@ -51,6 +61,9 @@ impl Default for ListRecordsConfig {
             max_records: DEFAULT_MAX_RECORDS,
             max_page_bytes: DEFAULT_MAX_PAGE_BYTES,
             chunk_idle_timeout: DEFAULT_CHUNK_IDLE_TIMEOUT,
+            page_download_timeout: DEFAULT_PAGE_DOWNLOAD_TIMEOUT,
+            min_progress_bytes: DEFAULT_MIN_PROGRESS_BYTES,
+            min_progress_interval: DEFAULT_MIN_PROGRESS_INTERVAL,
         }
     }
 }
@@ -105,6 +118,19 @@ pub enum ListRecordsError {
     Transport(#[from] reqwest::Error),
     #[error("no listRecords body chunk within {timeout:?}")]
     InactivityTimeout { timeout: Duration },
+    #[error("listRecords page download exceeded {timeout:?} after {observed_bytes} bytes")]
+    DownloadTimeout {
+        timeout: Duration,
+        observed_bytes: u64,
+    },
+    #[error(
+        "listRecords page body made {observed_bytes} bytes progress in {interval:?}, below minimum {min_bytes}"
+    )]
+    ProgressTimeout {
+        interval: Duration,
+        min_bytes: u64,
+        observed_bytes: u64,
+    },
     #[error("listRecords page JSON failed to decode: {0}")]
     PageJson(#[source] serde_json::Error),
     #[error("listRecords archive failed: {0}")]
@@ -128,6 +154,8 @@ impl ListRecordsError {
             }
             Self::Transport(_)
             | Self::InactivityTimeout { .. }
+            | Self::DownloadTimeout { .. }
+            | Self::ProgressTimeout { .. }
             | Self::PageJson(_)
             | Self::Archive(_)
             | Self::ResourceLimitExceeded { .. }
@@ -143,7 +171,10 @@ impl ListRecordsError {
             | Self::Archive(_)
             | Self::ResourceLimitExceeded { .. }
             | Self::Protocol(_) => false,
-            Self::Transport(_) | Self::InactivityTimeout { .. } => true,
+            Self::Transport(_)
+            | Self::InactivityTimeout { .. }
+            | Self::DownloadTimeout { .. }
+            | Self::ProgressTimeout { .. } => true,
             Self::HttpStatus { status, .. } => *status >= 500 || *status == 429,
         }
     }
@@ -203,20 +234,22 @@ pub async fn fetch_and_archive_list_records_with_rate_limit_observer(
         observe_rate_limit(&fetched.rate_limit);
         rate_limits.push(fetched.rate_limit);
         let next_cursor = fetched.page.cursor.clone();
+        if let Some(next_cursor_value) = next_cursor.as_deref() {
+            if Some(next_cursor_value) == cursor.as_deref() {
+                return Err(ListRecordsError::Protocol(
+                    "PDS returned the same listRecords cursor twice".to_owned(),
+                ));
+            }
+            if !seen_cursors.insert(next_cursor_value.to_owned()) {
+                return Err(ListRecordsError::Protocol(
+                    "PDS returned a repeated listRecords cursor".to_owned(),
+                ));
+            }
+        }
         archiver.push_page(fetched.page)?;
-        let Some(next_cursor_value) = next_cursor.as_deref() else {
+        let Some(_next_cursor_value) = next_cursor.as_deref() else {
             break;
         };
-        if Some(next_cursor_value) == cursor.as_deref() {
-            return Err(ListRecordsError::Protocol(
-                "PDS returned the same listRecords cursor twice".to_owned(),
-            ));
-        }
-        if !seen_cursors.insert(next_cursor_value.to_owned()) {
-            return Err(ListRecordsError::Protocol(
-                "PDS returned a repeated listRecords cursor".to_owned(),
-            ));
-        }
         if let Some(delay) = HostPacer::rate_limit_delay(
             rate_limits.last().ok_or_else(|| {
                 ListRecordsError::Protocol("missing rate-limit snapshot".to_owned())
@@ -405,9 +438,7 @@ async fn fetch_list_records_page(
     if let Some(content_length) = response.content_length() {
         enforce_cap("max_page_bytes", content_length, config.max_page_bytes)?;
     }
-    let body =
-        read_response_body_with_cap(response, config.max_page_bytes, config.chunk_idle_timeout)
-            .await?;
+    let body = read_response_body_with_cap(response, &config).await?;
 
     if !status.is_success() {
         return Err(classify_error_status(status, &rate_limit, &body));
@@ -420,18 +451,27 @@ async fn fetch_list_records_page(
 
 async fn read_response_body_with_cap(
     response: reqwest::Response,
-    max_page_bytes: u64,
-    chunk_idle_timeout: Duration,
+    config: &ListRecordsConfig,
 ) -> Result<Vec<u8>, ListRecordsError> {
     let mut body = Vec::new();
     let mut observed = 0_u64;
     let mut stream = response.bytes_stream();
-    while let Some(next_chunk) = time::timeout(chunk_idle_timeout, stream.next())
-        .await
-        .map_err(|_elapsed| ListRecordsError::InactivityTimeout {
-            timeout: chunk_idle_timeout,
-        })?
+    let started = time::Instant::now();
+    let mut progress_window_started = started;
+    let mut progress_window_bytes = 0_u64;
+
+    while let Some(next_chunk) = time::timeout(
+        next_page_chunk_timeout(started, config, observed)?,
+        stream.next(),
+    )
+    .await
+    .map_err(|_elapsed| list_records_timeout_error(started, config, observed))?
     {
+        enforce_page_progress(
+            &mut progress_window_started,
+            &mut progress_window_bytes,
+            config,
+        )?;
         let chunk = next_chunk?;
         let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
         observed =
@@ -440,12 +480,78 @@ async fn read_response_body_with_cap(
                 .ok_or(ListRecordsError::ResourceLimitExceeded {
                     limit: "max_page_bytes",
                     observed: u64::MAX,
-                    max: max_page_bytes,
+                    max: config.max_page_bytes,
                 })?;
-        enforce_cap("max_page_bytes", observed, max_page_bytes)?;
+        enforce_cap("max_page_bytes", observed, config.max_page_bytes)?;
         body.extend_from_slice(&chunk);
+        progress_window_bytes = progress_window_bytes.checked_add(chunk_len).ok_or(
+            ListRecordsError::ResourceLimitExceeded {
+                limit: "min_progress_bytes",
+                observed: u64::MAX,
+                max: config.min_progress_bytes,
+            },
+        )?;
     }
+    enforce_page_progress(
+        &mut progress_window_started,
+        &mut progress_window_bytes,
+        config,
+    )?;
     Ok(body)
+}
+
+fn next_page_chunk_timeout(
+    started: time::Instant,
+    config: &ListRecordsConfig,
+    observed: u64,
+) -> Result<Duration, ListRecordsError> {
+    let Some(remaining) = config.page_download_timeout.checked_sub(started.elapsed()) else {
+        return Err(ListRecordsError::DownloadTimeout {
+            timeout: config.page_download_timeout,
+            observed_bytes: observed,
+        });
+    };
+    Ok(remaining.min(config.chunk_idle_timeout))
+}
+
+fn list_records_timeout_error(
+    started: time::Instant,
+    config: &ListRecordsConfig,
+    observed: u64,
+) -> ListRecordsError {
+    if started.elapsed() >= config.page_download_timeout {
+        ListRecordsError::DownloadTimeout {
+            timeout: config.page_download_timeout,
+            observed_bytes: observed,
+        }
+    } else {
+        ListRecordsError::InactivityTimeout {
+            timeout: config.chunk_idle_timeout,
+        }
+    }
+}
+
+fn enforce_page_progress(
+    window_started: &mut time::Instant,
+    window_bytes: &mut u64,
+    config: &ListRecordsConfig,
+) -> Result<(), ListRecordsError> {
+    if config.min_progress_bytes == 0 || config.min_progress_interval.is_zero() {
+        return Ok(());
+    }
+    if window_started.elapsed() < config.min_progress_interval {
+        return Ok(());
+    }
+    if *window_bytes < config.min_progress_bytes {
+        return Err(ListRecordsError::ProgressTimeout {
+            interval: config.min_progress_interval,
+            min_bytes: config.min_progress_bytes,
+            observed_bytes: *window_bytes,
+        });
+    }
+    *window_started = time::Instant::now();
+    *window_bytes = 0;
+    Ok(())
 }
 
 fn classify_error_status(
@@ -539,7 +645,7 @@ fn validated_record_cid(cid: Option<String>) -> Result<String, ListRecordDecodeE
 fn rkey_from_uri<'a>(did_str: &str, uri: &'a str) -> Option<&'a str> {
     let prefix = format!("at://{did_str}/{POST_COLLECTION}/");
     let rkey = uri.strip_prefix(&prefix)?;
-    if rkey.is_empty() || rkey.contains('/') {
+    if rkey.is_empty() || rkey.contains('/') || Rkey::<&str>::new(rkey).is_err() {
         return None;
     }
     Some(rkey)

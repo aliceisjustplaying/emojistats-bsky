@@ -17,7 +17,7 @@ use super::{
     create_schema_sql, derive_insert_payloads, execute_insert_payloads,
 };
 use crate::{
-    archive::EmojiProjectionRow,
+    archive::{EmojiProjectionRow, current_normalizer},
     derive::{ClickHouseDeriveBatch, DeriveManifestIdentity, TotalPostCounterInput},
 };
 
@@ -31,6 +31,7 @@ fn batch() -> ClickHouseDeriveBatch {
             content_hash: "content-hash".to_owned(),
             receipt_hash: "receipt-hash".to_owned(),
             schema_version: 1,
+            normalizer: current_normalizer(),
         },
         dedupe_token: "derive:test-token".to_owned(),
         emoji_rows: vec![
@@ -57,6 +58,7 @@ fn batch() -> ClickHouseDeriveBatch {
             shard: "shard0".to_owned(),
             file_sequence: 42,
             receipt_hash: "receipt-hash".to_owned(),
+            normalizer: current_normalizer(),
             posts_processed: 3,
             posts_with_emojis: 2,
             emoji_occurrences: 3,
@@ -158,8 +160,9 @@ fn schema_sql_contains_typed_table_names_and_engines() {
     assert!(sql.contains("ENGINE = ReplacingMergeTree(inserted_at)"));
     assert!(sql.contains("non_replicated_deduplication_window = 10000"));
     assert!(sql.contains("LowCardinality(String)"));
-    assert!(sql.contains("ORDER BY (src, did, rkey, emoji)"));
-    assert!(sql.contains("ORDER BY (src, receipt_hash)"));
+    assert!(sql.contains("normalizer_git_rev LowCardinality(String)"));
+    assert!(sql.contains("ORDER BY (src, normalizer_git_rev, did, rkey, emoji)"));
+    assert!(sql.contains("ORDER BY (src, normalizer_git_rev, receipt_hash)"));
 }
 
 #[test]
@@ -187,6 +190,10 @@ fn json_each_row_payloads_include_derive_rows_and_total_counter() {
     let first_line = emoji_lines.first().expect("first emoji line should exist");
     let first: Value = serde_json::from_str(first_line).expect("first emoji row json");
     assert_eq!(field(&first, "src"), "backfill-v2-derive");
+    assert_eq!(
+        field(&first, "normalizer_name"),
+        &Value::String(batch().manifest_identity.normalizer.name)
+    );
     assert_eq!(field(&first, "did"), "did:plc:abc");
     assert_eq!(field(&first, "emoji"), "✅");
     assert_eq!(field(&first, "occurrences"), 2);
@@ -204,6 +211,10 @@ fn json_each_row_payloads_include_derive_rows_and_total_counter() {
         .next()
         .expect("counter row should exist");
     let counter: Value = serde_json::from_str(counter_line).expect("counter row json");
+    assert_eq!(
+        field(&counter, "normalizer_git_rev"),
+        &Value::String(batch().total_post_counter.normalizer.git_rev)
+    );
     assert_eq!(field(&counter, "posts_processed"), 3);
     assert_eq!(field(&counter, "posts_with_emojis"), 2);
     assert_eq!(field(&counter, "max_created_at"), &Value::Null);
@@ -227,7 +238,7 @@ fn request_builder_includes_auth_headers_and_dedupe_settings() {
     let url = request.url().as_str();
 
     assert_eq!(request.method(), "POST");
-    assert_eq!(request.timeout(), Some(&Duration::from_secs(30)));
+    assert_eq!(request.timeout(), None);
     assert!(url.contains("database=emojistats"));
     assert!(url.contains("query=INSERT"));
     assert!(url.contains("insert_deduplicate=1"));

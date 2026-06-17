@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     io::{Read, Write},
     path::PathBuf,
+    time::Duration,
 };
 
 use sha2::{Digest, Sha256};
@@ -47,7 +48,7 @@ impl StorageBoxCommands for FakeCommands {
     fn upload_reader(
         &mut self,
         remote_path: &str,
-        reader: &mut dyn Read,
+        reader: &mut (dyn Read + Send),
     ) -> Result<(), CommandError> {
         let mut bytes = Vec::new();
         reader
@@ -98,6 +99,16 @@ impl StorageBoxCommands for FakeCommands {
             .map(|bytes| bytes.iter().copied().take(max_bytes).collect::<Vec<u8>>()))
     }
 
+    fn remove(&mut self, remote_path: &str) -> Result<(), CommandError> {
+        self.operations.push(Operation {
+            name: "remove",
+            path: remote_path.to_owned(),
+            target: None,
+        });
+        self.files.remove(remote_path);
+        Ok(())
+    }
+
     fn rename(&mut self, from: &str, to: &str) -> Result<(), CommandError> {
         self.operations.push(Operation {
             name: "rename",
@@ -115,16 +126,26 @@ impl StorageBoxCommands for FakeCommands {
         Ok(())
     }
 
-    fn append(&mut self, remote_path: &str, bytes: &[u8]) -> Result<(), CommandError> {
+    fn append_manifest_record_if_missing(
+        &mut self,
+        remote_path: &str,
+        record_without_newline: &[u8],
+    ) -> Result<(), CommandError> {
         self.operations.push(Operation {
-            name: "append",
+            name: "append_manifest_record_if_missing",
             path: remote_path.to_owned(),
             target: None,
         });
-        self.files
-            .entry(remote_path.to_owned())
-            .or_default()
-            .extend_from_slice(bytes);
+        let present = self.files.get(remote_path).is_some_and(|bytes| {
+            bytes
+                .split(|byte| *byte == b'\n')
+                .any(|line| line == record_without_newline)
+        });
+        if !present {
+            let file = self.files.entry(remote_path.to_owned()).or_default();
+            file.extend_from_slice(record_without_newline);
+            file.push(b'\n');
+        }
         Ok(())
     }
 
@@ -219,6 +240,7 @@ fn commits_in_verified_remote_order_before_manifest_append() {
             "rename",
             "stat",
             "sha256",
+            "remove",
             "upload",
             "stat",
             "sha256",
@@ -226,8 +248,8 @@ fn commits_in_verified_remote_order_before_manifest_append() {
             "rename",
             "stat",
             "sha256",
-            "contains_manifest_record",
-            "append",
+            "remove",
+            "append_manifest_record_if_missing",
             "contains_manifest_record"
         ]
     );
@@ -243,7 +265,7 @@ fn commits_in_verified_remote_order_before_manifest_append() {
     assert_eq!(
         commands
             .operations
-            .get(15)
+            .get(17)
             .expect("manifest append operation should exist")
             .path,
         "/storage-box/emojistats/manifests/raw.jsonl"
@@ -264,6 +286,16 @@ fn commits_in_verified_remote_order_before_manifest_append() {
     assert_eq!(
         artifact.entry.object_path,
         "objects/run-1/shard0/42.parquet"
+    );
+    assert!(
+        !commands
+            .files
+            .contains_key(&artifact.remote_temp_object_path)
+    );
+    assert!(
+        !commands
+            .files
+            .contains_key(&artifact.remote_temp_receipt_path)
     );
 }
 
@@ -309,8 +341,53 @@ fn final_object_conflict_fails_before_manifest_append() {
         !commands
             .operations
             .iter()
-            .any(|operation| operation.name == "append")
+            .any(|operation| operation.name == "append_manifest_record_if_missing")
     );
+}
+
+#[test]
+fn retry_with_existing_final_files_cleans_temps_without_duplicating_manifest() {
+    let mut initial_backend = backend(FakeCommands::default());
+    let initial_artifact = initial_backend
+        .commit_bytes(&request(), b"parquet bytes")
+        .expect("initial remote commit should succeed");
+    let mut retry_backend = backend(FakeCommands {
+        files: initial_backend.into_commands().files,
+        ..FakeCommands::default()
+    });
+
+    let retry_artifact = retry_backend
+        .commit_bytes(&request(), b"parquet bytes")
+        .expect("retry should treat exact final files as idempotent");
+
+    let commands = retry_backend.into_commands();
+    assert_eq!(retry_artifact.entry, initial_artifact.entry);
+    assert!(
+        !commands
+            .files
+            .contains_key(&retry_artifact.remote_temp_object_path)
+    );
+    assert!(
+        !commands
+            .files
+            .contains_key(&retry_artifact.remote_temp_receipt_path)
+    );
+    assert_eq!(
+        commands
+            .operations
+            .iter()
+            .filter(|operation| operation.name == "remove")
+            .count(),
+        2
+    );
+    let manifest = std::str::from_utf8(
+        commands
+            .files
+            .get(&retry_artifact.remote_manifest_path)
+            .expect("manifest should exist"),
+    )
+    .expect("manifest should be UTF-8");
+    assert_eq!(manifest.lines().count(), 1);
 }
 
 #[test]
@@ -339,7 +416,7 @@ fn partial_object_upload_fails_before_rename_or_manifest_append() {
         !commands
             .operations
             .iter()
-            .any(|operation| operation.name == "append")
+            .any(|operation| operation.name == "append_manifest_record_if_missing")
     );
     assert!(
         !commands
@@ -363,6 +440,31 @@ fn rejects_remote_paths_outside_write_scope() {
 
     assert!(matches!(result, Err(Error::PathEscapesRoot { .. })));
     assert!(backend.into_commands().operations.is_empty());
+}
+
+#[test]
+fn rejects_dot_components_in_scoped_paths() {
+    let mut dot_path = request();
+    dot_path.object_path = PathBuf::from("objects/./inside.parquet");
+    let mut backend = backend(FakeCommands::default());
+
+    let result = backend.commit_bytes(&dot_path, b"parquet bytes");
+
+    assert!(matches!(result, Err(Error::PathEscapesRoot { .. })));
+    assert!(backend.into_commands().operations.is_empty());
+}
+
+#[test]
+fn rejects_dot_and_dotdot_components_in_remote_root() {
+    for root in ["/storage-box/./emojistats", "/storage-box/../emojistats"] {
+        let mut backend =
+            StorageBoxBackend::new(StorageBoxConfig::new(root), FakeCommands::default());
+
+        let result = backend.commit_bytes(&request(), b"parquet bytes");
+
+        assert!(matches!(result, Err(Error::InvalidRemoteRoot(_))));
+        assert!(backend.into_commands().operations.is_empty());
+    }
 }
 
 #[test]
@@ -414,7 +516,7 @@ fn ssh_rename_command_does_not_force_overwrite_final_path() {
 #[test]
 fn ssh_manifest_append_command_uses_flock() {
     let command = ssh_commands()
-        .append_command("/storage-box/emojistats/manifests/raw.jsonl")
+        .append_manifest_record_if_missing_command("/storage-box/emojistats/manifests/raw.jsonl")
         .expect("append command should build");
     let script = command
         .args
@@ -423,8 +525,24 @@ fn ssh_manifest_append_command_uses_flock() {
 
     assert!(command.stdin);
     assert!(script.contains("flock -- '/storage-box/emojistats/manifests/raw.jsonl.lock'"));
-    assert!(script.contains("cat >> \"$1\""));
+    assert!(script.contains("if [ -e \"$1\" ] && grep -Fqx -- \"$record\" \"$1\""));
+    assert!(script.contains("printf \"%s\\n\" \"$record\" >> \"$1\""));
     assert!(!script.contains("cat >> '/storage-box/emojistats/manifests/raw.jsonl'"));
+}
+
+#[test]
+fn ssh_remove_command_uses_rm_force_for_temp_cleanup() {
+    let command = ssh_commands()
+        .remove_command("/storage-box/emojistats/.tmp/run-1/shard0/42.parquet.tmp")
+        .expect("remove command should build");
+
+    assert_eq!(
+        command
+            .args
+            .last()
+            .expect("ssh script should be the final argument"),
+        "rm -f -- '/storage-box/emojistats/.tmp/run-1/shard0/42.parquet.tmp'"
+    );
 }
 
 #[test]
@@ -441,4 +559,21 @@ fn ssh_read_prefix_command_marks_absent_and_present_outputs() {
             .expect("ssh script should be the final argument"),
         "if [ -e '/storage-box/emojistats/objects/run-1/42.parquet' ]; then printf 'present\\n'; head -c 8 -- '/storage-box/emojistats/objects/run-1/42.parquet'; else printf 'absent\\n'; fi"
     );
+}
+
+#[test]
+fn ssh_run_command_times_out_and_kills_child() {
+    let spec = super::ssh::CommandSpec {
+        operation: "timeout_test",
+        program: PathBuf::from("/bin/sh"),
+        args: vec!["-c".to_owned(), "sleep 5".to_owned()],
+        stdin: false,
+        timeout: Duration::from_millis(50),
+    };
+
+    let error = super::ssh::run_command(&spec, None)
+        .expect_err("sleeping command should be killed after timeout");
+
+    assert!(error.to_string().contains("timed out"));
+    assert!(error.to_string().contains("was killed"));
 }

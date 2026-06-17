@@ -528,7 +528,13 @@ impl StreamingArchiveSink {
             .join(stable_repo_receipt_name(&self.did, &receipt_hash));
         write_temp_idempotent(&receipt_path, |path| write_json_pretty(path, &receipt))?;
         let committed_posts =
-            self.commit_streaming_posts(&receipt_hash, &artifact_stem, dataset)?;
+            match self.commit_streaming_posts(&receipt_hash, &artifact_stem, dataset) {
+                Ok(committed) => committed,
+                Err(error) => {
+                    let _ignored = fs::remove_file(&receipt_path);
+                    return Err(error);
+                }
+            };
         let emoji_stem = stable_artifact_stem(
             &self.did,
             "emoji_projection",

@@ -2,9 +2,9 @@ use super::{
     super::{
         ArchiveCommitContext, ArchiveError, AttemptOutcome, ClaimScope, CompletenessClass,
         DEFAULT_CLAIM_LEASE_DURATION, FetchMethod, FetchOneFailure, ForcedFetchMode,
-        HOST_OVERRIDE_CACHE_TTL, HostOverride, HostPacer, Instant, NormalizerVersion, ParseConfig,
-        ParseVisitError, ParsedRepoSummary, Path, PathBuf, RepoLedgerEntry, SharedHostPacer,
-        SqliteLedger, StreamingArchiveSink, StreamingReceiptInput, SystemTime, Uri,
+        HOST_OVERRIDE_CACHE_TTL, HostOverride, Instant, NormalizerVersion, ParseConfig,
+        ParseVisitError, ParsedRepoSummary, Path, PathBuf, RepoLedgerEntry, SqliteLedger,
+        StreamingArchiveSink, StreamingReceiptInput, SystemTime, Uri,
         archive_row_from_owned_post_observed_at, classify_archive_error, classify_parse_error,
         elapsed_ms, hash_profile_record, parse_repo_for_did_with_state, retryable_failure,
     },
@@ -220,7 +220,6 @@ pub async fn prepare_fetch_host(
     claim_scope: &ClaimScope,
     host_override_ledger_path: Option<&Path>,
     host_override_cache: Option<HostOverrideCache>,
-    host_pacer: Option<&SharedHostPacer>,
 ) -> Result<PreparedFetchHost, FetchOneFailure> {
     if !claim_scope.includes_did(did_str) {
         return Err(retryable_failure(format!(
@@ -232,19 +231,6 @@ pub async fn prepare_fetch_host(
     let host_override =
         load_host_override(host_override_ledger_path, host_override_cache, &host, now)?;
     let fetch_mode = fetch_mode_for_host(&host, host_override.as_ref(), now)?;
-    if let Some(pacer) = host_pacer {
-        HostPacer::wait_until_ready(pacer, &host)
-            .await
-            .map_err(|err| retryable_failure(format!("host pacing for {host}: {err}")))?;
-        if let Some(min_interval) = host_override
-            .as_ref()
-            .and_then(|override_record| override_record.min_interval)
-        {
-            HostPacer::record_retry_after(pacer, &host, min_interval).map_err(|err| {
-                retryable_failure(format!("host min-interval pacing for {host}: {err}"))
-            })?;
-        }
-    }
     Ok(PreparedFetchHost {
         host,
         host_override,

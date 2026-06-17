@@ -91,7 +91,10 @@ fn classifies_created_at_statuses() {
 
     let valid = classify_created_at(Some("2020-01-02T03:04:05Z"));
     assert_eq!(valid.status, CreatedAtParseStatus::Valid);
-    assert_eq!(valid.normalized, Some("2020-01-02T03:04:05Z".to_owned()));
+    assert_eq!(
+        valid.normalized,
+        Some("2020-01-02T03:04:05.000000Z".to_owned())
+    );
 }
 
 #[test]

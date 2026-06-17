@@ -239,9 +239,9 @@ where
 
 /// Verify a parsed committed manifest entry and build the `ClickHouse` derive batch it names.
 ///
-/// The object path is resolved under `archive_root`. The object bytes and SHA-256 are always
-/// verified against the manifest. Adjacent object receipts and repo receipts are validated when
-/// their current local artifact filenames are present.
+/// The object path is resolved under `archive_root`. The object bytes, SHA-256, and adjacent
+/// repo receipt are always verified against the manifest. Adjacent object receipts are validated
+/// when their current local artifact filenames are present.
 ///
 /// # Errors
 ///
@@ -271,7 +271,7 @@ pub fn load_verified_clickhouse_batch_with_caps(
     let digest = hash_file(&object_path)?;
     validate_object_digest(&object_path, &input.manifest, &digest)?;
 
-    if let Some(receipt_path) = first_existing_path(object_receipt_candidates(&object_path)) {
+    if let Some(receipt_path) = first_existing_path(object_receipt_candidates(&object_path))? {
         let receipt = read_receipt::<Receipt>(&receipt_path)?;
         validate_object_receipt(&receipt_path, &input.manifest, &receipt)?;
     }
@@ -282,12 +282,13 @@ pub fn load_verified_clickhouse_batch_with_caps(
             source,
         })?;
 
-    if let Some(receipt_path) =
-        first_existing_path(repo_receipt_candidates(&object_path, &input.manifest))
-    {
-        let receipt = read_receipt::<RepoReceipt>(&receipt_path)?;
-        validate_repo_receipt(&receipt_path, &input.manifest, &archive_rows, &receipt)?;
-    }
+    let Some(receipt_path) =
+        first_existing_path(repo_receipt_candidates(&object_path, &input.manifest))?
+    else {
+        return Err(Error::MissingRepoReceipt { path: object_path });
+    };
+    let receipt = read_receipt::<RepoReceipt>(&receipt_path)?;
+    validate_repo_receipt(&receipt_path, &input.manifest, &archive_rows, &receipt)?;
 
     Ok(derive_clickhouse_batch(DeriveBatchInput {
         manifest: &input.manifest,
@@ -312,13 +313,13 @@ pub fn verify_loader_input_for_streaming(
     let digest = hash_file(&object_path)?;
     validate_object_digest(&object_path, &input.manifest, &digest)?;
 
-    if let Some(receipt_path) = first_existing_path(object_receipt_candidates(&object_path)) {
+    if let Some(receipt_path) = first_existing_path(object_receipt_candidates(&object_path))? {
         let receipt = read_receipt::<Receipt>(&receipt_path)?;
         validate_object_receipt(&receipt_path, &input.manifest, &receipt)?;
     }
 
     let Some(repo_receipt_path) =
-        first_existing_path(repo_receipt_candidates(&object_path, &input.manifest))
+        first_existing_path(repo_receipt_candidates(&object_path, &input.manifest))?
     else {
         return Err(Error::MissingRepoReceipt { path: object_path });
     };
@@ -691,8 +692,17 @@ fn expect_receipt_field(
     }
 }
 
-fn first_existing_path(paths: Vec<PathBuf>) -> Option<PathBuf> {
-    paths.into_iter().find(|path| path.exists())
+fn first_existing_path(paths: Vec<PathBuf>) -> Result<Option<PathBuf>, Error> {
+    for path in paths {
+        if path.try_exists().map_err(|source| Error::HashIo {
+            operation: "stat",
+            path: path.clone(),
+            source,
+        })? {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
 }
 
 fn object_receipt_candidates(object_path: &Path) -> Vec<PathBuf> {

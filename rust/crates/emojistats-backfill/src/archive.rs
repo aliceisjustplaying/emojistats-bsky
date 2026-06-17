@@ -315,7 +315,7 @@ fn classify_present_created_at(raw: &str, observed_at: DateTime<Utc>) -> Classif
             normalized: Some(
                 timestamp
                     .with_timezone(&Utc)
-                    .to_rfc3339_opts(SecondsFormat::Secs, true),
+                    .to_rfc3339_opts(SecondsFormat::Micros, true),
             ),
             status: CreatedAtParseStatus::Valid,
         },
@@ -328,7 +328,7 @@ fn classify_present_created_at(raw: &str, observed_at: DateTime<Utc>) -> Classif
 }
 
 fn format_observed_at(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(SecondsFormat::Secs, true)
+    value.to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
 fn write_temp_idempotent<F>(path: &Path, write: F) -> Result<(), ArchiveError>

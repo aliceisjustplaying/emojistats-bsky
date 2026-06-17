@@ -47,6 +47,40 @@ impl HostPacer {
         }
     }
 
+    /// Serialize request admission for a host and reserve the next send time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchedulerError::PacerPoisoned`] if another holder panicked while
+    /// mutating the pacing table.
+    pub async fn reserve_next_request(
+        shared: &SharedHostPacer,
+        host: &str,
+        min_interval: Option<Duration>,
+    ) -> Result<(), SchedulerError> {
+        loop {
+            let delay = {
+                let mut guard = shared
+                    .lock()
+                    .map_err(|_err| SchedulerError::PacerPoisoned)?;
+                let now = Instant::now();
+                match guard.ready_delay(host, now) {
+                    Some(delay) if !delay.is_zero() => Some(delay),
+                    Some(_) | None => {
+                        if let Some(min_interval) = min_interval {
+                            guard.apply_retry_after(host, min_interval, now);
+                        }
+                        drop(guard);
+                        return Ok(());
+                    }
+                }
+            };
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+
     /// Record a host-level retry-after cooldown.
     ///
     /// # Errors
@@ -211,6 +245,21 @@ mod tests {
             pacer.ready_delay("pds.example", now + Duration::from_secs(11)),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn reserve_next_request_applies_min_interval_at_admission() {
+        let pacer = HostPacer::shared();
+
+        HostPacer::reserve_next_request(&pacer, "pds.example", Some(Duration::from_millis(20)))
+            .await
+            .unwrap();
+        let started = Instant::now();
+        HostPacer::reserve_next_request(&pacer, "pds.example", Some(Duration::from_millis(1)))
+            .await
+            .unwrap();
+
+        assert!(started.elapsed() >= Duration::from_millis(15));
     }
 
     #[test]

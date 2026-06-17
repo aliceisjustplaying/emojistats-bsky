@@ -4,10 +4,10 @@ use std::{
     error::Error,
     fmt,
     fs::{self, File},
-    io::{self, Write},
+    io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use futures_util::StreamExt as _;
@@ -22,10 +22,15 @@ use jacquard_common::{
 };
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
-use tokio::{sync::Notify, time};
+use tokio::{io::AsyncWriteExt as _, sync::Notify, time};
 
 const DEFAULT_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+#[allow(clippy::duration_suboptimal_units)]
+const DEFAULT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const DEFAULT_MAX_BYTES: u64 = 2_147_483_648;
+const DEFAULT_UNKNOWN_BODY_RESERVATION_BYTES: u64 = 268_435_456;
+const DEFAULT_MIN_PROGRESS_BYTES: u64 = 16_384;
+const DEFAULT_MIN_PROGRESS_INTERVAL: Duration = Duration::from_secs(60);
 const ERROR_BODY_MAX_BYTES: u64 = 65_536;
 
 /// Runtime limits and local storage path for Stage B repo transport.
@@ -35,6 +40,14 @@ pub struct FetchConfig {
     pub spool_dir: PathBuf,
     /// Maximum silence while waiting for the next body chunk.
     pub chunk_idle_timeout: Duration,
+    /// Maximum wall time for one successful body download.
+    pub download_timeout: Duration,
+    /// Admission reservation used when `Content-Length` is absent or malformed.
+    pub unknown_body_reservation_bytes: u64,
+    /// Minimum byte progress expected during a progress window.
+    pub min_progress_bytes: u64,
+    /// Progress watchdog window.
+    pub min_progress_interval: Duration,
     /// Loud single-repo byte cap for the spooled `CAR`.
     pub max_bytes: u64,
     /// Optional fleet-wide byte budget for in-flight spooled `CAR` bytes.
@@ -48,6 +61,10 @@ impl FetchConfig {
         Self {
             spool_dir: spool_dir.into(),
             chunk_idle_timeout: DEFAULT_CHUNK_IDLE_TIMEOUT,
+            download_timeout: DEFAULT_DOWNLOAD_TIMEOUT,
+            unknown_body_reservation_bytes: DEFAULT_UNKNOWN_BODY_RESERVATION_BYTES,
+            min_progress_bytes: DEFAULT_MIN_PROGRESS_BYTES,
+            min_progress_interval: DEFAULT_MIN_PROGRESS_INTERVAL,
             max_bytes: DEFAULT_MAX_BYTES,
             byte_budget: None,
         }
@@ -115,6 +132,30 @@ impl FetchByteBudget {
         }
     }
 
+    fn try_reserve_charged_delta(&self, delta: u64) -> Result<bool, FetchError> {
+        if delta == 0 || self.inner.max_bytes == 0 {
+            return Ok(true);
+        }
+        let mut charged = self
+            .inner
+            .charged_bytes
+            .lock()
+            .map_err(|_error| FetchError::ByteBudgetPoisoned)?;
+        let next = charged
+            .checked_add(delta)
+            .ok_or(FetchError::InFlightBytesExceeded {
+                max_bytes: self.inner.max_bytes,
+                observed_bytes: u64::MAX,
+            })?;
+        if next > self.inner.max_bytes {
+            drop(charged);
+            return Ok(false);
+        }
+        *charged = next;
+        drop(charged);
+        Ok(true)
+    }
+
     fn release_charged(&self, bytes: u64) {
         if bytes == 0 || self.inner.max_bytes == 0 {
             return;
@@ -153,6 +194,33 @@ impl FetchByteBudgetReservation {
         )?;
         self.budget.reserve_charged_delta(delta).await?;
         self.charged_bytes = charged_target;
+        Ok(())
+    }
+
+    fn try_reserve_capacity(&mut self, bytes: u64) -> Result<(), FetchError> {
+        if bytes > self.budget.inner.max_bytes {
+            return Err(FetchError::InFlightBytesExceeded {
+                max_bytes: self.budget.inner.max_bytes,
+                observed_bytes: bytes,
+            });
+        }
+        if bytes <= self.charged_bytes {
+            return Ok(());
+        }
+        let delta =
+            bytes
+                .checked_sub(self.charged_bytes)
+                .ok_or(FetchError::InFlightBytesExceeded {
+                    max_bytes: self.budget.inner.max_bytes,
+                    observed_bytes: bytes,
+                })?;
+        if !self.budget.try_reserve_charged_delta(delta)? {
+            return Err(FetchError::InFlightBytesUnavailable {
+                max_bytes: self.budget.inner.max_bytes,
+                requested_bytes: bytes,
+            });
+        }
+        self.charged_bytes = bytes;
         Ok(())
     }
 
@@ -288,6 +356,22 @@ pub enum FetchError {
         /// Timeout used for each chunk read.
         timeout: Duration,
     },
+    /// The body download exceeded the configured wall-clock timeout.
+    DownloadTimeout {
+        /// Timeout used for the whole body download.
+        timeout: Duration,
+        /// Bytes already written when the timeout fired.
+        observed_bytes: u64,
+    },
+    /// The body trickled below the configured progress floor.
+    ProgressTimeout {
+        /// Progress window.
+        interval: Duration,
+        /// Minimum bytes expected in the window.
+        min_bytes: u64,
+        /// Bytes observed in the last window.
+        observed_bytes: u64,
+    },
     /// The streamed body exceeded the configured single-repo byte cap.
     MaxBytesExceeded {
         /// Configured cap.
@@ -308,6 +392,13 @@ pub enum FetchError {
         max_bytes: u64,
         /// Bytes observed after accepting the chunk that crossed the cap.
         observed_bytes: u64,
+    },
+    /// The fleet-wide in-flight spool byte budget is temporarily occupied by other downloads.
+    InFlightBytesUnavailable {
+        /// Configured cap.
+        max_bytes: u64,
+        /// Bytes this reservation needed to hold.
+        requested_bytes: u64,
     },
     /// The in-flight byte budget lock was poisoned.
     ByteBudgetPoisoned,
@@ -356,6 +447,23 @@ impl fmt::Display for FetchError {
             Self::InactivityTimeout { timeout } => {
                 write!(f, "no body chunk within {}", timeout.as_secs())
             }
+            Self::DownloadTimeout {
+                timeout,
+                observed_bytes,
+            } => write!(
+                f,
+                "body download exceeded {} seconds after {observed_bytes} bytes",
+                timeout.as_secs()
+            ),
+            Self::ProgressTimeout {
+                interval,
+                min_bytes,
+                observed_bytes,
+            } => write!(
+                f,
+                "body download made {observed_bytes} bytes progress in {} seconds, below minimum {min_bytes}",
+                interval.as_secs()
+            ),
             Self::MaxBytesExceeded {
                 max_bytes,
                 observed_bytes,
@@ -376,6 +484,13 @@ impl fmt::Display for FetchError {
             } => write!(
                 f,
                 "in-flight spooled CAR bytes exceeded max bytes: observed {observed_bytes}, max {max_bytes}"
+            ),
+            Self::InFlightBytesUnavailable {
+                max_bytes,
+                requested_bytes,
+            } => write!(
+                f,
+                "in-flight spooled CAR byte budget unavailable: requested {requested_bytes}, max {max_bytes}"
             ),
             Self::ByteBudgetPoisoned => f.write_str("in-flight spool byte budget lock poisoned"),
             Self::Transport {
@@ -398,9 +513,12 @@ impl FetchError {
                 Some(rate_limit)
             }
             Self::InactivityTimeout { .. }
+            | Self::DownloadTimeout { .. }
+            | Self::ProgressTimeout { .. }
             | Self::MaxBytesExceeded { .. }
             | Self::ErrorBodyTooLarge { .. }
             | Self::InFlightBytesExceeded { .. }
+            | Self::InFlightBytesUnavailable { .. }
             | Self::ByteBudgetPoisoned
             | Self::Transport { .. }
             | Self::Io { .. } => None,
@@ -415,9 +533,12 @@ impl Error for FetchError {
             Self::AccountState { .. }
             | Self::HttpStatus { .. }
             | Self::InactivityTimeout { .. }
+            | Self::DownloadTimeout { .. }
+            | Self::ProgressTimeout { .. }
             | Self::MaxBytesExceeded { .. }
             | Self::ErrorBodyTooLarge { .. }
             | Self::InFlightBytesExceeded { .. }
+            | Self::InFlightBytesUnavailable { .. }
             | Self::ByteBudgetPoisoned
             | Self::Transport { .. } => None,
         }
@@ -461,16 +582,29 @@ where
         })?;
     let status = response.status();
     let rate_limit = RateLimitSnapshot::from_headers(response.headers());
-    let expected_body_bytes = if status.is_success() {
-        Some(expected_body_bytes(response.headers(), config.max_bytes)?)
+    let admission_body_bytes = if status.is_success() {
+        Some(admission_body_bytes(
+            response.headers(),
+            config.max_bytes,
+            config.unknown_body_reservation_bytes,
+        )?)
     } else {
         None
     };
     let (_parts, body) = response.into_parts();
 
     if !status.is_success() {
-        let body_bytes =
-            collect_body_with_cap(body, config.chunk_idle_timeout, ERROR_BODY_MAX_BYTES).await?;
+        let body_bytes = collect_body_with_cap(
+            body,
+            StreamLimits {
+                chunk_idle_timeout: config.chunk_idle_timeout,
+                download_timeout: config.download_timeout,
+                min_progress_bytes: config.min_progress_bytes,
+                min_progress_interval: config.min_progress_interval,
+                max_bytes: ERROR_BODY_MAX_BYTES,
+            },
+        )
+        .await?;
         return Err(classify_http_error(status, rate_limit, &body_bytes));
     }
 
@@ -478,9 +612,14 @@ where
     let (bytes, byte_budget_reservation) = stream_to_file(
         body,
         &car_path,
-        config.chunk_idle_timeout,
-        config.max_bytes,
-        expected_body_bytes.unwrap_or(config.max_bytes),
+        StreamLimits {
+            chunk_idle_timeout: config.chunk_idle_timeout,
+            download_timeout: config.download_timeout,
+            min_progress_bytes: config.min_progress_bytes,
+            min_progress_interval: config.min_progress_interval,
+            max_bytes: config.max_bytes,
+        },
+        admission_body_bytes.unwrap_or(config.unknown_body_reservation_bytes),
         config.byte_budget.as_ref(),
     )
     .await?;
@@ -494,31 +633,31 @@ where
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+struct StreamLimits {
+    chunk_idle_timeout: Duration,
+    download_timeout: Duration,
+    min_progress_bytes: u64,
+    min_progress_interval: Duration,
+    max_bytes: u64,
+}
+
 async fn stream_to_file(
     body: ByteStream,
     car_path: &Path,
-    chunk_idle_timeout: Duration,
-    max_bytes: u64,
-    expected_body_bytes: u64,
+    limits: StreamLimits,
+    admission_body_bytes: u64,
     byte_budget: Option<&FetchByteBudget>,
 ) -> Result<(u64, Option<FetchByteBudgetReservation>), FetchError> {
     let parent = car_path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "spool path has no parent"))?;
-    let mut temp_file = NamedTempFile::new_in(parent)?;
+    let temp_file = NamedTempFile::new_in(parent)?;
     let mut reservation = byte_budget.map(FetchByteBudget::reservation);
     if let Some(reservation) = reservation.as_mut() {
-        reservation.reserve_capacity(expected_body_bytes).await?;
+        reservation.reserve_capacity(admission_body_bytes).await?;
     }
-    match stream_to_temp_file(
-        body,
-        temp_file.as_file_mut(),
-        chunk_idle_timeout,
-        max_bytes,
-        reservation.as_mut(),
-    )
-    .await
-    {
+    match stream_to_temp_file(body, temp_file.path(), limits, reservation.as_mut()).await {
         Ok(bytes) => {
             temp_file.persist_noclobber(car_path).map_err(|error| {
                 io::Error::new(
@@ -538,50 +677,142 @@ async fn stream_to_file(
 
 async fn stream_to_temp_file(
     body: ByteStream,
-    file: &mut File,
-    chunk_idle_timeout: Duration,
-    max_bytes: u64,
+    path: &Path,
+    limits: StreamLimits,
     mut byte_budget_reservation: Option<&mut FetchByteBudgetReservation>,
 ) -> Result<u64, FetchError> {
     let mut bytes = 0_u64;
     let mut stream = body.into_inner();
+    let mut file = tokio::fs::OpenOptions::new().write(true).open(path).await?;
+    let started = Instant::now();
+    let mut progress_window_started = started;
+    let mut progress_window_bytes = 0_u64;
 
-    while let Some(next_chunk) = time::timeout(chunk_idle_timeout, stream.next())
-        .await
-        .map_err(|_elapsed| FetchError::InactivityTimeout {
-            timeout: chunk_idle_timeout,
-        })?
-    {
+    while let Some(next_chunk) = time::timeout(
+        next_chunk_timeout(
+            started,
+            limits.download_timeout,
+            limits.chunk_idle_timeout,
+            bytes,
+        )?,
+        stream.next(),
+    )
+    .await
+    .map_err(|_elapsed| {
+        timeout_error(
+            started,
+            limits.download_timeout,
+            limits.chunk_idle_timeout,
+            bytes,
+        )
+    })? {
+        enforce_progress(
+            &mut progress_window_started,
+            &mut progress_window_bytes,
+            limits.min_progress_interval,
+            limits.min_progress_bytes,
+        )?;
         let chunk = next_chunk.map_err(|err| FetchError::Transport {
             message: err.to_string(),
             observed_bytes: Some(bytes),
         })?;
         let chunk_len =
             u64::try_from(chunk.len()).map_err(|_err| FetchError::MaxBytesExceeded {
-                max_bytes,
+                max_bytes: limits.max_bytes,
                 observed_bytes: u64::MAX,
             })?;
         let observed_bytes = bytes
             .checked_add(chunk_len)
             .ok_or(FetchError::MaxBytesExceeded {
-                max_bytes,
+                max_bytes: limits.max_bytes,
                 observed_bytes: u64::MAX,
             })?;
-        if observed_bytes > max_bytes {
+        if observed_bytes > limits.max_bytes {
             return Err(FetchError::MaxBytesExceeded {
-                max_bytes,
+                max_bytes: limits.max_bytes,
                 observed_bytes,
             });
         }
         if let Some(reservation) = byte_budget_reservation.as_mut() {
-            reservation.reserve_capacity(observed_bytes).await?;
+            reservation.try_reserve_capacity(observed_bytes)?;
         }
-        file.write_all(chunk.as_ref())?;
+        file.write_all(chunk.as_ref()).await?;
         bytes = observed_bytes;
+        progress_window_bytes =
+            progress_window_bytes
+                .checked_add(chunk_len)
+                .ok_or(FetchError::ProgressTimeout {
+                    interval: limits.min_progress_interval,
+                    min_bytes: limits.min_progress_bytes,
+                    observed_bytes: u64::MAX,
+                })?;
     }
 
-    file.sync_all()?;
+    enforce_progress(
+        &mut progress_window_started,
+        &mut progress_window_bytes,
+        limits.min_progress_interval,
+        limits.min_progress_bytes,
+    )?;
+    file.sync_all().await?;
     Ok(bytes)
+}
+
+fn next_chunk_timeout(
+    started: Instant,
+    download_timeout: Duration,
+    chunk_idle_timeout: Duration,
+    bytes: u64,
+) -> Result<Duration, FetchError> {
+    let Some(remaining) = download_timeout.checked_sub(started.elapsed()) else {
+        return Err(FetchError::DownloadTimeout {
+            timeout: download_timeout,
+            observed_bytes: bytes,
+        });
+    };
+    Ok(remaining.min(chunk_idle_timeout))
+}
+
+fn timeout_error(
+    started: Instant,
+    download_timeout: Duration,
+    chunk_idle_timeout: Duration,
+    bytes: u64,
+) -> FetchError {
+    if started.elapsed() >= download_timeout {
+        FetchError::DownloadTimeout {
+            timeout: download_timeout,
+            observed_bytes: bytes,
+        }
+    } else {
+        FetchError::InactivityTimeout {
+            timeout: chunk_idle_timeout,
+        }
+    }
+}
+
+fn enforce_progress(
+    window_started: &mut Instant,
+    window_bytes: &mut u64,
+    min_progress_interval: Duration,
+    min_progress_bytes: u64,
+) -> Result<(), FetchError> {
+    if min_progress_bytes == 0 || min_progress_interval.is_zero() {
+        return Ok(());
+    }
+    if window_started.elapsed() < min_progress_interval {
+        return Ok(());
+    }
+    if *window_bytes < min_progress_bytes {
+        return Err(FetchError::ProgressTimeout {
+            interval: min_progress_interval,
+            min_bytes: min_progress_bytes,
+            observed_bytes: *window_bytes,
+        });
+    }
+    *window_started = Instant::now();
+    *window_bytes = 0;
+    Ok(())
 }
 
 fn sync_parent_dir(path: &Path) -> Result<(), FetchError> {
@@ -594,45 +825,79 @@ fn sync_parent_dir(path: &Path) -> Result<(), FetchError> {
 
 async fn collect_body_with_cap(
     body: ByteStream,
-    chunk_idle_timeout: Duration,
-    max_bytes: u64,
+    limits: StreamLimits,
 ) -> Result<Vec<u8>, FetchError> {
     let mut bytes = Vec::new();
     let mut observed = 0_u64;
     let mut stream = body.into_inner();
+    let started = Instant::now();
+    let mut progress_window_started = started;
+    let mut progress_window_bytes = 0_u64;
 
-    while let Some(next_chunk) = time::timeout(chunk_idle_timeout, stream.next())
-        .await
-        .map_err(|_elapsed| FetchError::InactivityTimeout {
-            timeout: chunk_idle_timeout,
-        })?
-    {
+    while let Some(next_chunk) = time::timeout(
+        next_chunk_timeout(
+            started,
+            limits.download_timeout,
+            limits.chunk_idle_timeout,
+            observed,
+        )?,
+        stream.next(),
+    )
+    .await
+    .map_err(|_elapsed| {
+        timeout_error(
+            started,
+            limits.download_timeout,
+            limits.chunk_idle_timeout,
+            observed,
+        )
+    })? {
+        enforce_progress(
+            &mut progress_window_started,
+            &mut progress_window_bytes,
+            limits.min_progress_interval,
+            limits.min_progress_bytes,
+        )?;
         let chunk = next_chunk.map_err(|err| FetchError::Transport {
             message: err.to_string(),
             observed_bytes: Some(observed),
         })?;
         let chunk_len =
             u64::try_from(chunk.len()).map_err(|_err| FetchError::ErrorBodyTooLarge {
-                max_bytes,
+                max_bytes: limits.max_bytes,
                 observed_bytes: u64::MAX,
             })?;
         let next_observed =
             observed
                 .checked_add(chunk_len)
                 .ok_or(FetchError::ErrorBodyTooLarge {
-                    max_bytes,
+                    max_bytes: limits.max_bytes,
                     observed_bytes: u64::MAX,
                 })?;
-        if next_observed > max_bytes {
+        if next_observed > limits.max_bytes {
             return Err(FetchError::ErrorBodyTooLarge {
-                max_bytes,
+                max_bytes: limits.max_bytes,
                 observed_bytes: next_observed,
             });
         }
         bytes.extend_from_slice(chunk.as_ref());
         observed = next_observed;
+        progress_window_bytes =
+            progress_window_bytes
+                .checked_add(chunk_len)
+                .ok_or(FetchError::ProgressTimeout {
+                    interval: limits.min_progress_interval,
+                    min_bytes: limits.min_progress_bytes,
+                    observed_bytes: u64::MAX,
+                })?;
     }
 
+    enforce_progress(
+        &mut progress_window_started,
+        &mut progress_window_bytes,
+        limits.min_progress_interval,
+        limits.min_progress_bytes,
+    )?;
     Ok(bytes)
 }
 
@@ -683,15 +948,19 @@ fn classify_http_error(
     }
 }
 
-fn expected_body_bytes(headers: &HeaderMap, max_bytes: u64) -> Result<u64, FetchError> {
+fn admission_body_bytes(
+    headers: &HeaderMap,
+    max_bytes: u64,
+    unknown_body_reservation_bytes: u64,
+) -> Result<u64, FetchError> {
     let Some(value) = headers.get(http::header::CONTENT_LENGTH) else {
-        return Ok(max_bytes);
+        return Ok(unknown_body_reservation_bytes.min(max_bytes));
     };
     let Ok(value) = value.to_str() else {
-        return Ok(max_bytes);
+        return Ok(unknown_body_reservation_bytes.min(max_bytes));
     };
     let Ok(bytes) = value.parse::<u64>() else {
-        return Ok(max_bytes);
+        return Ok(unknown_body_reservation_bytes.min(max_bytes));
     };
     if bytes > max_bytes {
         return Err(FetchError::MaxBytesExceeded {
@@ -789,7 +1058,7 @@ mod tests {
     use jacquard_common::{stream::ByteStream, types::did::Did};
 
     use super::{
-        AccountState, FetchByteBudget, FetchConfig, FetchError, RateLimitSnapshot,
+        AccountState, FetchByteBudget, FetchConfig, FetchError, RateLimitSnapshot, StreamLimits,
         classify_http_error, parse_http_date_retry_after, spool_path, stream_to_file,
     };
 
@@ -964,8 +1233,13 @@ mod tests {
             stream_to_file(
                 body,
                 &task_path,
-                Duration::from_secs(1),
-                3,
+                StreamLimits {
+                    chunk_idle_timeout: Duration::from_secs(1),
+                    download_timeout: Duration::from_secs(10),
+                    min_progress_bytes: 0,
+                    min_progress_interval: Duration::from_secs(1),
+                    max_bytes: 3,
+                },
                 3,
                 Some(&budget),
             )

@@ -298,7 +298,10 @@ fn classifies_created_at_values_for_archive_rows() {
     assert_eq!(future.raw.as_deref(), Some("9999-01-01T00:00:00Z"));
     assert_eq!(future.normalized, None);
     assert_eq!(valid.status, CreatedAtParseStatus::Valid);
-    assert_eq!(valid.normalized.as_deref(), Some("2024-01-02T03:04:05Z"));
+    assert_eq!(
+        valid.normalized.as_deref(),
+        Some("2024-01-02T03:04:05.000000Z")
+    );
 }
 
 #[test]

@@ -100,7 +100,7 @@ pub struct ClickHouseClientConfig {
     pub password: String,
     /// User-Agent/application marker visible in `ClickHouse` logs.
     pub application: String,
-    /// Per-request timeout applied to inserts.
+    /// Client-level request timeout applied to inserts.
     pub request_timeout: Duration,
     /// Connect timeout for clients built from this config.
     pub connect_timeout: Duration,
@@ -217,7 +217,6 @@ impl ClickHouseClientConfig {
                 ),
                 (DATE_TIME_INPUT_FORMAT_SETTING, "best_effort"),
             ])
-            .timeout(self.request_timeout)
             .body(payload.body.clone())
             .build()
             .map_err(ClickHouseSchemaError::Request)?;
@@ -476,6 +475,11 @@ fn emoji_serving_table_sql(database: &ClickHouseIdentifier) -> String {
   shard LowCardinality(String),
   file_sequence UInt64,
   receipt_hash String CODEC(ZSTD(1)),
+  normalizer_name LowCardinality(String),
+  normalizer_semver LowCardinality(String),
+  normalizer_git_rev LowCardinality(String),
+  normalizer_unicode_version LowCardinality(String),
+  normalizer_emoji_data_version LowCardinality(String),
   did String CODEC(ZSTD(1)),
   rkey String CODEC(ZSTD(1)),
   created_at Nullable(DateTime64(6, 'UTC')) CODEC(Delta(8), ZSTD(1)),
@@ -485,7 +489,7 @@ fn emoji_serving_table_sql(database: &ClickHouseIdentifier) -> String {
   inserted_at DateTime64(6, 'UTC') DEFAULT now64(6)
 ) ENGINE = ReplacingMergeTree(inserted_at)
 PARTITION BY toYYYYMM(coalesce(created_at, toDateTime64('1970-01-01 00:00:00', 6, 'UTC')))
-ORDER BY (src, did, rkey, emoji)
+ORDER BY (src, normalizer_git_rev, did, rkey, emoji)
 SETTINGS non_replicated_deduplication_window = 10000;"
     )
 }
@@ -498,6 +502,11 @@ fn total_post_counter_table_sql(database: &ClickHouseIdentifier) -> String {
   shard LowCardinality(String),
   file_sequence UInt64,
   receipt_hash String CODEC(ZSTD(1)),
+  normalizer_name LowCardinality(String),
+  normalizer_semver LowCardinality(String),
+  normalizer_git_rev LowCardinality(String),
+  normalizer_unicode_version LowCardinality(String),
+  normalizer_emoji_data_version LowCardinality(String),
   posts_processed UInt64,
   posts_with_emojis UInt64,
   emoji_occurrences UInt64,
@@ -505,7 +514,7 @@ fn total_post_counter_table_sql(database: &ClickHouseIdentifier) -> String {
   max_created_at Nullable(DateTime64(6, 'UTC')) CODEC(Delta(8), ZSTD(1)),
   inserted_at DateTime64(6, 'UTC') DEFAULT now64(6)
 ) ENGINE = ReplacingMergeTree(inserted_at)
-ORDER BY (src, receipt_hash)
+ORDER BY (src, normalizer_git_rev, receipt_hash)
 SETTINGS non_replicated_deduplication_window = 10000;"
     )
 }
@@ -558,6 +567,11 @@ struct EmojiServingInsertRow<'a> {
     shard: &'a str,
     file_sequence: u64,
     receipt_hash: &'a str,
+    normalizer_name: &'a str,
+    normalizer_semver: &'a str,
+    normalizer_git_rev: &'a str,
+    normalizer_unicode_version: &'a str,
+    normalizer_emoji_data_version: &'a str,
     did: &'a str,
     rkey: &'a str,
     created_at: Option<&'a str>,
@@ -574,6 +588,11 @@ impl<'a> EmojiServingInsertRow<'a> {
             shard: identity.shard.as_str(),
             file_sequence: identity.file_sequence,
             receipt_hash: identity.receipt_hash.as_str(),
+            normalizer_name: identity.normalizer.name.as_str(),
+            normalizer_semver: identity.normalizer.semver.as_str(),
+            normalizer_git_rev: identity.normalizer.git_rev.as_str(),
+            normalizer_unicode_version: identity.normalizer.unicode_version.as_str(),
+            normalizer_emoji_data_version: identity.normalizer.emoji_data_version.as_str(),
             did: row.did.as_str(),
             rkey: row.rkey.as_str(),
             created_at: row.created_at_normalized.as_deref(),
@@ -591,6 +610,11 @@ struct TotalPostCounterInsertRow<'a> {
     shard: &'a str,
     file_sequence: u64,
     receipt_hash: &'a str,
+    normalizer_name: &'a str,
+    normalizer_semver: &'a str,
+    normalizer_git_rev: &'a str,
+    normalizer_unicode_version: &'a str,
+    normalizer_emoji_data_version: &'a str,
     posts_processed: u64,
     posts_with_emojis: u64,
     emoji_occurrences: u64,
@@ -606,6 +630,11 @@ impl<'a> TotalPostCounterInsertRow<'a> {
             shard: counter.shard.as_str(),
             file_sequence: counter.file_sequence,
             receipt_hash: counter.receipt_hash.as_str(),
+            normalizer_name: counter.normalizer.name.as_str(),
+            normalizer_semver: counter.normalizer.semver.as_str(),
+            normalizer_git_rev: counter.normalizer.git_rev.as_str(),
+            normalizer_unicode_version: counter.normalizer.unicode_version.as_str(),
+            normalizer_emoji_data_version: counter.normalizer.emoji_data_version.as_str(),
             posts_processed: counter.posts_processed,
             posts_with_emojis: counter.posts_with_emojis,
             emoji_occurrences: counter.emoji_occurrences,
