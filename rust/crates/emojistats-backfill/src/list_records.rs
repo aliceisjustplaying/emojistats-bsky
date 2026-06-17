@@ -18,8 +18,8 @@ use tokio::time;
 
 use crate::{
     archive::{
-        ArchiveArtifacts, ArchiveCommitContext, ArchiveError, CompletenessClass, FetchMethod,
-        RepoReceipt, StreamingArchiveSink, StreamingReceiptInput,
+        ArchiveArtifacts, ArchiveCommitContext, ArchiveError, ArchiveStorageConfig,
+        CompletenessClass, FetchMethod, RepoReceipt, StreamingArchiveSink, StreamingReceiptInput,
         archive_row_from_post_observed_at,
     },
     parse::PostRecord,
@@ -201,6 +201,7 @@ pub async fn fetch_and_archive_list_records(
         did_str,
         archive_dir,
         archive_context,
+        ArchiveStorageConfig::Local,
         config,
         |_rate_limit| {},
     )
@@ -220,10 +221,17 @@ pub async fn fetch_and_archive_list_records_with_rate_limit_observer(
     did_str: &str,
     archive_dir: &Path,
     archive_context: ArchiveCommitContext,
+    archive_storage: ArchiveStorageConfig,
     config: ListRecordsConfig,
     mut observe_rate_limit: impl FnMut(&RateLimitSnapshot),
 ) -> Result<ListRecordsArchiveOutput, ListRecordsError> {
-    let mut archiver = ListRecordsArchiver::new(did_str, archive_dir, archive_context, config)?;
+    let mut archiver = ListRecordsArchiver::new(
+        did_str,
+        archive_dir,
+        archive_context,
+        archive_storage,
+        config,
+    )?;
     let mut rate_limits = Vec::new();
     let mut seen_cursors = HashSet::new();
     let mut cursor: Option<String> = None;
@@ -284,6 +292,7 @@ where
         did_str,
         archive_dir,
         ArchiveCommitContext::fetch_one_local(),
+        ArchiveStorageConfig::Local,
         config,
     )?;
 
@@ -308,11 +317,17 @@ impl<'a> ListRecordsArchiver<'a> {
         did_str: &'a str,
         archive_dir: &Path,
         archive_context: ArchiveCommitContext,
+        archive_storage: ArchiveStorageConfig,
         config: ListRecordsConfig,
     ) -> Result<Self, ListRecordsError> {
         Ok(Self {
             did_str,
-            sink: StreamingArchiveSink::new(archive_dir, did_str, archive_context)?,
+            sink: StreamingArchiveSink::new_with_storage(
+                archive_dir,
+                did_str,
+                archive_context,
+                archive_storage,
+            )?,
             config,
             records: 0,
             decode_errors: 0,

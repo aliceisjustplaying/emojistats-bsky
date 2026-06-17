@@ -19,8 +19,8 @@ use emojistats_backfill::{
 use jacquard_common::deps::fluent_uri::Uri;
 
 use super::{
-    Cli, Command, HostOverrideCache, fetch_mode_for_host, load_host_override, pds_host_key,
-    prepare_fetch_host, should_fallback_get_repo_to_list_records,
+    ArchiveBackend, Cli, Command, HostOverrideCache, fetch_mode_for_host, load_host_override,
+    pds_host_key, prepare_fetch_host, should_fallback_get_repo_to_list_records,
 };
 use crate::fleet::{
     HostConcurrencyLimiter, SeedSummary, claimable_entries_for_scope,
@@ -179,6 +179,49 @@ fn parses_run_fleet_resource_options() {
     assert_eq!(parse_concurrency, 2);
     assert_eq!(max_inflight_spool_bytes, 123_456);
     assert_eq!(cid_verification_threads, 7);
+}
+
+#[test]
+fn parses_storage_box_archive_backend_options() {
+    let cli = Cli::try_parse_from([
+        "emojistats-backfill",
+        "run-fleet",
+        "dids.txt",
+        "--archive-backend",
+        "storage-box-ssh",
+        "--storage-box-remote",
+        "u123@example.invalid",
+        "--storage-box-root",
+        "/storage-box/emojistats",
+        "--storage-box-ssh-program",
+        "/usr/bin/ssh",
+        "--storage-box-ssh-arg",
+        "-p",
+        "--storage-box-ssh-arg",
+        "23",
+        "--storage-box-command-timeout-secs",
+        "42",
+    ])
+    .unwrap();
+    let Command::RunFleet {
+        archive_backend,
+        storage_box_remote,
+        storage_box_root,
+        storage_box_ssh_program,
+        storage_box_ssh_arg,
+        storage_box_command_timeout_secs,
+        ..
+    } = cli.command
+    else {
+        unreachable!("expected run-fleet command");
+    };
+
+    assert_eq!(archive_backend, ArchiveBackend::StorageBoxSsh);
+    assert_eq!(storage_box_remote.as_deref(), Some("u123@example.invalid"));
+    assert_eq!(storage_box_root.as_deref(), Some("/storage-box/emojistats"));
+    assert_eq!(storage_box_ssh_program, PathBuf::from("/usr/bin/ssh"));
+    assert_eq!(storage_box_ssh_arg, vec!["-p", "23"]);
+    assert_eq!(storage_box_command_timeout_secs, 42);
 }
 
 #[test]

@@ -1,18 +1,18 @@
 use super::{
     ARCHIVE_SCHEMA_VERSION, Arc, ArchiveArtifacts, ArchiveCommitContext, ArchiveError,
-    ArchivePostRow, ArrowWriter, CompletenessClass, DateTime, Digest, FetchMethod, File,
-    LocalManifestEntry, LocalStore, ManifestMode, Metadata, NamedTempFile, NormalizerVersion,
-    PARQUET_BATCH_ROWS, PARTIAL_RECORD_STATUS, POST_COLLECTION, ParsedRepo, Path, PathBuf,
-    PostRecord, PostRecordBody, ProfileRecord, RawPartialPostRecord, RepoReceipt, Request, Schema,
-    Sha256, TempPath, Utc, Write,
+    ArchivePostRow, ArchiveStorageConfig, ArrowWriter, CompletenessClass, DateTime, Digest,
+    FetchMethod, File, LocalManifestEntry, LocalStore, ManifestMode, Metadata, NamedTempFile,
+    NormalizerVersion, PARQUET_BATCH_ROWS, PARTIAL_RECORD_STATUS, POST_COLLECTION, ParsedRepo,
+    Path, PathBuf, PostRecord, PostRecordBody, ProfileRecord, RawPartialPostRecord, RepoReceipt,
+    Request, Schema, Sha256, StorageBoxArchiveConfig, TempPath, Utc, Write,
     archive_io::{
         append_hash_field_frame, append_normalizer_frames, archive_error_from_derive,
         archive_schema, build_commit_metadata, commit_profile_sidecar, extract_emojis,
         framed_fields, hash_extras_json, hash_field, hash_field_bytes, hash_optional_field,
         hash_post_row_into, hash_string_slice, json_bytes, local_manifest_from_committed,
-        parquet_writer_properties, post_record_batch, record_extras_json, stable_artifact_stem,
-        stable_repo_receipt_name, update_min_max_created_at, write_emoji_projection_jsonl,
-        write_json_pretty, write_posts_parquet_to_writer,
+        parquet_writer_properties, post_record_batch, profile_sidecar_request, record_extras_json,
+        stable_artifact_stem, stable_repo_receipt_name, update_min_max_created_at,
+        write_emoji_projection_jsonl, write_json_pretty, write_posts_parquet_to_writer,
     },
     borrowed_emoji_projection_rows_for_post, classify_created_at_observed_at,
     derive_emoji_projection_rows, format_observed_at, fs, hash_serialized_json,
@@ -320,6 +320,7 @@ pub struct StreamingArchiveSink {
     max_created_at_normalized: Option<String>,
     normalizer: NormalizerVersion,
     commit_context: ArchiveCommitContext,
+    storage_config: ArchiveStorageConfig,
     observed_at: DateTime<Utc>,
     did: String,
     hash_prefix: Vec<u8>,
@@ -351,6 +352,20 @@ impl StreamingArchiveSink {
         output_dir: &Path,
         did: &str,
         commit_context: ArchiveCommitContext,
+    ) -> Result<Self, ArchiveError> {
+        Self::new_with_storage(output_dir, did, commit_context, ArchiveStorageConfig::Local)
+    }
+
+    /// Create a streaming sink with an explicit archive storage backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArchiveError`] if local files or the `Parquet` writer cannot be opened.
+    pub fn new_with_storage(
+        output_dir: &Path,
+        did: &str,
+        commit_context: ArchiveCommitContext,
+        storage_config: ArchiveStorageConfig,
     ) -> Result<Self, ArchiveError> {
         fs::create_dir_all(output_dir)?;
         let parquet_temp = NamedTempFile::new_in(output_dir)?;
@@ -389,6 +404,7 @@ impl StreamingArchiveSink {
             normalizer,
             observed_at: commit_context.observed_at,
             commit_context,
+            storage_config,
             did: did.to_owned(),
             hash_prefix,
             hash_after_cid,
@@ -607,7 +623,9 @@ impl StreamingArchiveSink {
             manifest_mode: ManifestMode::AppendJsonl,
             metadata: self.streaming_posts_metadata(receipt_hash, dataset),
         };
-        Ok(store.commit_prepared_temp(&request, self.parquet_temp_path.as_ref())?)
+        let committed = store.commit_prepared_temp(&request, self.parquet_temp_path.as_ref())?;
+        self.mirror_storage_box(&request, &committed)?;
+        Ok(committed)
     }
 
     fn streaming_posts_metadata(&self, receipt_hash: &str, dataset: &str) -> Metadata {
@@ -640,15 +658,39 @@ impl StreamingArchiveSink {
         let Some(profile) = profile else {
             return Ok(None);
         };
-        Ok(Some(commit_profile_sidecar(
+        let object_path = PathBuf::from(format!("{profile_stem}.profile.json"));
+        let receipt_path = PathBuf::from(format!("{profile_stem}.profile.object-receipt.json"));
+        let manifest_path = PathBuf::from(format!("{profile_stem}.profile.manifest.jsonl"));
+        let request = profile_sidecar_request(
+            object_path.clone(),
+            receipt_path.clone(),
+            manifest_path.clone(),
+            receipt,
+            &self.commit_context,
+        )?;
+        let committed = commit_profile_sidecar(
             &store,
-            PathBuf::from(format!("{profile_stem}.profile.json")),
-            PathBuf::from(format!("{profile_stem}.profile.object-receipt.json")),
-            PathBuf::from(format!("{profile_stem}.profile.manifest.jsonl")),
+            object_path,
+            receipt_path,
+            manifest_path,
             profile,
             receipt,
             &self.commit_context,
-        )?))
+        )?;
+        self.mirror_storage_box(&request, &committed)?;
+        Ok(Some(committed))
+    }
+
+    fn mirror_storage_box(
+        &self,
+        request: &Request,
+        committed: &crate::commit::Artifact,
+    ) -> Result<(), ArchiveError> {
+        let ArchiveStorageConfig::StorageBoxSsh(config) = &self.storage_config else {
+            return Ok(());
+        };
+        commit_file_to_storage_box(config, request, &committed.object_path)?;
+        Ok(())
     }
 
     fn into_artifacts(
@@ -691,6 +733,24 @@ impl StreamingArchiveSink {
         self.batch.clear();
         Ok(())
     }
+}
+
+fn commit_file_to_storage_box(
+    config: &StorageBoxArchiveConfig,
+    request: &Request,
+    object_path: &Path,
+) -> Result<(), ArchiveError> {
+    let storage_config = crate::storage_box::StorageBoxConfig::new(config.remote_root.clone());
+    let mut ssh_config = crate::storage_box::StorageBoxSshConfig::new(config.ssh_remote.clone())
+        .with_ssh_program(config.ssh_program.clone())
+        .with_command_timeout(config.command_timeout);
+    for arg in &config.ssh_args {
+        ssh_config = ssh_config.with_ssh_arg(arg.clone());
+    }
+    let commands = crate::storage_box::SshStorageBoxCommands::new(ssh_config);
+    let mut backend = crate::storage_box::StorageBoxBackend::new(storage_config, commands);
+    backend.commit_file(request, object_path)?;
+    Ok(())
 }
 
 const fn receipt_dataset(receipt: &RepoReceipt) -> &'static str {

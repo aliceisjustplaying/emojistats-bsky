@@ -15,9 +15,9 @@ use std::{
 use clap::Parser;
 use emojistats_backfill::{
     archive::{
-        ArchiveCommitContext, ArchiveError, CompletenessClass, FetchMethod, NormalizerVersion,
-        StreamingArchiveSink, StreamingReceiptInput, archive_row_from_owned_post_observed_at,
-        hash_profile_record,
+        ArchiveCommitContext, ArchiveError, ArchiveStorageConfig, CompletenessClass, FetchMethod,
+        NormalizerVersion, StorageBoxArchiveConfig, StreamingArchiveSink, StreamingReceiptInput,
+        archive_row_from_owned_post_observed_at, hash_profile_record,
     },
     clickhouse::create_schema_sql,
     ledger::{
@@ -34,6 +34,7 @@ use jacquard_identity::PublicResolver;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
+mod canary_cmd;
 mod cli;
 mod derive_manifest_cmd;
 mod failure;
@@ -42,7 +43,7 @@ mod fleet;
 pub(crate) mod main;
 mod profile_cmd;
 
-use cli::{Cli, Command, HttpProtocol};
+use cli::{ArchiveBackend, Cli, Command, HttpProtocol};
 use derive_manifest_cmd::DeriveManifestConfig;
 use failure::{
     FetchOneFailure, SmokeTelemetry, classify_archive_error, classify_fetch_error,
@@ -53,7 +54,10 @@ use fleet::{
     DEFAULT_HOST_CONCURRENCY_CAP, FleetConfig, HostConcurrencyLimiter, HostConcurrencyPermit,
     default_worker_id,
 };
-use main::{archive_host::parse_and_archive_spooled_repo, fetch_attempt::fetch_one_attempt};
+use main::{
+    archive_host::parse_and_archive_spooled_repo,
+    fetch_attempt::{LocalFetchOneAttemptConfig, fetch_one_attempt},
+};
 #[cfg(test)]
 use main::{
     archive_host::{fetch_mode_for_host, load_host_override, pds_host_key, prepare_fetch_host},
@@ -68,26 +72,12 @@ const HOST_OVERRIDE_CACHE_TTL: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    match cli.command {
-        Command::FetchOne {
-            did,
-            spool_dir,
-            max_bytes,
-            archive_dir,
-            cid_verification_threads,
-            http_protocol,
-        } => {
-            fetch_one(
-                &did,
-                spool_dir,
-                max_bytes,
-                archive_dir,
-                cid_verification_threads,
-                http_protocol,
-            )
-            .await
-        }
+    run_command(Cli::parse().command).await
+}
+
+async fn run_command(command: Command) -> anyhow::Result<()> {
+    match command {
+        command @ Command::FetchOne { .. } => run_fetch_one_command(command).await,
         Command::ProfileCar {
             did,
             car_path,
@@ -101,43 +91,7 @@ async fn main() -> anyhow::Result<()> {
             parse_only,
             cid_verification_threads,
         ),
-        Command::RunFleet {
-            dids_file,
-            ledger_path,
-            run_id,
-            claim_limit,
-            concurrency,
-            parse_concurrency,
-            max_inflight_spool_bytes,
-            shard_bucket,
-            spool_dir,
-            max_bytes,
-            archive_dir,
-            cid_verification_threads,
-            http_protocol,
-        } => {
-            validate_fleet_spool_budget(max_inflight_spool_bytes, max_bytes)?;
-            let worker_id = default_worker_id(&run_id);
-            fleet::run(FleetConfig {
-                dids_file,
-                ledger_path,
-                run_id,
-                worker_id,
-                claim_limit,
-                concurrency,
-                parse_concurrency,
-                max_inflight_spool_bytes,
-                spool_dir,
-                max_bytes,
-                archive_dir,
-                cid_verification_threads,
-                http_protocol,
-                claim_scope: ClaimScope {
-                    shard_filter: shard_bucket,
-                },
-            })
-            .await
-        }
+        command @ Command::RunFleet { .. } => run_fleet_command(command).await,
         Command::DeriveManifest {
             manifest_path,
             archive_root,
@@ -166,13 +120,139 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", create_schema_sql(&clickhouse_database)?);
             Ok(())
         }
+        Command::Canary {
+            evidence_path,
+            thresholds,
+        } => canary_cmd::run(canary_cmd::CanaryCommandConfig {
+            evidence_path,
+            thresholds: thresholds.into_thresholds(),
+        }),
     }
+}
+
+async fn run_fetch_one_command(command: Command) -> anyhow::Result<()> {
+    let Command::FetchOne {
+        did,
+        spool_dir,
+        max_bytes,
+        archive_dir,
+        archive_backend,
+        storage_box_remote,
+        storage_box_root,
+        storage_box_ssh_program,
+        storage_box_ssh_arg,
+        storage_box_command_timeout_secs,
+        cid_verification_threads,
+        http_protocol,
+    } = command
+    else {
+        anyhow::bail!("internal command dispatch mismatch for fetch-one");
+    };
+    let archive_storage = archive_storage_config(
+        archive_backend,
+        storage_box_remote,
+        storage_box_root,
+        storage_box_ssh_program,
+        storage_box_ssh_arg,
+        storage_box_command_timeout_secs,
+    )?;
+    fetch_one(
+        &did,
+        spool_dir,
+        max_bytes,
+        archive_dir,
+        archive_storage,
+        cid_verification_threads,
+        http_protocol,
+    )
+    .await
+}
+
+async fn run_fleet_command(command: Command) -> anyhow::Result<()> {
+    let Command::RunFleet {
+        dids_file,
+        ledger_path,
+        run_id,
+        claim_limit,
+        concurrency,
+        parse_concurrency,
+        max_inflight_spool_bytes,
+        shard_bucket,
+        spool_dir,
+        max_bytes,
+        archive_dir,
+        archive_backend,
+        storage_box_remote,
+        storage_box_root,
+        storage_box_ssh_program,
+        storage_box_ssh_arg,
+        storage_box_command_timeout_secs,
+        cid_verification_threads,
+        http_protocol,
+    } = command
+    else {
+        anyhow::bail!("internal command dispatch mismatch for run-fleet");
+    };
+    validate_fleet_spool_budget(max_inflight_spool_bytes, max_bytes)?;
+    let archive_storage = archive_storage_config(
+        archive_backend,
+        storage_box_remote,
+        storage_box_root,
+        storage_box_ssh_program,
+        storage_box_ssh_arg,
+        storage_box_command_timeout_secs,
+    )?;
+    let worker_id = default_worker_id(&run_id);
+    fleet::run(FleetConfig {
+        dids_file,
+        ledger_path,
+        run_id,
+        worker_id,
+        claim_limit,
+        concurrency,
+        parse_concurrency,
+        max_inflight_spool_bytes,
+        spool_dir,
+        max_bytes,
+        archive_dir,
+        archive_storage,
+        cid_verification_threads,
+        http_protocol,
+        claim_scope: ClaimScope {
+            shard_filter: shard_bucket,
+        },
+    })
+    .await
 }
 
 fn parse_config_for_threads(cid_verification_threads: usize) -> ParseConfig {
     ParseConfig {
         cid_verification_threads,
         ..ParseConfig::default()
+    }
+}
+
+fn archive_storage_config(
+    backend: ArchiveBackend,
+    storage_box_remote: Option<String>,
+    storage_box_root: Option<String>,
+    storage_box_ssh_program: PathBuf,
+    storage_box_ssh_arg: Vec<String>,
+    storage_box_command_timeout_secs: u64,
+) -> anyhow::Result<ArchiveStorageConfig> {
+    match backend {
+        ArchiveBackend::Local => Ok(ArchiveStorageConfig::Local),
+        ArchiveBackend::StorageBoxSsh => {
+            let remote = storage_box_remote
+                .ok_or_else(|| anyhow::anyhow!("--storage-box-remote is required"))?;
+            let root = storage_box_root
+                .ok_or_else(|| anyhow::anyhow!("--storage-box-root is required"))?;
+            let mut config = StorageBoxArchiveConfig::new(root, remote);
+            config.ssh_program = storage_box_ssh_program;
+            config.ssh_args = storage_box_ssh_arg;
+            config.command_timeout = Duration::from_secs(storage_box_command_timeout_secs);
+            Ok(ArchiveStorageConfig::StorageBoxSsh(config))
+        }
     }
 }
 
@@ -200,6 +280,7 @@ async fn fetch_one(
     spool_dir: PathBuf,
     max_bytes: u64,
     archive_dir: PathBuf,
+    archive_storage: ArchiveStorageConfig,
     cid_verification_threads: usize,
     http_protocol: cli::HttpProtocol,
 ) -> anyhow::Result<()> {
@@ -208,15 +289,16 @@ async fn fetch_one(
     let claimed = claim_repo(&ledger, AttemptId::new("fetch-one-local", did_str, 1), now)
         .map_err(|err| anyhow::anyhow!("claim fetch-one ledger entry for {did_str}: {err}"))?;
 
-    let result = fetch_one_attempt(
+    let result = fetch_one_attempt(LocalFetchOneAttemptConfig {
         did_str,
         spool_dir,
         max_bytes,
         archive_dir,
-        ArchiveCommitContext::fetch_one_local(),
-        parse_config_for_threads(cid_verification_threads),
+        archive_context: ArchiveCommitContext::fetch_one_local(),
+        archive_storage,
+        parse_config: parse_config_for_threads(cid_verification_threads),
         http_protocol,
-    )
+    })
     .await;
     let outcome = result.as_ref().map_or_else(
         |failure| failure.outcome.clone(),

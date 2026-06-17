@@ -428,18 +428,34 @@ pub(super) fn commit_profile_sidecar(
     receipt: &RepoReceipt,
     commit_context: &ArchiveCommitContext,
 ) -> Result<crate::commit::Artifact, ArchiveError> {
-    let request = Request {
+    let request = profile_sidecar_request(
         object_path,
         receipt_path,
         manifest_path,
-        manifest_mode: ManifestMode::AppendJsonl,
-        metadata: build_profile_sidecar_metadata(receipt, commit_context)?,
-    };
+        receipt,
+        commit_context,
+    )?;
     Ok(store.commit(&request, |file| {
         write_profile_sidecar_json_to_writer(file, profile).map_err(|error| {
             crate::commit::Error::writer(format!("write profile sidecar JSON: {error}"))
         })
     })?)
+}
+
+pub(super) fn profile_sidecar_request(
+    object_path: PathBuf,
+    receipt_path: PathBuf,
+    manifest_path: PathBuf,
+    receipt: &RepoReceipt,
+    commit_context: &ArchiveCommitContext,
+) -> Result<Request, ArchiveError> {
+    Ok(Request {
+        object_path,
+        receipt_path,
+        manifest_path,
+        manifest_mode: ManifestMode::AppendJsonl,
+        metadata: build_profile_sidecar_metadata(receipt, commit_context)?,
+    })
 }
 
 pub(super) fn local_manifest_from_committed(

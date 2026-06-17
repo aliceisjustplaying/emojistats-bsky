@@ -8,7 +8,7 @@ use std::{
 };
 
 use emojistats_backfill::{
-    archive::ArchiveCommitContext,
+    archive::{ArchiveCommitContext, ArchiveStorageConfig},
     ledger::{
         AttemptOutcome, DEFAULT_CLAIM_LEASE_DURATION, RepoLedgerEntry, RetryPolicy, SqliteLedger,
     },
@@ -54,6 +54,7 @@ pub struct FleetConfig {
     pub spool_dir: PathBuf,
     pub max_bytes: u64,
     pub archive_dir: PathBuf,
+    pub archive_storage: ArchiveStorageConfig,
     pub cid_verification_threads: usize,
     pub http_protocol: HttpProtocol,
     pub claim_scope: ClaimScope,
@@ -231,6 +232,7 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
                 spool_dir: config.spool_dir.clone(),
                 max_bytes: config.max_bytes,
                 archive_dir: config.archive_dir.clone(),
+                archive_storage: config.archive_storage.clone(),
                 parse_config: parse_config_for_threads(config.cid_verification_threads),
                 http_protocol: config.http_protocol,
                 host_pacer: host_pacer.clone(),
@@ -269,6 +271,7 @@ struct FleetAttemptConfig {
     spool_dir: PathBuf,
     max_bytes: u64,
     archive_dir: PathBuf,
+    archive_storage: ArchiveStorageConfig,
     parse_config: ParseConfig,
     http_protocol: HttpProtocol,
     host_pacer: SharedHostPacer,
@@ -297,6 +300,7 @@ async fn run_fleet_attempt(config: FleetAttemptConfig) -> FleetAttemptResult {
                 spool_dir: config.spool_dir,
                 max_bytes: config.max_bytes,
                 archive_dir: config.archive_dir,
+                archive_storage: config.archive_storage,
                 archive_context,
                 http_protocol: config.http_protocol,
                 runtime: AttemptRuntime::Fleet {

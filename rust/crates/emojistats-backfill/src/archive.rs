@@ -8,6 +8,7 @@ use std::{
     io::{self as std_io, Write},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, builder::StringBuilder};
@@ -163,7 +164,7 @@ pub enum CompletenessClass {
     CollectionPaginated,
 }
 
-/// Local manifest entry before the Storage Box commit protocol exists.
+/// Manifest entry projected into local paths for smoke/derive compatibility.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalManifestEntry {
     pub run_id: String,
@@ -188,6 +189,37 @@ pub struct ArchiveCommitContext {
     pub shard: String,
     pub file_sequence: u64,
     pub observed_at: DateTime<Utc>,
+}
+
+/// Archive commit backend.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ArchiveStorageConfig {
+    #[default]
+    Local,
+    StorageBoxSsh(StorageBoxArchiveConfig),
+}
+
+/// SSH Storage Box archive backend configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageBoxArchiveConfig {
+    pub remote_root: String,
+    pub ssh_remote: String,
+    pub ssh_program: PathBuf,
+    pub ssh_args: Vec<String>,
+    pub command_timeout: Duration,
+}
+
+impl StorageBoxArchiveConfig {
+    #[must_use]
+    pub fn new(remote_root: impl Into<String>, ssh_remote: impl Into<String>) -> Self {
+        Self {
+            remote_root: remote_root.into(),
+            ssh_remote: ssh_remote.into(),
+            ssh_program: PathBuf::from("ssh"),
+            ssh_args: Vec::new(),
+            command_timeout: Duration::from_secs(300),
+        }
+    }
 }
 
 impl ArchiveCommitContext {
@@ -230,6 +262,7 @@ pub enum ArchiveError {
     Arrow(arrow_schema::ArrowError),
     Json(serde_json::Error),
     Commit(crate::commit::Error),
+    StorageBox(crate::storage_box::Error),
     CountOverflow {
         field: &'static str,
     },
@@ -427,6 +460,7 @@ impl fmt::Display for ArchiveError {
             Self::Arrow(error) => write!(f, "Arrow error: {error}"),
             Self::Json(error) => write!(f, "JSON error: {error}"),
             Self::Commit(error) => write!(f, "commit protocol error: {error}"),
+            Self::StorageBox(error) => write!(f, "Storage Box commit error: {error}"),
             Self::CountOverflow { field } => write!(f, "count overflow for {field}"),
             Self::InvalidCompression(error) => write!(f, "invalid compression level: {error}"),
             Self::InvalidPath { path } => write!(f, "invalid archive path: {}", path.display()),
@@ -464,6 +498,7 @@ impl Error for ArchiveError {
             Self::Arrow(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Commit(error) => Some(error),
+            Self::StorageBox(error) => Some(error),
             Self::CountOverflow { .. }
             | Self::InvalidCompression(_)
             | Self::InvalidPath { .. }
@@ -504,6 +539,12 @@ impl From<serde_json::Error> for ArchiveError {
 impl From<crate::commit::Error> for ArchiveError {
     fn from(error: crate::commit::Error) -> Self {
         Self::Commit(error)
+    }
+}
+
+impl From<crate::storage_box::Error> for ArchiveError {
+    fn from(error: crate::storage_box::Error) -> Self {
+        Self::StorageBox(error)
     }
 }
 

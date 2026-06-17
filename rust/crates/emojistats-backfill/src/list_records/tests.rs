@@ -264,6 +264,7 @@ async fn rate_limit_observer_runs_after_each_fetched_page() {
         did_str,
         &archive_dir,
         ArchiveCommitContext::fetch_one_local(),
+        ArchiveStorageConfig::Local,
         ListRecordsConfig::default(),
         |rate_limit| observed_remaining.push(rate_limit.remaining),
     )

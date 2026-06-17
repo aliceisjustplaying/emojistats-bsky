@@ -4,8 +4,8 @@ use jacquard_identity::resolver::IdentityResolver;
 
 use super::{
     super::{
-        Arc, ArchiveCommitContext, AttemptOutcome, CRAWLER_USER_AGENT, ClaimScope,
-        DEFAULT_HOST_CONCURRENCY_CAP, Did, Digest, Duration, FETCH_TRANSPORT_ATTEMPTS,
+        Arc, ArchiveCommitContext, ArchiveStorageConfig, AttemptOutcome, CRAWLER_USER_AGENT,
+        ClaimScope, DEFAULT_HOST_CONCURRENCY_CAP, Did, Digest, Duration, FETCH_TRANSPORT_ATTEMPTS,
         FETCH_TRANSPORT_RETRY_BASE_DELAY, FETCH_TRANSPORT_RETRY_MAX_DELAY, FetchByteBudget,
         FetchConfig, FetchError, FetchOneFailure, ForcedFetchMode, HashMap, HostConcurrencyLimiter,
         HostConcurrencyPermit, HostOverride, HostPacer, HttpProtocol, Instant, ListRecordsConfig,
@@ -20,25 +20,31 @@ use super::{
     },
 };
 
+pub(crate) struct LocalFetchOneAttemptConfig<'a> {
+    pub(crate) did_str: &'a str,
+    pub(crate) spool_dir: PathBuf,
+    pub(crate) max_bytes: u64,
+    pub(crate) archive_dir: PathBuf,
+    pub(crate) archive_context: ArchiveCommitContext,
+    pub(crate) archive_storage: ArchiveStorageConfig,
+    pub(crate) parse_config: ParseConfig,
+    pub(crate) http_protocol: HttpProtocol,
+}
+
 pub(crate) async fn fetch_one_attempt(
-    did_str: &str,
-    spool_dir: PathBuf,
-    max_bytes: u64,
-    archive_dir: PathBuf,
-    archive_context: ArchiveCommitContext,
-    parse_config: ParseConfig,
-    http_protocol: HttpProtocol,
+    config: LocalFetchOneAttemptConfig<'_>,
 ) -> Result<(), FetchOneFailure> {
     let claim_scope = ClaimScope::default();
     fetch_one_attempt_with_pacer(FetchOneAttemptConfig {
-        did_str,
-        spool_dir,
-        max_bytes,
-        archive_dir,
-        archive_context,
+        did_str: config.did_str,
+        spool_dir: config.spool_dir,
+        max_bytes: config.max_bytes,
+        archive_dir: config.archive_dir,
+        archive_context: config.archive_context,
+        archive_storage: config.archive_storage,
         runtime: AttemptRuntime::Local { claim_scope },
-        parse_config,
-        http_protocol,
+        parse_config: config.parse_config,
+        http_protocol: config.http_protocol,
     })
     .await
 }
@@ -49,6 +55,7 @@ pub(crate) struct FetchOneAttemptConfig<'a> {
     pub(crate) max_bytes: u64,
     pub(crate) archive_dir: PathBuf,
     pub(crate) archive_context: ArchiveCommitContext,
+    pub(crate) archive_storage: ArchiveStorageConfig,
     pub(crate) runtime: AttemptRuntime<'a>,
     pub(crate) parse_config: ParseConfig,
     pub(crate) http_protocol: HttpProtocol,
@@ -196,6 +203,7 @@ pub(crate) async fn fetch_one_attempt_with_pacer(
             fetch_config: &fetch_config,
             archive_dir: &config.archive_dir,
             archive_context: config.archive_context,
+            archive_storage: config.archive_storage,
             host_pacer: config.runtime.host_pacer(),
             parse_permits: config.runtime.parse_permits(),
             claim_check: config.runtime.archive_claim_check(),
@@ -288,6 +296,7 @@ struct FetchModeStep<'a> {
     fetch_config: &'a FetchConfig,
     archive_dir: &'a Path,
     archive_context: ArchiveCommitContext,
+    archive_storage: ArchiveStorageConfig,
     host_pacer: Option<&'a SharedHostPacer>,
     parse_permits: Option<&'a Arc<Semaphore>>,
     claim_check: Option<ArchiveClaimCheck>,
@@ -310,6 +319,7 @@ async fn fetch_prepared_repo(
                 host: step.host,
                 archive_dir: step.archive_dir,
                 archive_context: step.archive_context,
+                archive_storage: step.archive_storage,
                 host_pacer: step.host_pacer,
                 attempt_started: step.attempt_started,
             })
@@ -343,6 +353,7 @@ async fn fetch_get_repo_and_archive(
                 host: step.host,
                 archive_dir: step.archive_dir,
                 archive_context: step.archive_context.clone(),
+                archive_storage: step.archive_storage.clone(),
                 host_pacer: step.host_pacer,
                 attempt_started: step.attempt_started,
             })
@@ -377,6 +388,7 @@ async fn fetch_get_repo_and_archive(
         parse_permits: step.parse_permits,
         claim_check: step.claim_check,
         archive_context: step.archive_context,
+        archive_storage: step.archive_storage,
         parse_config: step.parse_config,
         attempt_started: step.attempt_started,
     })
@@ -599,6 +611,7 @@ struct ParseArchiveStep<'a> {
     parse_permits: Option<&'a Arc<Semaphore>>,
     claim_check: Option<ArchiveClaimCheck>,
     archive_context: ArchiveCommitContext,
+    archive_storage: ArchiveStorageConfig,
     parse_config: ParseConfig,
     attempt_started: Instant,
 }
@@ -619,6 +632,7 @@ async fn parse_archive_or_emit_failure(
     let car_path = step.fetched.spooled.car_path.clone();
     let archive_dir = step.archive_dir.to_path_buf();
     let archive_context = step.archive_context;
+    let archive_storage = step.archive_storage;
     let parse_config = step.parse_config;
     let claim_check = step.claim_check;
     let parsed = tokio::task::spawn_blocking(move || {
@@ -627,6 +641,7 @@ async fn parse_archive_or_emit_failure(
             &car_path,
             &archive_dir,
             archive_context,
+            archive_storage,
             parse_config,
             claim_check,
         )
@@ -838,6 +853,7 @@ struct ListRecordsStep<'a> {
     host: &'a str,
     archive_dir: &'a Path,
     archive_context: ArchiveCommitContext,
+    archive_storage: ArchiveStorageConfig,
     host_pacer: Option<&'a SharedHostPacer>,
     attempt_started: Instant,
 }
@@ -856,6 +872,7 @@ async fn fetch_archive_list_records_or_emit_failure(
         step.did_str,
         step.archive_dir,
         step.archive_context.clone(),
+        step.archive_storage.clone(),
         ListRecordsConfig::default(),
         |rate_limit| record_rate_limit_snapshot(host_pacer, host, rate_limit, SystemTime::now()),
     )

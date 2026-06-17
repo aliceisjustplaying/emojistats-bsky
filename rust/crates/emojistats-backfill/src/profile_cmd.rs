@@ -1,7 +1,7 @@
 use std::{path::Path, time::Instant};
 
 use emojistats_backfill::{
-    archive::ArchiveCommitContext,
+    archive::{ArchiveCommitContext, ArchiveStorageConfig},
     parse::{ParseVisitError, PostRecordBody, parse_repo_for_did_with_state},
 };
 
@@ -26,6 +26,7 @@ pub fn run(
         car_path,
         archive_dir,
         ArchiveCommitContext::fetch_one_local(),
+        ArchiveStorageConfig::Local,
         parse_config_for_threads(cid_verification_threads),
         None,
     )

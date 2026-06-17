@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
-use emojistats_backfill::{ledger::ShardFilter, parse::default_cid_verification_threads};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use emojistats_backfill::{
+    canary::CanaryThresholds, ledger::ShardFilter, parse::default_cid_verification_threads,
+};
 
 const DEFAULT_PARSE_CONCURRENCY: usize = 1;
 const DEFAULT_MAX_INFLIGHT_SPOOL_BYTES: u64 = 2_147_483_648;
@@ -22,6 +24,52 @@ pub enum HttpProtocol {
     Auto,
 }
 
+#[derive(Args, Debug, Clone)]
+pub struct CanaryThresholdArgs {
+    /// Minimum free Storage Box headroom ratio required by policy.
+    #[arg(long)]
+    pub min_storage_box_headroom_ratio: f64,
+    /// Maximum `ClickHouse` serving-box utilization ratio allowed by policy.
+    #[arg(long)]
+    pub max_clickhouse_serving_box_ratio: f64,
+    /// Minimum derive/crawl throughput ratio required by policy.
+    #[arg(long)]
+    pub min_derive_to_crawl_ratio: f64,
+    /// Minimum sustained repo throughput required by policy.
+    #[arg(long)]
+    pub min_sustained_repos_per_second: f64,
+    /// Minimum mushroom host budget utilization ratio required by policy.
+    #[arg(long)]
+    pub min_mushroom_budget_utilization_ratio: f64,
+    /// Maximum observed mushroom 429 ratio allowed by policy.
+    #[arg(long)]
+    pub max_mushroom_429_ratio: f64,
+    /// Maximum aggregate rebuild runtime allowed by policy.
+    #[arg(long)]
+    pub max_aggregate_rebuild_hours: f64,
+}
+
+impl CanaryThresholdArgs {
+    #[must_use]
+    pub const fn into_thresholds(self) -> CanaryThresholds {
+        CanaryThresholds {
+            min_storage_box_headroom_ratio: self.min_storage_box_headroom_ratio,
+            max_clickhouse_serving_box_ratio: self.max_clickhouse_serving_box_ratio,
+            min_derive_to_crawl_ratio: self.min_derive_to_crawl_ratio,
+            min_sustained_repos_per_second: self.min_sustained_repos_per_second,
+            min_mushroom_budget_utilization_ratio: self.min_mushroom_budget_utilization_ratio,
+            max_mushroom_429_ratio: self.max_mushroom_429_ratio,
+            max_aggregate_rebuild_hours: self.max_aggregate_rebuild_hours,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ArchiveBackend {
+    Local,
+    StorageBoxSsh,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Fetch and process a single repo by DID (vertical-slice milestone).
@@ -37,6 +85,24 @@ pub enum Command {
         /// Directory for local archive artifacts.
         #[arg(long, default_value = "data/archive")]
         archive_dir: PathBuf,
+        /// Archive commit backend.
+        #[arg(long, value_enum, default_value_t = ArchiveBackend::Local)]
+        archive_backend: ArchiveBackend,
+        /// Storage Box SSH destination, e.g. u123@u123.your-storagebox.de.
+        #[arg(long)]
+        storage_box_remote: Option<String>,
+        /// Absolute Storage Box archive root.
+        #[arg(long)]
+        storage_box_root: Option<String>,
+        /// SSH program for Storage Box commands.
+        #[arg(long, default_value = "ssh")]
+        storage_box_ssh_program: PathBuf,
+        /// Extra SSH args for Storage Box commands. Repeat for multiple args.
+        #[arg(long, allow_hyphen_values = true)]
+        storage_box_ssh_arg: Vec<String>,
+        /// Per-command Storage Box SSH timeout in seconds.
+        #[arg(long, default_value_t = 300, value_parser = parse_positive_u64)]
+        storage_box_command_timeout_secs: u64,
         /// Worker threads used for CAR block CID verification.
         #[arg(long, default_value_t = default_cid_verification_threads(), value_parser = parse_positive_usize)]
         cid_verification_threads: usize,
@@ -94,6 +160,24 @@ pub enum Command {
         /// Directory for local archive artifacts.
         #[arg(long, default_value = "data/archive")]
         archive_dir: PathBuf,
+        /// Archive commit backend.
+        #[arg(long, value_enum, default_value_t = ArchiveBackend::Local)]
+        archive_backend: ArchiveBackend,
+        /// Storage Box SSH destination, e.g. u123@u123.your-storagebox.de.
+        #[arg(long)]
+        storage_box_remote: Option<String>,
+        /// Absolute Storage Box archive root.
+        #[arg(long)]
+        storage_box_root: Option<String>,
+        /// SSH program for Storage Box commands.
+        #[arg(long, default_value = "ssh")]
+        storage_box_ssh_program: PathBuf,
+        /// Extra SSH args for Storage Box commands. Repeat for multiple args.
+        #[arg(long, allow_hyphen_values = true)]
+        storage_box_ssh_arg: Vec<String>,
+        /// Per-command Storage Box SSH timeout in seconds.
+        #[arg(long, default_value_t = 300, value_parser = parse_positive_u64)]
+        storage_box_command_timeout_secs: u64,
         /// Worker threads used for CAR block CID verification.
         #[arg(long, default_value_t = default_cid_verification_threads(), value_parser = parse_positive_usize)]
         cid_verification_threads: usize,
@@ -132,6 +216,14 @@ pub enum Command {
         /// `ClickHouse` database.
         #[arg(long, default_value = "emojistats")]
         clickhouse_database: String,
+    },
+    /// Evaluate stratified canary evidence against the launch policy.
+    Canary {
+        /// JSON or JSONL canary evidence file.
+        evidence_path: PathBuf,
+        /// Policy thresholds for the launch gates.
+        #[command(flatten)]
+        thresholds: CanaryThresholdArgs,
     },
 }
 

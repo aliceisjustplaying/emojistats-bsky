@@ -206,9 +206,11 @@ pub fn classify_archive_error(context: &str, error: &ArchiveError) -> FetchOneFa
                 message: message.clone(),
             }
         }
-        ArchiveError::Io(_) | ArchiveError::Commit(_) => AttemptOutcome::RetryableFailure {
-            message: message.clone(),
-        },
+        ArchiveError::Io(_) | ArchiveError::Commit(_) | ArchiveError::StorageBox(_) => {
+            AttemptOutcome::RetryableFailure {
+                message: message.clone(),
+            }
+        }
         ArchiveError::CountOverflow { .. } => AttemptOutcome::ResourceLimitExceeded {
             message: message.clone(),
         },

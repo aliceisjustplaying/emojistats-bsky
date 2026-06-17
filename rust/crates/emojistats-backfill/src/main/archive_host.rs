@@ -1,10 +1,10 @@
 use super::{
     super::{
-        ArchiveCommitContext, ArchiveError, AttemptOutcome, ClaimScope, CompletenessClass,
-        DEFAULT_CLAIM_LEASE_DURATION, FetchMethod, FetchOneFailure, ForcedFetchMode,
-        HOST_OVERRIDE_CACHE_TTL, HostOverride, Instant, NormalizerVersion, ParseConfig,
-        ParseVisitError, ParsedRepoSummary, Path, PathBuf, RepoLedgerEntry, SqliteLedger,
-        StreamingArchiveSink, StreamingReceiptInput, SystemTime, Uri,
+        ArchiveCommitContext, ArchiveError, ArchiveStorageConfig, AttemptOutcome, ClaimScope,
+        CompletenessClass, DEFAULT_CLAIM_LEASE_DURATION, FetchMethod, FetchOneFailure,
+        ForcedFetchMode, HOST_OVERRIDE_CACHE_TTL, HostOverride, Instant, NormalizerVersion,
+        ParseConfig, ParseVisitError, ParsedRepoSummary, Path, PathBuf, RepoLedgerEntry,
+        SqliteLedger, StreamingArchiveSink, StreamingReceiptInput, SystemTime, Uri,
         archive_row_from_owned_post_observed_at, classify_archive_error, classify_parse_error,
         elapsed_ms, hash_profile_record, parse_repo_for_did_with_state, retryable_failure,
     },
@@ -26,11 +26,18 @@ pub fn parse_and_archive_spooled_repo(
     car_path: &Path,
     archive_dir: &Path,
     archive_context: ArchiveCommitContext,
+    archive_storage: ArchiveStorageConfig,
     parse_config: ParseConfig,
     claim_check: Option<ArchiveClaimCheck>,
 ) -> Result<ProcessedRepo, FetchOneFailure> {
     let parse_started = Instant::now();
-    let sink = StreamingArchiveSink::new(archive_dir, did_str, archive_context).map_err(|err| {
+    let sink = StreamingArchiveSink::new_with_storage(
+        archive_dir,
+        did_str,
+        archive_context,
+        archive_storage,
+    )
+    .map_err(|err| {
         classify_archive_error(&format!("open streaming archive sink for {did_str}"), &err)
     })?;
 
