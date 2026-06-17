@@ -9,12 +9,13 @@ use std::{
 
 use emojistats_backfill::{
     archive::{
-        ArchiveCommitContext, ArchivePostRow, CreatedAtParseStatus, LocalManifestEntry,
-        NormalizerVersion, RepoReceipt, RepoReceiptInput, build_repo_receipt, current_normalizer,
-        write_archive_artifacts,
+        ArchiveCommitContext, ArchivePostRow, CompletenessClass, CreatedAtParseStatus, FetchMethod,
+        LocalManifestEntry, NormalizerVersion, RepoReceipt, RepoReceiptInput, build_repo_receipt,
+        current_normalizer, write_archive_artifacts,
     },
     clickhouse::{ClickHouseInsertPayload, ClickHouseTable, JSON_EACH_ROW_FORMAT},
     derive::BACKFILL_DERIVE_SOURCE,
+    manifest_derive::read_committed_jsonl,
 };
 
 use super::*;
@@ -36,10 +37,13 @@ fn identity() -> DeriveManifestIdentity {
         run_id: "run-1".to_owned(),
         shard: "shard0".to_owned(),
         file_sequence: 7,
+        did: "did:plc:test".to_owned(),
         dataset: "raw_archive_posts".to_owned(),
+        fetch_method: "get_repo".to_owned(),
+        completeness_class: "content_addressed_snapshot".to_owned(),
         content_hash: "content-hash".to_owned(),
         receipt_hash: "receipt-hash".to_owned(),
-        schema_version: 1,
+        schema_version: 2,
         normalizer: test_normalizer(),
     }
 }
@@ -49,7 +53,9 @@ fn emoji_rows() -> Vec<EmojiProjectionRow> {
         EmojiProjectionRow {
             did: "did:plc:test".to_owned(),
             rkey: "a".to_owned(),
+            cid: "bafy-a".to_owned(),
             created_at_normalized: Some("2026-06-15T00:00:00Z".to_owned()),
+            created_at_parse_status: CreatedAtParseStatus::Valid,
             emoji: ":test:".to_owned(),
             occurrences: 2,
             langs: vec!["en".to_owned(), "ja".to_owned()],
@@ -57,7 +63,9 @@ fn emoji_rows() -> Vec<EmojiProjectionRow> {
         EmojiProjectionRow {
             did: "did:plc:test".to_owned(),
             rkey: "b".to_owned(),
+            cid: "bafy-b".to_owned(),
             created_at_normalized: None,
+            created_at_parse_status: CreatedAtParseStatus::Missing,
             emoji: ":other:".to_owned(),
             occurrences: 1,
             langs: Vec::new(),
@@ -71,6 +79,10 @@ fn counter() -> TotalPostCounterInput {
         run_id: "run-1".to_owned(),
         shard: "shard0".to_owned(),
         file_sequence: 7,
+        did: "did:plc:test".to_owned(),
+        dataset: "raw_archive_posts".to_owned(),
+        fetch_method: "get_repo".to_owned(),
+        completeness_class: "content_addressed_snapshot".to_owned(),
         receipt_hash: "receipt-hash".to_owned(),
         normalizer: test_normalizer(),
         posts_processed: 3,
@@ -103,6 +115,10 @@ fn archive_row(rkey: &str, text: &str, emojis: &[&str]) -> ArchivePostRow {
 fn repo_receipt(rows: &[ArchivePostRow]) -> RepoReceipt {
     build_repo_receipt(RepoReceiptInput {
         rows,
+        observed_at: ArchiveCommitContext::fetch_one_local().observed_at,
+        did: "did:plc:test",
+        fetch_method: FetchMethod::GetRepo,
+        completeness_class: CompletenessClass::ContentAddressedSnapshot,
         reachable_records_count: u64::try_from(rows.len()).expect("row count should fit u64"),
         reachable_post_records_count: u64::try_from(rows.len()).expect("row count should fit u64"),
         post_decode_error_count: 0,
@@ -221,6 +237,7 @@ fn verified_input() -> VerifiedLoaderInput {
             run_id: identity.run_id.clone(),
             shard: identity.shard.clone(),
             file_sequence: identity.file_sequence,
+            did: identity.did.clone(),
             dataset: identity.dataset.clone(),
             local_path: PathBuf::from("objects/raw_archive_posts/archive.parquet"),
             row_count: 0,
@@ -229,6 +246,7 @@ fn verified_input() -> VerifiedLoaderInput {
             min_created_at_normalized: None,
             max_created_at_normalized: None,
             receipt_hash: identity.receipt_hash.clone(),
+            repo_receipt_path: None,
             schema_version: identity.schema_version,
             normalizer: current_normalizer(),
         },
@@ -244,7 +262,7 @@ fn streaming_emoji_dedupe_token_is_stable_and_framed() {
 
     assert_eq!(
         token,
-        "derive:emoji:f985adfa7214340909aecd7c507191efb6486117d36afdb9a1ee1ea4b94466e3"
+        "derive:emoji:c140796160d4d7cb339d514053a68b76991bd67156693b53a88b0f07dbb8d629"
     );
 }
 
@@ -254,7 +272,7 @@ fn streaming_counter_dedupe_token_is_stable_and_framed() {
 
     assert_eq!(
         token,
-        "derive:counter:3ca03cb72923809cf6310fa77f73fa6d3a87cc06d9495314963cad50b9314725"
+        "derive:counter:6066bca798caeabbb48dad11cdd9fffa898176fccd5681c3de78130c471b25b4"
     );
 }
 
@@ -289,6 +307,25 @@ fn streaming_dedupe_tokens_are_stable_across_replay_manifest_sequence() {
         streaming_counter_dedupe_token(&identity(), &counter()).unwrap(),
         streaming_counter_dedupe_token(&replay_identity, &replay_counter).unwrap()
     );
+}
+
+#[test]
+fn streaming_payload_rejects_single_emoji_row_over_payload_cap() {
+    let verified = verified_input();
+    let mut row = archive_row("oversized", "hello ✅", &["✅"]);
+    row.langs = vec!["x".repeat(DEFAULT_EMOJI_SERVING_PAYLOAD_MAX_BYTES)];
+    let mut state = StreamingPayloadState::new(&verified);
+
+    let error = state
+        .consume_rows(&[row])
+        .expect_err("oversized single row should fail before chunking");
+    let error_text = error.to_string();
+
+    assert!(error_text.contains("emoji serving row exceeds payload byte cap"));
+    assert!(error_text.contains("did=did:plc:fixture123"));
+    assert!(error_text.contains("rkey=oversized"));
+    assert!(error_text.contains("cid=bafy-oversized"));
+    assert!(error_text.contains("emoji=✅"));
 }
 
 #[tokio::test]

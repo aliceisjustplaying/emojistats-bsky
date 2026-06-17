@@ -4,8 +4,8 @@ use std::{
 };
 
 use emojistats_backfill::{
-    archive::ArchiveError, ledger::AttemptOutcome, list_records::ListRecordsError,
-    parse::ParseError, transport::FetchError,
+    archive::ArchiveError, commit, ledger::AttemptOutcome, list_records::ListRecordsError,
+    parse::ParseError, storage_box, transport::FetchError,
 };
 use serde::Serialize;
 
@@ -88,12 +88,16 @@ pub fn classify_fetch_error(did: &str, error: &FetchError) -> FetchOneFailure {
         }
         FetchError::InactivityTimeout { .. }
         | FetchError::DownloadTimeout { .. }
+        | FetchError::ResponseHeaderTimeout { .. }
         | FetchError::ProgressTimeout { .. }
         | FetchError::Transport { .. }
-        | FetchError::Io { .. }
-        | FetchError::ErrorBodyTooLarge { .. }
+        | FetchError::Io { .. } => AttemptOutcome::RetryableFailure {
+            message: message.clone(),
+        },
+        FetchError::ErrorBodyTooLarge { .. }
         | FetchError::InFlightBytesUnavailable { .. }
-        | FetchError::ByteBudgetPoisoned => AttemptOutcome::RetryableFailure {
+        | FetchError::ByteBudgetPoisoned => AttemptOutcome::OperatorDeferred {
+            retry_after: None,
             message: message.clone(),
         },
         FetchError::MaxBytesExceeded { .. } | FetchError::InFlightBytesExceeded { .. } => {
@@ -135,9 +139,14 @@ pub fn classify_list_records_error(did: &str, error: &ListRecordsError) -> Fetch
             }
         }
         ListRecordsError::Transport(_)
+        | ListRecordsError::ResponseHeaderTimeout { .. }
         | ListRecordsError::InactivityTimeout { .. }
         | ListRecordsError::DownloadTimeout { .. }
         | ListRecordsError::ProgressTimeout { .. } => AttemptOutcome::RetryableFailure {
+            message: message.clone(),
+        },
+        ListRecordsError::PreCommit(_) => AttemptOutcome::OperatorDeferred {
+            retry_after: None,
             message: message.clone(),
         },
         ListRecordsError::ResourceLimitExceeded { .. } => AttemptOutcome::ResourceLimitExceeded {
@@ -206,11 +215,11 @@ pub fn classify_archive_error(context: &str, error: &ArchiveError) -> FetchOneFa
                 message: message.clone(),
             }
         }
-        ArchiveError::Io(_) | ArchiveError::Commit(_) | ArchiveError::StorageBox(_) => {
-            AttemptOutcome::RetryableFailure {
-                message: message.clone(),
-            }
-        }
+        ArchiveError::Commit(error) => classify_commit_error(error, message.clone()),
+        ArchiveError::StorageBox(error) => classify_storage_box_error(error, message.clone()),
+        ArchiveError::Io(_) => AttemptOutcome::RetryableFailure {
+            message: message.clone(),
+        },
         ArchiveError::CountOverflow { .. } => AttemptOutcome::ResourceLimitExceeded {
             message: message.clone(),
         },
@@ -231,6 +240,59 @@ pub fn classify_archive_error(context: &str, error: &ArchiveError) -> FetchOneFa
     FetchOneFailure {
         outcome,
         error: anyhow::anyhow!(message),
+    }
+}
+
+fn classify_commit_error(error: &commit::Error, message: String) -> AttemptOutcome {
+    match error {
+        commit::Error::FinalPathExists { .. }
+        | commit::Error::FinalHashMismatch { .. }
+        | commit::Error::ExistingReceiptMismatch { .. }
+        | commit::Error::PathEscapesRoot { .. }
+        | commit::Error::MissingFileName { .. }
+        | commit::Error::NonUtf8Path { .. }
+        | commit::Error::JsonRead { .. } => AttemptOutcome::PermanentFailure { message },
+        commit::Error::ByteCountOverflow { .. } | commit::Error::InvalidReadSize { .. } => {
+            AttemptOutcome::ResourceLimitExceeded { message }
+        }
+        commit::Error::Io { source, .. } if is_operator_io_error(source) => {
+            AttemptOutcome::OperatorDeferred {
+                retry_after: None,
+                message,
+            }
+        }
+        commit::Error::Io { .. } | commit::Error::Json { .. } | commit::Error::Writer(_) => {
+            AttemptOutcome::RetryableFailure { message }
+        }
+    }
+}
+
+fn classify_storage_box_error(error: &storage_box::Error, message: String) -> AttemptOutcome {
+    match error {
+        storage_box::Error::VerifySizeMismatch { .. }
+        | storage_box::Error::VerifyHashMismatch { .. }
+        | storage_box::Error::FinalExistsConflict { .. }
+        | storage_box::Error::VerifyReadbackMismatch { .. }
+        | storage_box::Error::InvalidRemoteRoot(_)
+        | storage_box::Error::TempDirectoryEscapesRoot { .. }
+        | storage_box::Error::PathEscapesRoot { .. }
+        | storage_box::Error::MissingFileName { .. }
+        | storage_box::Error::NonUtf8Path { .. }
+        | storage_box::Error::UnsupportedManifestMode
+        | storage_box::Error::MissingRemoteFile { .. }
+        | storage_box::Error::Json { .. } => AttemptOutcome::PermanentFailure { message },
+        storage_box::Error::ByteCountOverflow { .. } => {
+            AttemptOutcome::ResourceLimitExceeded { message }
+        }
+        storage_box::Error::LocalIo { source, .. } if is_operator_io_error(source) => {
+            AttemptOutcome::OperatorDeferred {
+                retry_after: None,
+                message,
+            }
+        }
+        storage_box::Error::LocalIo { .. } | storage_box::Error::Command { .. } => {
+            AttemptOutcome::RetryableFailure { message }
+        }
     }
 }
 
@@ -265,5 +327,87 @@ pub fn permanent_failure(message: String) -> FetchOneFailure {
             message: message.clone(),
         },
         error: anyhow::anyhow!(message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io, path::PathBuf};
+
+    use emojistats_backfill::transport::FetchError;
+
+    use super::*;
+
+    #[test]
+    fn commit_integrity_conflict_is_permanent_failure() {
+        let failure = classify_archive_error(
+            "archive",
+            &ArchiveError::Commit(commit::Error::FinalHashMismatch {
+                kind: "object",
+                path: PathBuf::from("objects/1.parquet"),
+                expected: "expected".to_owned(),
+                observed: "observed".to_owned(),
+            }),
+        );
+
+        assert!(matches!(
+            failure.outcome,
+            AttemptOutcome::PermanentFailure { .. }
+        ));
+    }
+
+    #[test]
+    fn commit_transient_io_stays_retryable() {
+        let failure = classify_archive_error(
+            "archive",
+            &ArchiveError::Commit(commit::Error::Io {
+                operation: "read final object for hashing",
+                path: PathBuf::from("objects/1.parquet"),
+                source: io::Error::from(io::ErrorKind::Interrupted),
+            }),
+        );
+
+        assert!(matches!(
+            failure.outcome,
+            AttemptOutcome::RetryableFailure { .. }
+        ));
+    }
+
+    #[test]
+    fn oversized_error_body_is_operator_deferred() {
+        let failure = classify_fetch_error(
+            "did:plc:test",
+            &FetchError::ErrorBodyTooLarge {
+                max_bytes: 65_536,
+                observed_bytes: 65_537,
+            },
+        );
+
+        assert!(matches!(
+            failure.outcome,
+            AttemptOutcome::OperatorDeferred {
+                retry_after: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn in_flight_byte_pressure_is_operator_deferred() {
+        let failure = classify_fetch_error(
+            "did:plc:test",
+            &FetchError::InFlightBytesUnavailable {
+                max_bytes: 10,
+                requested_bytes: 11,
+            },
+        );
+
+        assert!(matches!(
+            failure.outcome,
+            AttemptOutcome::OperatorDeferred {
+                retry_after: None,
+                ..
+            }
+        ));
     }
 }

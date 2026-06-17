@@ -91,6 +91,10 @@ pub struct ParseConfig {
     pub max_records: u64,
     /// Maximum `MST` cursor layer accepted while walking records.
     pub max_mst_depth: u64,
+    /// Maximum decoded entries accepted in one `MST` node.
+    pub max_mst_node_entries: u64,
+    /// Maximum total reconstructed key bytes accepted in one `MST` node.
+    pub max_mst_node_key_bytes: u64,
     /// Maximum number of non-fatal typed record decode errors accepted.
     pub max_decode_errors: u64,
     /// Maximum best-effort parser wall-clock time.
@@ -110,6 +114,8 @@ impl Default for ParseConfig {
             max_block_bytes: 67_108_864,
             max_records: 10_000_000,
             max_mst_depth: 256,
+            max_mst_node_entries: 65_536,
+            max_mst_node_key_bytes: 8_388_608,
             max_decode_errors: 1_000_000,
             #[allow(clippy::duration_suboptimal_units)]
             max_parse_wall_clock: Duration::from_secs(15 * 60),

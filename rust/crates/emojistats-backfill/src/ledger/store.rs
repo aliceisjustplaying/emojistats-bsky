@@ -60,7 +60,7 @@ fn select_claimable_did(
                 UNION ALL
                 SELECT did, next_attempt_after_ms AS ready_at
                 FROM repo_ledger
-                WHERE status = 'throttled'
+                WHERE status IN ('throttled', 'operator_deferred')
                     AND next_attempt_after_ms IS NOT NULL
                     AND next_attempt_after_ms <= ?1
                     AND (?2 IS NULL OR shard_bucket = ?2)
@@ -368,7 +368,7 @@ impl SqliteLedger {
                         AND (next_attempt_after_ms IS NULL OR next_attempt_after_ms <= ?4)
                     )
                     OR (
-                        status = 'throttled'
+                        status IN ('throttled', 'operator_deferred')
                         AND next_attempt_after_ms IS NOT NULL
                         AND next_attempt_after_ms <= ?4
                     )
@@ -763,7 +763,7 @@ impl SqliteLedger {
                         AND (next_attempt_after_ms IS NULL OR next_attempt_after_ms <= ?1)
                     )
                     OR (
-                        status = 'throttled'
+                        status IN ('throttled', 'operator_deferred')
                         AND next_attempt_after_ms IS NOT NULL
                         AND next_attempt_after_ms <= ?1
                     )

@@ -25,13 +25,15 @@ fn metadata(file_sequence: u64) -> Metadata {
         run_id: "run-1".to_owned(),
         shard: "shard0".to_owned(),
         file_sequence,
+        did: "did:plc:test".to_owned(),
         dataset: "raw_archive_posts".to_owned(),
         row_count: 2,
         min_created_at_normalized: Some("2026-06-01T00:00:00Z".to_owned()),
         max_created_at_normalized: Some("2026-06-02T00:00:00Z".to_owned()),
         receipt_hash: "repo-receipt-hash".to_owned(),
+        repo_receipt_path: None,
         normalizer: normalizer(),
-        schema_version: 1,
+        schema_version: 2,
     }
 }
 
@@ -136,6 +138,34 @@ fn commits_prepared_temp_object_receipt_and_manifest() {
     let entry: ManifestEntry =
         serde_json::from_str(manifest.trim()).expect("manifest entry should decode");
     assert_eq!(entry, artifact.entry);
+
+    fs::remove_dir_all(root).expect("test temp dir should be removed");
+}
+
+#[test]
+fn skip_manifest_mode_commits_object_and_receipt_without_manifest_exposure() {
+    let root = temp_dir("skip-manifest");
+    let store = LocalStore::new(&root);
+    let artifact = store
+        .commit(&request(31, ManifestMode::Skip), |file| {
+            file.write_all(b"remote-first").map_err(|source| Error::Io {
+                operation: "test write",
+                path: PathBuf::from("test"),
+                source,
+            })
+        })
+        .expect("commit should succeed");
+
+    assert_eq!(
+        fs::read(&artifact.object_path).expect("object should be readable"),
+        b"remote-first"
+    );
+    let receipt: Receipt = read_json(&artifact.receipt_path);
+    assert_eq!(receipt, artifact.receipt);
+    assert!(
+        !artifact.manifest_path.exists(),
+        "local manifest should not be exposed in skip mode"
+    );
 
     fs::remove_dir_all(root).expect("test temp dir should be removed");
 }

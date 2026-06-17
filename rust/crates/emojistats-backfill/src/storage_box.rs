@@ -341,73 +341,77 @@ where
         }
 
         let paths = RemotePaths::for_request(&self.config, request)?;
-        let object_digest = digest_bytes("object", object_bytes)?;
-        let object_prefix = prefix_bytes(object_bytes, self.config.readback_bytes)?;
-        self.commands
-            .upload(&paths.temp_object, object_bytes)
-            .map_err(|source| Error::Command {
-                operation: "upload object temp",
-                path: paths.temp_object.clone(),
-                source,
-            })?;
-        verify_remote_uploaded(
-            &mut self.commands,
-            &paths.temp_object,
-            &object_digest,
-            &object_prefix,
-            self.config.readback_bytes,
-        )?;
-        promote_temp_to_final(
-            &mut self.commands,
-            &paths.temp_object,
-            &paths.object,
-            &object_digest,
-            "object",
-        )?;
+        let result = (|| {
+            let object_digest = digest_bytes("object", object_bytes)?;
+            let object_prefix = prefix_bytes(object_bytes, self.config.readback_bytes)?;
+            self.commands
+                .upload(&paths.temp_object, object_bytes)
+                .map_err(|source| Error::Command {
+                    operation: "upload object temp",
+                    path: paths.temp_object.clone(),
+                    source,
+                })?;
+            verify_remote_uploaded(
+                &mut self.commands,
+                &paths.temp_object,
+                &object_digest,
+                &object_prefix,
+                self.config.readback_bytes,
+            )?;
+            promote_temp_to_final(
+                &mut self.commands,
+                &paths.temp_object,
+                &paths.object,
+                &object_digest,
+                "object",
+            )?;
 
-        let receipt = Receipt::from_parts(
-            &request.metadata,
-            paths.object_manifest_path,
-            &object_digest,
-        );
-        let entry = ManifestEntry::from_parts(&request.metadata, &receipt);
-        let receipt_bytes = json_bytes("receipt", &receipt)?;
-        let receipt_digest = digest_bytes("receipt", &receipt_bytes)?;
-        let receipt_prefix = prefix_bytes(&receipt_bytes, self.config.readback_bytes)?;
-        self.commands
-            .upload(&paths.temp_receipt, &receipt_bytes)
-            .map_err(|source| Error::Command {
-                operation: "upload receipt temp",
-                path: paths.temp_receipt.clone(),
-                source,
-            })?;
-        verify_remote_uploaded(
-            &mut self.commands,
-            &paths.temp_receipt,
-            &receipt_digest,
-            &receipt_prefix,
-            self.config.readback_bytes,
-        )?;
-        promote_temp_to_final(
-            &mut self.commands,
-            &paths.temp_receipt,
-            &paths.receipt,
-            &receipt_digest,
-            "receipt",
-        )?;
+            let receipt = Receipt::from_parts(
+                &request.metadata,
+                paths.object_manifest_path.clone(),
+                &object_digest,
+            );
+            let entry = ManifestEntry::from_parts(&request.metadata, &receipt);
+            let receipt_bytes = json_bytes("receipt", &receipt)?;
+            let receipt_digest = digest_bytes("receipt", &receipt_bytes)?;
+            let receipt_prefix = prefix_bytes(&receipt_bytes, self.config.readback_bytes)?;
+            self.commands
+                .upload(&paths.temp_receipt, &receipt_bytes)
+                .map_err(|source| Error::Command {
+                    operation: "upload receipt temp",
+                    path: paths.temp_receipt.clone(),
+                    source,
+                })?;
+            verify_remote_uploaded(
+                &mut self.commands,
+                &paths.temp_receipt,
+                &receipt_digest,
+                &receipt_prefix,
+                self.config.readback_bytes,
+            )?;
+            promote_temp_to_final(
+                &mut self.commands,
+                &paths.temp_receipt,
+                &paths.receipt,
+                &receipt_digest,
+                "receipt",
+            )?;
 
-        let manifest_line = jsonl_bytes("manifest", &entry)?;
-        append_manifest_if_missing(&mut self.commands, &paths.manifest, &manifest_line)?;
+            let manifest_line = jsonl_bytes("manifest", &entry)?;
+            append_manifest_if_missing(&mut self.commands, &paths.manifest, &manifest_line)?;
 
-        Ok(RemoteArtifact {
-            remote_object_path: paths.object,
-            remote_temp_object_path: paths.temp_object,
-            remote_receipt_path: paths.receipt,
-            remote_temp_receipt_path: paths.temp_receipt,
-            remote_manifest_path: paths.manifest,
-            entry,
-            receipt,
-        })
+            Ok(RemoteArtifact {
+                remote_object_path: paths.object.clone(),
+                remote_temp_object_path: paths.temp_object.clone(),
+                remote_receipt_path: paths.receipt.clone(),
+                remote_temp_receipt_path: paths.temp_receipt.clone(),
+                remote_manifest_path: paths.manifest.clone(),
+                entry,
+                receipt,
+            })
+        })();
+        cleanup_remote_temps_on_error(&mut self.commands, &paths, &result);
+        result
     }
 
     /// Commit one local object file without buffering the object bytes in memory.
@@ -426,78 +430,165 @@ where
         }
 
         let paths = RemotePaths::for_request(&self.config, request)?;
-        let object_source = digest_file("object", object_path, self.config.readback_bytes)?;
-        let mut object_file = File::open(object_path).map_err(|source| Error::LocalIo {
-            operation: "open object source",
-            path: object_path.to_path_buf(),
+        let result = (|| {
+            let object_source = digest_file("object", object_path, self.config.readback_bytes)?;
+            let mut object_file = File::open(object_path).map_err(|source| Error::LocalIo {
+                operation: "open object source",
+                path: object_path.to_path_buf(),
+                source,
+            })?;
+            self.commands
+                .upload_reader(&paths.temp_object, &mut object_file)
+                .map_err(|source| Error::Command {
+                    operation: "upload object temp",
+                    path: paths.temp_object.clone(),
+                    source,
+                })?;
+            verify_remote_uploaded(
+                &mut self.commands,
+                &paths.temp_object,
+                &object_source.digest,
+                &object_source.prefix,
+                self.config.readback_bytes,
+            )?;
+            promote_temp_to_final(
+                &mut self.commands,
+                &paths.temp_object,
+                &paths.object,
+                &object_source.digest,
+                "object",
+            )?;
+
+            let receipt = Receipt::from_parts(
+                &request.metadata,
+                paths.object_manifest_path.clone(),
+                &object_source.digest,
+            );
+            let entry = ManifestEntry::from_parts(&request.metadata, &receipt);
+            let receipt_bytes = json_bytes("receipt", &receipt)?;
+            let receipt_digest = digest_bytes("receipt", &receipt_bytes)?;
+            let receipt_prefix = prefix_bytes(&receipt_bytes, self.config.readback_bytes)?;
+            self.commands
+                .upload(&paths.temp_receipt, &receipt_bytes)
+                .map_err(|source| Error::Command {
+                    operation: "upload receipt temp",
+                    path: paths.temp_receipt.clone(),
+                    source,
+                })?;
+            verify_remote_uploaded(
+                &mut self.commands,
+                &paths.temp_receipt,
+                &receipt_digest,
+                &receipt_prefix,
+                self.config.readback_bytes,
+            )?;
+            promote_temp_to_final(
+                &mut self.commands,
+                &paths.temp_receipt,
+                &paths.receipt,
+                &receipt_digest,
+                "receipt",
+            )?;
+
+            let manifest_line = jsonl_bytes("manifest", &entry)?;
+            append_manifest_if_missing(&mut self.commands, &paths.manifest, &manifest_line)?;
+
+            Ok(RemoteArtifact {
+                remote_object_path: paths.object.clone(),
+                remote_temp_object_path: paths.temp_object.clone(),
+                remote_receipt_path: paths.receipt.clone(),
+                remote_temp_receipt_path: paths.temp_receipt.clone(),
+                remote_manifest_path: paths.manifest.clone(),
+                entry,
+                receipt,
+            })
+        })();
+        cleanup_remote_temps_on_error(&mut self.commands, &paths, &result);
+        result
+    }
+
+    /// Upload and promote an auxiliary file without appending a manifest entry.
+    ///
+    /// This is used for repo-level receipts that manifest entries refer to by hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] when the local source cannot be read, the remote upload cannot be
+    /// verified, or the final remote path already exists with different content.
+    pub fn commit_auxiliary_file(
+        &mut self,
+        request: &Request,
+        final_path: &Path,
+        source_path: &Path,
+        artifact_kind: &'static str,
+    ) -> Result<String, Error> {
+        let root = normalize_root(&self.config.remote_root)?;
+        let temp_directory = normalize_temp_directory(&self.config.temp_directory)?;
+        let final_manifest_path = manifest_path_string(artifact_kind, final_path)?;
+        let final_remote_path = join_remote(&root, &final_manifest_path);
+        let temp_base = join_remote(&root, &temp_directory);
+        let temp_run = join_remote(
+            &temp_base,
+            &safe_component("run id", &request.metadata.run_id)?,
+        );
+        let temp_shard = join_remote(
+            &temp_run,
+            &safe_component("shard", &request.metadata.shard)?,
+        );
+        let temp_path = join_remote(
+            &temp_shard,
+            &temp_name_for(artifact_kind, final_path, request.metadata.file_sequence)?,
+        );
+
+        let source = digest_file(artifact_kind, source_path, self.config.readback_bytes)?;
+        let mut source_file = File::open(source_path).map_err(|source| Error::LocalIo {
+            operation: "open auxiliary source",
+            path: source_path.to_path_buf(),
             source,
         })?;
         self.commands
-            .upload_reader(&paths.temp_object, &mut object_file)
+            .upload_reader(&temp_path, &mut source_file)
             .map_err(|source| Error::Command {
-                operation: "upload object temp",
-                path: paths.temp_object.clone(),
+                operation: "upload auxiliary temp",
+                path: temp_path.clone(),
                 source,
             })?;
-        verify_remote_uploaded(
-            &mut self.commands,
-            &paths.temp_object,
-            &object_source.digest,
-            &object_source.prefix,
-            self.config.readback_bytes,
-        )?;
-        promote_temp_to_final(
-            &mut self.commands,
-            &paths.temp_object,
-            &paths.object,
-            &object_source.digest,
-            "object",
-        )?;
-
-        let receipt = Receipt::from_parts(
-            &request.metadata,
-            paths.object_manifest_path,
-            &object_source.digest,
-        );
-        let entry = ManifestEntry::from_parts(&request.metadata, &receipt);
-        let receipt_bytes = json_bytes("receipt", &receipt)?;
-        let receipt_digest = digest_bytes("receipt", &receipt_bytes)?;
-        let receipt_prefix = prefix_bytes(&receipt_bytes, self.config.readback_bytes)?;
-        self.commands
-            .upload(&paths.temp_receipt, &receipt_bytes)
-            .map_err(|source| Error::Command {
-                operation: "upload receipt temp",
-                path: paths.temp_receipt.clone(),
-                source,
-            })?;
-        verify_remote_uploaded(
-            &mut self.commands,
-            &paths.temp_receipt,
-            &receipt_digest,
-            &receipt_prefix,
-            self.config.readback_bytes,
-        )?;
-        promote_temp_to_final(
-            &mut self.commands,
-            &paths.temp_receipt,
-            &paths.receipt,
-            &receipt_digest,
-            "receipt",
-        )?;
-
-        let manifest_line = jsonl_bytes("manifest", &entry)?;
-        append_manifest_if_missing(&mut self.commands, &paths.manifest, &manifest_line)?;
-
-        Ok(RemoteArtifact {
-            remote_object_path: paths.object,
-            remote_temp_object_path: paths.temp_object,
-            remote_receipt_path: paths.receipt,
-            remote_temp_receipt_path: paths.temp_receipt,
-            remote_manifest_path: paths.manifest,
-            entry,
-            receipt,
-        })
+        let result = (|| {
+            verify_remote_uploaded(
+                &mut self.commands,
+                &temp_path,
+                &source.digest,
+                &source.prefix,
+                self.config.readback_bytes,
+            )?;
+            promote_temp_to_final(
+                &mut self.commands,
+                &temp_path,
+                &final_remote_path,
+                &source.digest,
+                artifact_kind,
+            )?;
+            Ok(final_remote_path.clone())
+        })();
+        if result.is_err() {
+            let _ignored = self.commands.remove(&temp_path);
+        }
+        result
     }
+}
+
+fn cleanup_remote_temps_on_error<C>(
+    commands: &mut C,
+    paths: &RemotePaths,
+    result: &Result<RemoteArtifact, Error>,
+) where
+    C: StorageBoxCommands,
+{
+    if result.is_ok() {
+        return;
+    }
+    let _ignored = cleanup_remote_temp(commands, &paths.temp_object, "object");
+    let _ignored = cleanup_remote_temp(commands, &paths.temp_receipt, "receipt");
 }
 
 fn append_manifest_if_missing<C>(

@@ -42,18 +42,19 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   overrides by resolved PDS host, and claimed/completed transitions with heartbeat repair.
   It emits `smoke_telemetry` JSONL lines with per-repo fetch/parse/archive timings, bytes,
   rows, decode errors, emoji rows, host, stage, outcome, and current process `VmRSS` in KiB.
-  `force_mode = list_records` writes `collection_paginated_posts` artifacts; raw archive
-  derive only accepts content-addressed `getRepo` artifacts. The command is bounded batch
-  mode; a long-running daemon loop is future work.
-- `derive-manifest <manifest.jsonl>` verifies committed raw archive manifest entries,
+  `force_mode = list_records` writes `collection_paginated_posts` artifacts; derive loads
+  both raw and collection-paginated post artifacts with dataset/proof metadata preserved in
+  `ClickHouse`. The command is bounded batch mode; a long-running daemon loop is future work.
+- `derive-manifest <manifest.jsonl>` verifies committed post manifest entries,
   streams local `Parquet` archive rows in bounded batches, validates row hashes/counts against
   adjacent receipts, formats bounded `JSONEachRow` payloads, and inserts them into
   `ClickHouse` with chunk-stable dedupe tokens. `--dry-run` validates and counts payloads
   without sending inserts.
 - `clickhouse-schema --clickhouse-database <db>` prints the v2 `ClickHouse` schema SQL.
   Smoke bootstrap on this host created `emojistats_smoke` through `clickhouse-smoke.service`
-  (`HTTP 18123`, native `19000`) and verified `v2_emoji_serving` plus
-  `v2_total_post_counters` exist.
+  (`HTTP 18123`, native `19000`) and verified the then-current smoke tables exist. The
+  active incompatible schema names are `v2_emoji_serving_r2` and
+  `v2_total_post_counters_r2`.
 - `emoji-normalizer` is a new shared Rust crate. Current parity scope is ordered/repeated
   extraction, heart variation normalization, non-qualified keycaps, regional flags,
   skin-tone sequences, ZWJ sequences, and version metadata. Broad TS
@@ -126,6 +127,21 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   rows into `emojistats_smoke` in 2:53.52 with max RSS 71,632 KiB. Counter sums matched archive
   receipts: 16,652,368 posts, 374,996 posts with emoji, 539,721 emoji occurrences. Serving rows
   carried one normalizer identity: `emoji-normalizer 0.1.0 24c9549 16.0 emojis-16.0`.
+- Post-proof-boundary full smoke, release binary from the current working tree with `GIT_REV`
+  set to `497ec73`, same 24-DID fixture and full-whale settings, output under
+  `rust/data/scale-smoke-post-review-20260617T122651Z/`: 24 claimed, 19 succeeded, 5 expected
+  loud failures (3 terminal account states, 1 retryable dead host, 1 malformed `CAR`). Archive
+  wrote 12,453,955,078 fetched bytes, 16,908,598 reachable records, 16,689,533 post rows,
+  4,985 receipt post-decode diagnostics, and 499,590 emoji projection rows. Wall time was
+  19:27.64; process max RSS was 3,053,156 KiB; spool cleanup left 0 files. `o6g` fetched
+  3,971,951,431 bytes and parsed 5,061,139 posts in 309.5s at 1,493,880 KiB telemetry RSS;
+  `ndj` fetched 4,795,566,231 bytes and parsed 2,258,662 posts in 401.5s at 1,664,796 KiB
+  telemetry RSS. ClickHouse derive over the 19 raw manifests inserted 81 payloads and
+  499,609 rows into `emojistats_smoke` in 2:56.40 with max RSS 72,612 KiB. Counter sums matched
+  archive receipts: 16,689,533 posts, 375,028 posts with emoji, 539,761 emoji occurrences.
+  Serving rows and counters carried the raw/getRepo/content-addressed proof fields.
+  Current code preserves `dataset`, `fetch_method`, `completeness_class`, and `did` in
+  serving rows/counters, and archive post schema is version `2`.
 - Whale transport hardening: repo fetches default to HTTP/1 with an explicit
   `--http-protocol auto` escape hatch, TCP keepalive, and 30s connect timeout, and retry
   retryable body-stream transport/idle failures up to 3 full download attempts. Transport
@@ -151,23 +167,23 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
 - **D — archive/derive:** `src/archive.rs` converts parsed posts to archive rows, computes
   row-content receipt hashes and counts, writes `Parquet` with flat lossless columns plus
   `extras_json`, writes a local manifest entry, and derives local compact emoji JSONL rows.
-  `getRepo` receipts currently report `content_addressed_snapshot`; future `listRecords`
-  artifacts must be labeled `collection_paginated_posts`, not `raw_archive_posts`.
+  `getRepo` receipts report `content_addressed_snapshot`; `listRecords` artifacts are
+  labeled `collection_paginated_posts`, not `raw_archive_posts`.
 
-## Next roadmap
+## Next architecture roadmap
 
-- Add the remaining real scheduler controls: per-host concurrency caps from
-  `host_overrides`, advertised rate-limit pacing, host deadness, durable fleet telemetry,
-  and the `listRecords` fallback lane for hosts forced away from `getRepo`.
-- Wire remaining archive artifacts through the committed-artifact protocol, then configure
-  the `storage_box.rs` `ssh` transport for the real Storage Box. The `StorageBox` backend is
-  still experimental until a production archive backend is wired and canary-proven.
+- Define public latest-state semantics: versioning, post-level tombstones, recrawl overlap,
+  and aggregate rebuild queries over `raw_archive_posts` versus `collection_paginated_posts`.
+- Define durable observation identity for recrawls: when `observed_at` is reused, when a new
+  observation is intended, and how identical row content across observations is represented.
+- Turn the bounded fleet runner into production orchestration: durable host scheduling,
+  cross-box pacing/coordination, daemon idle/retry behavior, and durable fleet telemetry.
+- Canary-prove `StorageBox` as the selected archive backend, including remote manifest-only
+  derive, temp sweeping, and remote durability/runbook checks.
 - Add durable derive progress/attempt telemetry and resumable per-manifest chunk status so a
   process crash can replay only uncertain ClickHouse chunks with the same dedupe tokens.
 - Finish emoji normalization parity with the TypeScript data tables, then add WASM bindings
   before the browser/server serving path depends on it.
-- Wire derive/ClickHouse ingest from committed manifest entries, then run the stratified
-  canary and fleet scheduler work.
 
 ### Defaulted design choices (revisit if needed)
 

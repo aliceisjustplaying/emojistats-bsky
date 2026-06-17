@@ -4,11 +4,11 @@ use super::{
     ARCHIVE_SCHEMA_VERSION, Arc, ArchiveCommitContext, ArchiveError, ArchivePostRow, Array,
     ArrayRef, ArrowWriter, CompletenessClass, Compression, Cow, CreatedAtParseStatus, DataType,
     DeriveError, EmojiProjectionRow, FetchMethod, Field, File, LocalManifestEntry, LocalStore,
-    ManifestMode, Metadata, NormalizerVersion, PARQUET_BATCH_ROWS, POST_COLLECTION,
-    ParquetRecordBatchReaderBuilder, Path, PathBuf, ProfileRecord, ProfileSidecarRow, RecordBatch,
-    RepoReceipt, RepoReceiptInput, Request, Schema, Serialize, Sha256, StringArray, StringBuilder,
-    Utc, Write, WriterProperties, ZstdLevel, derive_emoji_projection_rows, format_observed_at,
-    hash_serialized_json,
+    ManifestMode, Metadata, NONCANONICAL_POSTS_DATASET, NormalizerVersion, PARQUET_BATCH_ROWS,
+    POST_COLLECTION, ParquetRecordBatchReaderBuilder, Path, PathBuf, PostDataset, ProfileRecord,
+    ProfileSidecarRow, RecordBatch, RepoReceipt, RepoReceiptInput, Request, Schema, Serialize,
+    Sha256, StringArray, StringBuilder, Write, WriterProperties, ZstdLevel,
+    derive_emoji_projection_rows, format_observed_at, hash_serialized_json,
 };
 
 /// Read raw archive post rows from the Stage D Parquet shape.
@@ -57,9 +57,10 @@ pub fn build_repo_receipt(input: RepoReceiptInput<'_>) -> Result<RepoReceipt, Ar
         derive_emoji_projection_rows(rows).map_err(archive_error_from_derive)?;
     let emoji_projection_hash = hash_emoji_projection_rows(&emoji_projection_rows)?;
     Ok(RepoReceipt {
-        observed_at: format_observed_at(Utc::now()),
-        fetch_method: FetchMethod::GetRepo,
-        completeness_class: CompletenessClass::ContentAddressedSnapshot,
+        observed_at: format_observed_at(input.observed_at),
+        did: input.did.to_owned(),
+        fetch_method: input.fetch_method,
+        completeness_class: input.completeness_class,
         reachable_records_count: input.reachable_records_count,
         reachable_post_records_count: input.reachable_post_records_count,
         archived_post_rows_count: u64::try_from(rows.len()).map_err(|_error| {
@@ -390,18 +391,43 @@ pub(super) fn build_commit_metadata(
         run_id: commit_context.run_id.clone(),
         shard: commit_context.shard.clone(),
         file_sequence: commit_context.file_sequence,
-        dataset: "raw_archive_posts".to_owned(),
+        did: receipt.did.clone(),
+        dataset: receipt_dataset(receipt).to_owned(),
         row_count: u64::try_from(rows.len())
             .map_err(|_error| ArchiveError::CountOverflow { field: "row_count" })?,
         min_created_at_normalized: min_created_at(rows),
         max_created_at_normalized: max_created_at(rows),
         receipt_hash: hash_serialized_json(receipt)?,
+        repo_receipt_path: None,
         normalizer: receipt.normalizer.clone(),
         schema_version: ARCHIVE_SCHEMA_VERSION,
     })
 }
 
+pub(super) const fn receipt_dataset(receipt: &RepoReceipt) -> &'static str {
+    match (receipt.fetch_method, receipt.completeness_class) {
+        (FetchMethod::GetRepo, CompletenessClass::ContentAddressedSnapshot) => {
+            PostDataset::RawArchivePosts.as_str()
+        }
+        (FetchMethod::ListRecords, CompletenessClass::CollectionPaginated) => {
+            PostDataset::CollectionPaginatedPosts.as_str()
+        }
+        (FetchMethod::GetRepo, CompletenessClass::CollectionPaginated)
+        | (FetchMethod::ListRecords, CompletenessClass::ContentAddressedSnapshot) => {
+            NONCANONICAL_POSTS_DATASET
+        }
+    }
+}
+
+pub(super) struct ProfileSidecarCommitPaths {
+    pub object_path: PathBuf,
+    pub receipt_path: PathBuf,
+    pub manifest_path: PathBuf,
+    pub manifest_mode: ManifestMode,
+}
+
 fn build_profile_sidecar_metadata(
+    did: &str,
     receipt: &RepoReceipt,
     commit_context: &ArchiveCommitContext,
 ) -> Result<Metadata, ArchiveError> {
@@ -409,11 +435,13 @@ fn build_profile_sidecar_metadata(
         run_id: commit_context.run_id.clone(),
         shard: commit_context.shard.clone(),
         file_sequence: commit_context.file_sequence,
+        did: did.to_owned(),
         dataset: "raw_profile_sidecar".to_owned(),
         row_count: 1,
         min_created_at_normalized: None,
         max_created_at_normalized: None,
         receipt_hash: hash_serialized_json(receipt)?,
+        repo_receipt_path: None,
         normalizer: receipt.normalizer.clone(),
         schema_version: ARCHIVE_SCHEMA_VERSION,
     })
@@ -421,20 +449,19 @@ fn build_profile_sidecar_metadata(
 
 pub(super) fn commit_profile_sidecar(
     store: &LocalStore,
-    object_path: PathBuf,
-    receipt_path: PathBuf,
-    manifest_path: PathBuf,
+    paths: ProfileSidecarCommitPaths,
     profile: &ProfileRecord,
     receipt: &RepoReceipt,
     commit_context: &ArchiveCommitContext,
 ) -> Result<crate::commit::Artifact, ArchiveError> {
-    let request = profile_sidecar_request(
-        object_path,
-        receipt_path,
-        manifest_path,
+    let mut request = profile_sidecar_request(
+        paths.object_path,
+        paths.receipt_path,
+        paths.manifest_path,
         receipt,
         commit_context,
     )?;
+    request.manifest_mode = paths.manifest_mode;
     Ok(store.commit(&request, |file| {
         write_profile_sidecar_json_to_writer(file, profile).map_err(|error| {
             crate::commit::Error::writer(format!("write profile sidecar JSON: {error}"))
@@ -454,7 +481,7 @@ pub(super) fn profile_sidecar_request(
         receipt_path,
         manifest_path,
         manifest_mode: ManifestMode::AppendJsonl,
-        metadata: build_profile_sidecar_metadata(receipt, commit_context)?,
+        metadata: build_profile_sidecar_metadata(&receipt.did, receipt, commit_context)?,
     })
 }
 
@@ -466,6 +493,7 @@ pub(super) fn local_manifest_from_committed(
         run_id: committed.entry.run_id.clone(),
         shard: committed.entry.shard.clone(),
         file_sequence: committed.entry.file_sequence,
+        did: committed.entry.did.clone(),
         dataset: committed.entry.dataset.clone(),
         local_path: committed.object_path.clone(),
         row_count: committed.entry.row_count,
@@ -474,6 +502,11 @@ pub(super) fn local_manifest_from_committed(
         min_created_at_normalized: committed.entry.min_created_at_normalized.clone(),
         max_created_at_normalized: committed.entry.max_created_at_normalized.clone(),
         receipt_hash: committed.entry.receipt_hash.clone(),
+        repo_receipt_path: committed
+            .entry
+            .repo_receipt_path
+            .as_ref()
+            .map(PathBuf::from),
         schema_version: committed.entry.schema_version,
         normalizer: receipt.normalizer.clone(),
     }
@@ -516,12 +549,18 @@ pub(super) fn extract_emojis(text: &str) -> Vec<String> {
     emoji_normalizer::extract_emoji_sequence(text)
 }
 
-pub(super) const fn archive_error_from_derive(error: DeriveError) -> ArchiveError {
+pub(super) fn archive_error_from_derive(error: DeriveError) -> ArchiveError {
     match error {
         DeriveError::CountOverflow { field } => ArchiveError::CountOverflow { field },
         DeriveError::RowCountMismatch { .. } => ArchiveError::CountOverflow {
             field: "derive_row_count_mismatch",
         },
+        DeriveError::UnsupportedDataset { dataset } => {
+            drop(dataset);
+            ArchiveError::CountOverflow {
+                field: "derive_unsupported_dataset",
+            }
+        }
     }
 }
 

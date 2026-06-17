@@ -10,10 +10,10 @@ use super::{
         FetchConfig, FetchError, FetchOneFailure, ForcedFetchMode, HashMap, HostConcurrencyLimiter,
         HostConcurrencyPermit, HostOverride, HostPacer, HttpProtocol, Instant, ListRecordsConfig,
         Mutex, ParseConfig, Path, PathBuf, PublicResolver, RepoLedgerEntry, Semaphore, Sha256,
-        SharedHostPacer, SmokeTelemetry, SystemTime, Uri, classify_fetch_error,
+        SharedHostPacer, SmokeTelemetry, SqliteLedger, SystemTime, Uri, classify_fetch_error,
         classify_list_records_error, current_rss_kb, elapsed_ms, emit_smoke_telemetry,
-        fetch_and_archive_list_records_with_rate_limit_observer, fetch_repo, outcome_name,
-        permanent_failure, retryable_failure,
+        fetch_and_archive_list_records_with_precommit_check, fetch_repo_with_rate_limit_observer,
+        outcome_name, permanent_failure, retryable_failure,
     },
     archive_host::{
         ArchiveClaimCheck, PreparedFetchHost, parse_and_archive_spooled_repo, prepare_fetch_host,
@@ -184,8 +184,11 @@ pub(crate) async fn fetch_one_attempt_with_pacer(
     .await?;
     let _host_permit =
         acquire_host_fetch_permit(config.runtime.host_limiter(), &prepared_host).await?;
-    reserve_host_send(config.runtime.host_pacer(), &prepared_host).await?;
     let host = prepared_host.host;
+    let host_min_interval = prepared_host
+        .host_override
+        .as_ref()
+        .and_then(|override_record| override_record.min_interval);
     let http = repo_fetch_client(config.http_protocol).map_err(|err| {
         retryable_failure(format!("build repo fetch HTTP client for {did_str}: {err}"))
     })?;
@@ -200,11 +203,13 @@ pub(crate) async fn fetch_one_attempt_with_pacer(
             did: &did,
             did_str,
             host: host.as_str(),
+            host_min_interval,
             fetch_config: &fetch_config,
             archive_dir: &config.archive_dir,
             archive_context: config.archive_context,
             archive_storage: config.archive_storage,
             host_pacer: config.runtime.host_pacer(),
+            host_override_ledger_path: config.runtime.host_override_ledger_path(),
             parse_permits: config.runtime.parse_permits(),
             claim_check: config.runtime.archive_claim_check(),
             parse_config: config.parse_config,
@@ -216,12 +221,12 @@ pub(crate) async fn fetch_one_attempt_with_pacer(
     let counts = processed.counts();
     let artifacts = processed.artifacts();
     println!(
-        "parsed {} records, {} posts, {} decode errors, {} emoji rows, receipt {}",
+        "parsed {} records, {} posts, {} decode errors, {} emoji rows, post rows hash {}",
         counts.records,
         counts.archived_posts,
         counts.decode_errors,
         counts.emoji_rows,
-        artifacts.receipt_hash
+        artifacts.post_rows_hash
     );
     println!(
         "wrote archive {}, receipt {}, manifest {}, emoji projection {}",
@@ -271,33 +276,19 @@ async fn acquire_host_fetch_permit(
         .await
 }
 
-async fn reserve_host_send(
-    host_pacer: Option<&SharedHostPacer>,
-    prepared_host: &PreparedFetchHost,
-) -> Result<(), FetchOneFailure> {
-    let Some(pacer) = host_pacer else {
-        return Ok(());
-    };
-    let min_interval = prepared_host
-        .host_override
-        .as_ref()
-        .and_then(|override_record| override_record.min_interval);
-    HostPacer::reserve_next_request(pacer, &prepared_host.host, min_interval)
-        .await
-        .map_err(|err| retryable_failure(format!("host pacing for {}: {err}", prepared_host.host)))
-}
-
 struct FetchModeStep<'a> {
     http: &'a reqwest::Client,
     pds: &'a Uri<String>,
     did: &'a Did,
     did_str: &'a str,
     host: &'a str,
+    host_min_interval: Option<Duration>,
     fetch_config: &'a FetchConfig,
     archive_dir: &'a Path,
     archive_context: ArchiveCommitContext,
     archive_storage: ArchiveStorageConfig,
     host_pacer: Option<&'a SharedHostPacer>,
+    host_override_ledger_path: Option<&'a Path>,
     parse_permits: Option<&'a Arc<Semaphore>>,
     claim_check: Option<ArchiveClaimCheck>,
     parse_config: ParseConfig,
@@ -317,10 +308,12 @@ async fn fetch_prepared_repo(
                 did: step.did,
                 did_str: step.did_str,
                 host: step.host,
+                host_min_interval: step.host_min_interval,
                 archive_dir: step.archive_dir,
                 archive_context: step.archive_context,
                 archive_storage: step.archive_storage,
                 host_pacer: step.host_pacer,
+                claim_check: step.claim_check,
                 attempt_started: step.attempt_started,
             })
             .await
@@ -337,6 +330,7 @@ async fn fetch_get_repo_and_archive(
         did: step.did,
         did_str: step.did_str,
         host: step.host,
+        host_min_interval: step.host_min_interval,
         config: step.fetch_config,
         host_pacer: step.host_pacer,
     })
@@ -345,16 +339,19 @@ async fn fetch_get_repo_and_archive(
         Ok(fetched) => fetched,
         Err(err) if should_fallback_get_repo_to_list_records(&err) => {
             emit_get_repo_fallback(step.did_str, step.host, step.attempt_started, &err);
+            persist_list_records_method_wall_override(&step, &err);
             return fetch_archive_list_records_or_emit_failure(ListRecordsStep {
                 http: step.http,
                 pds: step.pds,
                 did: step.did,
                 did_str: step.did_str,
                 host: step.host,
+                host_min_interval: step.host_min_interval,
                 archive_dir: step.archive_dir,
                 archive_context: step.archive_context.clone(),
                 archive_storage: step.archive_storage.clone(),
                 host_pacer: step.host_pacer,
+                claim_check: step.claim_check,
                 attempt_started: step.attempt_started,
             })
             .await;
@@ -419,12 +416,38 @@ fn emit_get_repo_fallback(did_str: &str, host: &str, attempt_started: Instant, e
     });
 }
 
+fn persist_list_records_method_wall_override(step: &FetchModeStep<'_>, error: &FetchError) {
+    let Some(ledger_path) = step.host_override_ledger_path else {
+        return;
+    };
+    let record = HostOverride {
+        host: step.host.to_owned(),
+        disabled: false,
+        concurrency_cap: None,
+        min_interval: step.host_min_interval,
+        revive_after: None,
+        force_mode: Some(ForcedFetchMode::ListRecords),
+        never_diff: false,
+    };
+    match SqliteLedger::open(ledger_path).and_then(|ledger| ledger.upsert_host_override(&record)) {
+        Ok(()) => eprintln!(
+            "recorded listRecords host override for {} after getRepo method wall: {error}",
+            step.host
+        ),
+        Err(err) => eprintln!(
+            "failed to persist listRecords host override for {} after getRepo method wall: {err}",
+            step.host
+        ),
+    }
+}
+
 struct FetchStep<'a> {
     http: &'a reqwest::Client,
     pds: &'a Uri<String>,
     did: &'a Did,
     did_str: &'a str,
     host: &'a str,
+    host_min_interval: Option<Duration>,
     config: &'a FetchConfig,
     host_pacer: Option<&'a SharedHostPacer>,
 }
@@ -438,14 +461,24 @@ async fn fetch_spooled_repo(step: FetchStep<'_>) -> Result<FetchedRepo, FetchErr
     let fetch_started = Instant::now();
     let mut attempt = 1_u8;
     loop {
-        match fetch_repo(step.http, step.pds, step.did, step.config).await {
-            Ok(spooled) => {
+        reserve_host_send_for_fetch(step.host_pacer, step.host, step.host_min_interval).await?;
+        match fetch_repo_with_rate_limit_observer(
+            step.http,
+            step.pds,
+            step.did,
+            step.config,
+            |rate_limit| {
                 record_rate_limit_snapshot(
                     step.host_pacer,
                     step.host,
-                    &spooled.rate_limit,
+                    rate_limit,
                     SystemTime::now(),
                 );
+            },
+        )
+        .await
+        {
+            Ok(spooled) => {
                 return Ok(FetchedRepo {
                     spooled,
                     fetch_ms: elapsed_ms(fetch_started),
@@ -470,6 +503,22 @@ async fn fetch_spooled_repo(step: FetchStep<'_>) -> Result<FetchedRepo, FetchErr
             }
         }
     }
+}
+
+async fn reserve_host_send_for_fetch(
+    host_pacer: Option<&SharedHostPacer>,
+    host: &str,
+    min_interval: Option<Duration>,
+) -> Result<(), FetchError> {
+    let Some(pacer) = host_pacer else {
+        return Ok(());
+    };
+    HostPacer::reserve_next_request(pacer, host, min_interval)
+        .await
+        .map_err(|err| FetchError::Transport {
+            message: format!("host pacing for {host}: {err}"),
+            observed_bytes: None,
+        })
 }
 
 fn emit_fetch_failure(step: &FetchModeStep<'_>, failure: &FetchOneFailure, started: Instant) {
@@ -573,7 +622,11 @@ fn transport_retry_jitter(did: &str, failed_attempt: u8, base: Duration) -> Dura
 const fn is_retryable_stream_fetch_error(error: &FetchError) -> bool {
     matches!(
         error,
-        FetchError::Transport { .. } | FetchError::InactivityTimeout { .. }
+        FetchError::Transport { .. }
+            | FetchError::InactivityTimeout { .. }
+            | FetchError::DownloadTimeout { .. }
+            | FetchError::ResponseHeaderTimeout { .. }
+            | FetchError::ProgressTimeout { .. }
     )
 }
 
@@ -742,7 +795,7 @@ pub(crate) struct ProcessedRepoCounts {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProcessedRepoArtifacts {
-    pub(crate) receipt_hash: String,
+    pub(crate) post_rows_hash: String,
     pub(crate) parquet_path: PathBuf,
     pub(crate) receipt_path: PathBuf,
     pub(crate) manifest_path: PathBuf,
@@ -851,10 +904,12 @@ struct ListRecordsStep<'a> {
     did: &'a Did,
     did_str: &'a str,
     host: &'a str,
+    host_min_interval: Option<Duration>,
     archive_dir: &'a Path,
     archive_context: ArchiveCommitContext,
     archive_storage: ArchiveStorageConfig,
     host_pacer: Option<&'a SharedHostPacer>,
+    claim_check: Option<ArchiveClaimCheck>,
     attempt_started: Instant,
 }
 
@@ -865,7 +920,7 @@ async fn fetch_archive_list_records_or_emit_failure(
     emit_list_records_running(&step);
     let host_pacer = step.host_pacer;
     let host = step.host;
-    match fetch_and_archive_list_records_with_rate_limit_observer(
+    match fetch_and_archive_list_records_with_precommit_check(
         step.http,
         step.pds,
         step.did,
@@ -874,7 +929,22 @@ async fn fetch_archive_list_records_or_emit_failure(
         step.archive_context.clone(),
         step.archive_storage.clone(),
         ListRecordsConfig::default(),
+        host_pacer.map(|pacer| {
+            emojistats_backfill::list_records::ListRecordsHostPacing::new(
+                pacer,
+                host,
+                step.host_min_interval,
+            )
+        }),
         |rate_limit| record_rate_limit_snapshot(host_pacer, host, rate_limit, SystemTime::now()),
+        || {
+            if let Some(claim_check) = &step.claim_check {
+                claim_check
+                    .ensure_owned_before_commit(step.did_str)
+                    .map_err(|err| err.error.to_string())?;
+            }
+            Ok(())
+        },
     )
     .await
     {
@@ -887,7 +957,7 @@ async fn fetch_archive_list_records_or_emit_failure(
                     emoji_rows: output.artifacts.emoji_rows,
                 },
                 artifacts: ProcessedRepoArtifacts {
-                    receipt_hash: output.receipt.post_rows_hash,
+                    post_rows_hash: output.receipt.post_rows_hash,
                     parquet_path: output.artifacts.parquet_path,
                     receipt_path: output.artifacts.receipt_path,
                     manifest_path: output.artifacts.manifest_path,
@@ -895,7 +965,7 @@ async fn fetch_archive_list_records_or_emit_failure(
                 },
                 timings: ListRecordsTimings {
                     fetch_ms: elapsed_ms(fetch_started),
-                    archive_ms: elapsed_ms(fetch_started),
+                    archive_ms: output.archive_ms,
                 },
             });
             emit_list_records_success(&step, &processed);
@@ -987,4 +1057,40 @@ fn emit_list_records_failure(
         rss_kb: current_rss_kb(),
         error: Some(failure.error.to_string()),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn immediate_stream_retry_includes_timeout_categories() {
+        assert!(is_retryable_stream_fetch_error(&FetchError::Transport {
+            message: "connection reset".to_owned(),
+            observed_bytes: None,
+        }));
+        assert!(is_retryable_stream_fetch_error(
+            &FetchError::InactivityTimeout {
+                timeout: Duration::from_secs(30),
+            }
+        ));
+        assert!(is_retryable_stream_fetch_error(
+            &FetchError::DownloadTimeout {
+                timeout: Duration::from_secs(600),
+                observed_bytes: 12,
+            }
+        ));
+        assert!(is_retryable_stream_fetch_error(
+            &FetchError::ResponseHeaderTimeout {
+                timeout: Duration::from_secs(60),
+            }
+        ));
+        assert!(is_retryable_stream_fetch_error(
+            &FetchError::ProgressTimeout {
+                interval: Duration::from_secs(60),
+                min_bytes: 16_384,
+                observed_bytes: 1024,
+            }
+        ));
+    }
 }

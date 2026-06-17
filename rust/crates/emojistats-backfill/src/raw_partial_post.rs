@@ -5,6 +5,10 @@ use serde::Deserialize;
 
 use crate::parse::RawPartialPostRecord;
 
+const MAX_RAW_TEXT_BYTES: usize = 65_536;
+const MAX_RAW_LANGS: usize = 1_024;
+const MAX_RAW_EXTRAS_JSON_BYTES: usize = 1_048_576;
+
 pub fn from_cbor(record_bytes: &[u8]) -> Option<RawPartialPostRecord> {
     if let Ok(fields) = serde_ipld_dagcbor::from_slice::<FastPostFields>(record_bytes) {
         return from_fast_cbor_fields(fields);
@@ -31,7 +35,7 @@ pub fn from_json_value(value: serde_json::Value) -> Option<RawPartialPostRecord>
     remove_core_fields(&mut fields);
     let mut extras_json = serde_json::Value::Object(fields);
     insert_invalid_core(&mut extras_json, invalid_core);
-    Some(RawPartialPostRecord {
+    capped_raw_partial(RawPartialPostRecord {
         typed_decode_failed,
         created_at_raw,
         text,
@@ -59,7 +63,7 @@ fn from_fast_cbor_fields(mut fields: FastPostFields) -> Option<RawPartialPostRec
     } else {
         ipld_to_json(Ipld::Map(fields.extras))?
     };
-    Some(RawPartialPostRecord {
+    capped_raw_partial(RawPartialPostRecord {
         typed_decode_failed: false,
         created_at_raw: Some(fields.created_at),
         text: Some(fields.text),
@@ -86,13 +90,31 @@ fn from_ipld_fields(mut fields: BTreeMap<String, Ipld>) -> Option<RawPartialPost
         ipld_to_json(Ipld::Map(fields))?
     };
     insert_invalid_core(&mut extras_json, invalid_core);
-    Some(RawPartialPostRecord {
+    capped_raw_partial(RawPartialPostRecord {
         typed_decode_failed,
         created_at_raw,
         text,
         langs,
         extras_json,
     })
+}
+
+fn capped_raw_partial(record: RawPartialPostRecord) -> Option<RawPartialPostRecord> {
+    if record
+        .text
+        .as_deref()
+        .is_some_and(|text| text.len() > MAX_RAW_TEXT_BYTES)
+    {
+        return None;
+    }
+    if record.langs.len() > MAX_RAW_LANGS {
+        return None;
+    }
+    let extras_bytes = serde_json::to_vec(&record.extras_json).ok()?;
+    if extras_bytes.len() > MAX_RAW_EXTRAS_JSON_BYTES {
+        return None;
+    }
+    Some(record)
 }
 
 fn ipld_typed_decode_failed(fields: &BTreeMap<String, Ipld>) -> bool {
@@ -329,5 +351,17 @@ mod tests {
         assert_eq!(post.text.as_deref(), Some("hello"));
         assert_eq!(post.langs, vec!["en"]);
         assert_eq!(post.extras_json, json!({"reply": {"root": "ignored"}}));
+    }
+
+    #[test]
+    fn json_partial_post_rejects_oversized_text() {
+        let oversized = "x".repeat(MAX_RAW_TEXT_BYTES + 1);
+        let post = from_json_value(json!({
+            "$type": "app.bsky.feed.post",
+            "createdAt": "2026-06-16T00:00:00Z",
+            "text": oversized,
+        }));
+
+        assert!(post.is_none());
     }
 }

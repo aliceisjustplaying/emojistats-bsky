@@ -11,10 +11,22 @@ use crate::{ledger::ShardFilter, transport::RateLimitSnapshot};
 /// Shared per-host pacing state used by concurrent fleet attempts.
 pub type SharedHostPacer = Arc<Mutex<HostPacer>>;
 
-/// Host cooldown table fed by retry-after outcomes and rate-limit window headers.
+/// Host pacing table fed by request reservations, retry-after outcomes, and
+/// rate-limit window headers.
 #[derive(Debug, Default)]
 pub struct HostPacer {
-    cooldowns: HashMap<String, Instant>,
+    hosts: HashMap<String, HostPacingState>,
+}
+
+#[derive(Debug, Default)]
+struct HostPacingState {
+    limit: Option<u64>,
+    remaining: Option<u64>,
+    reset_at: Option<u64>,
+    last_sent_at: Option<Instant>,
+    next_send_at: Option<Instant>,
+    retry_after_until: Option<Instant>,
+    rate_limit_until: Option<Instant>,
 }
 
 impl HostPacer {
@@ -67,9 +79,7 @@ impl HostPacer {
                 match guard.ready_delay(host, now) {
                     Some(delay) if !delay.is_zero() => Some(delay),
                     Some(_) | None => {
-                        if let Some(min_interval) = min_interval {
-                            guard.apply_retry_after(host, min_interval, now);
-                        }
+                        guard.reserve_send_at(host, now, min_interval);
                         drop(guard);
                         return Ok(());
                     }
@@ -111,35 +121,64 @@ impl HostPacer {
         rate_limit: &RateLimitSnapshot,
         observed_at: SystemTime,
     ) -> Result<(), SchedulerError> {
-        let Some(delay) = Self::rate_limit_delay(rate_limit, observed_at) else {
-            return Ok(());
-        };
         shared
             .lock()
             .map_err(|_err| SchedulerError::PacerPoisoned)?
-            .apply_retry_after(host, delay, Instant::now());
+            .record_rate_limit_state(host, rate_limit, observed_at, Instant::now());
         Ok(())
     }
 
     #[must_use]
     pub fn ready_delay(&self, host: &str, now: Instant) -> Option<Duration> {
-        self.cooldowns
+        self.hosts
             .get(host)
-            .and_then(|deadline| deadline.checked_duration_since(now))
+            .and_then(|state| state.ready_delay(now))
     }
 
     pub fn apply_retry_after(&mut self, host: &str, retry_after: Duration, now: Instant) {
         let Some(deadline) = now.checked_add(retry_after) else {
             return;
         };
-        self.cooldowns
-            .entry(host.to_owned())
-            .and_modify(|existing| {
-                if *existing < deadline {
-                    *existing = deadline;
-                }
-            })
-            .or_insert(deadline);
+        let state = self.hosts.entry(host.to_owned()).or_default();
+        state.retry_after_until = Some(max_instant(state.retry_after_until, deadline));
+    }
+
+    fn reserve_send_at(&mut self, host: &str, now: Instant, min_interval: Option<Duration>) {
+        let state = self.hosts.entry(host.to_owned()).or_default();
+        state.last_sent_at = Some(now);
+        if let Some(min_interval) = min_interval
+            && let Some(deadline) = now.checked_add(min_interval)
+        {
+            state.next_send_at = Some(max_instant(state.next_send_at, deadline));
+        }
+    }
+
+    fn record_rate_limit_state(
+        &mut self,
+        host: &str,
+        rate_limit: &RateLimitSnapshot,
+        observed_at: SystemTime,
+        now: Instant,
+    ) {
+        let state = self.hosts.entry(host.to_owned()).or_default();
+        state.limit = rate_limit.limit;
+        state.remaining = rate_limit.remaining;
+        state.reset_at = rate_limit.reset;
+        if let Some(retry_after) = rate_limit.retry_after
+            && let Some(deadline) = now.checked_add(retry_after)
+        {
+            state.retry_after_until = Some(max_instant(state.retry_after_until, deadline));
+        }
+        if let Some(delay) = Self::rate_limit_delay_without_retry_after(rate_limit, observed_at)
+            && let Some(deadline) = now.checked_add(delay)
+        {
+            state.rate_limit_until = Some(max_instant(state.rate_limit_until, deadline));
+        }
+    }
+
+    #[cfg(test)]
+    fn host_state(&self, host: &str) -> Option<&HostPacingState> {
+        self.hosts.get(host)
     }
 
     #[must_use]
@@ -150,6 +189,13 @@ impl HostPacer {
         if let Some(retry_after) = rate_limit.retry_after {
             return Some(retry_after);
         }
+        Self::rate_limit_delay_without_retry_after(rate_limit, observed_at)
+    }
+
+    fn rate_limit_delay_without_retry_after(
+        rate_limit: &RateLimitSnapshot,
+        observed_at: SystemTime,
+    ) -> Option<Duration> {
         let reset = reset_delay(rate_limit.reset?, observed_at)?;
         match rate_limit.remaining {
             Some(0) => Some(reset),
@@ -158,6 +204,27 @@ impl HostPacer {
                 .filter(|delay| !delay.is_zero()),
             _ => None,
         }
+    }
+}
+
+impl HostPacingState {
+    fn ready_delay(&self, now: Instant) -> Option<Duration> {
+        [
+            self.next_send_at,
+            self.retry_after_until,
+            self.rate_limit_until,
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|deadline| deadline.checked_duration_since(now))
+        .max()
+    }
+}
+
+fn max_instant(current: Option<Instant>, candidate: Instant) -> Instant {
+    match current {
+        Some(current) if current > candidate => current,
+        _ => candidate,
     }
 }
 
@@ -245,6 +312,30 @@ mod tests {
             pacer.ready_delay("pds.example", now + Duration::from_secs(11)),
             None
         );
+    }
+
+    #[test]
+    fn rate_limit_headers_update_explicit_host_state() {
+        let mut pacer = HostPacer::default();
+        let observed_at = UNIX_EPOCH + Duration::from_secs(100);
+        let snapshot = RateLimitSnapshot {
+            limit: Some(300),
+            remaining: Some(2),
+            reset: Some(130),
+            retry_after: None,
+            policy: None,
+        };
+
+        pacer.record_rate_limit_state("pds.example", &snapshot, observed_at, Instant::now());
+
+        let state = pacer
+            .host_state("pds.example")
+            .expect("host state should be recorded");
+        assert_eq!(state.limit, Some(300));
+        assert_eq!(state.remaining, Some(2));
+        assert_eq!(state.reset_at, Some(130));
+        assert!(state.rate_limit_until.is_some());
+        assert!(state.retry_after_until.is_none());
     }
 
     #[tokio::test]

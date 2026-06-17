@@ -3,6 +3,8 @@ use smol_str::SmolStr;
 
 use crate::parse::{PostRecordBody, raw_partial_post};
 
+const POST_TYPE: &str = "app.bsky.feed.post";
+
 pub struct DecodedPostBody {
     pub body: PostRecordBody,
     pub typed_decode_failed: bool,
@@ -26,9 +28,13 @@ pub fn from_cbor(record_bytes: &[u8]) -> Option<DecodedPostBody> {
 
 pub fn from_json_value(mut value: serde_json::Value) -> Option<DecodedPostBody> {
     if let serde_json::Value::Object(object) = &mut value {
+        match object.get("$type").and_then(serde_json::Value::as_str) {
+            Some(POST_TYPE) | None => {}
+            Some(_other) => return None,
+        }
         object
             .entry("$type")
-            .or_insert_with(|| serde_json::Value::String("app.bsky.feed.post".to_owned()));
+            .or_insert_with(|| serde_json::Value::String(POST_TYPE.to_owned()));
     }
     match serde_json::from_value::<Post<SmolStr>>(value.clone()) {
         Ok(post) => Some(DecodedPostBody {
@@ -91,6 +97,17 @@ mod tests {
                 "embed": {"kind": "external"}
             })
         );
+    }
+
+    #[test]
+    fn json_post_rejects_explicit_non_post_type() {
+        let decoded = from_json_value(json!({
+            "$type": "app.bsky.actor.profile",
+            "createdAt": "2026-06-16T00:00:00Z",
+            "text": "not a post"
+        }));
+
+        assert!(decoded.is_none());
     }
 
     #[test]

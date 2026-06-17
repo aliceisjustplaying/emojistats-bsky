@@ -5,7 +5,7 @@ Fetches Bluesky repositories, emits `content_addressed_snapshot` proofs from `ge
 CAR/MST traversal, archives posts locally, and derives the emoji serving projection. The
 current proof is not canonical snapshot-complete root recomputation, `listRecords` outputs
 are `collection_paginated_posts`, fleet runs are bounded batches, and the `StorageBox`
-backend is experimental until a production archive backend is wired.
+backend needs canary proof before production use.
 
 See [`docs/backfill-v2-design.md`](../../../docs/backfill-v2-design.md) for the design, and
 [`rust/check.sh`](../../check.sh) for the muster gate (fmt, clippy, test, nextest, deny,

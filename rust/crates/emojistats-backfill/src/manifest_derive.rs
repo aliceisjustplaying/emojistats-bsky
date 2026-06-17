@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     archive::{
-        ArchiveError, LocalManifestEntry, RepoReceipt, hash_post_rows, read_all_archive_post_rows,
+        ARCHIVE_SCHEMA_VERSION, ArchiveError, LocalManifestEntry, PostDataset, RepoReceipt,
+        hash_post_rows, read_all_archive_post_rows,
     },
     commit::{ManifestEntry, Receipt},
     derive::{
@@ -20,12 +21,10 @@ use crate::{
     hash::hash_serialized_json,
 };
 
-const RAW_ARCHIVE_POSTS_DATASET: &str = "raw_archive_posts";
-const RAW_ARCHIVE_POSTS_SCHEMA_VERSION: u16 = 1;
 const DEFAULT_MAX_FULL_DERIVE_ROWS: u64 = 50_000;
 const DEFAULT_MAX_FULL_DERIVE_BYTES: u64 = 536_870_912;
 
-/// A committed raw-archive manifest prepared for the derive loader.
+/// A committed post-archive manifest prepared for the derive loader.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoaderInput {
     pub manifest: LocalManifestEntry,
@@ -64,7 +63,21 @@ pub struct Plan {
     pub skipped_entries: Vec<SkippedEntry>,
 }
 
-/// A well-formed committed manifest row that is not a raw archive post object.
+/// One parsed row from a committed manifest stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestReadItem {
+    Input(Box<LoaderInput>),
+    Skipped(SkippedEntry),
+}
+
+/// Streaming reader for committed JSONL manifests.
+#[derive(Debug)]
+pub struct CommittedManifestJsonlReader<R> {
+    lines: io::Lines<R>,
+    line_number: usize,
+}
+
+/// A well-formed committed manifest row that is not a derivable post object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkippedEntry {
     pub line_number: usize,
@@ -94,6 +107,8 @@ pub enum Error {
         line_number: usize,
         field: &'static str,
     },
+    #[error("unsupported post dataset in committed manifest: {dataset}")]
+    UnsupportedDataset { dataset: String },
     #[error(
         "committed raw archive manifest line {line_number} has schema_version {actual}, expected {expected}"
     )]
@@ -195,15 +210,15 @@ pub enum Error {
     },
 }
 
-/// Read a committed JSONL manifest and prepare raw archive entries for derive loading.
+/// Read a committed JSONL manifest and prepare post archive entries for derive loading.
 ///
 /// Non-empty lines must deserialize as [`ManifestEntry`]. Entries for datasets other than
-/// `raw_archive_posts` are reported as skips; raw archive entries are validated and mapped
+/// post datasets are reported as skips; post entries are validated and mapped
 /// into [`LocalManifestEntry`] plus the stable derive identity.
 ///
 /// # Errors
 ///
-/// Returns [`Error`] when a line cannot be read or parsed, or when a target raw archive
+/// Returns [`Error`] when a line cannot be read or parsed, or when a target post archive
 /// manifest entry has invalid schema or required fields.
 pub fn read_committed_jsonl<R>(reader: R) -> Result<Plan, Error>
 where
@@ -212,22 +227,10 @@ where
     let mut inputs = Vec::new();
     let mut skipped_entries = Vec::new();
 
-    for (line_index, line) in reader.lines().enumerate() {
-        let line_number = line_index.checked_add(1).ok_or(Error::LineNumberOverflow)?;
-        let line = line.map_err(|source| Error::Io {
-            line_number,
-            source,
-        })?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let entry: ManifestEntry = serde_json::from_str(&line).map_err(|source| Error::Json {
-            line_number,
-            source,
-        })?;
-        match loader_input_from_entry(entry, line_number)? {
-            EntryDisposition::Load(input) => inputs.push(*input),
-            EntryDisposition::Skip(skip) => skipped_entries.push(skip),
+    for item in stream_committed_jsonl(reader) {
+        match item? {
+            ManifestReadItem::Input(input) => inputs.push(*input),
+            ManifestReadItem::Skipped(skip) => skipped_entries.push(skip),
         }
     }
 
@@ -235,6 +238,61 @@ where
         inputs,
         skipped_entries,
     })
+}
+
+/// Stream parsed committed manifest rows without materializing the whole plan.
+pub fn stream_committed_jsonl<R>(reader: R) -> CommittedManifestJsonlReader<R>
+where
+    R: BufRead,
+{
+    CommittedManifestJsonlReader {
+        lines: reader.lines(),
+        line_number: 0,
+    }
+}
+
+impl<R> Iterator for CommittedManifestJsonlReader<R>
+where
+    R: BufRead,
+{
+    type Item = Result<ManifestReadItem, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            self.line_number = match self.line_number.checked_add(1) {
+                Some(line_number) => line_number,
+                None => return Some(Err(Error::LineNumberOverflow)),
+            };
+            let line_number = self.line_number;
+            let line = match self.lines.next()? {
+                Ok(line) => line,
+                Err(source) => {
+                    return Some(Err(Error::Io {
+                        line_number,
+                        source,
+                    }));
+                }
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let entry = match serde_json::from_str(&line) {
+                Ok(entry) => entry,
+                Err(source) => {
+                    return Some(Err(Error::Json {
+                        line_number,
+                        source,
+                    }));
+                }
+            };
+            return Some(
+                loader_input_from_entry(entry, line_number).map(|disposition| match disposition {
+                    EntryDisposition::Load(input) => ManifestReadItem::Input(input),
+                    EntryDisposition::Skip(skip) => ManifestReadItem::Skipped(skip),
+                }),
+            );
+        }
+    }
 }
 
 /// Verify a parsed committed manifest entry and build the `ClickHouse` derive batch it names.
@@ -271,7 +329,9 @@ pub fn load_verified_clickhouse_batch_with_caps(
     let digest = hash_file(&object_path)?;
     validate_object_digest(&object_path, &input.manifest, &digest)?;
 
-    if let Some(receipt_path) = first_existing_path(object_receipt_candidates(&object_path))? {
+    if let Some(receipt_path) =
+        first_existing_path(object_receipt_candidates(&object_path, &input.manifest))?
+    {
         let receipt = read_receipt::<Receipt>(&receipt_path)?;
         validate_object_receipt(&receipt_path, &input.manifest, &receipt)?;
     }
@@ -282,8 +342,11 @@ pub fn load_verified_clickhouse_batch_with_caps(
             source,
         })?;
 
-    let Some(receipt_path) =
-        first_existing_path(repo_receipt_candidates(&object_path, &input.manifest))?
+    let Some(receipt_path) = first_existing_path(repo_receipt_candidates(
+        archive_root,
+        &object_path,
+        &input.manifest,
+    )?)?
     else {
         return Err(Error::MissingRepoReceipt { path: object_path });
     };
@@ -313,17 +376,23 @@ pub fn verify_loader_input_for_streaming(
     let digest = hash_file(&object_path)?;
     validate_object_digest(&object_path, &input.manifest, &digest)?;
 
-    if let Some(receipt_path) = first_existing_path(object_receipt_candidates(&object_path))? {
+    if let Some(receipt_path) =
+        first_existing_path(object_receipt_candidates(&object_path, &input.manifest))?
+    {
         let receipt = read_receipt::<Receipt>(&receipt_path)?;
         validate_object_receipt(&receipt_path, &input.manifest, &receipt)?;
     }
 
-    let Some(repo_receipt_path) =
-        first_existing_path(repo_receipt_candidates(&object_path, &input.manifest))?
+    let Some(repo_receipt_path) = first_existing_path(repo_receipt_candidates(
+        archive_root,
+        &object_path,
+        &input.manifest,
+    )?)?
     else {
         return Err(Error::MissingRepoReceipt { path: object_path });
     };
     let repo_receipt = read_receipt::<RepoReceipt>(&repo_receipt_path)?;
+    validate_repo_receipt_metadata(&repo_receipt_path, &input.manifest, &repo_receipt)?;
 
     Ok(VerifiedLoaderInput {
         manifest: input.manifest.clone(),
@@ -358,7 +427,7 @@ fn loader_input_from_entry(
     line_number: usize,
 ) -> Result<EntryDisposition, Error> {
     validate_required_fields(&entry, line_number)?;
-    if entry.dataset != RAW_ARCHIVE_POSTS_DATASET {
+    if !is_derivable_post_dataset(&entry.dataset) {
         return Ok(EntryDisposition::Skip(SkippedEntry {
             line_number,
             dataset: entry.dataset,
@@ -366,9 +435,9 @@ fn loader_input_from_entry(
         }));
     }
 
-    validate_raw_archive_entry(&entry, line_number)?;
+    validate_post_archive_entry(&entry, line_number)?;
     let manifest = local_manifest_from_entry(entry);
-    let identity = manifest_identity(&manifest);
+    let identity = manifest_identity(&manifest)?;
 
     Ok(EntryDisposition::Load(Box::new(LoaderInput {
         manifest,
@@ -386,17 +455,21 @@ fn validate_required_fields(entry: &ManifestEntry, line_number: usize) -> Result
     validate_scoped_object_path(&entry.object_path, line_number)
 }
 
-const fn validate_raw_archive_entry(
+const fn is_derivable_post_dataset(dataset: &str) -> bool {
+    PostDataset::from_dataset(dataset).is_some()
+}
+
+const fn validate_post_archive_entry(
     entry: &ManifestEntry,
     line_number: usize,
 ) -> Result<(), Error> {
-    if entry.schema_version == RAW_ARCHIVE_POSTS_SCHEMA_VERSION {
+    if entry.schema_version == ARCHIVE_SCHEMA_VERSION {
         Ok(())
     } else {
         Err(Error::UnsupportedSchemaVersion {
             line_number,
             actual: entry.schema_version,
-            expected: RAW_ARCHIVE_POSTS_SCHEMA_VERSION,
+            expected: ARCHIVE_SCHEMA_VERSION,
         })
     }
 }
@@ -434,6 +507,7 @@ fn local_manifest_from_entry(entry: ManifestEntry) -> LocalManifestEntry {
         run_id: entry.run_id,
         shard: entry.shard,
         file_sequence: entry.file_sequence,
+        did: entry.did,
         dataset: entry.dataset,
         local_path: PathBuf::from(entry.object_path),
         row_count: entry.row_count,
@@ -442,6 +516,7 @@ fn local_manifest_from_entry(entry: ManifestEntry) -> LocalManifestEntry {
         min_created_at_normalized: entry.min_created_at_normalized,
         max_created_at_normalized: entry.max_created_at_normalized,
         receipt_hash: entry.receipt_hash,
+        repo_receipt_path: entry.repo_receipt_path.map(PathBuf::from),
         schema_version: entry.schema_version,
         normalizer: entry.normalizer,
     }
@@ -636,24 +711,7 @@ fn validate_repo_receipt(
     rows: &[crate::archive::ArchivePostRow],
     receipt: &RepoReceipt,
 ) -> Result<(), Error> {
-    expect_receipt_field(
-        path,
-        "archived_post_rows_count",
-        &manifest.row_count.to_string(),
-        &receipt.archived_post_rows_count.to_string(),
-    )?;
-    expect_receipt_field(
-        path,
-        "normalizer",
-        &serde_json::to_string(&manifest.normalizer).map_err(|source| Error::ReceiptJson {
-            path: path.to_path_buf(),
-            source,
-        })?,
-        &serde_json::to_string(&receipt.normalizer).map_err(|source| Error::ReceiptJson {
-            path: path.to_path_buf(),
-            source,
-        })?,
-    )?;
+    validate_repo_receipt_metadata(path, manifest, receipt)?;
 
     let row_hash = hash_post_rows(rows).map_err(|source| Error::Archive {
         path: path.to_path_buf(),
@@ -666,6 +724,55 @@ fn validate_repo_receipt(
         &row_hash,
         &receipt.archive_rows_hash,
     )?;
+
+    let receipt_hash = hash_serialized_json(receipt).map_err(|source| Error::ReceiptJson {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    expect_receipt_field(path, "receipt_hash", &manifest.receipt_hash, &receipt_hash)
+}
+
+fn validate_repo_receipt_metadata(
+    path: &Path,
+    manifest: &LocalManifestEntry,
+    receipt: &RepoReceipt,
+) -> Result<(), Error> {
+    expect_receipt_field(
+        path,
+        "archived_post_rows_count",
+        &manifest.row_count.to_string(),
+        &receipt.archived_post_rows_count.to_string(),
+    )?;
+    expect_receipt_field(path, "did", &manifest.did, &receipt.did)?;
+    expect_receipt_field(
+        path,
+        "normalizer",
+        &serde_json::to_string(&manifest.normalizer).map_err(|source| Error::ReceiptJson {
+            path: path.to_path_buf(),
+            source,
+        })?,
+        &serde_json::to_string(&receipt.normalizer).map_err(|source| Error::ReceiptJson {
+            path: path.to_path_buf(),
+            source,
+        })?,
+    )?;
+    let dataset = expected_post_dataset(&manifest.dataset)?;
+    if receipt.fetch_method != dataset.fetch_method() {
+        return Err(Error::ReceiptFieldMismatch {
+            path: path.to_path_buf(),
+            field: "fetch_method",
+            expected: format!("{:?}", dataset.fetch_method()),
+            actual: format!("{:?}", receipt.fetch_method),
+        });
+    }
+    if receipt.completeness_class != dataset.completeness_class() {
+        return Err(Error::ReceiptFieldMismatch {
+            path: path.to_path_buf(),
+            field: "completeness_class",
+            expected: format!("{:?}", dataset.completeness_class()),
+            actual: format!("{:?}", receipt.completeness_class),
+        });
+    }
 
     let receipt_hash = hash_serialized_json(receipt).map_err(|source| Error::ReceiptJson {
         path: path.to_path_buf(),
@@ -705,33 +812,47 @@ fn first_existing_path(paths: Vec<PathBuf>) -> Result<Option<PathBuf>, Error> {
     Ok(None)
 }
 
-fn object_receipt_candidates(object_path: &Path) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    candidates.push(object_path.with_extension("receipt.json"));
-    if let Some(path) = replace_file_suffix(object_path, ".posts.parquet", ".object-receipt.json") {
-        candidates.push(path);
-    }
-    if let Some(path) = replace_file_suffix(object_path, ".parquet", ".object-receipt.json") {
-        candidates.push(path);
-    }
-    candidates
+fn object_receipt_candidates(object_path: &Path, manifest: &LocalManifestEntry) -> Vec<PathBuf> {
+    replace_file_suffix(
+        object_path,
+        ".posts.parquet",
+        &format!(".{}.object-receipt.json", manifest.receipt_hash),
+    )
+    .into_iter()
+    .collect()
 }
 
-fn repo_receipt_candidates(object_path: &Path, manifest: &LocalManifestEntry) -> Vec<PathBuf> {
+fn repo_receipt_candidates(
+    archive_root: &Path,
+    object_path: &Path,
+    manifest: &LocalManifestEntry,
+) -> Result<Vec<PathBuf>, Error> {
     let mut candidates = Vec::new();
+    if let Some(path) = manifest.repo_receipt_path.as_ref() {
+        candidates.push(resolve_local_path(archive_root, path)?);
+    }
     if let Some(path) = archive_stem_receipt_path(object_path, &manifest.receipt_hash) {
         candidates.push(path);
     }
     if let Some(path) = replace_file_suffix(object_path, ".posts.parquet", ".receipt.json") {
         candidates.push(path);
     }
-    candidates
+    Ok(candidates)
+}
+
+fn expected_post_dataset(dataset: &str) -> Result<PostDataset, Error> {
+    PostDataset::from_dataset(dataset).ok_or(Error::UnsupportedDataset {
+        dataset: dataset.to_owned(),
+    })
 }
 
 fn archive_stem_receipt_path(object_path: &Path, receipt_hash: &str) -> Option<PathBuf> {
     let file_name = object_path.file_name()?.to_str()?;
-    let marker = format!(".{RAW_ARCHIVE_POSTS_DATASET}__");
-    let marker_start = file_name.find(&marker)?;
+    let raw_marker = format!(".{}__", PostDataset::RawArchivePosts.as_str());
+    let collection_marker = format!(".{}__", PostDataset::CollectionPaginatedPosts.as_str());
+    let marker_start = file_name
+        .find(&raw_marker)
+        .or_else(|| file_name.find(&collection_marker))?;
     let artifact_stem = file_name.get(..marker_start)?;
     Some(object_path.with_file_name(format!("{artifact_stem}.{receipt_hash}.receipt.json")))
 }

@@ -51,6 +51,10 @@ fn receipt_counts_posts_and_emoji_occurrences() {
     let rows = [row("a", &["✅", "✅"]), row("b", &[])];
     let receipt = build_repo_receipt(RepoReceiptInput {
         rows: &rows,
+        observed_at: ArchiveCommitContext::fetch_one_local().observed_at,
+        did: "did:plc:test",
+        fetch_method: FetchMethod::GetRepo,
+        completeness_class: CompletenessClass::ContentAddressedSnapshot,
         reachable_records_count: 3,
         reachable_post_records_count: 2,
         post_decode_error_count: 1,
@@ -87,7 +91,10 @@ fn classifies_created_at_statuses() {
 
     let future = classify_created_at(Some("9999-12-31T23:59:59Z"));
     assert_eq!(future.status, CreatedAtParseStatus::Future);
-    assert_eq!(future.normalized, None);
+    assert_eq!(
+        future.normalized,
+        Some("9999-12-31T23:59:59.000000Z".to_owned())
+    );
 
     let valid = classify_created_at(Some("2020-01-02T03:04:05Z"));
     assert_eq!(valid.status, CreatedAtParseStatus::Valid);

@@ -29,6 +29,7 @@ const INSERT_DEDUPLICATE_SETTING: &str = "insert_deduplicate";
 const INSERT_DEDUPLICATION_TOKEN_SETTING: &str = "insert_deduplication_token";
 const DATE_TIME_INPUT_FORMAT_SETTING: &str = "date_time_input_format";
 const CLICKHOUSE_RESPONSE_SNIPPET_MAX_BYTES: usize = 4_096;
+pub const DEFAULT_EMOJI_SERVING_PAYLOAD_MAX_BYTES: usize = 8_388_608;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
@@ -52,8 +53,8 @@ impl ClickHouseTable {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::EmojiServing => "v2_emoji_serving",
-            Self::TotalPostCounter => "v2_total_post_counters",
+            Self::EmojiServing => "v2_emoji_serving_r2",
+            Self::TotalPostCounter => "v2_total_post_counters_r2",
         }
     }
 
@@ -184,7 +185,7 @@ impl ClickHouseClientConfig {
         &self,
         payload: &ClickHouseInsertPayload,
     ) -> Result<Request, ClickHouseSchemaError> {
-        let client = reqwest::Client::new();
+        let client = self.http_client()?;
         self.insert_request_with_client(&client, payload)
     }
 
@@ -217,6 +218,7 @@ impl ClickHouseClientConfig {
                 ),
                 (DATE_TIME_INPUT_FORMAT_SETTING, "best_effort"),
             ])
+            .timeout(self.request_timeout)
             .body(payload.body.clone())
             .build()
             .map_err(ClickHouseSchemaError::Request)?;
@@ -284,6 +286,12 @@ pub enum ClickHouseSchemaError {
     /// Request construction failed.
     #[error("failed to build ClickHouse HTTP request")]
     Request(reqwest::Error),
+    /// Resource counter overflowed before an insert request was built.
+    #[error("ClickHouse resource counter overflow: {field}")]
+    CountOverflow {
+        /// Counter that overflowed.
+        field: &'static str,
+    },
 }
 
 /// Insert metadata retained on success and failure so retries stay idempotent.
@@ -434,6 +442,23 @@ pub fn emoji_serving_rows_insert_payload(
     })
 }
 
+/// Return the exact `JSONEachRow` byte cost for one emoji-serving row.
+///
+/// # Errors
+///
+/// Returns [`ClickHouseSchemaError`] if `JSONEachRow` serialization fails.
+pub fn emoji_serving_row_body_bytes(
+    identity: &DeriveManifestIdentity,
+    row: &EmojiProjectionRow,
+) -> Result<usize, ClickHouseSchemaError> {
+    serde_json::to_string(&EmojiServingInsertRow::from_projection(row, identity))?
+        .len()
+        .checked_add(1)
+        .ok_or(ClickHouseSchemaError::CountOverflow {
+            field: "emoji_serving_row_body_bytes",
+        })
+}
+
 /// Format the total-post counter as a `ClickHouse` `JSONEachRow` insert payload.
 ///
 /// # Errors
@@ -469,11 +494,14 @@ pub fn total_post_counter_insert_payload_for_counter(
 
 fn emoji_serving_table_sql(database: &ClickHouseIdentifier) -> String {
     format!(
-        r"CREATE TABLE IF NOT EXISTS {database}.v2_emoji_serving (
+        r"CREATE TABLE IF NOT EXISTS {database}.v2_emoji_serving_r2 (
   src LowCardinality(String),
   run_id LowCardinality(String),
   shard LowCardinality(String),
   file_sequence UInt64,
+  dataset LowCardinality(String),
+  fetch_method LowCardinality(String),
+  completeness_class LowCardinality(String),
   receipt_hash String CODEC(ZSTD(1)),
   normalizer_name LowCardinality(String),
   normalizer_semver LowCardinality(String),
@@ -483,30 +511,35 @@ fn emoji_serving_table_sql(database: &ClickHouseIdentifier) -> String {
   did String CODEC(ZSTD(1)),
   rkey String CODEC(ZSTD(1)),
   created_at Nullable(DateTime64(6, 'UTC')) CODEC(Delta(8), ZSTD(1)),
+  created_at_parse_status LowCardinality(String),
   emoji LowCardinality(String),
   occurrences UInt64,
   langs Array(LowCardinality(String)),
   inserted_at DateTime64(6, 'UTC') DEFAULT now64(6)
 ) ENGINE = ReplacingMergeTree(inserted_at)
 PARTITION BY toYYYYMM(coalesce(created_at, toDateTime64('1970-01-01 00:00:00', 6, 'UTC')))
-ORDER BY (src, normalizer_git_rev, did, rkey, emoji)
+ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, did, rkey, emoji)
 SETTINGS non_replicated_deduplication_window = 10000;"
     )
 }
 
 fn total_post_counter_table_sql(database: &ClickHouseIdentifier) -> String {
     format!(
-        r"CREATE TABLE IF NOT EXISTS {database}.v2_total_post_counters (
+        r"CREATE TABLE IF NOT EXISTS {database}.v2_total_post_counters_r2 (
   src LowCardinality(String),
   run_id LowCardinality(String),
   shard LowCardinality(String),
   file_sequence UInt64,
+  dataset LowCardinality(String),
+  fetch_method LowCardinality(String),
+  completeness_class LowCardinality(String),
   receipt_hash String CODEC(ZSTD(1)),
   normalizer_name LowCardinality(String),
   normalizer_semver LowCardinality(String),
   normalizer_git_rev LowCardinality(String),
   normalizer_unicode_version LowCardinality(String),
   normalizer_emoji_data_version LowCardinality(String),
+  did String CODEC(ZSTD(1)),
   posts_processed UInt64,
   posts_with_emojis UInt64,
   emoji_occurrences UInt64,
@@ -514,7 +547,7 @@ fn total_post_counter_table_sql(database: &ClickHouseIdentifier) -> String {
   max_created_at Nullable(DateTime64(6, 'UTC')) CODEC(Delta(8), ZSTD(1)),
   inserted_at DateTime64(6, 'UTC') DEFAULT now64(6)
 ) ENGINE = ReplacingMergeTree(inserted_at)
-ORDER BY (src, normalizer_git_rev, receipt_hash)
+ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, did)
 SETTINGS non_replicated_deduplication_window = 10000;"
     )
 }
@@ -566,6 +599,9 @@ struct EmojiServingInsertRow<'a> {
     run_id: &'a str,
     shard: &'a str,
     file_sequence: u64,
+    dataset: &'a str,
+    fetch_method: &'a str,
+    completeness_class: &'a str,
     receipt_hash: &'a str,
     normalizer_name: &'a str,
     normalizer_semver: &'a str,
@@ -575,6 +611,7 @@ struct EmojiServingInsertRow<'a> {
     did: &'a str,
     rkey: &'a str,
     created_at: Option<&'a str>,
+    created_at_parse_status: &'a str,
     emoji: &'a str,
     occurrences: u64,
     langs: &'a [String],
@@ -587,6 +624,9 @@ impl<'a> EmojiServingInsertRow<'a> {
             run_id: identity.run_id.as_str(),
             shard: identity.shard.as_str(),
             file_sequence: identity.file_sequence,
+            dataset: identity.dataset.as_str(),
+            fetch_method: identity.fetch_method.as_str(),
+            completeness_class: identity.completeness_class.as_str(),
             receipt_hash: identity.receipt_hash.as_str(),
             normalizer_name: identity.normalizer.name.as_str(),
             normalizer_semver: identity.normalizer.semver.as_str(),
@@ -596,6 +636,7 @@ impl<'a> EmojiServingInsertRow<'a> {
             did: row.did.as_str(),
             rkey: row.rkey.as_str(),
             created_at: row.created_at_normalized.as_deref(),
+            created_at_parse_status: row.created_at_parse_status.as_str(),
             emoji: row.emoji.as_str(),
             occurrences: row.occurrences,
             langs: row.langs.as_slice(),
@@ -609,12 +650,16 @@ struct TotalPostCounterInsertRow<'a> {
     run_id: &'a str,
     shard: &'a str,
     file_sequence: u64,
+    dataset: &'a str,
+    fetch_method: &'a str,
+    completeness_class: &'a str,
     receipt_hash: &'a str,
     normalizer_name: &'a str,
     normalizer_semver: &'a str,
     normalizer_git_rev: &'a str,
     normalizer_unicode_version: &'a str,
     normalizer_emoji_data_version: &'a str,
+    did: &'a str,
     posts_processed: u64,
     posts_with_emojis: u64,
     emoji_occurrences: u64,
@@ -629,12 +674,16 @@ impl<'a> TotalPostCounterInsertRow<'a> {
             run_id: counter.run_id.as_str(),
             shard: counter.shard.as_str(),
             file_sequence: counter.file_sequence,
+            dataset: counter.dataset.as_str(),
+            fetch_method: counter.fetch_method.as_str(),
+            completeness_class: counter.completeness_class.as_str(),
             receipt_hash: counter.receipt_hash.as_str(),
             normalizer_name: counter.normalizer.name.as_str(),
             normalizer_semver: counter.normalizer.semver.as_str(),
             normalizer_git_rev: counter.normalizer.git_rev.as_str(),
             normalizer_unicode_version: counter.normalizer.unicode_version.as_str(),
             normalizer_emoji_data_version: counter.normalizer.emoji_data_version.as_str(),
+            did: counter.did.as_str(),
             posts_processed: counter.posts_processed,
             posts_with_emojis: counter.posts_with_emojis,
             emoji_occurrences: counter.emoji_occurrences,

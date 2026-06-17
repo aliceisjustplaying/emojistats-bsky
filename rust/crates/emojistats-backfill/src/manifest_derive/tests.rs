@@ -8,13 +8,15 @@ use std::{
 };
 
 use super::{
-    Error, FullLoadCaps, load_verified_clickhouse_batch, load_verified_clickhouse_batch_with_caps,
-    read_committed_jsonl, verify_loader_input_for_streaming,
+    Error, FullLoadCaps, ManifestReadItem, load_verified_clickhouse_batch,
+    load_verified_clickhouse_batch_with_caps, read_committed_jsonl, stream_committed_jsonl,
+    verify_loader_input_for_streaming,
 };
 use crate::{
     archive::{
-        ArchiveCommitContext, ArchivePostRow, CreatedAtParseStatus, NormalizerVersion, RepoReceipt,
-        RepoReceiptInput, build_repo_receipt, current_normalizer, write_archive_artifacts,
+        ArchiveCommitContext, ArchivePostRow, CompletenessClass, CreatedAtParseStatus, FetchMethod,
+        NormalizerVersion, RepoReceipt, RepoReceiptInput, build_repo_receipt, current_normalizer,
+        write_archive_artifacts,
     },
     commit::ManifestEntry,
 };
@@ -36,6 +38,7 @@ fn entry(dataset: &str) -> ManifestEntry {
         run_id: "run-1".to_owned(),
         shard: "shard3".to_owned(),
         file_sequence: 42,
+        did: "did:plc:test".to_owned(),
         dataset: dataset.to_owned(),
         object_path: format!("objects/{dataset}/part-000042.parquet"),
         row_count: 123,
@@ -44,8 +47,9 @@ fn entry(dataset: &str) -> ManifestEntry {
         min_created_at_normalized: Some("2026-06-15T00:00:00Z".to_owned()),
         max_created_at_normalized: Some("2026-06-15T01:00:00Z".to_owned()),
         receipt_hash: "receipt-hash".to_owned(),
+        repo_receipt_path: None,
         normalizer: normalizer(),
-        schema_version: 1,
+        schema_version: 2,
     }
 }
 
@@ -80,6 +84,10 @@ fn archive_row(rkey: &str, text: &str, emojis: &[&str]) -> ArchivePostRow {
 fn repo_receipt(rows: &[ArchivePostRow]) -> RepoReceipt {
     build_repo_receipt(RepoReceiptInput {
         rows,
+        observed_at: ArchiveCommitContext::fetch_one_local().observed_at,
+        did: "did:plc:test",
+        fetch_method: FetchMethod::GetRepo,
+        completeness_class: CompletenessClass::ContentAddressedSnapshot,
         reachable_records_count: u64::try_from(rows.len()).expect("row count should fit u64"),
         reachable_post_records_count: u64::try_from(rows.len()).expect("row count should fit u64"),
         post_decode_error_count: 0,
@@ -115,7 +123,48 @@ fn parses_jsonl_and_builds_loader_inputs_for_raw_archive_posts() {
 }
 
 #[test]
-fn skips_non_raw_dataset_and_rejects_bad_dataset_field() {
+fn parses_collection_paginated_posts_as_loader_inputs() {
+    let collection_entry = entry("collection_paginated_posts");
+    let plan = read_committed_jsonl(Cursor::new(jsonl(std::slice::from_ref(&collection_entry))))
+        .expect("read manifest jsonl");
+
+    assert_eq!(plan.inputs.len(), 1);
+    assert!(plan.skipped_entries.is_empty());
+    let input = plan.inputs.first().expect("one loader input");
+    assert_eq!(input.identity.dataset, "collection_paginated_posts");
+    assert_eq!(
+        input.manifest.local_path,
+        std::path::PathBuf::from(collection_entry.object_path)
+    );
+}
+
+#[test]
+fn streaming_reader_yields_first_item_before_later_parse_error() {
+    let raw_entry = entry("raw_archive_posts");
+    let body = format!(
+        "{}\nnot-json\n",
+        serde_json::to_string(&raw_entry).expect("serialize manifest entry")
+    );
+    let mut reader = stream_committed_jsonl(Cursor::new(body));
+
+    let first = reader
+        .next()
+        .expect("first item")
+        .expect("first item should parse");
+    let ManifestReadItem::Input(input) = first else {
+        panic!("first item should be a loader input");
+    };
+    assert_eq!(input.identity.dataset, "raw_archive_posts");
+
+    let error = reader
+        .next()
+        .expect("second item")
+        .expect_err("second item should fail");
+    assert!(matches!(error, Error::Json { line_number: 2, .. }));
+}
+
+#[test]
+fn skips_non_post_dataset_and_rejects_bad_dataset_field() {
     let skipped = read_committed_jsonl(Cursor::new(jsonl(&[entry("raw_profile_sidecar")])))
         .expect("read skipped manifest jsonl");
     assert!(skipped.inputs.is_empty());
@@ -137,7 +186,7 @@ fn skips_non_raw_dataset_and_rejects_bad_dataset_field() {
 #[test]
 fn rejects_raw_archive_schema_mismatch() {
     let mut bad = entry("raw_archive_posts");
-    bad.schema_version = 2;
+    bad.schema_version = 1;
 
     let error = read_committed_jsonl(Cursor::new(jsonl(&[bad]))).expect_err("bad schema rejected");
 
@@ -145,8 +194,8 @@ fn rejects_raw_archive_schema_mismatch() {
         error,
         Error::UnsupportedSchemaVersion {
             line_number: 1,
-            actual: 2,
-            expected: 1
+            actual: 1,
+            expected: 2
         }
     ));
 }
@@ -175,7 +224,7 @@ fn stable_identity_fields_come_from_committed_manifest() {
     assert_eq!(first_identity.dataset, "raw_archive_posts");
     assert_eq!(first_identity.content_hash, "content-hash");
     assert_eq!(first_identity.receipt_hash, "receipt-hash");
-    assert_eq!(first_identity.schema_version, 1);
+    assert_eq!(first_identity.schema_version, 2);
 }
 
 #[test]
@@ -225,11 +274,53 @@ fn streaming_verifier_finds_content_stem_repo_receipt() {
     .expect("archive artifacts should write");
     let plan = read_plan_from_path(&artifacts.manifest_path);
     let input = plan.inputs.first().expect("loader input");
+    assert_eq!(
+        input.manifest.repo_receipt_path.as_deref(),
+        artifacts.receipt_path.file_name().map(Path::new)
+    );
 
     let verified = verify_loader_input_for_streaming(&output_dir, input)
         .expect("streaming verifier should find repo receipt");
 
     assert_eq!(verified.repo_receipt.archived_post_rows_count, 1);
+}
+
+#[test]
+fn streaming_verifier_rejects_raw_manifest_with_collection_paginated_receipt() {
+    let temp = TempDir::new("streaming-proof-mismatch");
+    let output_dir = temp.path.join("archive");
+    let rows = vec![archive_row("a", "hello ✅", &["✅"])];
+    let receipt = repo_receipt(&rows);
+    let artifacts = write_archive_artifacts(
+        &output_dir,
+        "did:plc:fixture123",
+        &ArchiveCommitContext::fetch_one_local(),
+        &rows,
+        None,
+        &receipt,
+    )
+    .expect("archive artifacts should write");
+    let plan = read_plan_from_path(&artifacts.manifest_path);
+    let input = plan.inputs.first().expect("loader input");
+    let mut bad_receipt = receipt;
+    bad_receipt.fetch_method = FetchMethod::ListRecords;
+    bad_receipt.completeness_class = CompletenessClass::CollectionPaginated;
+    fs::write(
+        &artifacts.receipt_path,
+        serde_json::to_vec(&bad_receipt).expect("serialize bad receipt"),
+    )
+    .expect("repo receipt should be writable");
+
+    let error = verify_loader_input_for_streaming(&output_dir, input)
+        .expect_err("streaming verifier should reject proof mismatch");
+
+    assert!(matches!(
+        error,
+        Error::ReceiptFieldMismatch {
+            field: "fetch_method",
+            ..
+        }
+    ));
 }
 
 #[test]

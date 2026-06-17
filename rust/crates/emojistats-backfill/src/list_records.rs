@@ -4,7 +4,7 @@ use std::{
     collections::HashSet,
     fmt,
     path::Path,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use futures_util::StreamExt as _;
@@ -24,7 +24,7 @@ use crate::{
     },
     parse::PostRecord,
     post_decode,
-    scheduler::HostPacer,
+    scheduler::{HostPacer, SharedHostPacer},
     transport::{AccountState, RateLimitSnapshot},
 };
 
@@ -33,8 +33,10 @@ const LIST_RECORDS_XRPC: &str = "com.atproto.repo.listRecords";
 const DEFAULT_PAGE_LIMIT: u16 = 100;
 const DEFAULT_MAX_PAGES: u64 = 100_000;
 const DEFAULT_MAX_RECORDS: u64 = 10_000_000;
+const DEFAULT_MAX_DECODE_ERRORS: u64 = 100_000;
 const DEFAULT_MAX_PAGE_BYTES: u64 = 8_388_608;
 const DEFAULT_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 #[allow(clippy::duration_suboptimal_units)]
 const DEFAULT_PAGE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_MIN_PROGRESS_BYTES: u64 = 16_384;
@@ -46,7 +48,9 @@ pub struct ListRecordsConfig {
     pub page_limit: u16,
     pub max_pages: u64,
     pub max_records: u64,
+    pub max_decode_errors: u64,
     pub max_page_bytes: u64,
+    pub response_header_timeout: Duration,
     pub chunk_idle_timeout: Duration,
     pub page_download_timeout: Duration,
     pub min_progress_bytes: u64,
@@ -59,7 +63,9 @@ impl Default for ListRecordsConfig {
             page_limit: DEFAULT_PAGE_LIMIT,
             max_pages: DEFAULT_MAX_PAGES,
             max_records: DEFAULT_MAX_RECORDS,
+            max_decode_errors: DEFAULT_MAX_DECODE_ERRORS,
             max_page_bytes: DEFAULT_MAX_PAGE_BYTES,
+            response_header_timeout: DEFAULT_RESPONSE_HEADER_TIMEOUT,
             chunk_idle_timeout: DEFAULT_CHUNK_IDLE_TIMEOUT,
             page_download_timeout: DEFAULT_PAGE_DOWNLOAD_TIMEOUT,
             min_progress_bytes: DEFAULT_MIN_PROGRESS_BYTES,
@@ -94,7 +100,39 @@ pub struct ListRecordsArchiveOutput {
     pub records: u64,
     pub archived_posts: u64,
     pub decode_errors: u64,
+    pub archive_ms: u64,
     pub rate_limits: Vec<RateLimitSnapshot>,
+}
+
+/// Shared host pacing used before each `listRecords` page request.
+#[derive(Debug, Clone, Copy)]
+pub struct ListRecordsHostPacing<'a> {
+    pub pacer: &'a SharedHostPacer,
+    pub host: &'a str,
+    pub min_interval: Option<Duration>,
+}
+
+impl<'a> ListRecordsHostPacing<'a> {
+    #[must_use]
+    pub const fn new(
+        pacer: &'a SharedHostPacer,
+        host: &'a str,
+        min_interval: Option<Duration>,
+    ) -> Self {
+        Self {
+            pacer,
+            host,
+            min_interval,
+        }
+    }
+
+    async fn reserve_page_request(self) -> Result<(), ListRecordsError> {
+        HostPacer::reserve_next_request(self.pacer, self.host, self.min_interval)
+            .await
+            .map_err(|err| {
+                ListRecordsError::PreCommit(format!("host pacing for {}: {err}", self.host))
+            })
+    }
 }
 
 /// `listRecords` transport, protocol, cap, decode, and archive failures.
@@ -116,6 +154,8 @@ pub enum ListRecordsError {
     },
     #[error("listRecords transport failed: {0}")]
     Transport(#[from] reqwest::Error),
+    #[error("listRecords response headers did not arrive within {timeout:?}")]
+    ResponseHeaderTimeout { timeout: Duration },
     #[error("no listRecords body chunk within {timeout:?}")]
     InactivityTimeout { timeout: Duration },
     #[error("listRecords page download exceeded {timeout:?} after {observed_bytes} bytes")]
@@ -143,6 +183,8 @@ pub enum ListRecordsError {
     },
     #[error("listRecords protocol error: {0}")]
     Protocol(String),
+    #[error("listRecords pre-commit check failed: {0}")]
+    PreCommit(String),
 }
 
 impl ListRecordsError {
@@ -153,13 +195,15 @@ impl ListRecordsError {
                 Some(rate_limit)
             }
             Self::Transport(_)
+            | Self::ResponseHeaderTimeout { .. }
             | Self::InactivityTimeout { .. }
             | Self::DownloadTimeout { .. }
             | Self::ProgressTimeout { .. }
             | Self::PageJson(_)
             | Self::Archive(_)
             | Self::ResourceLimitExceeded { .. }
-            | Self::Protocol(_) => None,
+            | Self::Protocol(_)
+            | Self::PreCommit(_) => None,
         }
     }
 
@@ -172,9 +216,11 @@ impl ListRecordsError {
             | Self::ResourceLimitExceeded { .. }
             | Self::Protocol(_) => false,
             Self::Transport(_)
+            | Self::ResponseHeaderTimeout { .. }
             | Self::InactivityTimeout { .. }
             | Self::DownloadTimeout { .. }
-            | Self::ProgressTimeout { .. } => true,
+            | Self::ProgressTimeout { .. }
+            | Self::PreCommit(_) => true,
             Self::HttpStatus { status, .. } => *status >= 500 || *status == 429,
         }
     }
@@ -223,7 +269,42 @@ pub async fn fetch_and_archive_list_records_with_rate_limit_observer(
     archive_context: ArchiveCommitContext,
     archive_storage: ArchiveStorageConfig,
     config: ListRecordsConfig,
+    observe_rate_limit: impl FnMut(&RateLimitSnapshot),
+) -> Result<ListRecordsArchiveOutput, ListRecordsError> {
+    fetch_and_archive_list_records_with_precommit_check(
+        http,
+        pds,
+        did,
+        did_str,
+        archive_dir,
+        archive_context,
+        archive_storage,
+        config,
+        None,
+        observe_rate_limit,
+        || Ok(()),
+    )
+    .await
+}
+
+/// Fetch all post records and run a final check immediately before artifacts are committed.
+///
+/// # Errors
+///
+/// Returns [`ListRecordsError`] for transport, pagination cap, decode, pre-commit, or archive failures.
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_and_archive_list_records_with_precommit_check(
+    http: &Client,
+    pds: &Uri<String>,
+    did: &Did,
+    did_str: &str,
+    archive_dir: &Path,
+    archive_context: ArchiveCommitContext,
+    archive_storage: ArchiveStorageConfig,
+    config: ListRecordsConfig,
+    host_pacing: Option<ListRecordsHostPacing<'_>>,
     mut observe_rate_limit: impl FnMut(&RateLimitSnapshot),
+    before_commit: impl FnOnce() -> Result<(), String>,
 ) -> Result<ListRecordsArchiveOutput, ListRecordsError> {
     let mut archiver = ListRecordsArchiver::new(
         did_str,
@@ -237,6 +318,9 @@ pub async fn fetch_and_archive_list_records_with_rate_limit_observer(
     let mut cursor: Option<String> = None;
 
     loop {
+        if let Some(host_pacing) = host_pacing {
+            host_pacing.reserve_page_request().await?;
+        }
         let fetched = fetch_list_records_page(http, pds, did, cursor.as_deref(), config).await?;
         let observed_at = SystemTime::now();
         observe_rate_limit(&fetched.rate_limit);
@@ -258,18 +342,20 @@ pub async fn fetch_and_archive_list_records_with_rate_limit_observer(
         let Some(_next_cursor_value) = next_cursor.as_deref() else {
             break;
         };
-        if let Some(delay) = HostPacer::rate_limit_delay(
-            rate_limits.last().ok_or_else(|| {
-                ListRecordsError::Protocol("missing rate-limit snapshot".to_owned())
-            })?,
-            observed_at,
-        ) {
+        if host_pacing.is_none()
+            && let Some(delay) = HostPacer::rate_limit_delay(
+                rate_limits.last().ok_or_else(|| {
+                    ListRecordsError::Protocol("missing rate-limit snapshot".to_owned())
+                })?,
+                observed_at,
+            )
+        {
             time::sleep(delay).await;
         }
         cursor = next_cursor;
     }
 
-    let mut output = archiver.finish()?;
+    let mut output = archiver.finish(before_commit)?;
     output.rate_limits = rate_limits;
     Ok(output)
 }
@@ -300,7 +386,7 @@ where
         archiver.push_page(page)?;
     }
 
-    archiver.finish()
+    archiver.finish(|| Ok(()))
 }
 
 struct ListRecordsArchiver<'a> {
@@ -310,6 +396,7 @@ struct ListRecordsArchiver<'a> {
     records: u64,
     decode_errors: u64,
     pages_seen: u64,
+    seen_rkeys: HashSet<String>,
 }
 
 impl<'a> ListRecordsArchiver<'a> {
@@ -332,6 +419,7 @@ impl<'a> ListRecordsArchiver<'a> {
             records: 0,
             decode_errors: 0,
             pages_seen: 0,
+            seen_rkeys: HashSet::new(),
         })
     }
 
@@ -361,6 +449,14 @@ impl<'a> ListRecordsArchiver<'a> {
                     max: self.config.max_records,
                 })?;
         enforce_cap("max_records", self.records, self.config.max_records)?;
+        let rkey = rkey_from_uri(self.did_str, &record.uri).map(ToOwned::to_owned);
+        if let Some(rkey) = &rkey
+            && !self.seen_rkeys.insert(rkey.clone())
+        {
+            return Err(ListRecordsError::Protocol(format!(
+                "PDS returned duplicate listRecords rkey {rkey}"
+            )));
+        }
         match post_record_from_list_record(self.did_str, record) {
             Ok(decoded) => {
                 if decoded.typed_decode_failed {
@@ -388,14 +484,24 @@ impl<'a> ListRecordsArchiver<'a> {
                 .ok_or(ListRecordsError::ResourceLimitExceeded {
                     limit: "decode_errors",
                     observed: u64::MAX,
-                    max: u64::MAX,
+                    max: self.config.max_decode_errors,
                 })?;
+        enforce_cap(
+            "max_decode_errors",
+            self.decode_errors,
+            self.config.max_decode_errors,
+        )?;
         Ok(())
     }
 
-    fn finish(self) -> Result<ListRecordsArchiveOutput, ListRecordsError> {
+    fn finish(
+        self,
+        before_commit: impl FnOnce() -> Result<(), String>,
+    ) -> Result<ListRecordsArchiveOutput, ListRecordsError> {
         let records = self.records;
         let decode_errors = self.decode_errors;
+        let archive_started = Instant::now();
+        before_commit().map_err(ListRecordsError::PreCommit)?;
         let (receipt, artifacts) = self.sink.finish(
             StreamingReceiptInput {
                 fetch_method: FetchMethod::ListRecords,
@@ -409,6 +515,7 @@ impl<'a> ListRecordsArchiver<'a> {
             },
             None,
         )?;
+        let archive_ms = u64::try_from(archive_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         Ok(ListRecordsArchiveOutput {
             archived_posts: receipt.archived_post_rows_count,
@@ -416,6 +523,7 @@ impl<'a> ListRecordsArchiver<'a> {
             artifacts,
             records,
             decode_errors,
+            archive_ms,
             rate_limits: Vec::new(),
         })
     }
@@ -447,7 +555,14 @@ async fn fetch_list_records_page(
         query.push(("cursor", cursor.to_owned()));
     }
 
-    let response = http.get(url).query(&query).send().await?;
+    let response = time::timeout(
+        config.response_header_timeout,
+        http.get(url).query(&query).send(),
+    )
+    .await
+    .map_err(|_elapsed| ListRecordsError::ResponseHeaderTimeout {
+        timeout: config.response_header_timeout,
+    })??;
     let status = response.status();
     let rate_limit = RateLimitSnapshot::from_headers(response.headers());
     if let Some(content_length) = response.content_length() {
@@ -507,11 +622,6 @@ async fn read_response_body_with_cap(
             },
         )?;
     }
-    enforce_page_progress(
-        &mut progress_window_started,
-        &mut progress_window_bytes,
-        config,
-    )?;
     Ok(body)
 }
 

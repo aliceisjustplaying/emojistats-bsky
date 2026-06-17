@@ -12,9 +12,10 @@ idempotent.
   `backfill_progress` / `backfill_repo_events` telemetry tables) and the live
   Jetstream ingest worker. The ingest worker starts *before* the crawl and never
   stops; backfill/live overlap collapses structurally via ReplacingMergeTree.
-- Crawl box (ephemeral, hourly billed) — the `packages/backfill` processes, the
-  ledger at `LEDGER_DB_PATH` (default `packages/backfill/data/ledger.sqlite`),
-  and the archive spool at `ARCHIVE_DIR`.
+- Crawl box (ephemeral, hourly billed) — the Rust `emojistats-backfill run-fleet`
+  processes, the ledger at `--ledger-path` (default
+  `rust/data/ledger/backfill.sqlite` when run from `rust/`), the local CAR spool
+  at `--spool-dir`, and committed archive artifacts at `--archive-dir`.
 - Storage Box — receives finalized parquet files via `ARCHIVE_SYNC_COMMAND`.
   The archive is the ONLY durable home of full post text (ClickHouse keeps text
   for emoji posts only), so this hop is part of the critical path, not a backup.
@@ -61,52 +62,36 @@ Settings that were tried and should not be repeated without a new hypothesis:
 - ClickHouse schema migrated (`bun run db:migrate` in `packages/ingest`) — this
   includes the telemetry tables.
 - Live ingest worker running and healthy since before the first repo fetch.
-- `.env` in `packages/backfill` on the crawl box:
-  - `CLICKHOUSE_URL` / `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` /
-    `CLICKHOUSE_DATABASE` pointing at the permanent box.
-  - `BACKFILL_RUN_ID` set to something memorable for this run (e.g.
-    `full-2026-06`); it tags every telemetry row, so keep it identical across
-    all shards and boxes of the same run.
-  - `ARCHIVE_DIR` on a disk with headroom — full text is roughly 75–90 GB of
-    zstd parquet across the whole network, less per box when sharded.
-  - `ARCHIVE_SYNC_COMMAND` (see the archive section) so finalized files leave
-    the ephemeral box as soon as they rotate.
+- Rust `run-fleet` args on the crawl box:
+  - `--run-id` set to something memorable for this run (e.g. `full-2026-06`);
+    keep it identical across all buckets and boxes of the same run.
+  - `--ledger-path` on durable local disk for the SQLite checkpoint.
+  - `--spool-dir` on fast scratch disk for streamed CAR files.
+  - `--archive-dir` on a disk with headroom; use `--archive-backend
+    storage-box-ssh` plus the Storage Box args when committing directly remote.
+  - `--max-bytes` and `--max-inflight-spool-bytes` set explicitly for whale
+    handling; the in-flight cap must be at least the per-repo cap.
 - Sanity-check connectivity with a tiny bounded run before committing the box:
-  `bun run enumerate -- --limit 1000`, then `bun run crawl -- --limit 1000`,
-  then `bun run verify`.
+  `cd rust && cargo run -p emojistats-backfill -- run-fleet fixtures/scale-smoke.dids --claim-limit 1`.
 
-## Enumeration first
+## DID seed file first
 
-- `bun run enumerate` in `packages/backfill` streams the PLC `/export` feed
-  into the ledger. The full directory at the self-imposed ~2 pages/sec
-  (1,000 ops/page) takes on the order of **a day** — start it early, it is the
-  long pole before any crawling can begin.
-- It is resumable: the cursor (`plc_cursor` in ledger meta) commits atomically
-  with each page, so a Ctrl-C or crash loses nothing; re-running continues
-  where it left off. Re-running after the crawl also picks up newly created
-  accounts.
-- `--limit N` bounds the run by distinct DIDs touched (dry-runs); `--did <did>`
-  enumerates individual DIDs by resolving their documents directly.
-- Honest gap: enumeration covers PLC DIDs only. `did:web` accounts and the
-  relay `listRepos` union/diff from the plan are not implemented yet; the few
-  did:web stragglers can be added later with `--did`.
+- Rust `run-fleet` takes a newline-delimited DID file and seeds missing rows into
+  the SQLite ledger before claiming work.
+- Re-running with the same file is idempotent: existing rows keep their ledger
+  state, and stale claimed rows from that seed file are repaired at startup.
+- Build or refresh the DID file before the crawl. Whole-network enumeration is
+  still an upstream input to the Rust runner, not a `run-fleet` subcommand.
 
 ## Running the crawl
 
-- `bun run crawl` claims pending repos (host-spread and claim-time capped so one
-  cooling or already-full PDS cannot monopolize the scheduler's active slots),
-  fetches CARs, extracts posts, archives full rows, loads ClickHouse, and
-  updates the ledger. `--limit N` caps claims for a bounded run; `--did <did>`
-  forces specific repos through the pipeline.
-- Politeness knobs: `GLOBAL_CONCURRENCY` (default 32), `PER_HOST_CONCURRENCY`
-  (default 2), `PER_HOST_CONCURRENCY_BSKY` (default 16 for the
-  `*.bsky.network` mushroom fleet). These are CEILINGS: per-host pressure is
-  AIMD (host-pressure.ts) — a 429 burst halves that host's effective cap
-  (floor 1) and arms a short cooldown (5s, max 2 min); every 20 successes
-  raise the cap by one; ten quiet minutes restore the ceiling. Each host
-  converges to just under what it actually tolerates instead of oscillating
-  between full-blast and ten dark minutes. Rate-limit retries still never
-  burn the repo's reachability attempts.
+- `emojistats-backfill run-fleet <dids_file>` claims pending repos, streams CARs
+  into bounded local spool files, parses posts, commits archive artifacts, and
+  updates the ledger. `--claim-limit N` caps a bounded run.
+- Politeness knobs: `--concurrency`, `--parse-concurrency`,
+  `--max-inflight-spool-bytes`, host pacing from rate-limit headers, and
+  persisted host overrides. Rate-limit retries still never burn the repo's
+  reachability attempts.
 - Dead hosts: 30 consecutive ENOTFOUND/HTTP-451 failures over ≥30s declare a
   host dead for the run (host-health.ts). Its claimable rows bulk-park as
   out-of-budget `unreachable` (the final-sweep list), the verdict persists in
@@ -117,8 +102,6 @@ Settings that were tried and should not be repeated without a new hypothesis:
 - `TEXT_IN_CLICKHOUSE` (default `emoji`) controls what reaches ClickHouse:
   emoji-less posts get their `text` written as `''`; the archive always gets
   the full text regardless. `all` is the upgrade path if disk economics change.
-- `bun run status` gives a one-glance readout (status counts, repos/min, last
-  error, PLC cursor) without disturbing the run.
 - Unreachable PDSes retry in spaced waves automatically. The run ends on its
   own when every repo is terminal and the remaining unreachables are out of
   attempts budget — they stay parked as the explicit unreachable list.
@@ -127,13 +110,12 @@ Settings that were tried and should not be repeated without a new hypothesis:
 
 ## Sharding: multi-process and multi-box
 
-- `CRAWL_SHARDS` / `CRAWL_SHARD_INDEX` partition the claimable set by a
-  deterministic hash of the DID, evaluated inside SQLite. Each shard is its own
-  `bun run crawl` process; shards never claim each other's repos. The default
-  (1 shard, index 0) means no filtering.
-- `SHARD_LABEL` (default `shard{N}`) names the shard's telemetry stream and its
-  archive file prefix (`backfill-{SHARD_LABEL}-...parquet`). Keep it unique per
-  process or the parquet files will collide.
+- `--shard-bucket <0..7>` partitions the claimable set by the persisted
+  `DID_SHARD_BUCKET_MODULUS = 8` bucket stored in SQLite. Each bucket is its own
+  Rust `run-fleet` process; buckets never claim each other's repos. Omit the flag
+  only for an unsharded local run.
+- The Rust runner uses canonical labels `shard{bucket}` for bucket-scoped
+  archive metadata and telemetry.
 - Within one box, all shard processes share the single ledger file — SQLite WAL
   handles the concurrency, and the guarded `fetching` transition makes claims
   race-safe. Consequence for telemetry: each process reports status counts and
@@ -146,13 +128,13 @@ Settings that were tried and should not be repeated without a new hypothesis:
 - Multi-box is a per-box-ledger model, stated honestly: the ledger does not
   replicate or merge on its own. Run the full enumeration once, copy the
   finished `ledger.sqlite` to every box, and give each box a complementary,
-  non-overlapping set of shard indices. The current persisted bucket modulus is
-  6, so use `CRAWL_SHARDS=6` unless the ledger buckets have been rebuilt — e.g.
-  two boxes: one runs shard indices 0–2, the other 3–5.
+  non-overlapping set of shard buckets. The current persisted bucket modulus is
+  8, so assign bucket numbers 0 through 7 exactly once — e.g. two boxes: one
+  runs buckets 0–3, the other 4–7.
 - Each box's ledger then records progress only for its own shards; rows
   belonging to the other box's shards sit in `pending` forever in the local
   file. That is expected, not a bug — but it means the final accounting must
-  union the boxes: run `bun run verify` on each box against its own ledger
+  union the boxes: verify each box against its own ledger
   (they all point at the same ClickHouse), and import each box's
   loaded/terminal rows when building the permanent `backfill_repos` snapshot,
   ignoring the foreign-shard pendings.
@@ -164,7 +146,7 @@ Settings that were tried and should not be repeated without a new hypothesis:
   process's counts and idle/exit policy are scoped to its own shard slice, so
   a drained shard ends its run on its own, exactly like the single-box case —
   foreign-shard pendings are not remaining work. Only the ledger-wide tools
-  (`bun run status`, verify) still count them, which is the global view those
+  (status/verification tooling) still count them, which is the global view those
   tools want.
 
 ## Telemetry and the dashboard
@@ -228,16 +210,15 @@ Settings that were tried and should not be repeated without a new hypothesis:
   backoff. Whatever the run leaves in `unreachable` / `failed` / `quarantined`
   is the explicit remainder, queryable in the ledger — silence is not an
   outcome.
-- Final sweep: after a day or two, re-run `bun run crawl -- --final-sweep` —
-  the flag zeroes the attempt budgets on parked unreachable rows (a plain
-  re-run deliberately does NOT, so a crash loop can never hammer dead hosts)
-  and stale PDS pointers re-resolve through the DID document on retry. Once Hubble (microcosm's whole-network
-  mirror) ships, point the stragglers at it as a fallback CAR source.
-- `bun run verify` is the acceptance-criteria engine: it reconciles every
-  loaded repo's `posts_total` against ClickHouse per-DID counts (exact matches
-  promote to `verified`, mismatches fail the run), prints the terminal-state
-  report with the explicit DID lists, and `--sample N` re-fetches N random
-  repos end to end to catch systematic parse bugs.
+- Final sweep is still explicit Rust-v2 follow-up work: do not use the old Bun
+  `crawl --final-sweep` command against a Rust ledger. Parked stragglers must be
+  re-armed through the Rust ledger/host-override path so a crash loop cannot
+  hammer dead hosts. Once Hubble (microcosm's whole-network mirror) ships, point
+  the stragglers at it as a fallback CAR source.
+- Acceptance requires deriving committed Rust manifests, reconciling loaded
+  repos against ClickHouse per-DID counts, printing the terminal-state report
+  with explicit DID lists, and re-fetching a sample end to end to catch
+  systematic parse bugs.
 - The backfill is done only when every DID has a terminal status, verify passes
   with zero mismatches, the sampled repos match, the hourly series shows no
   discontinuity at the backfill/live boundary, and the final ledger snapshot is
@@ -273,7 +254,7 @@ Gotchas to respect:
   start — a plain restart picks it up at startup, no CLI flag needed because the
   meta is persistent.
 - The merge SQL is idempotent (dedups via `UNION`); run it per box against
-  `/workspace/src/emojistats-bsky/packages/backfill/data/ledger.sqlite`:
+  `/workspace/src/emojistats-bsky/rust/data/ledger/backfill.sqlite`:
   `UPDATE meta SET value = (SELECT json_group_array(h) FROM (SELECT value AS h FROM json_each((SELECT value FROM meta WHERE key='dead_hosts')) UNION SELECT 'atproto.brid.gy' UNION SELECT 'fed.brid.gy')) WHERE key='dead_hosts';`
 - Verify after with:
   `SELECT je.value FROM json_each((SELECT value FROM meta WHERE key='dead_hosts')) je WHERE je.value LIKE '%brid.gy%';` — it must list both.
@@ -332,10 +313,10 @@ Gotchas to respect:
 
 - The ledger is the only checkpoint. Kill any process at any moment — power
   loss included — and nothing is lost; in-flight repos simply re-fetch.
-- Normal crawler startup does not run the loaded-row ClickHouse digest audit:
-  `CRASH_RECONCILE_ON_STARTUP=false` by default because `posts FINAL` over the
-  hot table can pin the serving box during deploys. Turn it on only for an
-  explicit recovery audit; `bun run verify` is the normal acceptance gate.
+- Normal crawler startup does not run the loaded-row ClickHouse digest audit;
+  `posts FINAL` over the hot table can pin the serving box during deploys. Use
+  the Rust manifest/ClickHouse reconciliation path as the normal acceptance
+  gate.
 - Dirty flag: the crawler sets `crawl_dirty=1` in ledger meta at startup and
   `0` on clean exit. When `CRASH_RECONCILE_ON_STARTUP=true`, a dirty start
   reconciles the last hour of `loaded` rows against actual ClickHouse counts

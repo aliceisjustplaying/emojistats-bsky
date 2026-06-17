@@ -6,12 +6,14 @@ use std::{
 };
 
 use bytes::Bytes;
+use futures_util::StreamExt as _;
 use http::{HeaderMap, StatusCode};
 use jacquard_common::{stream::ByteStream, types::did::Did};
 
 use super::{
     AccountState, FetchByteBudget, FetchConfig, FetchError, RateLimitSnapshot, StreamLimits,
-    classify_http_error, parse_http_date_retry_after, spool_path, stream_to_file,
+    admission_body_bytes, classify_http_error, parse_http_date_retry_after, spool_path,
+    stream_to_file,
 };
 
 #[test]
@@ -128,6 +130,25 @@ fn default_config_sets_spool_dir_and_limits() {
     assert!(config.byte_budget.is_none());
 }
 
+#[test]
+fn unknown_content_length_admits_full_repo_cap() {
+    let headers = HeaderMap::new();
+
+    let bytes = admission_body_bytes(&headers, 10).unwrap();
+
+    assert_eq!(bytes, 10);
+}
+
+#[test]
+fn malformed_content_length_admits_full_repo_cap() {
+    let mut headers = HeaderMap::new();
+    headers.insert(http::header::CONTENT_LENGTH, "wat".parse().unwrap());
+
+    let bytes = admission_body_bytes(&headers, 10).unwrap();
+
+    assert_eq!(bytes, 10);
+}
+
 #[tokio::test]
 async fn byte_budget_blocks_until_prior_reservation_is_dropped() {
     let budget = FetchByteBudget::new(10);
@@ -209,6 +230,84 @@ async fn byte_budget_blocks_before_streaming_file() {
         .unwrap();
     assert_eq!(result, 3);
     assert_eq!(reservation.unwrap().charged_bytes(), 3);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn byte_budget_shrinks_admission_reservation_to_actual_bytes() {
+    let budget = FetchByteBudget::new(10);
+    let path = std::env::temp_dir().join(format!(
+        "emojistats-byte-budget-shrink-{}-{}.car",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let body = ByteStream::new(futures_util::stream::iter([Ok(Bytes::from_static(b"abc"))]));
+
+    let (bytes, reservation) = stream_to_file(
+        body,
+        &path,
+        StreamLimits {
+            chunk_idle_timeout: Duration::from_secs(1),
+            download_timeout: Duration::from_secs(10),
+            min_progress_bytes: 0,
+            min_progress_interval: Duration::from_secs(1),
+            max_bytes: 10,
+        },
+        8,
+        Some(&budget),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bytes, 3);
+    assert_eq!(reservation.unwrap().charged_bytes(), 3);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn small_body_with_slow_eof_does_not_fail_progress_floor() {
+    let path = std::env::temp_dir().join(format!(
+        "emojistats-small-slow-eof-{}-{}.car",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let body = ByteStream::new(
+        futures_util::stream::unfold(0_u8, |state| async move {
+            match state {
+                0 => Some((Ok(Bytes::from_static(b"abc")), 1)),
+                1 => {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    None
+                }
+                _ => None,
+            }
+        })
+        .boxed(),
+    );
+
+    let (bytes, _reservation) = stream_to_file(
+        body,
+        &path,
+        StreamLimits {
+            chunk_idle_timeout: Duration::from_secs(1),
+            download_timeout: Duration::from_secs(10),
+            min_progress_bytes: 16,
+            min_progress_interval: Duration::from_millis(10),
+            max_bytes: 10,
+        },
+        10,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(bytes, 3);
     std::fs::remove_file(path).unwrap();
 }
 

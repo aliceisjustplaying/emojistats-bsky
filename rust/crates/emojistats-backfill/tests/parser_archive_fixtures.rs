@@ -5,9 +5,9 @@ mod fixtures;
 use bytes::Bytes;
 use emojistats_backfill::{
     archive::{
-        ArchivePostRow, CompletenessClass, CreatedAtParseStatus, FetchMethod, RepoReceiptInput,
-        archive_rows_from_parsed_repo, build_repo_receipt, classify_created_at, current_normalizer,
-        hash_post_rows,
+        ArchiveCommitContext, ArchivePostRow, CompletenessClass, CreatedAtParseStatus, FetchMethod,
+        RepoReceiptInput, archive_rows_from_parsed_repo, build_repo_receipt, classify_created_at,
+        current_normalizer, hash_post_rows,
     },
     parse::{
         CompletenessClass as ParseCompletenessClass, ParseConfig, ParseError, parse_repo,
@@ -296,7 +296,10 @@ fn classifies_created_at_values_for_archive_rows() {
     assert_eq!(invalid.normalized, None);
     assert_eq!(future.status, CreatedAtParseStatus::Future);
     assert_eq!(future.raw.as_deref(), Some("9999-01-01T00:00:00Z"));
-    assert_eq!(future.normalized, None);
+    assert_eq!(
+        future.normalized.as_deref(),
+        Some("9999-01-01T00:00:00.000000Z")
+    );
     assert_eq!(valid.status, CreatedAtParseStatus::Valid);
     assert_eq!(
         valid.normalized.as_deref(),
@@ -403,6 +406,10 @@ fn archive_row_content_change_changes_receipt_hashes() {
 fn receipt_for(rows: &[ArchivePostRow]) -> emojistats_backfill::archive::RepoReceipt {
     build_repo_receipt(RepoReceiptInput {
         rows,
+        observed_at: ArchiveCommitContext::fetch_one_local().observed_at,
+        did: "did:plc:test",
+        fetch_method: FetchMethod::GetRepo,
+        completeness_class: CompletenessClass::ContentAddressedSnapshot,
         reachable_records_count: u64::try_from(rows.len()).expect("row count should fit u64"),
         reachable_post_records_count: u64::try_from(rows.len()).expect("row count should fit u64"),
         post_decode_error_count: 0,

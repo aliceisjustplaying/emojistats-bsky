@@ -1,8 +1,12 @@
 //! Derive-lane DTOs for turning committed archive manifests into `ClickHouse` loads.
 
+use std::collections::HashMap;
+
 use sha2::{Digest, Sha256};
 
-use crate::archive::{ArchivePostRow, EmojiProjectionRow, LocalManifestEntry, NormalizerVersion};
+use crate::archive::{
+    ArchivePostRow, EmojiProjectionRow, LocalManifestEntry, NormalizerVersion, PostDataset,
+};
 
 /// Source marker for rows produced by the v2 backfill derive lane.
 pub const BACKFILL_DERIVE_SOURCE: &str = "backfill-v2-derive";
@@ -13,7 +17,10 @@ pub struct DeriveManifestIdentity {
     pub run_id: String,
     pub shard: String,
     pub file_sequence: u64,
+    pub did: String,
     pub dataset: String,
+    pub fetch_method: String,
+    pub completeness_class: String,
     pub content_hash: String,
     pub receipt_hash: String,
     pub schema_version: u16,
@@ -27,6 +34,10 @@ pub struct TotalPostCounterInput {
     pub run_id: String,
     pub shard: String,
     pub file_sequence: u64,
+    pub did: String,
+    pub dataset: String,
+    pub fetch_method: String,
+    pub completeness_class: String,
     pub receipt_hash: String,
     pub normalizer: NormalizerVersion,
     pub posts_processed: u64,
@@ -57,7 +68,9 @@ pub struct ClickHouseDeriveBatch {
 pub struct BorrowedEmojiProjectionRow<'a> {
     pub did: &'a str,
     pub rkey: &'a str,
+    pub cid: &'a str,
     pub created_at_normalized: Option<&'a str>,
+    pub created_at_parse_status: crate::archive::CreatedAtParseStatus,
     pub emoji: &'a str,
     pub occurrences: u64,
     pub langs: &'a [String],
@@ -90,7 +103,7 @@ pub struct DeriveCheckpointRecord {
 }
 
 /// Derive-lane failures before any `ClickHouse` network write is attempted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DeriveError {
     #[error(
         "manifest row_count {manifest_rows} did not match verified archive row count {archive_rows}"
@@ -101,6 +114,8 @@ pub enum DeriveError {
     },
     #[error("resource counter overflow: {field}")]
     CountOverflow { field: &'static str },
+    #[error("unsupported post dataset for derive: {dataset}")]
+    UnsupportedDataset { dataset: String },
 }
 
 impl DeriveCheckpointKey {
@@ -161,7 +176,7 @@ pub fn derive_clickhouse_batch(
     input: DeriveBatchInput<'_>,
 ) -> Result<ClickHouseDeriveBatch, DeriveError> {
     validate_manifest_row_count(input.manifest, input.archive_rows)?;
-    let manifest_identity = manifest_identity(input.manifest);
+    let manifest_identity = manifest_identity(input.manifest)?;
     let emoji_rows = derive_emoji_projection_rows(input.archive_rows)?;
     let total_post_counter = total_post_counter_input(input.manifest, input.archive_rows)?;
     let dedupe_token = derive_dedupe_token(&manifest_identity, &emoji_rows, &total_post_counter)?;
@@ -175,17 +190,46 @@ pub fn derive_clickhouse_batch(
 }
 
 /// Extract the stable manifest identity used by derive ledgers.
-#[must_use]
-pub fn manifest_identity(manifest: &LocalManifestEntry) -> DeriveManifestIdentity {
-    DeriveManifestIdentity {
+///
+/// # Errors
+///
+/// Returns [`DeriveError`] when the committed manifest names an unsupported post dataset.
+pub fn manifest_identity(
+    manifest: &LocalManifestEntry,
+) -> Result<DeriveManifestIdentity, DeriveError> {
+    let dataset = post_dataset(manifest)?;
+    Ok(DeriveManifestIdentity {
         run_id: manifest.run_id.clone(),
         shard: manifest.shard.clone(),
         file_sequence: manifest.file_sequence,
+        did: manifest.did.clone(),
         dataset: manifest.dataset.clone(),
+        fetch_method: fetch_method_str(dataset).to_owned(),
+        completeness_class: completeness_class_str(dataset).to_owned(),
         content_hash: manifest.content_hash.clone(),
         receipt_hash: manifest.receipt_hash.clone(),
         schema_version: manifest.schema_version,
         normalizer: manifest.normalizer.clone(),
+    })
+}
+
+fn post_dataset(manifest: &LocalManifestEntry) -> Result<PostDataset, DeriveError> {
+    PostDataset::from_dataset(&manifest.dataset).ok_or_else(|| DeriveError::UnsupportedDataset {
+        dataset: manifest.dataset.clone(),
+    })
+}
+
+const fn fetch_method_str(dataset: PostDataset) -> &'static str {
+    match dataset {
+        PostDataset::RawArchivePosts => "get_repo",
+        PostDataset::CollectionPaginatedPosts => "list_records",
+    }
+}
+
+const fn completeness_class_str(dataset: PostDataset) -> &'static str {
+    match dataset {
+        PostDataset::RawArchivePosts => "content_addressed_snapshot",
+        PostDataset::CollectionPaginatedPosts => "collection_paginated",
     }
 }
 
@@ -218,11 +262,16 @@ pub fn total_post_counter_input(
     manifest: &LocalManifestEntry,
     rows: &[ArchivePostRow],
 ) -> Result<TotalPostCounterInput, DeriveError> {
+    let dataset = post_dataset(manifest)?;
     Ok(TotalPostCounterInput {
         source: BACKFILL_DERIVE_SOURCE.to_owned(),
         run_id: manifest.run_id.clone(),
         shard: manifest.shard.clone(),
         file_sequence: manifest.file_sequence,
+        did: manifest.did.clone(),
+        dataset: manifest.dataset.clone(),
+        fetch_method: fetch_method_str(dataset).to_owned(),
+        completeness_class: completeness_class_str(dataset).to_owned(),
         receipt_hash: manifest.receipt_hash.clone(),
         normalizer: manifest.normalizer.clone(),
         posts_processed: count_rows(rows)?,
@@ -276,7 +325,9 @@ pub fn emoji_projection_rows_for_post(
         .map(|row| EmojiProjectionRow {
             did: row.did.to_owned(),
             rkey: row.rkey.to_owned(),
+            cid: row.cid.to_owned(),
             created_at_normalized: row.created_at_normalized.map(ToOwned::to_owned),
+            created_at_parse_status: row.created_at_parse_status,
             emoji: row.emoji.to_owned(),
             occurrences: row.occurrences,
             langs: row.langs.to_vec(),
@@ -292,34 +343,62 @@ pub fn emoji_projection_rows_for_post(
 pub fn borrowed_emoji_projection_rows_for_post(
     row: &ArchivePostRow,
 ) -> Result<Vec<BorrowedEmojiProjectionRow<'_>>, DeriveError> {
-    let mut rows = Vec::new();
+    const MAP_THRESHOLD: usize = 16;
+    let mut rows: Vec<BorrowedEmojiProjectionRow<'_>> = Vec::new();
+    if row.emoji_sequence.len() <= MAP_THRESHOLD {
+        for emoji in &row.emoji_sequence {
+            if let Some(existing) =
+                rows.iter_mut()
+                    .find(|candidate: &&mut BorrowedEmojiProjectionRow<'_>| {
+                        candidate.emoji == emoji.as_str()
+                    })
+            {
+                increment_occurrences(&mut existing.occurrences)?;
+            } else {
+                rows.push(borrowed_projection_row(row, emoji.as_str(), 1));
+            }
+        }
+        return Ok(rows);
+    }
+
+    let mut indexes: HashMap<&str, usize> = HashMap::new();
     for emoji in &row.emoji_sequence {
-        if let Some(existing) =
-            rows.iter_mut()
-                .find(|candidate: &&mut BorrowedEmojiProjectionRow<'_>| {
-                    candidate.emoji == emoji.as_str()
-                })
-        {
-            existing.occurrences =
-                existing
-                    .occurrences
-                    .checked_add(1)
-                    .ok_or(DeriveError::CountOverflow {
-                        field: "emoji_occurrences",
-                    })?;
+        if let Some(index) = indexes.get(emoji.as_str()).copied() {
+            let existing = rows.get_mut(index).ok_or(DeriveError::CountOverflow {
+                field: "emoji_row_index",
+            })?;
+            increment_occurrences(&mut existing.occurrences)?;
         } else {
-            rows.push(BorrowedEmojiProjectionRow {
-                did: row.did.as_str(),
-                rkey: row.rkey.as_str(),
-                created_at_normalized: row.created_at_normalized.as_deref(),
-                emoji: emoji.as_str(),
-                occurrences: 1,
-                langs: &row.langs,
-            });
+            indexes.insert(emoji.as_str(), rows.len());
+            rows.push(borrowed_projection_row(row, emoji.as_str(), 1));
         }
     }
 
     Ok(rows)
+}
+
+fn borrowed_projection_row<'a>(
+    row: &'a ArchivePostRow,
+    emoji: &'a str,
+    occurrences: u64,
+) -> BorrowedEmojiProjectionRow<'a> {
+    BorrowedEmojiProjectionRow {
+        did: row.did.as_str(),
+        rkey: row.rkey.as_str(),
+        cid: row.cid.as_str(),
+        created_at_normalized: row.created_at_normalized.as_deref(),
+        created_at_parse_status: row.created_at_parse_status,
+        emoji,
+        occurrences,
+        langs: &row.langs,
+    }
+}
+
+fn increment_occurrences(value: &mut u64) -> Result<(), DeriveError> {
+    *value = value.checked_add(1).ok_or(DeriveError::CountOverflow {
+        field: "emoji_occurrences",
+    })?;
+    Ok(())
 }
 
 fn count_rows(rows: &[ArchivePostRow]) -> Result<u64, DeriveError> {
@@ -356,7 +435,10 @@ fn hash_manifest_identity(
     hasher: &mut Sha256,
     identity: &DeriveManifestIdentity,
 ) -> Result<(), DeriveError> {
+    hash_field(hasher, &identity.did)?;
     hash_field(hasher, &identity.dataset)?;
+    hash_field(hasher, &identity.fetch_method)?;
+    hash_field(hasher, &identity.completeness_class)?;
     hash_field(hasher, &identity.content_hash)?;
     hash_field(hasher, &identity.receipt_hash)?;
     hash_u16(hasher, identity.schema_version);
@@ -367,7 +449,9 @@ fn hash_manifest_identity(
 fn hash_emoji_row(hasher: &mut Sha256, row: &EmojiProjectionRow) -> Result<(), DeriveError> {
     hash_field(hasher, &row.did)?;
     hash_field(hasher, &row.rkey)?;
+    hash_field(hasher, &row.cid)?;
     hash_optional_field(hasher, row.created_at_normalized.as_deref())?;
+    hash_field(hasher, row.created_at_parse_status.as_str())?;
     hash_field(hasher, &row.emoji)?;
     hash_u64(hasher, row.occurrences);
     for lang in &row.langs {
@@ -381,6 +465,10 @@ fn hash_total_post_counter(
     counter: &TotalPostCounterInput,
 ) -> Result<(), DeriveError> {
     hash_field(hasher, &counter.source)?;
+    hash_field(hasher, &counter.did)?;
+    hash_field(hasher, &counter.dataset)?;
+    hash_field(hasher, &counter.fetch_method)?;
+    hash_field(hasher, &counter.completeness_class)?;
     hash_field(hasher, &counter.receipt_hash)?;
     hash_normalizer(hasher, &counter.normalizer)?;
     hash_u64(hasher, counter.posts_processed);
@@ -478,6 +566,7 @@ mod tests {
             run_id: "run-1".to_owned(),
             shard: "shard0".to_owned(),
             file_sequence: 7,
+            did: "did:plc:test".to_owned(),
             dataset: "raw_archive_posts".to_owned(),
             local_path: PathBuf::from("/tmp/archive.parquet"),
             row_count,
@@ -486,7 +575,8 @@ mod tests {
             min_created_at_normalized: Some("2026-06-15T00:00:00Z".to_owned()),
             max_created_at_normalized: Some("2026-06-15T01:00:00Z".to_owned()),
             receipt_hash: "receipt-hash".to_owned(),
-            schema_version: 1,
+            repo_receipt_path: None,
+            schema_version: 2,
             normalizer: normalizer(),
         }
     }
@@ -510,6 +600,7 @@ mod tests {
             .get(1)
             .expect("second emoji row should exist");
         assert_eq!(first.emoji, "✅");
+        assert_eq!(first.cid, "bafy-a");
         assert_eq!(first.occurrences, 2);
         assert_eq!(second.emoji, "🔥");
         assert_eq!(batch.total_post_counter.posts_processed, 2);
@@ -584,22 +675,22 @@ mod tests {
 
     #[test]
     fn manifest_identity_omits_local_path() {
-        let first = manifest_identity(&manifest(1));
+        let first = manifest_identity(&manifest(1)).expect("manifest identity");
         let mut second_manifest = manifest(1);
         second_manifest.local_path = PathBuf::from("/different/local/path.parquet");
-        let second = manifest_identity(&second_manifest);
+        let second = manifest_identity(&second_manifest).expect("manifest identity");
 
         assert_eq!(first, second);
     }
 
     #[test]
     fn checkpoint_keys_are_stable_across_replay_manifest_sequence() {
-        let first = manifest_identity(&manifest(1));
+        let first = manifest_identity(&manifest(1)).expect("manifest identity");
         let mut replay_manifest = manifest(1);
         replay_manifest.run_id = "run-2".to_owned();
         replay_manifest.shard = "shard9".to_owned();
         replay_manifest.file_sequence = 99;
-        let replay = manifest_identity(&replay_manifest);
+        let replay = manifest_identity(&replay_manifest).expect("manifest identity");
 
         assert_eq!(
             DeriveCheckpointKey::emoji_serving(&first, 2),

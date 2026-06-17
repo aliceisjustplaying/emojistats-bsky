@@ -163,7 +163,7 @@ fn operator_deferred_rolls_back_claim_attempt() {
     )
     .unwrap();
 
-    assert_eq!(deferred.status, RepoLedgerStatus::Throttled);
+    assert_eq!(deferred.status, RepoLedgerStatus::OperatorDeferred);
     assert_eq!(deferred.attempts, 0);
     assert_eq!(deferred.next_attempt_after, None);
     assert!(!deferred.can_claim_at(now + Duration::from_secs(86_400)));

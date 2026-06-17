@@ -35,6 +35,10 @@ impl From<&RepoLedgerStatus> for StoredStatus {
                 status: "throttled",
                 terminal_account_state: None,
             },
+            RepoLedgerStatus::OperatorDeferred => Self {
+                status: "operator_deferred",
+                terminal_account_state: None,
+            },
             RepoLedgerStatus::ResourceLimited => Self {
                 status: "resource_limited",
                 terminal_account_state: None,
@@ -360,6 +364,7 @@ fn parse_status(
         "succeeded" => RepoLedgerStatus::Succeeded,
         "retryable_failure" => RepoLedgerStatus::RetryableFailure,
         "throttled" => RepoLedgerStatus::Throttled,
+        "operator_deferred" => RepoLedgerStatus::OperatorDeferred,
         "resource_limited" => RepoLedgerStatus::ResourceLimited,
         "terminal_account" => {
             let state =

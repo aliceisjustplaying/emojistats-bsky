@@ -6,7 +6,7 @@ use jacquard_repo::mst::NodeData;
 use super::{
     ParseConfig, ParseDeadline, ParseError, ParseVisitError, PostRecord, ProfileRecord, RkeyDigest,
     car::IndexedCarBlockStore,
-    checked_increment, ensure_u64_at_most,
+    checked_add_u64, checked_increment, ensure_u64_at_most,
     record::{DecodeDigest, RecordSinks, extract_known_record, update_digest, validate_repo_key},
 };
 
@@ -136,7 +136,8 @@ impl<'a> StreamingMstCursor<'a> {
             .ok_or_else(|| ParseError::MissingBlock {
                 cid: cid.to_string(),
             })?;
-        self.stack.push(StreamingMstFrame::decode(bytes.as_ref())?);
+        self.stack
+            .push(StreamingMstFrame::decode(bytes.as_ref(), config)?);
         Ok(())
     }
 
@@ -167,16 +168,25 @@ struct StreamingMstFrame {
 }
 
 impl StreamingMstFrame {
-    fn decode(bytes: &[u8]) -> Result<Self, ParseError> {
+    fn decode(bytes: &[u8], config: ParseConfig) -> Result<Self, ParseError> {
         let node: NodeData = serde_ipld_dagcbor::from_slice(bytes).map_err(|source| {
             ParseError::MalformedCar(format!("failed to decode MST node: {source}"))
         })?;
         let mut items = Vec::new();
+        let mut decoded_entries = 0_u64;
+        let mut decoded_key_bytes = 0_u64;
         if let Some(left) = node.left {
             items.push(StreamingMstItem::Tree(left));
         }
         let mut last_key = String::new();
         for entry in node.entries {
+            decoded_entries = checked_increment(decoded_entries, "mst_node_entries")?;
+            ensure_u64_at_most(
+                decoded_entries,
+                config.max_mst_node_entries,
+                "max_mst_node_entries",
+                "raise parser max_mst_node_entries only after inspecting the repo MST",
+            )?;
             let prefix_len = usize::from(entry.prefix_len);
             if !last_key.is_char_boundary(prefix_len) || prefix_len > last_key.len() {
                 return Err(ParseError::MalformedCar(
@@ -187,6 +197,19 @@ impl StreamingMstFrame {
                 ParseError::MalformedCar(format!("invalid UTF-8 in MST key suffix: {source}"))
             })?;
             let key = format!("{}{}", &last_key[..prefix_len], suffix);
+            decoded_key_bytes = checked_add_u64(
+                decoded_key_bytes,
+                u64::try_from(key.len()).map_err(|_err| ParseError::CarLengthOverflow {
+                    field: "mst_node_key_bytes",
+                })?,
+                "mst_node_key_bytes",
+            )?;
+            ensure_u64_at_most(
+                decoded_key_bytes,
+                config.max_mst_node_key_bytes,
+                "max_mst_node_key_bytes",
+                "raise parser max_mst_node_key_bytes only after inspecting the repo MST",
+            )?;
             items.push(StreamingMstItem::Leaf {
                 key: key.clone(),
                 cid: entry.value,

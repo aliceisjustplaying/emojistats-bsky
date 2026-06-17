@@ -4,7 +4,7 @@ use std::{
     net::{TcpListener, TcpStream},
     path::PathBuf,
     thread,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use jacquard_common::deps::fluent_uri::Uri;
@@ -87,6 +87,52 @@ fn invalid_record_is_counted_as_decode_error() {
 }
 
 #[test]
+fn duplicate_rkey_is_a_protocol_error() {
+    let archive_dir = temp_dir("list-records-duplicate-rkey");
+    let did = "did:plc:testrepo";
+    let pages = vec![ListRecordsPage {
+        records: vec![
+            post_record(did, "3kabc", TEST_CID_A, "hello"),
+            post_record(did, "3kabc", TEST_CID_B, "edited"),
+        ],
+        cursor: None,
+    }];
+
+    let error = archive_list_records_pages(did, &archive_dir, pages, ListRecordsConfig::default())
+        .expect_err("duplicate rkey should fail");
+
+    assert!(
+        matches!(error, ListRecordsError::Protocol(message) if message.contains("duplicate listRecords rkey 3kabc"))
+    );
+    fs::remove_dir_all(archive_dir).expect("remove archive dir");
+}
+
+#[test]
+fn duplicate_rkey_is_rejected_before_decode() {
+    let archive_dir = temp_dir("list-records-duplicate-before-decode");
+    let did = "did:plc:testrepo";
+    let pages = vec![ListRecordsPage {
+        records: vec![
+            ListRecordsRecord {
+                uri: format!("at://{did}/{POST_COLLECTION}/3kabc"),
+                cid: None,
+                value: json!({"$type": POST_COLLECTION, "text": "missing fields"}),
+            },
+            post_record(did, "3kabc", TEST_CID_A, "valid later"),
+        ],
+        cursor: None,
+    }];
+
+    let error = archive_list_records_pages(did, &archive_dir, pages, ListRecordsConfig::default())
+        .expect_err("duplicate rkey should fail before decode");
+
+    assert!(
+        matches!(error, ListRecordsError::Protocol(message) if message.contains("duplicate listRecords rkey 3kabc"))
+    );
+    fs::remove_dir_all(archive_dir).expect("remove archive dir");
+}
+
+#[test]
 fn invalid_record_cid_is_counted_as_decode_error() {
     let archive_dir = temp_dir("list-records-invalid-cid");
     let did = "did:plc:testrepo";
@@ -135,6 +181,52 @@ fn missing_record_cid_is_counted_as_decode_error() {
     assert_eq!(output.records, 1);
     assert_eq!(output.archived_posts, 0);
     assert_eq!(output.decode_errors, 1);
+    fs::remove_dir_all(archive_dir).expect("remove archive dir");
+}
+
+#[test]
+fn decode_error_cap_is_loud() {
+    let archive_dir = temp_dir("list-records-decode-cap");
+    let did = "did:plc:testrepo";
+    let pages = vec![ListRecordsPage {
+        records: vec![
+            ListRecordsRecord {
+                uri: format!("at://{did}/{POST_COLLECTION}/3kabc"),
+                cid: None,
+                value: json!({"$type": POST_COLLECTION, "text": "first"}),
+            },
+            ListRecordsRecord {
+                uri: format!("at://{did}/{POST_COLLECTION}/3kabd"),
+                cid: None,
+                value: json!({"$type": POST_COLLECTION, "text": "second"}),
+            },
+        ],
+        cursor: None,
+    }];
+
+    let error = archive_list_records_pages(
+        did,
+        &archive_dir,
+        pages,
+        ListRecordsConfig {
+            max_decode_errors: 1,
+            ..ListRecordsConfig::default()
+        },
+    )
+    .expect_err("decode cap should fail");
+
+    match error {
+        ListRecordsError::ResourceLimitExceeded {
+            limit,
+            observed,
+            max,
+        } => {
+            assert_eq!(limit, "max_decode_errors");
+            assert_eq!(observed, 2);
+            assert_eq!(max, 1);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
     fs::remove_dir_all(archive_dir).expect("remove archive dir");
 }
 
@@ -282,6 +374,90 @@ async fn rate_limit_observer_runs_after_each_fetched_page() {
     );
     assert_eq!(output.archived_posts, 2);
     assert_eq!(handle.join().expect("server thread").len(), 2);
+    fs::remove_dir_all(archive_dir).expect("remove archive dir");
+}
+
+#[tokio::test]
+async fn shared_host_pacer_reserves_each_page_request() {
+    let archive_dir = temp_dir("list-records-host-pacing");
+    let did_str = "did:plc:testrepo";
+    let first_record = post_record(did_str, "3kabc", TEST_CID_A, "hello");
+    let second_record = post_record(did_str, "3kabd", TEST_CID_B, "second");
+    let (base_url, handle) = spawn_list_records_server(vec![
+        TestResponse::json_page(Some(&first_record), Some("next"), None, true),
+        TestResponse::json_page(Some(&second_record), None, None, true),
+    ]);
+    let http = Client::new();
+    let pds = Uri::parse(base_url).expect("parse pds").clone();
+    let did = Did::new_owned(did_str).expect("parse did");
+    let pacer = HostPacer::shared();
+    let started = Instant::now();
+
+    let output = fetch_and_archive_list_records_with_precommit_check(
+        &http,
+        &pds,
+        &did,
+        did_str,
+        &archive_dir,
+        ArchiveCommitContext::fetch_one_local(),
+        ArchiveStorageConfig::Local,
+        ListRecordsConfig::default(),
+        Some(ListRecordsHostPacing::new(
+            &pacer,
+            "pds.example",
+            Some(Duration::from_millis(40)),
+        )),
+        |_rate_limit| {},
+        || Ok(()),
+    )
+    .await
+    .expect("fetch and archive listRecords");
+
+    assert!(started.elapsed() >= Duration::from_millis(30));
+    assert_eq!(output.archived_posts, 2);
+    assert_eq!(handle.join().expect("server thread").len(), 2);
+    fs::remove_dir_all(archive_dir).expect("remove archive dir");
+}
+
+#[tokio::test]
+async fn archive_ms_tracks_finalization_not_fetch_wall() {
+    let archive_dir = temp_dir("list-records-archive-ms");
+    let did_str = "did:plc:testrepo";
+    let body = json!({"records": [], "cursor": null}).to_string();
+    let (base_url, handle) = spawn_list_records_server(vec![TestResponse::raw_delayed(
+        body,
+        None,
+        true,
+        Duration::from_millis(100),
+    )]);
+    let http = Client::new();
+    let pds = Uri::parse(base_url).expect("parse pds").clone();
+    let did = Did::new_owned(did_str).expect("parse did");
+    let started = Instant::now();
+
+    let output = fetch_and_archive_list_records_with_precommit_check(
+        &http,
+        &pds,
+        &did,
+        did_str,
+        &archive_dir,
+        ArchiveCommitContext::fetch_one_local(),
+        ArchiveStorageConfig::Local,
+        ListRecordsConfig::default(),
+        None,
+        |_rate_limit| {},
+        || {
+            thread::sleep(Duration::from_millis(20));
+            Ok(())
+        },
+    )
+    .await
+    .expect("fetch and archive listRecords");
+    let wall_ms = u64::try_from(started.elapsed().as_millis()).expect("elapsed fits");
+
+    assert!(output.archive_ms >= 15);
+    assert!(output.archive_ms.saturating_add(50) < wall_ms);
+    assert_eq!(handle.join().expect("server thread").len(), 1);
     fs::remove_dir_all(archive_dir).expect("remove archive dir");
 }
 

@@ -8,8 +8,9 @@ use std::{
 
 use emojistats_backfill::{
     archive::{
-        ArchiveCommitContext, ArchivePostRow, CreatedAtParseStatus, RepoReceipt, RepoReceiptInput,
-        build_repo_receipt, current_normalizer, hash_profile_record, write_archive_artifacts,
+        ArchiveCommitContext, ArchivePostRow, CompletenessClass, CreatedAtParseStatus, FetchMethod,
+        RepoReceipt, RepoReceiptInput, build_repo_receipt, current_normalizer, hash_profile_record,
+        write_archive_artifacts,
     },
     commit::{ManifestEntry, Receipt},
     parse::ProfileRecord,
@@ -114,6 +115,10 @@ fn assert_path_name_shape(path: &Path, prefix: &str, suffix: &str) {
 fn receipt_for(rows: &[ArchivePostRow], profile: &ProfileRecord) -> RepoReceipt {
     build_repo_receipt(RepoReceiptInput {
         rows,
+        observed_at: ArchiveCommitContext::fetch_one_local().observed_at,
+        did: "did:plc:test",
+        fetch_method: FetchMethod::GetRepo,
+        completeness_class: CompletenessClass::ContentAddressedSnapshot,
         reachable_records_count: u64::try_from(rows.len()).expect("row count should fit u64"),
         reachable_post_records_count: u64::try_from(rows.len()).expect("row count should fit u64"),
         post_decode_error_count: 0,

@@ -107,7 +107,7 @@ pub fn parse_and_archive_spooled_repo(
             emoji_rows: artifacts.emoji_rows,
         },
         artifacts: ProcessedRepoArtifacts {
-            receipt_hash: receipt.post_rows_hash,
+            post_rows_hash: receipt.post_rows_hash,
             parquet_path: artifacts.parquet_path,
             receipt_path: artifacts.receipt_path,
             manifest_path: artifacts.manifest_path,

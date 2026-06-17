@@ -33,7 +33,10 @@ use crate::{
 
 const POST_COLLECTION: &str = "app.bsky.feed.post";
 const PARTIAL_RECORD_STATUS: &str = "typed_decode_failed";
-const ARCHIVE_SCHEMA_VERSION: u16 = 1;
+pub const RAW_ARCHIVE_POSTS_DATASET: &str = "raw_archive_posts";
+pub const COLLECTION_PAGINATED_POSTS_DATASET: &str = "collection_paginated_posts";
+pub const NONCANONICAL_POSTS_DATASET: &str = "noncanonical_posts";
+pub const ARCHIVE_SCHEMA_VERSION: u16 = 2;
 const PARQUET_BATCH_ROWS: usize = 65_536;
 
 /// Data-model-lossless post row before `Parquet` encoding.
@@ -89,7 +92,9 @@ impl ArchivePostRowsHasher {
 pub struct EmojiProjectionRow {
     pub did: String,
     pub rkey: String,
+    pub cid: String,
     pub created_at_normalized: Option<String>,
+    pub created_at_parse_status: CreatedAtParseStatus,
     pub emoji: String,
     pub occurrences: u64,
     pub langs: Vec<String>,
@@ -117,6 +122,7 @@ pub enum CreatedAtParseStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoReceipt {
     pub observed_at: String,
+    pub did: String,
     pub fetch_method: FetchMethod,
     pub completeness_class: CompletenessClass,
     pub reachable_records_count: u64,
@@ -141,6 +147,10 @@ pub struct RepoReceipt {
 #[derive(Debug, Clone)]
 pub struct RepoReceiptInput<'a> {
     pub rows: &'a [ArchivePostRow],
+    pub observed_at: DateTime<Utc>,
+    pub did: &'a str,
+    pub fetch_method: FetchMethod,
+    pub completeness_class: CompletenessClass,
     pub reachable_records_count: u64,
     pub reachable_post_records_count: u64,
     pub post_decode_error_count: u64,
@@ -164,12 +174,54 @@ pub enum CompletenessClass {
     CollectionPaginated,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostDataset {
+    RawArchivePosts,
+    CollectionPaginatedPosts,
+}
+
+impl PostDataset {
+    #[must_use]
+    pub const fn from_dataset(value: &str) -> Option<Self> {
+        match value.as_bytes() {
+            b"raw_archive_posts" => Some(Self::RawArchivePosts),
+            b"collection_paginated_posts" => Some(Self::CollectionPaginatedPosts),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RawArchivePosts => RAW_ARCHIVE_POSTS_DATASET,
+            Self::CollectionPaginatedPosts => COLLECTION_PAGINATED_POSTS_DATASET,
+        }
+    }
+
+    #[must_use]
+    pub const fn fetch_method(self) -> FetchMethod {
+        match self {
+            Self::RawArchivePosts => FetchMethod::GetRepo,
+            Self::CollectionPaginatedPosts => FetchMethod::ListRecords,
+        }
+    }
+
+    #[must_use]
+    pub const fn completeness_class(self) -> CompletenessClass {
+        match self {
+            Self::RawArchivePosts => CompletenessClass::ContentAddressedSnapshot,
+            Self::CollectionPaginatedPosts => CompletenessClass::CollectionPaginated,
+        }
+    }
+}
+
 /// Manifest entry projected into local paths for smoke/derive compatibility.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalManifestEntry {
     pub run_id: String,
     pub shard: String,
     pub file_sequence: u64,
+    pub did: String,
     pub dataset: String,
     pub local_path: PathBuf,
     pub row_count: u64,
@@ -178,6 +230,7 @@ pub struct LocalManifestEntry {
     pub min_created_at_normalized: Option<String>,
     pub max_created_at_normalized: Option<String>,
     pub receipt_hash: String,
+    pub repo_receipt_path: Option<PathBuf>,
     pub schema_version: u16,
     pub normalizer: NormalizerVersion,
 }
@@ -340,7 +393,11 @@ fn classify_present_created_at(raw: &str, observed_at: DateTime<Utc>) -> Classif
     match DateTime::parse_from_rfc3339(raw) {
         Ok(timestamp) if timestamp.with_timezone(&Utc) > observed_at => ClassifiedCreatedAt {
             raw: Some(raw.to_owned()),
-            normalized: None,
+            normalized: Some(
+                timestamp
+                    .with_timezone(&Utc)
+                    .to_rfc3339_opts(SecondsFormat::Micros, true),
+            ),
             status: CreatedAtParseStatus::Future,
         },
         Ok(timestamp) => ClassifiedCreatedAt {
@@ -442,7 +499,8 @@ fn sync_parent_dir(path: &Path) -> Result<(), ArchiveError> {
 }
 
 impl CreatedAtParseStatus {
-    const fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Valid => "valid",
             Self::Missing => "missing",

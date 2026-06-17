@@ -6,13 +6,14 @@ use super::{
     Path, PathBuf, PostRecord, PostRecordBody, ProfileRecord, RawPartialPostRecord, RepoReceipt,
     Request, Schema, Sha256, StorageBoxArchiveConfig, TempPath, Utc, Write,
     archive_io::{
-        append_hash_field_frame, append_normalizer_frames, archive_error_from_derive,
-        archive_schema, build_commit_metadata, commit_profile_sidecar, extract_emojis,
-        framed_fields, hash_extras_json, hash_field, hash_field_bytes, hash_optional_field,
-        hash_post_row_into, hash_string_slice, json_bytes, local_manifest_from_committed,
-        parquet_writer_properties, post_record_batch, profile_sidecar_request, record_extras_json,
-        stable_artifact_stem, stable_repo_receipt_name, update_min_max_created_at,
-        write_emoji_projection_jsonl, write_json_pretty, write_posts_parquet_to_writer,
+        ProfileSidecarCommitPaths, append_hash_field_frame, append_normalizer_frames,
+        archive_error_from_derive, archive_schema, build_commit_metadata, commit_profile_sidecar,
+        extract_emojis, framed_fields, hash_extras_json, hash_field, hash_field_bytes,
+        hash_optional_field, hash_post_row_into, hash_string_slice, json_bytes,
+        local_manifest_from_committed, parquet_writer_properties, post_record_batch,
+        profile_sidecar_request, receipt_dataset, record_extras_json, stable_artifact_stem,
+        stable_repo_receipt_name, update_min_max_created_at, write_emoji_projection_jsonl,
+        write_json_pretty, write_posts_parquet_to_writer,
     },
     borrowed_emoji_projection_rows_for_post, classify_created_at_observed_at,
     derive_emoji_projection_rows, format_observed_at, fs, hash_serialized_json,
@@ -226,10 +227,13 @@ pub fn write_archive_artifacts(
 ) -> Result<ArchiveArtifacts, ArchiveError> {
     fs::create_dir_all(output_dir)?;
     let receipt_hash = hash_serialized_json(receipt)?;
-    let artifact_stem = stable_artifact_stem(did, "raw_archive_posts", &receipt.post_rows_hash);
+    let artifact_stem =
+        stable_artifact_stem(did, receipt_dataset(receipt), &receipt.post_rows_hash);
     let parquet_object_path = PathBuf::from(format!("{artifact_stem}.posts.parquet"));
     let receipt_path = output_dir.join(stable_repo_receipt_name(did, &receipt_hash));
-    let object_receipt_object_path = PathBuf::from(format!("{artifact_stem}.object-receipt.json"));
+    let object_receipt_object_path = PathBuf::from(format!(
+        "{artifact_stem}.{receipt_hash}.object-receipt.json"
+    ));
     let manifest_object_path = PathBuf::from(format!("{artifact_stem}.manifest.jsonl"));
     let emoji_projection_stem =
         stable_artifact_stem(did, "emoji_projection", &receipt.emoji_projection_hash);
@@ -240,19 +244,30 @@ pub fn write_archive_artifacts(
         receipt.profile_row_hash.as_deref().unwrap_or(&receipt_hash),
     );
     let profile_sidecar_object_path = PathBuf::from(format!("{profile_stem}.profile.json"));
-    let profile_sidecar_receipt_object_path =
-        PathBuf::from(format!("{profile_stem}.profile.object-receipt.json"));
+    let profile_sidecar_receipt_object_path = PathBuf::from(format!(
+        "{profile_stem}.{receipt_hash}.profile.object-receipt.json"
+    ));
     let profile_sidecar_manifest_object_path =
         PathBuf::from(format!("{profile_stem}.profile.manifest.jsonl"));
 
     write_temp_idempotent(&receipt_path, |path| write_json_pretty(path, receipt))?;
     let store = LocalStore::new(output_dir);
+    let mut commit_metadata = build_commit_metadata(rows, receipt, commit_context)?;
+    commit_metadata.repo_receipt_path = Some(
+        receipt_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(ArchiveError::CountOverflow {
+                field: "repo_receipt_file_name",
+            })?
+            .to_owned(),
+    );
     let commit_request = Request {
         object_path: parquet_object_path,
         receipt_path: object_receipt_object_path,
         manifest_path: manifest_object_path,
         manifest_mode: ManifestMode::AppendJsonl,
-        metadata: build_commit_metadata(rows, receipt, commit_context)?,
+        metadata: commit_metadata,
     };
     let committed = store.commit(&commit_request, |file| {
         write_posts_parquet_to_writer(file, rows)
@@ -272,9 +287,12 @@ pub fn write_archive_artifacts(
         .map(|profile| {
             commit_profile_sidecar(
                 &store,
-                profile_sidecar_object_path,
-                profile_sidecar_receipt_object_path,
-                profile_sidecar_manifest_object_path,
+                ProfileSidecarCommitPaths {
+                    object_path: profile_sidecar_object_path,
+                    receipt_path: profile_sidecar_receipt_object_path,
+                    manifest_path: profile_sidecar_manifest_object_path,
+                    manifest_mode: ManifestMode::AppendJsonl,
+                },
                 profile,
                 receipt,
                 commit_context,
@@ -544,13 +562,7 @@ impl StreamingArchiveSink {
             .join(stable_repo_receipt_name(&self.did, &receipt_hash));
         write_temp_idempotent(&receipt_path, |path| write_json_pretty(path, &receipt))?;
         let committed_posts =
-            match self.commit_streaming_posts(&receipt_hash, &artifact_stem, dataset) {
-                Ok(committed) => committed,
-                Err(error) => {
-                    let _ignored = fs::remove_file(&receipt_path);
-                    return Err(error);
-                }
-            };
+            self.commit_streaming_posts(&receipt_hash, &artifact_stem, dataset, &receipt_path)?;
         let emoji_stem = stable_artifact_stem(
             &self.did,
             "emoji_projection",
@@ -589,6 +601,7 @@ impl StreamingArchiveSink {
         let post_rows_hash = hex::encode(self.rows_hash.clone().finalize());
         RepoReceipt {
             observed_at: format_observed_at(self.observed_at),
+            did: self.did.clone(),
             fetch_method: input.fetch_method,
             completeness_class: input.completeness_class,
             reachable_records_count: input.reachable_records_count,
@@ -614,33 +627,51 @@ impl StreamingArchiveSink {
         receipt_hash: &str,
         artifact_stem: &str,
         dataset: &str,
+        repo_receipt_path: &Path,
     ) -> Result<crate::commit::Artifact, ArchiveError> {
         let store = LocalStore::new(&self.output_dir);
         let request = Request {
             object_path: PathBuf::from(format!("{artifact_stem}.posts.parquet")),
-            receipt_path: PathBuf::from(format!("{artifact_stem}.object-receipt.json")),
+            receipt_path: PathBuf::from(format!(
+                "{artifact_stem}.{receipt_hash}.object-receipt.json"
+            )),
             manifest_path: PathBuf::from(format!("{artifact_stem}.manifest.jsonl")),
-            manifest_mode: ManifestMode::AppendJsonl,
-            metadata: self.streaming_posts_metadata(receipt_hash, dataset),
+            manifest_mode: self.local_manifest_mode(),
+            metadata: self.streaming_posts_metadata(receipt_hash, dataset, repo_receipt_path)?,
         };
         let committed = store.commit_prepared_temp(&request, self.parquet_temp_path.as_ref())?;
-        self.mirror_storage_box(&request, &committed)?;
+        self.mirror_storage_box(&request, &committed, Some(repo_receipt_path))?;
         Ok(committed)
     }
 
-    fn streaming_posts_metadata(&self, receipt_hash: &str, dataset: &str) -> Metadata {
-        Metadata {
+    fn streaming_posts_metadata(
+        &self,
+        receipt_hash: &str,
+        dataset: &str,
+        repo_receipt_path: &Path,
+    ) -> Result<Metadata, ArchiveError> {
+        Ok(Metadata {
             run_id: self.commit_context.run_id.clone(),
             shard: self.commit_context.shard.clone(),
             file_sequence: self.commit_context.file_sequence,
+            did: self.did.clone(),
             dataset: dataset.to_owned(),
             row_count: self.archived_post_rows_count,
             min_created_at_normalized: self.min_created_at_normalized.clone(),
             max_created_at_normalized: self.max_created_at_normalized.clone(),
             receipt_hash: receipt_hash.to_owned(),
+            repo_receipt_path: Some(
+                repo_receipt_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or(ArchiveError::CountOverflow {
+                        field: "repo_receipt_file_name",
+                    })?
+                    .to_owned(),
+            ),
             normalizer: self.normalizer.clone(),
             schema_version: ARCHIVE_SCHEMA_VERSION,
-        }
+        })
     }
 
     fn commit_profile(
@@ -659,7 +690,9 @@ impl StreamingArchiveSink {
             return Ok(None);
         };
         let object_path = PathBuf::from(format!("{profile_stem}.profile.json"));
-        let receipt_path = PathBuf::from(format!("{profile_stem}.profile.object-receipt.json"));
+        let receipt_path = PathBuf::from(format!(
+            "{profile_stem}.{receipt_hash}.profile.object-receipt.json"
+        ));
         let manifest_path = PathBuf::from(format!("{profile_stem}.profile.manifest.jsonl"));
         let request = profile_sidecar_request(
             object_path.clone(),
@@ -670,26 +703,44 @@ impl StreamingArchiveSink {
         )?;
         let committed = commit_profile_sidecar(
             &store,
-            object_path,
-            receipt_path,
-            manifest_path,
+            ProfileSidecarCommitPaths {
+                object_path,
+                receipt_path,
+                manifest_path,
+                manifest_mode: self.local_manifest_mode(),
+            },
             profile,
             receipt,
             &self.commit_context,
         )?;
-        self.mirror_storage_box(&request, &committed)?;
+        self.mirror_storage_box(&request, &committed, None)?;
         Ok(Some(committed))
+    }
+
+    const fn local_manifest_mode(&self) -> ManifestMode {
+        match self.storage_config {
+            ArchiveStorageConfig::Local => ManifestMode::AppendJsonl,
+            ArchiveStorageConfig::StorageBoxSsh(_) => ManifestMode::Skip,
+        }
     }
 
     fn mirror_storage_box(
         &self,
         request: &Request,
         committed: &crate::commit::Artifact,
+        repo_receipt_path: Option<&Path>,
     ) -> Result<(), ArchiveError> {
         let ArchiveStorageConfig::StorageBoxSsh(config) = &self.storage_config else {
             return Ok(());
         };
-        commit_file_to_storage_box(config, request, &committed.object_path)?;
+        let mut remote_request = request.clone();
+        remote_request.manifest_mode = ManifestMode::AppendJsonl;
+        commit_file_to_storage_box(
+            config,
+            &remote_request,
+            &committed.object_path,
+            repo_receipt_path,
+        )?;
         Ok(())
     }
 
@@ -739,6 +790,7 @@ fn commit_file_to_storage_box(
     config: &StorageBoxArchiveConfig,
     request: &Request,
     object_path: &Path,
+    repo_receipt_path: Option<&Path>,
 ) -> Result<(), ArchiveError> {
     let storage_config = crate::storage_box::StorageBoxConfig::new(config.remote_root.clone());
     let mut ssh_config = crate::storage_box::StorageBoxSshConfig::new(config.ssh_remote.clone())
@@ -749,21 +801,21 @@ fn commit_file_to_storage_box(
     }
     let commands = crate::storage_box::SshStorageBoxCommands::new(ssh_config);
     let mut backend = crate::storage_box::StorageBoxBackend::new(storage_config, commands);
+    if let Some(repo_receipt_path) = repo_receipt_path {
+        let relative_repo_receipt_path = PathBuf::from(repo_receipt_path.file_name().ok_or(
+            ArchiveError::CountOverflow {
+                field: "repo_receipt_file_name",
+            },
+        )?);
+        backend.commit_auxiliary_file(
+            request,
+            &relative_repo_receipt_path,
+            repo_receipt_path,
+            "repo receipt",
+        )?;
+    }
     backend.commit_file(request, object_path)?;
     Ok(())
-}
-
-const fn receipt_dataset(receipt: &RepoReceipt) -> &'static str {
-    match (receipt.fetch_method, receipt.completeness_class) {
-        (FetchMethod::GetRepo, CompletenessClass::ContentAddressedSnapshot) => "raw_archive_posts",
-        (FetchMethod::ListRecords, CompletenessClass::CollectionPaginated) => {
-            "collection_paginated_posts"
-        }
-        (FetchMethod::GetRepo, CompletenessClass::CollectionPaginated)
-        | (FetchMethod::ListRecords, CompletenessClass::ContentAddressedSnapshot) => {
-            "noncanonical_posts"
-        }
-    }
 }
 
 impl Drop for StreamingArchiveSink {

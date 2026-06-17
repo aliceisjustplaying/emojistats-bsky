@@ -61,6 +61,18 @@ pub fn run(config: CanaryCommandConfig) -> anyhow::Result<()> {
     anyhow::bail!("canary policy did not pass: {:?}", report.status());
 }
 
+pub fn require_passing_evidence(path: &Path, thresholds: CanaryThresholds) -> anyhow::Result<()> {
+    let report = evaluate_file(path, thresholds)?;
+    if report.is_pass() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "canary evidence {} did not pass: {:?}",
+        path.display(),
+        report.status()
+    );
+}
+
 fn evaluate_file(path: &Path, thresholds: CanaryThresholds) -> anyhow::Result<CanaryReport> {
     let policy = CanaryPolicy::design_default(thresholds);
     let evidence = read_evidence_file(path)?;

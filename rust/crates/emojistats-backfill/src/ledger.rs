@@ -88,6 +88,7 @@ pub enum RepoLedgerStatus {
     Succeeded,
     RetryableFailure,
     Throttled,
+    OperatorDeferred,
     ResourceLimited,
     TerminalAccount(AccountState),
     PermanentFailure,
@@ -136,7 +137,7 @@ impl RepoLedgerEntry {
             RepoLedgerStatus::Pending | RepoLedgerStatus::RetryableFailure => self
                 .next_attempt_after
                 .is_none_or(|next_attempt_after| next_attempt_after <= now),
-            RepoLedgerStatus::Throttled => self
+            RepoLedgerStatus::Throttled | RepoLedgerStatus::OperatorDeferred => self
                 .next_attempt_after
                 .is_some_and(|next_attempt_after| next_attempt_after <= now),
             RepoLedgerStatus::Claimed
@@ -315,7 +316,7 @@ pub fn complete_attempt(
             retry_after,
             message,
         } => {
-            next.status = RepoLedgerStatus::Throttled;
+            next.status = RepoLedgerStatus::OperatorDeferred;
             next.attempts = next
                 .attempts
                 .checked_sub(1)

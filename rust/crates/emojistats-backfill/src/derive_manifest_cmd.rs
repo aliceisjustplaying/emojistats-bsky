@@ -12,6 +12,7 @@ use emojistats_backfill::{
     },
     clickhouse::{
         ClickHouseClientConfig, ClickHouseInsertPayload, ClickHouseInsertReceipt,
+        DEFAULT_EMOJI_SERVING_PAYLOAD_MAX_BYTES, emoji_serving_row_body_bytes,
         emoji_serving_rows_insert_payload, execute_insert_payloads,
         total_post_counter_insert_payload_for_counter,
     },
@@ -21,7 +22,8 @@ use emojistats_backfill::{
     },
     hash::hash_serialized_json,
     manifest_derive::{
-        LoaderInput, VerifiedLoaderInput, read_committed_jsonl, verify_loader_input_for_streaming,
+        LoaderInput, ManifestReadItem, VerifiedLoaderInput, stream_committed_jsonl,
+        verify_loader_input_for_streaming,
     },
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -183,7 +185,6 @@ impl DeriveLedger {
 
 pub async fn run(config: DeriveManifestConfig) -> anyhow::Result<()> {
     let file = File::open(&config.manifest_path)?;
-    let plan = read_committed_jsonl(BufReader::new(file))?;
     let clickhouse = ClickHouseClientConfig::new(
         &config.clickhouse_url,
         &config.clickhouse_database,
@@ -192,24 +193,28 @@ pub async fn run(config: DeriveManifestConfig) -> anyhow::Result<()> {
         "emojistats-backfill-derive",
     )?;
     let http = clickhouse.http_client()?;
-    let mut summary = DeriveManifestSummary {
-        manifest_entries: count_len(plan.inputs.len(), "manifest_entries")?,
-        skipped_entries: count_len(plan.skipped_entries.len(), "skipped_entries")?,
-        ..DeriveManifestSummary::default()
-    };
+    let mut summary = DeriveManifestSummary::default();
     let mut derive_ledger = DeriveLedger::new(config.derive_ledger_path.as_deref())?;
 
-    for input in &plan.inputs {
-        derive_loader_input_streaming(
-            &config.archive_root,
-            input,
-            &http,
-            &clickhouse,
-            config.dry_run,
-            &mut derive_ledger,
-            &mut summary,
-        )
-        .await?;
+    for item in stream_committed_jsonl(BufReader::new(file)) {
+        match item? {
+            ManifestReadItem::Input(input) => {
+                increment(&mut summary.manifest_entries, "manifest entry count")?;
+                derive_loader_input_streaming(
+                    &config.archive_root,
+                    &input,
+                    &http,
+                    &clickhouse,
+                    config.dry_run,
+                    &mut derive_ledger,
+                    &mut summary,
+                )
+                .await?;
+            }
+            ManifestReadItem::Skipped(_skip) => {
+                increment(&mut summary.skipped_entries, "skipped manifest entry count")?;
+            }
+        }
     }
 
     println!(
@@ -447,6 +452,7 @@ struct StreamingPayloadState<'a> {
     posts_with_emojis: u64,
     emoji_occurrences: u64,
     emoji_chunk_rows: Vec<EmojiProjectionRow>,
+    emoji_chunk_body_bytes: usize,
     emoji_chunk_index: u64,
 }
 
@@ -458,6 +464,7 @@ impl<'a> StreamingPayloadState<'a> {
             posts_with_emojis: 0,
             emoji_occurrences: 0,
             emoji_chunk_rows: Vec::with_capacity(DERIVE_EMOJI_CHUNK_ROWS),
+            emoji_chunk_body_bytes: 0,
             emoji_chunk_index: 0,
         }
     }
@@ -485,13 +492,41 @@ impl<'a> StreamingPayloadState<'a> {
             )?;
             let projection_rows = emoji_projection_rows_for_post(row)?;
             for projection_row in projection_rows {
+                let row_body_bytes =
+                    emoji_serving_row_body_bytes(&self.verified.identity, &projection_row)?;
+                validate_emoji_row_payload_size(row_body_bytes, &projection_row)?;
+                self.flush_emoji_chunk_if_needed(row_body_bytes, &mut payloads)?;
                 self.emoji_chunk_rows.push(projection_row);
+                self.emoji_chunk_body_bytes = self
+                    .emoji_chunk_body_bytes
+                    .checked_add(row_body_bytes)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("streaming derive emoji payload bytes overflow")
+                    })?;
                 if self.emoji_chunk_rows.len() >= DERIVE_EMOJI_CHUNK_ROWS {
                     payloads.push(self.flush_emoji_chunk()?);
                 }
             }
         }
         Ok(payloads)
+    }
+
+    fn flush_emoji_chunk_if_needed(
+        &mut self,
+        row_body_bytes: usize,
+        payloads: &mut Vec<ClickHouseInsertPayload>,
+    ) -> anyhow::Result<()> {
+        if self.emoji_chunk_rows.is_empty() {
+            return Ok(());
+        }
+        let next_bytes = self
+            .emoji_chunk_body_bytes
+            .checked_add(row_body_bytes)
+            .ok_or_else(|| anyhow::anyhow!("streaming derive emoji payload bytes overflow"))?;
+        if next_bytes > DEFAULT_EMOJI_SERVING_PAYLOAD_MAX_BYTES {
+            payloads.push(self.flush_emoji_chunk()?);
+        }
+        Ok(())
     }
 
     fn finish(mut self) -> anyhow::Result<Vec<ClickHouseInsertPayload>> {
@@ -504,6 +539,10 @@ impl<'a> StreamingPayloadState<'a> {
             run_id: self.verified.manifest.run_id.clone(),
             shard: self.verified.manifest.shard.clone(),
             file_sequence: self.verified.manifest.file_sequence,
+            did: self.verified.manifest.did.clone(),
+            dataset: self.verified.identity.dataset.clone(),
+            fetch_method: self.verified.identity.fetch_method.clone(),
+            completeness_class: self.verified.identity.completeness_class.clone(),
             receipt_hash: self.verified.manifest.receipt_hash.clone(),
             normalizer: self.verified.manifest.normalizer.clone(),
             posts_processed: self.rows,
@@ -528,12 +567,31 @@ impl<'a> StreamingPayloadState<'a> {
             "streaming derive emoji chunk index",
         )?;
         self.emoji_chunk_rows = Vec::with_capacity(DERIVE_EMOJI_CHUNK_ROWS);
+        self.emoji_chunk_body_bytes = 0;
         Ok(emoji_serving_rows_insert_payload(
             &self.verified.identity,
             &rows,
             token,
         )?)
     }
+}
+
+fn validate_emoji_row_payload_size(
+    row_body_bytes: usize,
+    row: &EmojiProjectionRow,
+) -> anyhow::Result<()> {
+    if row_body_bytes <= DEFAULT_EMOJI_SERVING_PAYLOAD_MAX_BYTES {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "emoji serving row exceeds payload byte cap before chunking: did={} rkey={} cid={} emoji={} row_body_bytes={} max={}",
+        row.did,
+        row.rkey,
+        row.cid,
+        row.emoji,
+        row_body_bytes,
+        DEFAULT_EMOJI_SERVING_PAYLOAD_MAX_BYTES
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -617,6 +675,13 @@ fn hash_identity_frames(
     identity: &DeriveManifestIdentity,
 ) -> anyhow::Result<()> {
     hash_str_frame(hasher, "identity.dataset", &identity.dataset)?;
+    hash_str_frame(hasher, "identity.did", &identity.did)?;
+    hash_str_frame(hasher, "identity.fetch_method", &identity.fetch_method)?;
+    hash_str_frame(
+        hasher,
+        "identity.completeness_class",
+        &identity.completeness_class,
+    )?;
     hash_str_frame(hasher, "identity.content_hash", &identity.content_hash)?;
     hash_str_frame(hasher, "identity.receipt_hash", &identity.receipt_hash)?;
     hash_u16_frame(hasher, "identity.schema_version", identity.schema_version)?;
@@ -626,10 +691,16 @@ fn hash_identity_frames(
 fn hash_emoji_row_frames(hasher: &mut Sha256, row: &EmojiProjectionRow) -> anyhow::Result<()> {
     hash_str_frame(hasher, "emoji_row.did", &row.did)?;
     hash_str_frame(hasher, "emoji_row.rkey", &row.rkey)?;
+    hash_str_frame(hasher, "emoji_row.cid", &row.cid)?;
     hash_optional_str_frame(
         hasher,
         "emoji_row.created_at_normalized",
         row.created_at_normalized.as_deref(),
+    )?;
+    hash_str_frame(
+        hasher,
+        "emoji_row.created_at_parse_status",
+        row.created_at_parse_status.as_str(),
     )?;
     hash_str_frame(hasher, "emoji_row.emoji", &row.emoji)?;
     hash_u64_frame(hasher, "emoji_row.occurrences", row.occurrences)?;
@@ -651,6 +722,14 @@ fn hash_emoji_row_frames(hasher: &mut Sha256, row: &EmojiProjectionRow) -> anyho
 
 fn hash_counter_frames(hasher: &mut Sha256, counter: &TotalPostCounterInput) -> anyhow::Result<()> {
     hash_str_frame(hasher, "counter.source", &counter.source)?;
+    hash_str_frame(hasher, "counter.did", &counter.did)?;
+    hash_str_frame(hasher, "counter.dataset", &counter.dataset)?;
+    hash_str_frame(hasher, "counter.fetch_method", &counter.fetch_method)?;
+    hash_str_frame(
+        hasher,
+        "counter.completeness_class",
+        &counter.completeness_class,
+    )?;
     hash_str_frame(hasher, "counter.receipt_hash", &counter.receipt_hash)?;
     hash_normalizer_frames(hasher, "counter.normalizer", &counter.normalizer)?;
     hash_u64_frame(hasher, "counter.posts_processed", counter.posts_processed)?;

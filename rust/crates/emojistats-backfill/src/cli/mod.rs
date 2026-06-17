@@ -27,25 +27,25 @@ pub enum HttpProtocol {
 #[derive(Args, Debug, Clone)]
 pub struct CanaryThresholdArgs {
     /// Minimum free Storage Box headroom ratio required by policy.
-    #[arg(long)]
+    #[arg(long, default_value_t = 0.20)]
     pub min_storage_box_headroom_ratio: f64,
     /// Maximum `ClickHouse` serving-box utilization ratio allowed by policy.
-    #[arg(long)]
+    #[arg(long, default_value_t = 0.80)]
     pub max_clickhouse_serving_box_ratio: f64,
     /// Minimum derive/crawl throughput ratio required by policy.
-    #[arg(long)]
+    #[arg(long, default_value_t = 1.0)]
     pub min_derive_to_crawl_ratio: f64,
     /// Minimum sustained repo throughput required by policy.
-    #[arg(long)]
+    #[arg(long, default_value_t = 100.0)]
     pub min_sustained_repos_per_second: f64,
     /// Minimum mushroom host budget utilization ratio required by policy.
-    #[arg(long)]
+    #[arg(long, default_value_t = 0.70)]
     pub min_mushroom_budget_utilization_ratio: f64,
     /// Maximum observed mushroom 429 ratio allowed by policy.
-    #[arg(long)]
+    #[arg(long, default_value_t = 0.01)]
     pub max_mushroom_429_ratio: f64,
     /// Maximum aggregate rebuild runtime allowed by policy.
-    #[arg(long)]
+    #[arg(long, default_value_t = 2.0)]
     pub max_aggregate_rebuild_hours: f64,
 }
 
@@ -184,6 +184,15 @@ pub enum Command {
         /// HTTP protocol behavior for repo fetches.
         #[arg(long, value_enum, default_value_t = HttpProtocol::Http1)]
         http_protocol: HttpProtocol,
+        /// Passing canary evidence required before fleet work starts.
+        #[arg(long)]
+        canary_evidence: Option<PathBuf>,
+        /// Explicitly bypass the canary gate for smoke/local runs.
+        #[arg(long)]
+        bypass_canary: bool,
+        /// Canary gate thresholds used when --canary-evidence is provided.
+        #[command(flatten)]
+        canary_thresholds: CanaryThresholdArgs,
     },
     /// Verify a committed archive manifest and load derived rows into `ClickHouse`.
     DeriveManifest {

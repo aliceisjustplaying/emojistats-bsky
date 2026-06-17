@@ -27,10 +27,13 @@ fn batch() -> ClickHouseDeriveBatch {
             run_id: "run-1".to_owned(),
             shard: "shard0".to_owned(),
             file_sequence: 42,
+            did: "did:plc:abc".to_owned(),
             dataset: "raw_archive_posts".to_owned(),
+            fetch_method: "get_repo".to_owned(),
+            completeness_class: "content_addressed_snapshot".to_owned(),
             content_hash: "content-hash".to_owned(),
             receipt_hash: "receipt-hash".to_owned(),
-            schema_version: 1,
+            schema_version: 2,
             normalizer: current_normalizer(),
         },
         dedupe_token: "derive:test-token".to_owned(),
@@ -38,7 +41,9 @@ fn batch() -> ClickHouseDeriveBatch {
             EmojiProjectionRow {
                 did: "did:plc:abc".to_owned(),
                 rkey: "3kxyz".to_owned(),
+                cid: "bafy-abc".to_owned(),
                 created_at_normalized: Some("2026-06-15T00:00:00Z".to_owned()),
+                created_at_parse_status: crate::archive::CreatedAtParseStatus::Valid,
                 emoji: "✅".to_owned(),
                 occurrences: 2,
                 langs: vec!["en".to_owned(), "ja".to_owned()],
@@ -46,7 +51,9 @@ fn batch() -> ClickHouseDeriveBatch {
             EmojiProjectionRow {
                 did: "did:plc:def".to_owned(),
                 rkey: "3kxyy".to_owned(),
+                cid: "bafy-def".to_owned(),
                 created_at_normalized: None,
+                created_at_parse_status: crate::archive::CreatedAtParseStatus::Missing,
                 emoji: "🔥".to_owned(),
                 occurrences: 1,
                 langs: Vec::new(),
@@ -57,6 +64,10 @@ fn batch() -> ClickHouseDeriveBatch {
             run_id: "run-1".to_owned(),
             shard: "shard0".to_owned(),
             file_sequence: 42,
+            did: "did:plc:abc".to_owned(),
+            dataset: "raw_archive_posts".to_owned(),
+            fetch_method: "get_repo".to_owned(),
+            completeness_class: "content_addressed_snapshot".to_owned(),
             receipt_hash: "receipt-hash".to_owned(),
             normalizer: current_normalizer(),
             posts_processed: 3,
@@ -155,14 +166,22 @@ fn write_http_response(stream: &mut TcpStream, status: u16, body: &str) {
 fn schema_sql_contains_typed_table_names_and_engines() {
     let sql = create_schema_sql("emojistats").expect("schema sql");
 
-    assert!(sql.contains("CREATE TABLE IF NOT EXISTS emojistats.v2_emoji_serving"));
-    assert!(sql.contains("CREATE TABLE IF NOT EXISTS emojistats.v2_total_post_counters"));
+    assert!(sql.contains("CREATE TABLE IF NOT EXISTS emojistats.v2_emoji_serving_r2"));
+    assert!(sql.contains("CREATE TABLE IF NOT EXISTS emojistats.v2_total_post_counters_r2"));
     assert!(sql.contains("ENGINE = ReplacingMergeTree(inserted_at)"));
     assert!(sql.contains("non_replicated_deduplication_window = 10000"));
     assert!(sql.contains("LowCardinality(String)"));
     assert!(sql.contains("normalizer_git_rev LowCardinality(String)"));
-    assert!(sql.contains("ORDER BY (src, normalizer_git_rev, did, rkey, emoji)"));
-    assert!(sql.contains("ORDER BY (src, normalizer_git_rev, receipt_hash)"));
+    assert!(!sql.contains("cid String CODEC(ZSTD(1))"));
+    assert!(sql.contains("dataset LowCardinality(String)"));
+    assert!(sql.contains("fetch_method LowCardinality(String)"));
+    assert!(sql.contains("completeness_class LowCardinality(String)"));
+    assert!(sql.contains(
+        "ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, did, rkey, emoji)"
+    ));
+    assert!(sql.contains(
+        "ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, did)"
+    ));
 }
 
 #[test]
@@ -190,11 +209,18 @@ fn json_each_row_payloads_include_derive_rows_and_total_counter() {
     let first_line = emoji_lines.first().expect("first emoji line should exist");
     let first: Value = serde_json::from_str(first_line).expect("first emoji row json");
     assert_eq!(field(&first, "src"), "backfill-v2-derive");
+    assert_eq!(field(&first, "dataset"), "raw_archive_posts");
+    assert_eq!(field(&first, "fetch_method"), "get_repo");
+    assert_eq!(
+        field(&first, "completeness_class"),
+        "content_addressed_snapshot"
+    );
     assert_eq!(
         field(&first, "normalizer_name"),
         &Value::String(batch().manifest_identity.normalizer.name)
     );
     assert_eq!(field(&first, "did"), "did:plc:abc");
+    assert!(first.get("cid").is_none());
     assert_eq!(field(&first, "emoji"), "✅");
     assert_eq!(field(&first, "occurrences"), 2);
     let langs = field(&first, "langs")
@@ -238,7 +264,7 @@ fn request_builder_includes_auth_headers_and_dedupe_settings() {
     let url = request.url().as_str();
 
     assert_eq!(request.method(), "POST");
-    assert_eq!(request.timeout(), None);
+    assert_eq!(request.timeout(), Some(&Duration::from_secs(30)));
     assert!(url.contains("database=emojistats"));
     assert!(url.contains("query=INSERT"));
     assert!(url.contains("insert_deduplicate=1"));
@@ -302,14 +328,14 @@ async fn execute_insert_payloads_sends_payloads_in_order() {
             .first()
             .expect("first request")
             .target
-            .contains("v2_emoji_serving")
+            .contains("v2_emoji_serving_r2")
     );
     assert!(
         requests
             .get(1)
             .expect("second request")
             .target
-            .contains("v2_total_post_counters")
+            .contains("v2_total_post_counters_r2")
     );
     assert!(
         requests

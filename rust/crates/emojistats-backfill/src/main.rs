@@ -24,10 +24,10 @@ use emojistats_backfill::{
         AttemptId, AttemptOutcome, DEFAULT_CLAIM_LEASE_DURATION, ForcedFetchMode, HostOverride,
         RepoLedgerEntry, RetryPolicy, SqliteLedger, claim_repo, complete_attempt,
     },
-    list_records::{ListRecordsConfig, fetch_and_archive_list_records_with_rate_limit_observer},
+    list_records::{ListRecordsConfig, fetch_and_archive_list_records_with_precommit_check},
     parse::{ParseConfig, ParseVisitError, ParsedRepoSummary, parse_repo_for_did_with_state},
     scheduler::{ClaimScope, HostPacer, SharedHostPacer},
-    transport::{FetchByteBudget, FetchConfig, FetchError, fetch_repo},
+    transport::{FetchByteBudget, FetchConfig, FetchError, fetch_repo_with_rate_limit_observer},
 };
 use jacquard_common::{deps::fluent_uri::Uri, types::did::Did};
 use jacquard_identity::PublicResolver;
@@ -189,10 +189,14 @@ async fn run_fleet_command(command: Command) -> anyhow::Result<()> {
         storage_box_command_timeout_secs,
         cid_verification_threads,
         http_protocol,
+        canary_evidence,
+        bypass_canary,
+        canary_thresholds,
     } = command
     else {
         anyhow::bail!("internal command dispatch mismatch for run-fleet");
     };
+    enforce_canary_gate(canary_evidence.as_deref(), bypass_canary, canary_thresholds)?;
     validate_fleet_spool_budget(max_inflight_spool_bytes, max_bytes)?;
     let archive_storage = archive_storage_config(
         archive_backend,
@@ -223,6 +227,21 @@ async fn run_fleet_command(command: Command) -> anyhow::Result<()> {
         },
     })
     .await
+}
+
+fn enforce_canary_gate(
+    canary_evidence: Option<&Path>,
+    bypass_canary: bool,
+    thresholds: cli::CanaryThresholdArgs,
+) -> anyhow::Result<()> {
+    if bypass_canary {
+        eprintln!("run-fleet canary gate bypassed by explicit --bypass-canary");
+        return Ok(());
+    }
+    let Some(path) = canary_evidence else {
+        anyhow::bail!("run-fleet requires --canary-evidence <path> or explicit --bypass-canary");
+    };
+    canary_cmd::require_passing_evidence(path, thresholds.into_thresholds())
 }
 
 fn parse_config_for_threads(cid_verification_threads: usize) -> ParseConfig {

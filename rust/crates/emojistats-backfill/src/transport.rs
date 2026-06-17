@@ -24,10 +24,10 @@ use tempfile::NamedTempFile;
 use tokio::{io::AsyncWriteExt as _, sync::Notify, time};
 
 const DEFAULT_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 #[allow(clippy::duration_suboptimal_units)]
 const DEFAULT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const DEFAULT_MAX_BYTES: u64 = 2_147_483_648;
-const DEFAULT_UNKNOWN_BODY_RESERVATION_BYTES: u64 = 268_435_456;
 const DEFAULT_MIN_PROGRESS_BYTES: u64 = 16_384;
 const DEFAULT_MIN_PROGRESS_INTERVAL: Duration = Duration::from_secs(60);
 const ERROR_BODY_MAX_BYTES: u64 = 65_536;
@@ -39,10 +39,10 @@ pub struct FetchConfig {
     pub spool_dir: PathBuf,
     /// Maximum silence while waiting for the next body chunk.
     pub chunk_idle_timeout: Duration,
+    /// Maximum wall time waiting for response headers.
+    pub response_header_timeout: Duration,
     /// Maximum wall time for one successful body download.
     pub download_timeout: Duration,
-    /// Admission reservation used when `Content-Length` is absent or malformed.
-    pub unknown_body_reservation_bytes: u64,
     /// Minimum byte progress expected during a progress window.
     pub min_progress_bytes: u64,
     /// Progress watchdog window.
@@ -60,8 +60,8 @@ impl FetchConfig {
         Self {
             spool_dir: spool_dir.into(),
             chunk_idle_timeout: DEFAULT_CHUNK_IDLE_TIMEOUT,
+            response_header_timeout: DEFAULT_RESPONSE_HEADER_TIMEOUT,
             download_timeout: DEFAULT_DOWNLOAD_TIMEOUT,
-            unknown_body_reservation_bytes: DEFAULT_UNKNOWN_BODY_RESERVATION_BYTES,
             min_progress_bytes: DEFAULT_MIN_PROGRESS_BYTES,
             min_progress_interval: DEFAULT_MIN_PROGRESS_INTERVAL,
             max_bytes: DEFAULT_MAX_BYTES,
@@ -131,30 +131,6 @@ impl FetchByteBudget {
         }
     }
 
-    fn try_reserve_charged_delta(&self, delta: u64) -> Result<bool, FetchError> {
-        if delta == 0 || self.inner.max_bytes == 0 {
-            return Ok(true);
-        }
-        let mut charged = self
-            .inner
-            .charged_bytes
-            .lock()
-            .map_err(|_error| FetchError::ByteBudgetPoisoned)?;
-        let next = charged
-            .checked_add(delta)
-            .ok_or(FetchError::InFlightBytesExceeded {
-                max_bytes: self.inner.max_bytes,
-                observed_bytes: u64::MAX,
-            })?;
-        if next > self.inner.max_bytes {
-            drop(charged);
-            return Ok(false);
-        }
-        *charged = next;
-        drop(charged);
-        Ok(true)
-    }
-
     fn release_charged(&self, bytes: u64) {
         if bytes == 0 || self.inner.max_bytes == 0 {
             return;
@@ -196,30 +172,22 @@ impl FetchByteBudgetReservation {
         Ok(())
     }
 
-    fn try_reserve_capacity(&mut self, bytes: u64) -> Result<(), FetchError> {
-        if bytes > self.budget.inner.max_bytes {
+    fn shrink_to_actual(&mut self, bytes: u64) -> Result<(), FetchError> {
+        if bytes > self.charged_bytes {
             return Err(FetchError::InFlightBytesExceeded {
                 max_bytes: self.budget.inner.max_bytes,
                 observed_bytes: bytes,
             });
         }
-        if bytes <= self.charged_bytes {
-            return Ok(());
-        }
         let delta =
-            bytes
-                .checked_sub(self.charged_bytes)
+            self.charged_bytes
+                .checked_sub(bytes)
                 .ok_or(FetchError::InFlightBytesExceeded {
                     max_bytes: self.budget.inner.max_bytes,
                     observed_bytes: bytes,
                 })?;
-        if !self.budget.try_reserve_charged_delta(delta)? {
-            return Err(FetchError::InFlightBytesUnavailable {
-                max_bytes: self.budget.inner.max_bytes,
-                requested_bytes: bytes,
-            });
-        }
         self.charged_bytes = bytes;
+        self.budget.release_charged(delta);
         Ok(())
     }
 
@@ -296,6 +264,11 @@ pub enum FetchError {
         timeout: Duration,
         /// Bytes already written when the timeout fired.
         observed_bytes: u64,
+    },
+    /// The PDS did not return response headers inside the configured timeout.
+    ResponseHeaderTimeout {
+        /// Timeout used while waiting for response headers.
+        timeout: Duration,
     },
     /// The body trickled below the configured progress floor.
     ProgressTimeout {
@@ -389,6 +362,13 @@ impl fmt::Display for FetchError {
                 "body download exceeded {} seconds after {observed_bytes} bytes",
                 timeout.as_secs()
             ),
+            Self::ResponseHeaderTimeout { timeout } => {
+                write!(
+                    f,
+                    "response headers did not arrive within {} seconds",
+                    timeout.as_secs()
+                )
+            }
             Self::ProgressTimeout {
                 interval,
                 min_bytes,
@@ -448,6 +428,7 @@ impl FetchError {
             }
             Self::InactivityTimeout { .. }
             | Self::DownloadTimeout { .. }
+            | Self::ResponseHeaderTimeout { .. }
             | Self::ProgressTimeout { .. }
             | Self::MaxBytesExceeded { .. }
             | Self::ErrorBodyTooLarge { .. }
@@ -468,6 +449,7 @@ impl Error for FetchError {
             | Self::HttpStatus { .. }
             | Self::InactivityTimeout { .. }
             | Self::DownloadTimeout { .. }
+            | Self::ResponseHeaderTimeout { .. }
             | Self::ProgressTimeout { .. }
             | Self::MaxBytesExceeded { .. }
             | Self::ErrorBodyTooLarge { .. }
@@ -500,28 +482,47 @@ pub async fn fetch_repo<C>(
 where
     C: HttpClient + HttpClientExt + Sync,
 {
+    fetch_repo_with_rate_limit_observer(http, pds, did, config, |_rate_limit| {}).await
+}
+
+/// Stream `com.atproto.sync.getRepo` and report response rate-limit headers before body reads.
+///
+/// # Errors
+///
+/// Returns [`FetchError`] when response headers, body streaming, caps, or local I/O fail.
+pub async fn fetch_repo_with_rate_limit_observer<C>(
+    http: &C,
+    pds: &Uri<String>,
+    did: &Did,
+    config: &FetchConfig,
+    mut observe_rate_limit: impl FnMut(&RateLimitSnapshot),
+) -> Result<SpooledRepo, FetchError>
+where
+    C: HttpClient + HttpClientExt + Sync,
+{
     fs::create_dir_all(&config.spool_dir)?;
 
     let request = GetRepo {
         did: did.clone(),
         since: None,
     };
-    let response = http
-        .xrpc(pds.borrow())
-        .download(&request)
-        .await
-        .map_err(|err| FetchError::Transport {
-            message: err.to_string(),
-            observed_bytes: None,
-        })?;
+    let response = time::timeout(
+        config.response_header_timeout,
+        http.xrpc(pds.borrow()).download(&request),
+    )
+    .await
+    .map_err(|_elapsed| FetchError::ResponseHeaderTimeout {
+        timeout: config.response_header_timeout,
+    })?
+    .map_err(|err| FetchError::Transport {
+        message: err.to_string(),
+        observed_bytes: None,
+    })?;
     let status = response.status();
     let rate_limit = RateLimitSnapshot::from_headers(response.headers());
+    observe_rate_limit(&rate_limit);
     let admission_body_bytes = if status.is_success() {
-        Some(admission_body_bytes(
-            response.headers(),
-            config.max_bytes,
-            config.unknown_body_reservation_bytes,
-        )?)
+        Some(admission_body_bytes(response.headers(), config.max_bytes)?)
     } else {
         None
     };
@@ -553,7 +554,7 @@ where
             min_progress_interval: config.min_progress_interval,
             max_bytes: config.max_bytes,
         },
-        admission_body_bytes.unwrap_or(config.unknown_body_reservation_bytes),
+        admission_body_bytes.unwrap_or(config.max_bytes),
         config.byte_budget.as_ref(),
     )
     .await?;
@@ -593,6 +594,9 @@ async fn stream_to_file(
     }
     match stream_to_temp_file(body, temp_file.path(), limits, reservation.as_mut()).await {
         Ok(bytes) => {
+            if let Some(reservation) = reservation.as_mut() {
+                reservation.shrink_to_actual(bytes)?;
+            }
             temp_file.persist_noclobber(car_path).map_err(|error| {
                 io::Error::new(
                     error.error.kind(),
@@ -668,7 +672,7 @@ async fn stream_to_temp_file(
             });
         }
         if let Some(reservation) = byte_budget_reservation.as_mut() {
-            reservation.try_reserve_capacity(observed_bytes)?;
+            reservation.reserve_capacity(observed_bytes).await?;
         }
         file.write_all(chunk.as_ref()).await?;
         bytes = observed_bytes;
@@ -682,12 +686,6 @@ async fn stream_to_temp_file(
                 })?;
     }
 
-    enforce_progress(
-        &mut progress_window_started,
-        &mut progress_window_bytes,
-        limits.min_progress_interval,
-        limits.min_progress_bytes,
-    )?;
     file.sync_all().await?;
     Ok(bytes)
 }
@@ -826,12 +824,6 @@ async fn collect_body_with_cap(
                 })?;
     }
 
-    enforce_progress(
-        &mut progress_window_started,
-        &mut progress_window_bytes,
-        limits.min_progress_interval,
-        limits.min_progress_bytes,
-    )?;
     Ok(bytes)
 }
 
@@ -882,19 +874,15 @@ fn classify_http_error(
     }
 }
 
-fn admission_body_bytes(
-    headers: &HeaderMap,
-    max_bytes: u64,
-    unknown_body_reservation_bytes: u64,
-) -> Result<u64, FetchError> {
+fn admission_body_bytes(headers: &HeaderMap, max_bytes: u64) -> Result<u64, FetchError> {
     let Some(value) = headers.get(http::header::CONTENT_LENGTH) else {
-        return Ok(unknown_body_reservation_bytes.min(max_bytes));
+        return Ok(max_bytes);
     };
     let Ok(value) = value.to_str() else {
-        return Ok(unknown_body_reservation_bytes.min(max_bytes));
+        return Ok(max_bytes);
     };
     let Ok(bytes) = value.parse::<u64>() else {
-        return Ok(unknown_body_reservation_bytes.min(max_bytes));
+        return Ok(max_bytes);
     };
     if bytes > max_bytes {
         return Err(FetchError::MaxBytesExceeded {

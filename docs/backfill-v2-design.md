@@ -157,8 +157,9 @@ derive marks data loadable.
 
 Minimum receipt fields:
 
-- `fetch_method = getRepo | listRecords`
-- `completeness_class = content_addressed_snapshot | collection_paginated_posts`
+- `dataset = raw_archive_posts | collection_paginated_posts`
+- `fetch_method = get_repo | list_records`
+- `completeness_class = content_addressed_snapshot | collection_paginated`
 - `all_records_count`
 - `all_posts_count`
 - `emoji_posts_count`
@@ -219,7 +220,7 @@ Commit protocol:
 
 1. write local temp Parquet;
 2. fsync local temp;
-3. rename local temp to local finalized path;
+3. promote local temp to local finalized path with no-overwrite hard-link semantics;
 4. compute row count, byte count, and content hash;
 5. upload remote temp path;
 6. verify remote size/hash, either by readback or checksum sidecar chosen by canary;
@@ -240,6 +241,13 @@ schema version.
   rows.
 - **ClickHouse omits CID.** Parquet and receipts carry CID. The serving projection uses
   `(did, rkey)` for dedupe because it is not the raw corpus.
+- **Serving proof classes stay query-visible.** Serving rows and total counters carry
+  dataset, fetch method, completeness class, normalizer, and DID so canonical raw archive
+  aggregates can exclude collection-paginated fallback rows.
+- **Latest-state serving is a separate architecture step.** The current backfill projection
+  is safe as a loadable observed projection plus rebuild input. Public latest-state counts
+  need explicit version/tombstone semantics before recrawls, edits, deletes, or old/new
+  overlaps are allowed to determine user-visible numbers.
 - **Emoji schema keeps v1's serving shape:** glyph-string keys (`LowCardinality(String)`),
   no integer `emoji_dim` unless a canary proves strings are a real storage problem, and
   `langs` remains in the serving rows and language aggregates.

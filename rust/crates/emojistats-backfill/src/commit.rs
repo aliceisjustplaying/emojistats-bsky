@@ -55,6 +55,8 @@ pub struct Metadata {
     /// Derive idempotency is keyed by content and receipt hashes, so this value is not a
     /// global per-shard ordering primitive.
     pub file_sequence: u64,
+    /// DID that produced this committed repo artifact.
+    pub did: String,
     /// Dataset name, such as `raw_archive_posts`.
     pub dataset: String,
     /// Number of rows in the committed object.
@@ -65,6 +67,8 @@ pub struct Metadata {
     pub max_created_at_normalized: Option<String>,
     /// Hash of the row-content receipt that produced this object.
     pub receipt_hash: String,
+    /// Optional repo-level receipt path advertised to derive consumers.
+    pub repo_receipt_path: Option<String>,
     /// Normalizer version used to produce row content.
     pub normalizer: NormalizerVersion,
     /// Archive schema version.
@@ -74,6 +78,10 @@ pub struct Metadata {
 /// Manifest update strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManifestMode {
+    /// Do not expose a local manifest entry for this commit.
+    ///
+    /// Used when another selected backend owns manifest publication.
+    Skip,
     /// Append a single JSON object plus newline.
     AppendJsonl,
     /// Replace the manifest file with a JSON array containing this entry.
@@ -101,6 +109,7 @@ pub struct ManifestEntry {
     pub run_id: String,
     pub shard: String,
     pub file_sequence: u64,
+    pub did: String,
     pub dataset: String,
     pub object_path: String,
     pub row_count: u64,
@@ -109,6 +118,8 @@ pub struct ManifestEntry {
     pub min_created_at_normalized: Option<String>,
     pub max_created_at_normalized: Option<String>,
     pub receipt_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_receipt_path: Option<String>,
     pub normalizer: NormalizerVersion,
     pub schema_version: u16,
 }
@@ -195,11 +206,11 @@ impl LocalStore {
         Self { root: root.into() }
     }
 
-    /// Commit one object through temp write, fsync, rename, digest, sidecar, and manifest.
+    /// Commit one object through temp write, fsync, hard-link promotion, digest, sidecar, and manifest.
     ///
     /// # Errors
     ///
-    /// Returns [`Error`] if path validation, object writing, fsync, rename, digesting,
+    /// Returns [`Error`] if path validation, object writing, fsync, promotion, digesting,
     /// receipt writing, or manifest writing fails.
     pub fn commit<F>(&self, request: &Request, write_object: F) -> Result<Artifact, Error>
     where
@@ -210,7 +221,7 @@ impl LocalStore {
         })
     }
 
-    /// Commit an already-written temp object through fsync, rename, digest, sidecar, and manifest.
+    /// Commit an already-written temp object through fsync, hard-link promotion, digest, sidecar, and manifest.
     ///
     /// # Errors
     ///
@@ -247,14 +258,18 @@ impl LocalStore {
             ObjectCommitState::Promoted(_) => {
                 let entry = ManifestEntry::from_parts(&request.metadata, &receipt_doc);
                 write_json_temp_promote(&receipt, "receipt", &receipt_doc)?;
-                write_manifest(&manifest, request.manifest_mode, &entry)?;
+                if request.manifest_mode != ManifestMode::Skip {
+                    write_manifest(&manifest, request.manifest_mode, &entry)?;
+                }
                 (entry, receipt_doc)
             }
             ObjectCommitState::AlreadyCommitted(_) => {
                 let committed_receipt =
                     repair_or_validate_existing_receipt(&receipt, &receipt_doc)?;
                 let entry = ManifestEntry::from_parts(&request.metadata, &committed_receipt);
-                write_manifest_if_missing(&manifest, request.manifest_mode, &entry)?;
+                if request.manifest_mode != ManifestMode::Skip {
+                    write_manifest_if_missing(&manifest, request.manifest_mode, &entry)?;
+                }
                 (entry, committed_receipt)
             }
         };
@@ -314,6 +329,7 @@ impl ManifestEntry {
             run_id: receipt.run_id.clone(),
             shard: receipt.shard.clone(),
             file_sequence: receipt.file_sequence,
+            did: metadata.did.clone(),
             dataset: receipt.dataset.clone(),
             object_path: receipt.object_path.clone(),
             row_count: receipt.row_count,
@@ -322,6 +338,7 @@ impl ManifestEntry {
             min_created_at_normalized: metadata.min_created_at_normalized.clone(),
             max_created_at_normalized: metadata.max_created_at_normalized.clone(),
             receipt_hash: receipt.receipt_hash.clone(),
+            repo_receipt_path: metadata.repo_receipt_path.clone(),
             normalizer: metadata.normalizer.clone(),
             schema_version: receipt.schema_version,
         }
@@ -502,6 +519,7 @@ where
 
 fn write_manifest(path: &Path, mode: ManifestMode, entry: &ManifestEntry) -> Result<(), Error> {
     match mode {
+        ManifestMode::Skip => Ok(()),
         ManifestMode::AppendJsonl => append_manifest_jsonl(path, entry),
         ManifestMode::ReplaceJsonArray => write_json_temp_promote(path, "manifest", &[entry]),
     }
@@ -512,6 +530,9 @@ fn write_manifest_if_missing(
     mode: ManifestMode,
     entry: &ManifestEntry,
 ) -> Result<(), Error> {
+    if mode == ManifestMode::Skip {
+        return Ok(());
+    }
     if mode == ManifestMode::AppendJsonl {
         return append_manifest_jsonl_if_missing(path, entry);
     }
@@ -540,6 +561,7 @@ fn manifest_contains_entry(
     };
 
     match mode {
+        ManifestMode::Skip => Ok(false),
         ManifestMode::AppendJsonl => {
             for line in contents.lines().filter(|line| !line.trim().is_empty()) {
                 let candidate: ManifestEntry =
@@ -753,6 +775,7 @@ fn receipts_are_content_compatible(actual: &Receipt, expected: &Receipt) -> bool
         && actual.row_count == expected.row_count
         && actual.bytes == expected.bytes
         && actual.content_hash == expected.content_hash
+        && actual.receipt_hash == expected.receipt_hash
         && actual.schema_version == expected.schema_version
 }
 

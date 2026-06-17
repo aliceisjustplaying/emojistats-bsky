@@ -182,13 +182,15 @@ fn metadata() -> Metadata {
         run_id: "run-1".to_owned(),
         shard: "shard0".to_owned(),
         file_sequence: 42,
+        did: "did:plc:test".to_owned(),
         dataset: "raw_archive_posts".to_owned(),
         row_count: 2,
         min_created_at_normalized: Some("2026-06-01T00:00:00Z".to_owned()),
         max_created_at_normalized: Some("2026-06-02T00:00:00Z".to_owned()),
         receipt_hash: "repo-receipt-hash".to_owned(),
+        repo_receipt_path: Some("did.repo-receipt-hash.receipt.json".to_owned()),
         normalizer: normalizer(),
-        schema_version: 1,
+        schema_version: 2,
     }
 }
 
@@ -322,6 +324,44 @@ fn commits_local_file_without_buffering_object_in_backend() {
         b"parquet bytes"
     );
     assert!(commands.files.contains_key(&artifact.remote_manifest_path));
+}
+
+#[test]
+fn commits_auxiliary_file_without_manifest_append() {
+    let mut source = tempfile::NamedTempFile::new().expect("temp source should be created");
+    source
+        .write_all(b"repo receipt")
+        .expect("temp source should be written");
+    source.flush().expect("temp source should be flushed");
+    let mut backend = backend(FakeCommands::default());
+
+    let remote_path = backend
+        .commit_auxiliary_file(
+            &request(),
+            PathBuf::from("did.repo-receipt-hash.receipt.json").as_path(),
+            source.path(),
+            "repo receipt",
+        )
+        .expect("auxiliary commit should succeed");
+
+    let commands = backend.into_commands();
+    assert_eq!(
+        remote_path,
+        "/storage-box/emojistats/did.repo-receipt-hash.receipt.json"
+    );
+    assert_eq!(
+        commands
+            .files
+            .get(&remote_path)
+            .expect("repo receipt should be committed"),
+        b"repo receipt"
+    );
+    assert!(
+        !commands
+            .operations
+            .iter()
+            .any(|operation| operation.name == "append_manifest_record_if_missing")
+    );
 }
 
 #[test]
