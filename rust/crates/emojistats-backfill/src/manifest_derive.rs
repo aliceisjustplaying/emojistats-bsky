@@ -18,7 +18,9 @@ use crate::{
 use crate::{
     archive::{ARCHIVE_SCHEMA_VERSION, ArchiveError, LocalManifestEntry, PostDataset, RepoReceipt},
     commit::{ManifestEntry, Receipt},
-    derive::{DeriveError, DeriveManifestIdentity, manifest_identity},
+    derive::{
+        DeriveError, DeriveManifestIdentity, manifest_identity, manifest_identity_with_observed_at,
+    },
     hash::hash_serialized_json,
 };
 
@@ -350,6 +352,7 @@ pub fn debug_materialize_clickhouse_batch_with_caps(
     Ok(derive_clickhouse_batch(DeriveBatchInput {
         manifest: &input.manifest,
         archive_rows: &archive_rows,
+        observed_at: &proof.repo_receipt.observed_at,
     })?)
 }
 
@@ -370,7 +373,10 @@ pub fn verify_loader_input_for_streaming(
 
     Ok(VerifiedLoaderInput {
         manifest: input.manifest.clone(),
-        identity: input.identity.clone(),
+        identity: manifest_identity_with_observed_at(
+            &input.manifest,
+            &proof.repo_receipt.observed_at,
+        )?,
         object_path: proof.object_path,
         repo_receipt: proof.repo_receipt,
     })

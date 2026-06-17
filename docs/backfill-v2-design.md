@@ -57,7 +57,7 @@ enumerate: PLC export + did:web best-effort seeds
   || DERIVE POOL:
        read committed manifest entries
        -> recompute Parquet row hashes vs receipts
-       -> bulk-load compact emoji serving rows + total counters to ClickHouse
+       -> bulk-load compact post serving rows + total counters to ClickHouse
   -> JETSTREAM CATCH-UP:
        replay from backfill_started_at - 4h to live tail
        -> write directly to ClickHouse serving projection, not the Raw Archive

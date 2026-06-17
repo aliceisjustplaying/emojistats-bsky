@@ -14,12 +14,9 @@ mod execute;
 use execute::classify_insert_status;
 pub use execute::execute_insert_payloads;
 
-use crate::{
-    archive::EmojiProjectionRow,
-    derive::{
-        BACKFILL_DERIVE_SOURCE, ClickHouseDeriveBatch, DeriveManifestIdentity,
-        TotalPostCounterInput,
-    },
+use crate::derive::{
+    BACKFILL_DERIVE_SOURCE, ClickHouseDeriveBatch, DeriveManifestIdentity, PostServingRow,
+    TotalPostCounterInput,
 };
 
 /// `ClickHouse` HTTP insert format used by the derive lane.
@@ -29,7 +26,7 @@ const INSERT_DEDUPLICATE_SETTING: &str = "insert_deduplicate";
 const INSERT_DEDUPLICATION_TOKEN_SETTING: &str = "insert_deduplication_token";
 const DATE_TIME_INPUT_FORMAT_SETTING: &str = "date_time_input_format";
 const CLICKHOUSE_RESPONSE_SNIPPET_MAX_BYTES: usize = 4_096;
-pub const DEFAULT_EMOJI_SERVING_PAYLOAD_MAX_BYTES: usize = 8_388_608;
+pub const DEFAULT_POST_SERVING_PAYLOAD_MAX_BYTES: usize = 8_388_608;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
@@ -42,10 +39,18 @@ const CLICKHOUSE_DATABASE_HEADER: HeaderName = HeaderName::from_static("x-clickh
 /// Fixed `ClickHouse` table names owned by the v2 derive lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClickHouseTable {
-    /// Compact emoji serving projection derived from archive rows.
-    EmojiServing,
+    /// Compact post serving projection derived from archive rows.
+    PostServing,
     /// Per-manifest total-post counters that cannot be reconstructed from emoji rows.
     TotalPostCounter,
+    /// Aggregate emoji totals rebuilt from compact post-serving rows.
+    EmojiTotal,
+    /// Aggregate emoji totals by language rebuilt from compact post-serving rows.
+    EmojiTotalByLang,
+    /// Aggregate language totals rebuilt from compact post-serving rows.
+    LangTotal,
+    /// Aggregate hourly post counters rebuilt from compact post-serving rows.
+    PostsHourly,
 }
 
 impl ClickHouseTable {
@@ -53,8 +58,12 @@ impl ClickHouseTable {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::EmojiServing => "v2_emoji_serving_r2",
-            Self::TotalPostCounter => "v2_total_post_counters_r2",
+            Self::PostServing => "v2_post_serving_r3",
+            Self::TotalPostCounter => "v2_total_post_counters_r3",
+            Self::EmojiTotal => "v2_emoji_total_r3",
+            Self::EmojiTotalByLang => "v2_emoji_total_by_lang_r3",
+            Self::LangTotal => "v2_lang_total_r3",
+            Self::PostsHourly => "v2_posts_hourly_r3",
         }
     }
 
@@ -67,8 +76,12 @@ impl ClickHouseTable {
     pub fn create_table_sql(self, database: &str) -> Result<String, ClickHouseSchemaError> {
         let database = ClickHouseIdentifier::new(database)?;
         Ok(match self {
-            Self::EmojiServing => emoji_serving_table_sql(&database),
+            Self::PostServing => post_serving_table_sql(&database),
             Self::TotalPostCounter => total_post_counter_table_sql(&database),
+            Self::EmojiTotal => emoji_total_table_sql(&database),
+            Self::EmojiTotalByLang => emoji_total_by_lang_table_sql(&database),
+            Self::LangTotal => lang_total_table_sql(&database),
+            Self::PostsHourly => posts_hourly_table_sql(&database),
         })
     }
 }
@@ -379,16 +392,36 @@ pub enum ClickHouseInsertError {
 /// Returns [`ClickHouseSchemaError`] if the database name is not a valid `ClickHouse` identifier.
 pub fn create_schema_sql(database: &str) -> Result<String, ClickHouseSchemaError> {
     let statements = [
-        ClickHouseTable::EmojiServing.create_table_sql(database)?,
+        ClickHouseTable::PostServing.create_table_sql(database)?,
         ClickHouseTable::TotalPostCounter.create_table_sql(database)?,
+        ClickHouseTable::EmojiTotal.create_table_sql(database)?,
+        ClickHouseTable::EmojiTotalByLang.create_table_sql(database)?,
+        ClickHouseTable::LangTotal.create_table_sql(database)?,
+        ClickHouseTable::PostsHourly.create_table_sql(database)?,
     ];
     Ok(statements.join("\n\n"))
 }
 
+/// Return aggregate rebuild SQL statements that derive serving caches from compact post rows.
+///
+/// # Errors
+///
+/// Returns [`ClickHouseSchemaError`] if the database name is not a valid `ClickHouse` identifier.
+pub fn aggregate_rebuild_sql(database: &str) -> Result<String, ClickHouseSchemaError> {
+    let database = ClickHouseIdentifier::new(database)?;
+    Ok([
+        rebuild_emoji_total_sql(&database),
+        rebuild_emoji_total_by_lang_sql(&database),
+        rebuild_lang_total_sql(&database),
+        rebuild_posts_hourly_sql(&database),
+    ]
+    .join("\n\n"))
+}
+
 /// Format the `ClickHouse` payloads needed to load one derive batch.
 ///
-/// The total-post counter payload is always emitted. The emoji payload is omitted when the batch
-/// contains no emoji rows.
+/// The total-post counter payload is always emitted. The compact post payload is omitted only when
+/// the batch contains no post rows.
 ///
 /// # Errors
 ///
@@ -397,44 +430,45 @@ pub fn derive_insert_payloads(
     batch: &ClickHouseDeriveBatch,
 ) -> Result<Vec<ClickHouseInsertPayload>, ClickHouseSchemaError> {
     let mut payloads = Vec::with_capacity(2);
-    if !batch.emoji_rows.is_empty() {
-        payloads.push(emoji_serving_insert_payload(batch)?);
+    if !batch.post_rows.is_empty() {
+        payloads.push(post_serving_insert_payload(batch)?);
     }
     payloads.push(total_post_counter_insert_payload(batch)?);
     Ok(payloads)
 }
 
-/// Format emoji serving rows as a `ClickHouse` `JSONEachRow` insert payload.
+/// Format compact post-serving rows as a `ClickHouse` `JSONEachRow` insert payload.
 ///
 /// # Errors
 ///
 /// Returns [`ClickHouseSchemaError`] if `JSONEachRow` serialization fails.
-pub fn emoji_serving_insert_payload(
+pub fn post_serving_insert_payload(
     batch: &ClickHouseDeriveBatch,
 ) -> Result<ClickHouseInsertPayload, ClickHouseSchemaError> {
-    emoji_serving_rows_insert_payload(
+    post_serving_rows_insert_payload(
         &batch.manifest_identity,
-        &batch.emoji_rows,
+        &batch.post_rows,
         batch.dedupe_token.clone(),
     )
 }
 
-/// Format a bounded chunk of emoji serving rows as a `ClickHouse` `JSONEachRow` insert payload.
+/// Format a bounded chunk of compact post-serving rows as a `ClickHouse` `JSONEachRow` insert
+/// payload.
 ///
 /// # Errors
 ///
 /// Returns [`ClickHouseSchemaError`] if `JSONEachRow` serialization fails.
-pub fn emoji_serving_rows_insert_payload(
+pub fn post_serving_rows_insert_payload(
     identity: &DeriveManifestIdentity,
-    emoji_rows: &[EmojiProjectionRow],
+    post_rows: &[PostServingRow],
     dedupe_token: String,
 ) -> Result<ClickHouseInsertPayload, ClickHouseSchemaError> {
-    let rows = emoji_rows
+    let rows = post_rows
         .iter()
-        .map(|row| EmojiServingInsertRow::from_projection(row, identity))
+        .map(|row| PostServingInsertRow::from_projection(row, identity))
         .collect::<Vec<_>>();
     Ok(ClickHouseInsertPayload {
-        table: ClickHouseTable::EmojiServing,
+        table: ClickHouseTable::PostServing,
         format: JSON_EACH_ROW_FORMAT,
         body: json_each_row(&rows)?,
         row_count: rows.len(),
@@ -442,20 +476,20 @@ pub fn emoji_serving_rows_insert_payload(
     })
 }
 
-/// Return the exact `JSONEachRow` byte cost for one emoji-serving row.
+/// Return the exact `JSONEachRow` byte cost for one compact post-serving row.
 ///
 /// # Errors
 ///
 /// Returns [`ClickHouseSchemaError`] if `JSONEachRow` serialization fails.
-pub fn emoji_serving_row_body_bytes(
+pub fn post_serving_row_body_bytes(
     identity: &DeriveManifestIdentity,
-    row: &EmojiProjectionRow,
+    row: &PostServingRow,
 ) -> Result<usize, ClickHouseSchemaError> {
-    serde_json::to_string(&EmojiServingInsertRow::from_projection(row, identity))?
+    serde_json::to_string(&PostServingInsertRow::from_projection(row, identity))?
         .len()
         .checked_add(1)
         .ok_or(ClickHouseSchemaError::CountOverflow {
-            field: "emoji_serving_row_body_bytes",
+            field: "post_serving_row_body_bytes",
         })
 }
 
@@ -492,9 +526,9 @@ pub fn total_post_counter_insert_payload_for_counter(
     })
 }
 
-fn emoji_serving_table_sql(database: &ClickHouseIdentifier) -> String {
+fn post_serving_table_sql(database: &ClickHouseIdentifier) -> String {
     format!(
-        r"CREATE TABLE IF NOT EXISTS {database}.v2_emoji_serving_r2 (
+        r"CREATE TABLE IF NOT EXISTS {database}.v2_post_serving_r3 (
   src LowCardinality(String),
   run_id LowCardinality(String),
   shard LowCardinality(String),
@@ -512,20 +546,21 @@ fn emoji_serving_table_sql(database: &ClickHouseIdentifier) -> String {
   rkey String CODEC(ZSTD(1)),
   created_at Nullable(DateTime64(6, 'UTC')) CODEC(Delta(8), ZSTD(1)),
   created_at_parse_status LowCardinality(String),
-  emoji LowCardinality(String),
-  occurrences UInt64,
   langs Array(LowCardinality(String)),
+  emojis Array(LowCardinality(String)),
+  emoji_occurrences UInt64,
+  observed_at DateTime64(6, 'UTC'),
   inserted_at DateTime64(6, 'UTC') DEFAULT now64(6)
-) ENGINE = ReplacingMergeTree(inserted_at)
-PARTITION BY toYYYYMM(coalesce(created_at, toDateTime64('1970-01-01 00:00:00', 6, 'UTC')))
-ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, did, rkey, emoji)
+) ENGINE = ReplacingMergeTree(observed_at)
+PARTITION BY cityHash64(did) % 256
+ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, did, rkey)
 SETTINGS non_replicated_deduplication_window = 10000;"
     )
 }
 
 fn total_post_counter_table_sql(database: &ClickHouseIdentifier) -> String {
     format!(
-        r"CREATE TABLE IF NOT EXISTS {database}.v2_total_post_counters_r2 (
+        r"CREATE TABLE IF NOT EXISTS {database}.v2_total_post_counters_r3 (
   src LowCardinality(String),
   run_id LowCardinality(String),
   shard LowCardinality(String),
@@ -549,6 +584,146 @@ fn total_post_counter_table_sql(database: &ClickHouseIdentifier) -> String {
 ) ENGINE = ReplacingMergeTree(inserted_at)
 ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, did)
 SETTINGS non_replicated_deduplication_window = 10000;"
+    )
+}
+
+fn emoji_total_table_sql(database: &ClickHouseIdentifier) -> String {
+    format!(
+        r"CREATE TABLE IF NOT EXISTS {database}.v2_emoji_total_r3 (
+  src LowCardinality(String),
+  normalizer_git_rev LowCardinality(String),
+  dataset LowCardinality(String),
+  fetch_method LowCardinality(String),
+  completeness_class LowCardinality(String),
+  emoji LowCardinality(String),
+  occurrences UInt64,
+  posts UInt64
+) ENGINE = SummingMergeTree((occurrences, posts))
+ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, emoji);"
+    )
+}
+
+fn emoji_total_by_lang_table_sql(database: &ClickHouseIdentifier) -> String {
+    format!(
+        r"CREATE TABLE IF NOT EXISTS {database}.v2_emoji_total_by_lang_r3 (
+  src LowCardinality(String),
+  normalizer_git_rev LowCardinality(String),
+  dataset LowCardinality(String),
+  fetch_method LowCardinality(String),
+  completeness_class LowCardinality(String),
+  lang LowCardinality(String),
+  emoji LowCardinality(String),
+  occurrences UInt64,
+  posts UInt64
+) ENGINE = SummingMergeTree((occurrences, posts))
+ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, lang, emoji);"
+    )
+}
+
+fn lang_total_table_sql(database: &ClickHouseIdentifier) -> String {
+    format!(
+        r"CREATE TABLE IF NOT EXISTS {database}.v2_lang_total_r3 (
+  src LowCardinality(String),
+  normalizer_git_rev LowCardinality(String),
+  dataset LowCardinality(String),
+  fetch_method LowCardinality(String),
+  completeness_class LowCardinality(String),
+  lang LowCardinality(String),
+  occurrences UInt64,
+  posts UInt64
+) ENGINE = SummingMergeTree((occurrences, posts))
+ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, lang);"
+    )
+}
+
+fn posts_hourly_table_sql(database: &ClickHouseIdentifier) -> String {
+    format!(
+        r"CREATE TABLE IF NOT EXISTS {database}.v2_posts_hourly_r3 (
+  hour DateTime('UTC') CODEC(Delta(4), ZSTD(1)),
+  src LowCardinality(String),
+  normalizer_git_rev LowCardinality(String),
+  dataset LowCardinality(String),
+  fetch_method LowCardinality(String),
+  completeness_class LowCardinality(String),
+  posts UInt64,
+  posts_with_emojis UInt64,
+  emoji_occurrences UInt64
+) ENGINE = SummingMergeTree((posts, posts_with_emojis, emoji_occurrences))
+PARTITION BY toYear(hour)
+ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, hour);"
+    )
+}
+
+fn rebuild_emoji_total_sql(database: &ClickHouseIdentifier) -> String {
+    format!(
+        r"INSERT INTO {database}.v2_emoji_total_r3
+SELECT
+  src,
+  normalizer_git_rev,
+  dataset,
+  fetch_method,
+  completeness_class,
+  emoji,
+  count() AS occurrences,
+  uniqExact(did, rkey) AS posts
+FROM {database}.v2_post_serving_r3 FINAL
+ARRAY JOIN emojis AS emoji
+GROUP BY src, normalizer_git_rev, dataset, fetch_method, completeness_class, emoji;"
+    )
+}
+
+fn rebuild_emoji_total_by_lang_sql(database: &ClickHouseIdentifier) -> String {
+    format!(
+        r"INSERT INTO {database}.v2_emoji_total_by_lang_r3
+SELECT
+  src,
+  normalizer_git_rev,
+  dataset,
+  fetch_method,
+  completeness_class,
+  arrayJoin(langs) AS lang,
+  arrayJoin(emojis) AS emoji,
+  count() AS occurrences,
+  uniqExact(did, rkey) AS posts
+FROM {database}.v2_post_serving_r3 FINAL
+WHERE notEmpty(langs) AND notEmpty(emojis)
+GROUP BY src, normalizer_git_rev, dataset, fetch_method, completeness_class, lang, emoji;"
+    )
+}
+
+fn rebuild_lang_total_sql(database: &ClickHouseIdentifier) -> String {
+    format!(
+        r"INSERT INTO {database}.v2_lang_total_r3
+SELECT
+  src,
+  normalizer_git_rev,
+  dataset,
+  fetch_method,
+  completeness_class,
+  lang,
+  sum(emoji_occurrences) AS occurrences,
+  countIf(emoji_occurrences > 0) AS posts
+FROM {database}.v2_post_serving_r3 FINAL
+ARRAY JOIN langs AS lang
+GROUP BY src, normalizer_git_rev, dataset, fetch_method, completeness_class, lang;"
+    )
+}
+
+fn rebuild_posts_hourly_sql(database: &ClickHouseIdentifier) -> String {
+    format!(
+        r"INSERT INTO {database}.v2_posts_hourly_r3
+SELECT
+  toStartOfHour(coalesce(created_at, toDateTime64('1970-01-01 00:00:00', 6, 'UTC'))) AS hour,
+  src,
+  normalizer_git_rev,
+  dataset,
+  fetch_method,
+  completeness_class,
+  count() AS posts,
+  countIf(emoji_occurrences > 0) AS posts_with_emojis,
+  sum(emoji_occurrences) AS emoji_occurrences
+FROM {database}.v2_post_serving_r3 FINAL
+GROUP BY hour, src, normalizer_git_rev, dataset, fetch_method, completeness_class;"
     )
 }
 
@@ -594,7 +769,7 @@ fn is_clickhouse_identifier(value: &str) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct EmojiServingInsertRow<'a> {
+struct PostServingInsertRow<'a> {
     src: &'static str,
     run_id: &'a str,
     shard: &'a str,
@@ -612,13 +787,14 @@ struct EmojiServingInsertRow<'a> {
     rkey: &'a str,
     created_at: Option<&'a str>,
     created_at_parse_status: &'a str,
-    emoji: &'a str,
-    occurrences: u64,
     langs: &'a [String],
+    emojis: &'a [String],
+    emoji_occurrences: usize,
+    observed_at: &'a str,
 }
 
-impl<'a> EmojiServingInsertRow<'a> {
-    fn from_projection(row: &'a EmojiProjectionRow, identity: &'a DeriveManifestIdentity) -> Self {
+impl<'a> PostServingInsertRow<'a> {
+    fn from_projection(row: &'a PostServingRow, identity: &'a DeriveManifestIdentity) -> Self {
         Self {
             src: BACKFILL_DERIVE_SOURCE,
             run_id: identity.run_id.as_str(),
@@ -637,9 +813,10 @@ impl<'a> EmojiServingInsertRow<'a> {
             rkey: row.rkey.as_str(),
             created_at: row.created_at_normalized.as_deref(),
             created_at_parse_status: row.created_at_parse_status.as_str(),
-            emoji: row.emoji.as_str(),
-            occurrences: row.occurrences,
             langs: row.langs.as_slice(),
+            emojis: row.emojis.as_slice(),
+            emoji_occurrences: row.emojis.len(),
+            observed_at: identity.observed_at.as_str(),
         }
     }
 }

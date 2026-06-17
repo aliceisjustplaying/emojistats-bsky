@@ -44,32 +44,29 @@ fn identity() -> DeriveManifestIdentity {
         completeness_class: "content_addressed_snapshot".to_owned(),
         content_hash: "content-hash".to_owned(),
         receipt_hash: "receipt-hash".to_owned(),
+        observed_at: "2026-06-15T00:00:00Z".to_owned(),
         schema_version: 2,
         normalizer: test_normalizer(),
     }
 }
 
-fn emoji_rows() -> Vec<EmojiProjectionRow> {
+fn post_rows() -> Vec<PostServingRow> {
     vec![
-        EmojiProjectionRow {
+        PostServingRow {
             did: "did:plc:test".to_owned(),
             rkey: "a".to_owned(),
-            cid: "bafy-a".to_owned(),
             created_at_normalized: Some("2026-06-15T00:00:00Z".to_owned()),
             created_at_parse_status: CreatedAtParseStatus::Valid,
-            emoji: ":test:".to_owned(),
-            occurrences: 2,
             langs: vec!["en".to_owned(), "ja".to_owned()],
+            emojis: vec![":test:".to_owned(), ":test:".to_owned()],
         },
-        EmojiProjectionRow {
+        PostServingRow {
             did: "did:plc:test".to_owned(),
             rkey: "b".to_owned(),
-            cid: "bafy-b".to_owned(),
             created_at_normalized: None,
             created_at_parse_status: CreatedAtParseStatus::Missing,
-            emoji: ":other:".to_owned(),
-            occurrences: 1,
             langs: Vec::new(),
+            emojis: vec![":other:".to_owned()],
         },
     ]
 }
@@ -276,12 +273,12 @@ fn verified_input() -> VerifiedLoaderInput {
 }
 
 #[test]
-fn canonical_streaming_emoji_dedupe_token_is_stable_and_framed() {
-    let token = canonical_streaming_emoji_dedupe_token(&identity(), 0, &emoji_rows()).unwrap();
+fn canonical_streaming_post_dedupe_token_is_stable_and_framed() {
+    let token = canonical_streaming_post_dedupe_token(&identity(), 0, &post_rows()).unwrap();
 
     assert_eq!(
         token,
-        "derive:emoji:c140796160d4d7cb339d514053a68b76991bd67156693b53a88b0f07dbb8d629"
+        "derive:post:ff84475ac048b15d8703b8daab1ba57cc404c9a7037b89de1a7477a824cc0906"
     );
 }
 
@@ -291,19 +288,19 @@ fn canonical_streaming_counter_dedupe_token_is_stable_and_framed() {
 
     assert_eq!(
         token,
-        "derive:counter:6066bca798caeabbb48dad11cdd9fffa898176fccd5681c3de78130c471b25b4"
+        "derive:counter:7c858ca5d61a5d2d0732c9c04d79f1497f636ca9420e2b32d7f1ccd044d2a274"
     );
 }
 
 #[test]
 fn canonical_streaming_dedupe_tokens_include_lane_and_chunk() {
-    let rows = emoji_rows();
-    let first = canonical_streaming_emoji_dedupe_token(&identity(), 0, &rows).unwrap();
-    let second = canonical_streaming_emoji_dedupe_token(&identity(), 1, &rows).unwrap();
+    let rows = post_rows();
+    let first = canonical_streaming_post_dedupe_token(&identity(), 0, &rows).unwrap();
+    let second = canonical_streaming_post_dedupe_token(&identity(), 1, &rows).unwrap();
     let counter = canonical_streaming_counter_dedupe_token(&identity(), &counter()).unwrap();
 
     assert_ne!(first, second);
-    assert!(first.starts_with("derive:emoji:"));
+    assert!(first.starts_with("derive:post:"));
     assert!(counter.starts_with("derive:counter:"));
 }
 
@@ -319,8 +316,8 @@ fn canonical_streaming_dedupe_tokens_are_stable_across_replay_manifest_sequence(
     replay_counter.file_sequence = 99;
 
     assert_eq!(
-        canonical_streaming_emoji_dedupe_token(&identity(), 0, &emoji_rows()).unwrap(),
-        canonical_streaming_emoji_dedupe_token(&replay_identity, 0, &emoji_rows()).unwrap()
+        canonical_streaming_post_dedupe_token(&identity(), 0, &post_rows()).unwrap(),
+        canonical_streaming_post_dedupe_token(&replay_identity, 0, &post_rows()).unwrap()
     );
     assert_eq!(
         canonical_streaming_counter_dedupe_token(&identity(), &counter()).unwrap(),
@@ -329,10 +326,10 @@ fn canonical_streaming_dedupe_tokens_are_stable_across_replay_manifest_sequence(
 }
 
 #[test]
-fn canonical_streaming_payload_rejects_single_emoji_row_over_payload_cap() {
+fn canonical_streaming_payload_rejects_single_post_row_over_payload_cap() {
     let verified = verified_input();
     let mut row = archive_row("oversized", "hello ✅", &["✅"]);
-    row.langs = vec!["x".repeat(DEFAULT_EMOJI_SERVING_PAYLOAD_MAX_BYTES)];
+    row.langs = vec!["x".repeat(DEFAULT_POST_SERVING_PAYLOAD_MAX_BYTES)];
     let mut state = CanonicalStreamingPayloadState::new(&verified);
 
     let error = state
@@ -340,11 +337,9 @@ fn canonical_streaming_payload_rejects_single_emoji_row_over_payload_cap() {
         .expect_err("oversized single row should fail before chunking");
     let error_text = error.to_string();
 
-    assert!(error_text.contains("emoji serving row exceeds payload byte cap"));
+    assert!(error_text.contains("post serving row exceeds payload byte cap"));
     assert!(error_text.contains("did=did:plc:fixture123"));
     assert!(error_text.contains("rkey=oversized"));
-    assert!(error_text.contains("cid=bafy-oversized"));
-    assert!(error_text.contains("emoji=✅"));
 }
 
 #[tokio::test]
@@ -451,8 +446,8 @@ async fn insert_payloads_records_partial_success_and_resumes_from_ledger() {
     let verified = verified_input();
     let payloads = vec![
         payload(
-            ClickHouseTable::EmojiServing,
-            "derive:emoji:first",
+            ClickHouseTable::PostServing,
+            "derive:post:first",
             "{\"a\":1}\n",
         ),
         payload(

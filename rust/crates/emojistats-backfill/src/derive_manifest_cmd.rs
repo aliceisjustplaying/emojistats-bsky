@@ -7,19 +7,16 @@ use std::{
 };
 
 use emojistats_backfill::{
-    archive::{
-        ArchivePostRowsHasher, EmojiProjectionRow, NormalizerVersion,
-        archive_post_rows_from_record_batch,
-    },
+    archive::{ArchivePostRowsHasher, NormalizerVersion, archive_post_rows_from_record_batch},
     clickhouse::{
         ClickHouseClientConfig, ClickHouseInsertPayload, ClickHouseInsertReceipt,
-        DEFAULT_EMOJI_SERVING_PAYLOAD_MAX_BYTES, emoji_serving_row_body_bytes,
-        emoji_serving_rows_insert_payload, execute_insert_payloads,
+        DEFAULT_POST_SERVING_PAYLOAD_MAX_BYTES, execute_insert_payloads,
+        post_serving_row_body_bytes, post_serving_rows_insert_payload,
         total_post_counter_insert_payload_for_counter,
     },
     derive::{
-        BACKFILL_DERIVE_SOURCE, DeriveManifestIdentity, TotalPostCounterInput,
-        emoji_projection_rows_for_post,
+        BACKFILL_DERIVE_SOURCE, DeriveManifestIdentity, PostServingRow, TotalPostCounterInput,
+        post_serving_row_for_post,
     },
     hash::hash_serialized_json,
     manifest_derive::{
@@ -34,7 +31,7 @@ use sha2::{Digest, Sha256};
 
 use super::{add_count, count_len, increment, payload_row_count};
 
-const DERIVE_EMOJI_CHUNK_ROWS: usize = 10_000;
+const DERIVE_POST_CHUNK_ROWS: usize = 10_000;
 // Canonical streaming derive tokens are lane/chunk-framed and use the same stable manifest
 // identity fields as full-batch derive tokens: dataset, DID, proof hashes, schema, and normalizer.
 const STREAMING_DEDUPE_TOKEN_DOMAIN: &str = "emojistats-backfill-streaming-derive-token-v1";
@@ -542,9 +539,9 @@ struct CanonicalStreamingPayloadState<'a> {
     rows: u64,
     posts_with_emojis: u64,
     emoji_occurrences: u64,
-    emoji_chunk_rows: Vec<EmojiProjectionRow>,
-    emoji_chunk_body_bytes: usize,
-    emoji_chunk_index: u64,
+    post_chunk_rows: Vec<PostServingRow>,
+    post_chunk_body_bytes: usize,
+    post_chunk_index: u64,
 }
 
 impl<'a> CanonicalStreamingPayloadState<'a> {
@@ -554,9 +551,9 @@ impl<'a> CanonicalStreamingPayloadState<'a> {
             rows: 0,
             posts_with_emojis: 0,
             emoji_occurrences: 0,
-            emoji_chunk_rows: Vec::with_capacity(DERIVE_EMOJI_CHUNK_ROWS),
-            emoji_chunk_body_bytes: 0,
-            emoji_chunk_index: 0,
+            post_chunk_rows: Vec::with_capacity(DERIVE_POST_CHUNK_ROWS),
+            post_chunk_body_bytes: 0,
+            post_chunk_index: 0,
         }
     }
 
@@ -581,49 +578,44 @@ impl<'a> CanonicalStreamingPayloadState<'a> {
                 )?,
                 "streaming derive emoji occurrence total",
             )?;
-            let projection_rows = emoji_projection_rows_for_post(row)?;
-            for projection_row in projection_rows {
-                let row_body_bytes =
-                    emoji_serving_row_body_bytes(&self.verified.identity, &projection_row)?;
-                validate_emoji_row_payload_size(row_body_bytes, &projection_row)?;
-                self.flush_emoji_chunk_if_needed(row_body_bytes, &mut payloads)?;
-                self.emoji_chunk_rows.push(projection_row);
-                self.emoji_chunk_body_bytes = self
-                    .emoji_chunk_body_bytes
-                    .checked_add(row_body_bytes)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("streaming derive emoji payload bytes overflow")
-                    })?;
-                if self.emoji_chunk_rows.len() >= DERIVE_EMOJI_CHUNK_ROWS {
-                    payloads.push(self.flush_emoji_chunk()?);
-                }
+            let post_row = post_serving_row_for_post(row);
+            let row_body_bytes = post_serving_row_body_bytes(&self.verified.identity, &post_row)?;
+            validate_post_row_payload_size(row_body_bytes, &post_row)?;
+            self.flush_post_chunk_if_needed(row_body_bytes, &mut payloads)?;
+            self.post_chunk_rows.push(post_row);
+            self.post_chunk_body_bytes = self
+                .post_chunk_body_bytes
+                .checked_add(row_body_bytes)
+                .ok_or_else(|| anyhow::anyhow!("streaming derive post payload bytes overflow"))?;
+            if self.post_chunk_rows.len() >= DERIVE_POST_CHUNK_ROWS {
+                payloads.push(self.flush_post_chunk()?);
             }
         }
         Ok(payloads)
     }
 
-    fn flush_emoji_chunk_if_needed(
+    fn flush_post_chunk_if_needed(
         &mut self,
         row_body_bytes: usize,
         payloads: &mut Vec<ClickHouseInsertPayload>,
     ) -> anyhow::Result<()> {
-        if self.emoji_chunk_rows.is_empty() {
+        if self.post_chunk_rows.is_empty() {
             return Ok(());
         }
         let next_bytes = self
-            .emoji_chunk_body_bytes
+            .post_chunk_body_bytes
             .checked_add(row_body_bytes)
-            .ok_or_else(|| anyhow::anyhow!("streaming derive emoji payload bytes overflow"))?;
-        if next_bytes > DEFAULT_EMOJI_SERVING_PAYLOAD_MAX_BYTES {
-            payloads.push(self.flush_emoji_chunk()?);
+            .ok_or_else(|| anyhow::anyhow!("streaming derive post payload bytes overflow"))?;
+        if next_bytes > DEFAULT_POST_SERVING_PAYLOAD_MAX_BYTES {
+            payloads.push(self.flush_post_chunk()?);
         }
         Ok(())
     }
 
     fn finish(mut self) -> anyhow::Result<Vec<ClickHouseInsertPayload>> {
         let mut payloads = Vec::new();
-        if !self.emoji_chunk_rows.is_empty() {
-            payloads.push(self.flush_emoji_chunk()?);
+        if !self.post_chunk_rows.is_empty() {
+            payloads.push(self.flush_post_chunk()?);
         }
         let counter = TotalPostCounterInput {
             source: BACKFILL_DERIVE_SOURCE.to_owned(),
@@ -649,20 +641,20 @@ impl<'a> CanonicalStreamingPayloadState<'a> {
         Ok(payloads)
     }
 
-    fn flush_emoji_chunk(&mut self) -> anyhow::Result<ClickHouseInsertPayload> {
-        let rows = std::mem::take(&mut self.emoji_chunk_rows);
-        let token = canonical_streaming_emoji_dedupe_token(
+    fn flush_post_chunk(&mut self) -> anyhow::Result<ClickHouseInsertPayload> {
+        let rows = std::mem::take(&mut self.post_chunk_rows);
+        let token = canonical_streaming_post_dedupe_token(
             &self.verified.identity,
-            self.emoji_chunk_index,
+            self.post_chunk_index,
             &rows,
         )?;
         increment(
-            &mut self.emoji_chunk_index,
-            "streaming derive emoji chunk index",
+            &mut self.post_chunk_index,
+            "streaming derive post chunk index",
         )?;
-        self.emoji_chunk_rows = Vec::with_capacity(DERIVE_EMOJI_CHUNK_ROWS);
-        self.emoji_chunk_body_bytes = 0;
-        Ok(emoji_serving_rows_insert_payload(
+        self.post_chunk_rows = Vec::with_capacity(DERIVE_POST_CHUNK_ROWS);
+        self.post_chunk_body_bytes = 0;
+        Ok(post_serving_rows_insert_payload(
             &self.verified.identity,
             &rows,
             token,
@@ -670,61 +662,59 @@ impl<'a> CanonicalStreamingPayloadState<'a> {
     }
 }
 
-fn validate_emoji_row_payload_size(
+fn validate_post_row_payload_size(
     row_body_bytes: usize,
-    row: &EmojiProjectionRow,
+    row: &PostServingRow,
 ) -> anyhow::Result<()> {
-    if row_body_bytes <= DEFAULT_EMOJI_SERVING_PAYLOAD_MAX_BYTES {
+    if row_body_bytes <= DEFAULT_POST_SERVING_PAYLOAD_MAX_BYTES {
         return Ok(());
     }
     anyhow::bail!(
-        "emoji serving row exceeds payload byte cap before chunking: did={} rkey={} cid={} emoji={} row_body_bytes={} max={}",
+        "post serving row exceeds payload byte cap before chunking: did={} rkey={} row_body_bytes={} max={}",
         row.did,
         row.rkey,
-        row.cid,
-        row.emoji,
         row_body_bytes,
-        DEFAULT_EMOJI_SERVING_PAYLOAD_MAX_BYTES
+        DEFAULT_POST_SERVING_PAYLOAD_MAX_BYTES
     )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamingDedupeLane {
-    Emoji,
+    Post,
     Counter,
 }
 
 impl StreamingDedupeLane {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::Emoji => "emoji",
+            Self::Post => "post",
             Self::Counter => "counter",
         }
     }
 }
 
-fn canonical_streaming_emoji_dedupe_token(
+fn canonical_streaming_post_dedupe_token(
     identity: &DeriveManifestIdentity,
     chunk_index: u64,
-    rows: &[EmojiProjectionRow],
+    rows: &[PostServingRow],
 ) -> anyhow::Result<String> {
     let mut hasher =
-        canonical_streaming_dedupe_hasher(identity, StreamingDedupeLane::Emoji, Some(chunk_index))?;
-    hash_str_frame(&mut hasher, "payload.kind", "emoji_rows")?;
+        canonical_streaming_dedupe_hasher(identity, StreamingDedupeLane::Post, Some(chunk_index))?;
+    hash_str_frame(&mut hasher, "payload.kind", "post_rows")?;
     hash_u64_frame(
         &mut hasher,
-        "emoji_rows.len",
-        count_len(rows.len(), "streaming dedupe emoji row count")?,
+        "post_rows.len",
+        count_len(rows.len(), "streaming dedupe post row count")?,
     )?;
     for (index, row) in rows.iter().enumerate() {
         hash_u64_frame(
             &mut hasher,
-            "emoji_row.index",
-            count_len(index, "streaming dedupe emoji row index")?,
+            "post_row.index",
+            count_len(index, "streaming dedupe post row index")?,
         )?;
-        hash_emoji_row_frames(&mut hasher, row)?;
+        hash_post_row_frames(&mut hasher, row)?;
     }
-    Ok(streaming_dedupe_token(StreamingDedupeLane::Emoji, hasher))
+    Ok(streaming_dedupe_token(StreamingDedupeLane::Post, hasher))
 }
 
 fn canonical_streaming_counter_dedupe_token(
@@ -779,38 +769,49 @@ fn hash_identity_frames(
     )?;
     hash_str_frame(hasher, "identity.content_hash", &identity.content_hash)?;
     hash_str_frame(hasher, "identity.receipt_hash", &identity.receipt_hash)?;
+    hash_str_frame(hasher, "identity.observed_at", &identity.observed_at)?;
     hash_u16_frame(hasher, "identity.schema_version", identity.schema_version)?;
     hash_normalizer_frames(hasher, "identity.normalizer", &identity.normalizer)
 }
 
-fn hash_emoji_row_frames(hasher: &mut Sha256, row: &EmojiProjectionRow) -> anyhow::Result<()> {
-    hash_str_frame(hasher, "emoji_row.did", &row.did)?;
-    hash_str_frame(hasher, "emoji_row.rkey", &row.rkey)?;
-    hash_str_frame(hasher, "emoji_row.cid", &row.cid)?;
+fn hash_post_row_frames(hasher: &mut Sha256, row: &PostServingRow) -> anyhow::Result<()> {
+    hash_str_frame(hasher, "post_row.did", &row.did)?;
+    hash_str_frame(hasher, "post_row.rkey", &row.rkey)?;
     hash_optional_str_frame(
         hasher,
-        "emoji_row.created_at_normalized",
+        "post_row.created_at_normalized",
         row.created_at_normalized.as_deref(),
     )?;
     hash_str_frame(
         hasher,
-        "emoji_row.created_at_parse_status",
+        "post_row.created_at_parse_status",
         row.created_at_parse_status.as_str(),
     )?;
-    hash_str_frame(hasher, "emoji_row.emoji", &row.emoji)?;
-    hash_u64_frame(hasher, "emoji_row.occurrences", row.occurrences)?;
     hash_u64_frame(
         hasher,
-        "emoji_row.langs.len",
+        "post_row.langs.len",
         count_len(row.langs.len(), "streaming dedupe language count")?,
     )?;
     for (index, lang) in row.langs.iter().enumerate() {
         hash_u64_frame(
             hasher,
-            "emoji_row.lang.index",
+            "post_row.lang.index",
             count_len(index, "streaming dedupe language index")?,
         )?;
-        hash_str_frame(hasher, "emoji_row.lang", lang)?;
+        hash_str_frame(hasher, "post_row.lang", lang)?;
+    }
+    hash_u64_frame(
+        hasher,
+        "post_row.emojis.len",
+        count_len(row.emojis.len(), "streaming dedupe emoji count")?,
+    )?;
+    for (index, emoji) in row.emojis.iter().enumerate() {
+        hash_u64_frame(
+            hasher,
+            "post_row.emoji.index",
+            count_len(index, "streaming dedupe emoji index")?,
+        )?;
+        hash_str_frame(hasher, "post_row.emoji", emoji)?;
     }
     Ok(())
 }

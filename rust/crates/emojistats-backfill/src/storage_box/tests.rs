@@ -524,7 +524,7 @@ fn remote_only_derive_canary_commits_storage_box_artifacts() {
     assert_eq!(verified.repo_receipt.did, CANARY_DID);
     assert_eq!(batch.total_post_counter.posts_processed, 2);
     assert_eq!(batch.total_post_counter.emoji_occurrences, 3);
-    assert_eq!(batch.emoji_rows.len(), 2);
+    assert_eq!(batch.post_rows.len(), 2);
 }
 
 #[test]

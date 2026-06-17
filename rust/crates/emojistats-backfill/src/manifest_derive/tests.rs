@@ -253,8 +253,10 @@ fn verified_manifest_entry_loads_clickhouse_batch() {
     let batch =
         debug_materialize_clickhouse_batch(&output_dir, input).expect("verified batch should load");
 
-    assert_eq!(batch.manifest_identity, input.identity);
-    assert_eq!(batch.emoji_rows.len(), 2);
+    let verified = verify_loader_input_for_streaming(&output_dir, input)
+        .expect("streaming proof should verify");
+    assert_eq!(batch.manifest_identity, verified.identity);
+    assert_eq!(batch.post_rows.len(), 2);
     assert_eq!(batch.total_post_counter.posts_processed, 2);
     assert_eq!(batch.total_post_counter.emoji_occurrences, 3);
 }

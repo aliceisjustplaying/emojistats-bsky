@@ -13,12 +13,14 @@ use serde_json::Value;
 use super::{
     CLICKHOUSE_DATABASE_HEADER, CLICKHOUSE_KEY_HEADER, CLICKHOUSE_RESPONSE_SNIPPET_MAX_BYTES,
     CLICKHOUSE_USER_HEADER, ClickHouseClientConfig, ClickHouseInsertContext, ClickHouseInsertError,
-    ClickHouseSchemaError, ClickHouseTable, JSON_EACH_ROW_FORMAT, classify_insert_status,
-    create_schema_sql, derive_insert_payloads, execute_insert_payloads,
+    ClickHouseSchemaError, ClickHouseTable, JSON_EACH_ROW_FORMAT, aggregate_rebuild_sql,
+    classify_insert_status, create_schema_sql, derive_insert_payloads, execute_insert_payloads,
 };
 use crate::{
-    archive::{EmojiProjectionRow, current_normalizer},
-    derive::{ClickHouseDeriveBatch, DeriveManifestIdentity, TotalPostCounterInput},
+    archive::current_normalizer,
+    derive::{
+        ClickHouseDeriveBatch, DeriveManifestIdentity, PostServingRow, TotalPostCounterInput,
+    },
 };
 
 fn batch() -> ClickHouseDeriveBatch {
@@ -33,30 +35,27 @@ fn batch() -> ClickHouseDeriveBatch {
             completeness_class: "content_addressed_snapshot".to_owned(),
             content_hash: "content-hash".to_owned(),
             receipt_hash: "receipt-hash".to_owned(),
+            observed_at: "2026-06-15T00:00:00Z".to_owned(),
             schema_version: 2,
             normalizer: current_normalizer(),
         },
         dedupe_token: "derive:test-token".to_owned(),
-        emoji_rows: vec![
-            EmojiProjectionRow {
+        post_rows: vec![
+            PostServingRow {
                 did: "did:plc:abc".to_owned(),
                 rkey: "3kxyz".to_owned(),
-                cid: "bafy-abc".to_owned(),
                 created_at_normalized: Some("2026-06-15T00:00:00Z".to_owned()),
                 created_at_parse_status: crate::archive::CreatedAtParseStatus::Valid,
-                emoji: "✅".to_owned(),
-                occurrences: 2,
                 langs: vec!["en".to_owned(), "ja".to_owned()],
+                emojis: vec!["✅".to_owned(), "✅".to_owned(), "🔥".to_owned()],
             },
-            EmojiProjectionRow {
+            PostServingRow {
                 did: "did:plc:def".to_owned(),
                 rkey: "3kxyy".to_owned(),
-                cid: "bafy-def".to_owned(),
                 created_at_normalized: None,
                 created_at_parse_status: crate::archive::CreatedAtParseStatus::Missing,
-                emoji: "🔥".to_owned(),
-                occurrences: 1,
                 langs: Vec::new(),
+                emojis: Vec::new(),
             },
         ],
         total_post_counter: TotalPostCounterInput {
@@ -166,22 +165,39 @@ fn write_http_response(stream: &mut TcpStream, status: u16, body: &str) {
 fn schema_sql_contains_typed_table_names_and_engines() {
     let sql = create_schema_sql("emojistats").expect("schema sql");
 
-    assert!(sql.contains("CREATE TABLE IF NOT EXISTS emojistats.v2_emoji_serving_r2"));
-    assert!(sql.contains("CREATE TABLE IF NOT EXISTS emojistats.v2_total_post_counters_r2"));
-    assert!(sql.contains("ENGINE = ReplacingMergeTree(inserted_at)"));
+    assert!(sql.contains("CREATE TABLE IF NOT EXISTS emojistats.v2_post_serving_r3"));
+    assert!(sql.contains("CREATE TABLE IF NOT EXISTS emojistats.v2_total_post_counters_r3"));
+    assert!(sql.contains("CREATE TABLE IF NOT EXISTS emojistats.v2_emoji_total_r3"));
+    assert!(sql.contains("CREATE TABLE IF NOT EXISTS emojistats.v2_posts_hourly_r3"));
+    assert!(sql.contains("ENGINE = ReplacingMergeTree(observed_at)"));
     assert!(sql.contains("non_replicated_deduplication_window = 10000"));
     assert!(sql.contains("LowCardinality(String)"));
     assert!(sql.contains("normalizer_git_rev LowCardinality(String)"));
     assert!(!sql.contains("cid String CODEC(ZSTD(1))"));
+    assert!(!sql.contains("text String"));
     assert!(sql.contains("dataset LowCardinality(String)"));
     assert!(sql.contains("fetch_method LowCardinality(String)"));
     assert!(sql.contains("completeness_class LowCardinality(String)"));
+    assert!(sql.contains("emojis Array(LowCardinality(String))"));
     assert!(sql.contains(
-        "ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, did, rkey, emoji)"
+        "ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, did, rkey)"
     ));
     assert!(sql.contains(
         "ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, did)"
     ));
+}
+
+#[test]
+fn aggregate_rebuild_sql_uses_compact_post_rows_and_array_join() {
+    let sql = aggregate_rebuild_sql("emojistats").expect("aggregate rebuild sql");
+
+    assert!(sql.contains("INSERT INTO emojistats.v2_emoji_total_r3"));
+    assert!(sql.contains("FROM emojistats.v2_post_serving_r3 FINAL"));
+    assert!(sql.contains("ARRAY JOIN emojis AS emoji"));
+    assert!(sql.contains("arrayJoin(langs) AS lang"));
+    assert!(sql.contains("arrayJoin(emojis) AS emoji"));
+    assert!(sql.contains("INSERT INTO emojistats.v2_posts_hourly_r3"));
+    assert!(sql.contains("sum(emoji_occurrences) AS emoji_occurrences"));
 }
 
 #[test]
@@ -199,15 +215,15 @@ fn json_each_row_payloads_include_derive_rows_and_total_counter() {
     let payloads = derive_insert_payloads(&batch()).expect("payloads");
 
     assert_eq!(payloads.len(), 2);
-    let emoji_payload = payloads.first().expect("emoji payload should exist");
-    assert_eq!(emoji_payload.table, ClickHouseTable::EmojiServing);
-    assert_eq!(emoji_payload.format, JSON_EACH_ROW_FORMAT);
-    assert_eq!(emoji_payload.row_count, 2);
-    assert!(emoji_payload.body.ends_with('\n'));
-    let emoji_lines = emoji_payload.body.lines().collect::<Vec<_>>();
-    assert_eq!(emoji_lines.len(), 2);
-    let first_line = emoji_lines.first().expect("first emoji line should exist");
-    let first: Value = serde_json::from_str(first_line).expect("first emoji row json");
+    let post_payload = payloads.first().expect("post payload should exist");
+    assert_eq!(post_payload.table, ClickHouseTable::PostServing);
+    assert_eq!(post_payload.format, JSON_EACH_ROW_FORMAT);
+    assert_eq!(post_payload.row_count, 2);
+    assert!(post_payload.body.ends_with('\n'));
+    let post_lines = post_payload.body.lines().collect::<Vec<_>>();
+    assert_eq!(post_lines.len(), 2);
+    let first_line = post_lines.first().expect("first post line should exist");
+    let first: Value = serde_json::from_str(first_line).expect("first post row json");
     assert_eq!(field(&first, "src"), "backfill-v2-derive");
     assert_eq!(field(&first, "dataset"), "raw_archive_posts");
     assert_eq!(field(&first, "fetch_method"), "get_repo");
@@ -221,8 +237,13 @@ fn json_each_row_payloads_include_derive_rows_and_total_counter() {
     );
     assert_eq!(field(&first, "did"), "did:plc:abc");
     assert!(first.get("cid").is_none());
-    assert_eq!(field(&first, "emoji"), "✅");
-    assert_eq!(field(&first, "occurrences"), 2);
+    assert!(first.get("text").is_none());
+    assert_eq!(field(&first, "emoji_occurrences"), 3);
+    assert_eq!(field(&first, "observed_at"), "2026-06-15T00:00:00Z");
+    let emojis = field(&first, "emojis")
+        .as_array()
+        .expect("emojis should be an array");
+    assert_eq!(emojis.get(1), Some(&Value::String("✅".to_owned())));
     let langs = field(&first, "langs")
         .as_array()
         .expect("langs should be an array");
@@ -316,7 +337,7 @@ async fn execute_insert_payloads_sends_payloads_in_order() {
     assert_eq!(receipts.len(), 2);
     assert_eq!(
         receipts.first().expect("first receipt").context.table,
-        ClickHouseTable::EmojiServing
+        ClickHouseTable::PostServing
     );
     assert_eq!(
         receipts.get(1).expect("second receipt").context.table,
@@ -328,14 +349,14 @@ async fn execute_insert_payloads_sends_payloads_in_order() {
             .first()
             .expect("first request")
             .target
-            .contains("v2_emoji_serving_r2")
+            .contains("v2_post_serving_r3")
     );
     assert!(
         requests
             .get(1)
             .expect("second request")
             .target
-            .contains("v2_total_post_counters_r2")
+            .contains("v2_total_post_counters_r3")
     );
     assert!(
         requests
@@ -394,7 +415,7 @@ async fn execute_insert_payloads_classifies_retryable_status_with_snippet() {
             response_snippet,
         } => {
             assert_eq!(status, 503);
-            assert_eq!(context.table, ClickHouseTable::EmojiServing);
+            assert_eq!(context.table, ClickHouseTable::PostServing);
             assert_eq!(context.dedupe_token, "derive:test-token");
             assert!(context.insert_deduplicate);
             assert_eq!(
@@ -465,9 +486,9 @@ fn classify_insert_status_marks_client_errors_permanent() {
 }
 
 #[test]
-fn empty_emoji_batches_only_emit_total_counter_payload() {
+fn empty_post_batches_only_emit_total_counter_payload() {
     let mut batch = batch();
-    batch.emoji_rows.clear();
+    batch.post_rows.clear();
 
     let payloads = derive_insert_payloads(&batch).expect("payloads");
 

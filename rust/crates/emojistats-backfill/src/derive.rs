@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use sha2::{Digest, Sha256};
 
 use crate::archive::{
-    ArchivePostRow, EmojiProjectionRow, LocalManifestEntry, NormalizerVersion, PostDataset,
+    ArchivePostRow, CreatedAtParseStatus, EmojiProjectionRow, LocalManifestEntry,
+    NormalizerVersion, PostDataset,
 };
 
 /// Source marker for rows produced by the v2 backfill derive lane.
@@ -23,11 +24,12 @@ pub struct DeriveManifestIdentity {
     pub completeness_class: String,
     pub content_hash: String,
     pub receipt_hash: String,
+    pub observed_at: String,
     pub schema_version: u16,
     pub normalizer: NormalizerVersion,
 }
 
-/// Counter input for the total-post path that cannot be reconstructed from emoji rows.
+/// Counter input for the per-manifest total-post audit path.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TotalPostCounterInput {
     pub source: String,
@@ -52,6 +54,7 @@ pub struct TotalPostCounterInput {
 pub struct DeriveBatchInput<'a> {
     pub manifest: &'a LocalManifestEntry,
     pub archive_rows: &'a [ArchivePostRow],
+    pub observed_at: &'a str,
 }
 
 /// `ClickHouse`-ready batch payload. Network insert/retry policy stays outside this module.
@@ -59,8 +62,19 @@ pub struct DeriveBatchInput<'a> {
 pub struct ClickHouseDeriveBatch {
     pub manifest_identity: DeriveManifestIdentity,
     pub dedupe_token: String,
-    pub emoji_rows: Vec<EmojiProjectionRow>,
+    pub post_rows: Vec<PostServingRow>,
     pub total_post_counter: TotalPostCounterInput,
+}
+
+/// Compact `ClickHouse` serving post row derived from one archive row.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PostServingRow {
+    pub did: String,
+    pub rkey: String,
+    pub created_at_normalized: Option<String>,
+    pub created_at_parse_status: CreatedAtParseStatus,
+    pub langs: Vec<String>,
+    pub emojis: Vec<String>,
 }
 
 /// Borrowed projection row derived from one archive post row.
@@ -89,7 +103,7 @@ pub struct DeriveCheckpointKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeriveCheckpointLane {
-    EmojiServing,
+    PostServing,
     TotalPostCounter,
 }
 
@@ -121,11 +135,11 @@ pub enum DeriveError {
 impl DeriveCheckpointKey {
     /// Build a stable checkpoint key for an emoji-serving chunk.
     #[must_use]
-    pub fn emoji_serving(identity: &DeriveManifestIdentity, chunk_index: u64) -> Self {
+    pub fn post_serving(identity: &DeriveManifestIdentity, chunk_index: u64) -> Self {
         Self {
             source: BACKFILL_DERIVE_SOURCE.to_owned(),
             receipt_hash: identity.receipt_hash.clone(),
-            lane: DeriveCheckpointLane::EmojiServing,
+            lane: DeriveCheckpointLane::PostServing,
             chunk_index: Some(chunk_index),
         }
     }
@@ -176,15 +190,15 @@ pub fn derive_clickhouse_batch(
     input: DeriveBatchInput<'_>,
 ) -> Result<ClickHouseDeriveBatch, DeriveError> {
     validate_manifest_row_count(input.manifest, input.archive_rows)?;
-    let manifest_identity = manifest_identity(input.manifest)?;
-    let emoji_rows = derive_emoji_projection_rows(input.archive_rows)?;
+    let manifest_identity = manifest_identity_with_observed_at(input.manifest, input.observed_at)?;
+    let post_rows = derive_post_serving_rows(input.archive_rows);
     let total_post_counter = total_post_counter_input(input.manifest, input.archive_rows)?;
-    let dedupe_token = derive_dedupe_token(&manifest_identity, &emoji_rows, &total_post_counter)?;
+    let dedupe_token = derive_dedupe_token(&manifest_identity, &post_rows, &total_post_counter)?;
 
     Ok(ClickHouseDeriveBatch {
         manifest_identity,
         dedupe_token,
-        emoji_rows,
+        post_rows,
         total_post_counter,
     })
 }
@@ -208,9 +222,24 @@ pub fn manifest_identity(
         completeness_class: completeness_class_str(dataset).to_owned(),
         content_hash: manifest.content_hash.clone(),
         receipt_hash: manifest.receipt_hash.clone(),
+        observed_at: String::new(),
         schema_version: manifest.schema_version,
         normalizer: manifest.normalizer.clone(),
     })
+}
+
+/// Attach the verified repo receipt observation time to a manifest-derived identity.
+///
+/// # Errors
+///
+/// Returns [`DeriveError`] when the committed manifest names an unsupported post dataset.
+pub fn manifest_identity_with_observed_at(
+    manifest: &LocalManifestEntry,
+    observed_at: &str,
+) -> Result<DeriveManifestIdentity, DeriveError> {
+    let mut identity = manifest_identity(manifest)?;
+    observed_at.clone_into(&mut identity.observed_at);
+    Ok(identity)
 }
 
 fn post_dataset(manifest: &LocalManifestEntry) -> Result<PostDataset, DeriveError> {
@@ -240,14 +269,14 @@ const fn completeness_class_str(dataset: PostDataset) -> &'static str {
 /// Returns [`DeriveError`] if any framed hash field length exceeds `u64`.
 pub fn derive_dedupe_token(
     identity: &DeriveManifestIdentity,
-    emoji_rows: &[EmojiProjectionRow],
+    post_rows: &[PostServingRow],
     total_post_counter: &TotalPostCounterInput,
 ) -> Result<String, DeriveError> {
     let mut hasher = Sha256::new();
     hash_field(&mut hasher, "emojistats-backfill-derive-v1")?;
     hash_manifest_identity(&mut hasher, identity)?;
-    for row in emoji_rows {
-        hash_emoji_row(&mut hasher, row)?;
+    for row in post_rows {
+        hash_post_serving_row(&mut hasher, row)?;
     }
     hash_total_post_counter(&mut hasher, total_post_counter)?;
     Ok(format!("derive:{}", hex::encode(hasher.finalize())))
@@ -280,6 +309,25 @@ pub fn total_post_counter_input(
         min_created_at_normalized: manifest.min_created_at_normalized.clone(),
         max_created_at_normalized: manifest.max_created_at_normalized.clone(),
     })
+}
+
+/// Derive compact post-serving rows for archive post rows.
+#[must_use]
+pub fn derive_post_serving_rows(rows: &[ArchivePostRow]) -> Vec<PostServingRow> {
+    rows.iter().map(post_serving_row_for_post).collect()
+}
+
+/// Derive one compact post-serving row from one archive post row.
+#[must_use]
+pub fn post_serving_row_for_post(row: &ArchivePostRow) -> PostServingRow {
+    PostServingRow {
+        did: row.did.clone(),
+        rkey: row.rkey.clone(),
+        created_at_normalized: row.created_at_normalized.clone(),
+        created_at_parse_status: row.created_at_parse_status,
+        langs: row.langs.clone(),
+        emojis: row.emoji_sequence.clone(),
+    }
 }
 
 fn validate_manifest_row_count(
@@ -441,21 +489,23 @@ fn hash_manifest_identity(
     hash_field(hasher, &identity.completeness_class)?;
     hash_field(hasher, &identity.content_hash)?;
     hash_field(hasher, &identity.receipt_hash)?;
+    hash_field(hasher, &identity.observed_at)?;
     hash_u16(hasher, identity.schema_version);
     hash_normalizer(hasher, &identity.normalizer)?;
     Ok(())
 }
 
-fn hash_emoji_row(hasher: &mut Sha256, row: &EmojiProjectionRow) -> Result<(), DeriveError> {
+fn hash_post_serving_row(hasher: &mut Sha256, row: &PostServingRow) -> Result<(), DeriveError> {
     hash_field(hasher, &row.did)?;
     hash_field(hasher, &row.rkey)?;
-    hash_field(hasher, &row.cid)?;
     hash_optional_field(hasher, row.created_at_normalized.as_deref())?;
     hash_field(hasher, row.created_at_parse_status.as_str())?;
-    hash_field(hasher, &row.emoji)?;
-    hash_u64(hasher, row.occurrences);
     for lang in &row.langs {
         hash_field(hasher, lang)?;
+    }
+    hash_field(hasher, "")?;
+    for emoji in &row.emojis {
+        hash_field(hasher, emoji)?;
     }
     hash_field(hasher, "")
 }
@@ -582,27 +632,27 @@ mod tests {
     }
 
     #[test]
-    fn derives_emoji_rows_and_total_post_counter() {
+    fn derives_post_rows_and_total_post_counter() {
         let rows = [row("a", &["✅", "✅", "🔥"]), row("b", &[])];
         let batch = derive_clickhouse_batch(DeriveBatchInput {
             manifest: &manifest(2),
             archive_rows: &rows,
+            observed_at: "2026-06-15T00:00:00Z",
         })
         .expect("derive batch");
 
-        assert_eq!(batch.emoji_rows.len(), 2);
+        assert_eq!(batch.post_rows.len(), 2);
         let first = batch
-            .emoji_rows
+            .post_rows
             .first()
-            .expect("first emoji row should exist");
+            .expect("first post row should exist");
         let second = batch
-            .emoji_rows
+            .post_rows
             .get(1)
-            .expect("second emoji row should exist");
-        assert_eq!(first.emoji, "✅");
-        assert_eq!(first.cid, "bafy-a");
-        assert_eq!(first.occurrences, 2);
-        assert_eq!(second.emoji, "🔥");
+            .expect("second post row should exist");
+        assert_eq!(first.emojis, vec!["✅", "✅", "🔥"]);
+        assert_eq!(first.langs, vec!["en", "ja"]);
+        assert!(second.emojis.is_empty());
         assert_eq!(batch.total_post_counter.posts_processed, 2);
         assert_eq!(batch.total_post_counter.posts_with_emojis, 1);
         assert_eq!(batch.total_post_counter.emoji_occurrences, 3);
@@ -614,11 +664,12 @@ mod tests {
         let batch = derive_clickhouse_batch(DeriveBatchInput {
             manifest: &manifest(1),
             archive_rows: &rows,
+            observed_at: "2026-06-15T00:00:00Z",
         })
         .expect("derive batch");
         let same_token = derive_dedupe_token(
             &batch.manifest_identity,
-            &batch.emoji_rows,
+            &batch.post_rows,
             &batch.total_post_counter,
         )
         .expect("dedupe token");
@@ -627,6 +678,7 @@ mod tests {
         let changed = derive_clickhouse_batch(DeriveBatchInput {
             manifest: &manifest(1),
             archive_rows: &changed_rows,
+            observed_at: "2026-06-15T00:00:00Z",
         })
         .expect("changed derive batch");
 
@@ -640,6 +692,7 @@ mod tests {
         let first = derive_clickhouse_batch(DeriveBatchInput {
             manifest: &manifest(1),
             archive_rows: &rows,
+            observed_at: "2026-06-15T00:00:00Z",
         })
         .expect("derive batch");
         let mut replay_manifest = manifest(1);
@@ -649,6 +702,7 @@ mod tests {
         let replay = derive_clickhouse_batch(DeriveBatchInput {
             manifest: &replay_manifest,
             archive_rows: &rows,
+            observed_at: "2026-06-15T00:00:00Z",
         })
         .expect("replay derive batch");
 
@@ -661,6 +715,7 @@ mod tests {
         let error = derive_clickhouse_batch(DeriveBatchInput {
             manifest: &manifest(2),
             archive_rows: &rows,
+            observed_at: "2026-06-15T00:00:00Z",
         })
         .expect_err("row count mismatch");
 
@@ -693,8 +748,8 @@ mod tests {
         let replay = manifest_identity(&replay_manifest).expect("manifest identity");
 
         assert_eq!(
-            DeriveCheckpointKey::emoji_serving(&first, 2),
-            DeriveCheckpointKey::emoji_serving(&replay, 2)
+            DeriveCheckpointKey::post_serving(&first, 2),
+            DeriveCheckpointKey::post_serving(&replay, 2)
         );
         assert_eq!(
             DeriveCheckpointKey::total_post_counter(&first),

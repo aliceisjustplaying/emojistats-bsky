@@ -53,8 +53,17 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
 - `clickhouse-schema --clickhouse-database <db>` prints the v2 `ClickHouse` schema SQL.
   Smoke bootstrap on this host created `emojistats_smoke` through `clickhouse-smoke.service`
   (`HTTP 18123`, native `19000`) and verified the then-current smoke tables exist. The
-  active incompatible schema names are `v2_emoji_serving_r2` and
-  `v2_total_post_counters_r2`.
+  active incompatible schema names are `v2_post_serving_r3`, `v2_total_post_counters_r3`,
+  `v2_emoji_total_r3`, `v2_emoji_total_by_lang_r3`, `v2_lang_total_r3`, and
+  `v2_posts_hourly_r3`.
+- The v2 serving projection is intentionally compact and no-delete. Storage Box `Parquet`
+  remains the full observed corpus; `ClickHouse` stores one compact post row per
+  `(dataset, fetch_method, completeness_class, did, rkey)` with emoji arrays and aggregate
+  rebuild SQL based on `arrayJoin`.
+- Serving r3 dry-run derive smoke against `rust/data/metrics-smoke-20260617/` validated
+  30,048 archive rows and formatted five dry-run payloads / 30,049 insert rows: compact post
+  chunks plus one total counter. `clickhouse-schema` emitted `v2_post_serving_r3`,
+  `v2_total_post_counters_r3`, and the aggregate r3 tables.
 - `emoji-normalizer` is a new shared Rust crate. Current parity scope is ordered/repeated
   extraction, heart variation normalization, non-qualified keycaps, regional flags,
   skin-tone sequences, ZWJ sequences, and version metadata. Broad TS
@@ -101,7 +110,7 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   projection rows, and completed in 14:56.02 with max RSS 1,503,144 KiB. Fetch took
   454.1s, parse 438.1s, archive finalization 3.2s. Streaming derive loaded that manifest
   into `emojistats_smoke` in 29.6s with max RSS 54,080 KiB. Smoke tables then held 497,605
-  emoji serving rows across 12 DIDs and 17 counter rows totalling 10,172,807 posts.
+  emoji rows across 12 DIDs and 17 counter rows totalling 10,172,807 posts.
 - Post-review full smoke, release binary at git `ee66323`, `rust/fixtures/scale-smoke.dids`,
   `--concurrency 4 --parse-concurrency 1 --max-inflight-spool-bytes 17179869184 --max-bytes
   5368709120 --cid-verification-threads 4`, output under
