@@ -201,7 +201,7 @@ fn aggregate_rebuild_sql_uses_compact_post_rows_and_array_join() {
     assert!(sql.contains("arrayJoin(langs) AS lang"));
     assert!(sql.contains("arrayJoin(emojis) AS emoji"));
     assert!(sql.contains("INSERT INTO emojistats.v2_posts_hourly_r3"));
-    assert!(sql.contains("sum(emoji_occurrences) AS emoji_occurrences"));
+    assert!(sql.contains("sum(emoji_occurrences) AS total_emoji_occurrences"));
 }
 
 #[test]

@@ -326,7 +326,7 @@ SELECT
   completeness_class,
   count() AS posts,
   countIf(emoji_occurrences > 0) AS posts_with_emojis,
-  sum(emoji_occurrences) AS emoji_occurrences
+  sum(emoji_occurrences) AS total_emoji_occurrences
 FROM {database}.v2_post_serving_r3 FINAL
 GROUP BY hour, src, normalizer_git_rev, dataset, fetch_method, completeness_class;"
     )

@@ -53,11 +53,16 @@ fn matches_typescript_oracle_golden() {
         total += 1;
         if got != expected {
             if diffs.len() < 25 {
-                diffs.push(format!("  input [{input_hex}]: expected [{expected}], got [{got}]"));
+                diffs.push(format!(
+                    "  input [{input_hex}]: expected [{expected}], got [{got}]"
+                ));
             }
         }
     }
-    assert!(total > 5000, "golden corpus unexpectedly small: {total} rows");
+    assert!(
+        total > 5000,
+        "golden corpus unexpectedly small: {total} rows"
+    );
     assert!(
         diffs.is_empty(),
         "{} / {total} sequences diverged from the legacy TypeScript oracle:\n{}",

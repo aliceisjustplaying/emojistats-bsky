@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use reqwest::{
     Client, Method, Request, Url,
-    header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT},
+    header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT},
 };
 use serde::Serialize;
 
@@ -210,7 +210,7 @@ impl ClickHouseClientConfig {
         client: &Client,
         query: &str,
     ) -> Result<Request, ClickHouseSchemaError> {
-        client
+        let mut request = client
             .request(Method::POST, self.url.clone())
             .headers(self.headers()?)
             .query(&[
@@ -219,8 +219,13 @@ impl ClickHouseClientConfig {
                 (DATE_TIME_INPUT_FORMAT_SETTING, "best_effort"),
             ])
             .timeout(self.request_timeout)
+            .body(String::new())
             .build()
-            .map_err(ClickHouseSchemaError::Request)
+            .map_err(ClickHouseSchemaError::Request)?;
+        request
+            .headers_mut()
+            .insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
+        Ok(request)
     }
 
     /// Execute a batch of insert payloads in the order they were built.
