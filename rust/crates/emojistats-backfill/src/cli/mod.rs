@@ -193,6 +193,9 @@ pub enum Command {
         /// Canary gate thresholds used when --canary-evidence is provided.
         #[command(flatten)]
         canary_thresholds: CanaryThresholdArgs,
+        /// Optional JSONL file for stable launch metrics.
+        #[arg(long)]
+        metrics_jsonl: Option<PathBuf>,
     },
     /// Verify a committed archive manifest and load derived rows into `ClickHouse`.
     DeriveManifest {
@@ -219,6 +222,9 @@ pub enum Command {
         /// Optional JSONL ledger recording successful derive payload inserts.
         #[arg(long)]
         derive_ledger_path: Option<PathBuf>,
+        /// Optional JSONL file for stable launch metrics.
+        #[arg(long)]
+        metrics_jsonl: Option<PathBuf>,
     },
     /// Print the v2 `ClickHouse` schema SQL.
     ClickhouseSchema {

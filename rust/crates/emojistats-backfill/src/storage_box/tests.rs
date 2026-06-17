@@ -1,7 +1,8 @@
 use std::{
     collections::BTreeMap,
-    io::{Read, Write},
-    path::PathBuf,
+    fs::{self, File, OpenOptions},
+    io::{BufReader, Read, Write},
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -12,9 +13,19 @@ use super::{
     StorageBoxConfig, StorageBoxSshConfig,
 };
 use crate::{
-    archive::NormalizerVersion,
+    archive::{
+        ArchiveCommitContext, ArchivePostRow, CompletenessClass, CreatedAtParseStatus, FetchMethod,
+        NormalizerVersion, RepoReceipt, RepoReceiptInput, build_repo_receipt, current_normalizer,
+        write_archive_artifacts,
+    },
     commit::{ManifestEntry, ManifestMode, Metadata, Request},
+    manifest_derive::{
+        ManifestReadItem, debug_load_verified_clickhouse_batch, stream_committed_jsonl,
+        verify_loader_input_for_streaming,
+    },
 };
+
+const CANARY_DID: &str = "did:plc:storageboxcanary";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Operation {
@@ -29,6 +40,9 @@ struct FakeCommands {
     operations: Vec<Operation>,
     upload_limit: Option<usize>,
 }
+
+#[derive(Debug, Default)]
+struct LocalRemoteCommands;
 
 impl StorageBoxCommands for FakeCommands {
     fn upload(&mut self, remote_path: &str, bytes: &[u8]) -> Result<(), CommandError> {
@@ -167,6 +181,149 @@ impl StorageBoxCommands for FakeCommands {
     }
 }
 
+impl StorageBoxCommands for LocalRemoteCommands {
+    fn upload(&mut self, remote_path: &str, bytes: &[u8]) -> Result<(), CommandError> {
+        write_remote(remote_path, bytes)
+    }
+
+    fn upload_reader(
+        &mut self,
+        remote_path: &str,
+        reader: &mut (dyn Read + Send),
+    ) -> Result<(), CommandError> {
+        let path = Path::new(remote_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(command_error)?;
+        }
+        let mut file = File::create(path).map_err(command_error)?;
+        std::io::copy(reader, &mut file).map_err(command_error)?;
+        file.sync_all().map_err(command_error)?;
+        Ok(())
+    }
+
+    fn stat_len(&mut self, remote_path: &str) -> Result<Option<u64>, CommandError> {
+        match fs::metadata(remote_path) {
+            Ok(metadata) => Ok(Some(metadata.len())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(command_error(error)),
+        }
+    }
+
+    fn sha256(&mut self, remote_path: &str) -> Result<Option<String>, CommandError> {
+        let mut file = match File::open(remote_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(command_error(error)),
+        };
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 65_536].into_boxed_slice();
+        loop {
+            let read = file.read(&mut buffer).map_err(command_error)?;
+            if read == 0 {
+                break;
+            }
+            let chunk = buffer
+                .get(..read)
+                .expect("read byte count should fit buffer");
+            hasher.update(chunk);
+        }
+        Ok(Some(hex::encode(hasher.finalize())))
+    }
+
+    fn read_prefix(
+        &mut self,
+        remote_path: &str,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, CommandError> {
+        let mut file = match File::open(remote_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(command_error(error)),
+        };
+        let mut prefix = vec![0_u8; max_bytes];
+        let read = file.read(&mut prefix).map_err(command_error)?;
+        prefix.truncate(read);
+        Ok(Some(prefix))
+    }
+
+    fn remove(&mut self, remote_path: &str) -> Result<(), CommandError> {
+        match fs::remove_file(remote_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(command_error(error)),
+        }
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), CommandError> {
+        if Path::new(to).exists() {
+            return Err(CommandError::new("final path already exists"));
+        }
+        if let Some(parent) = Path::new(to).parent() {
+            fs::create_dir_all(parent).map_err(command_error)?;
+        }
+        fs::rename(from, to).map_err(command_error)
+    }
+
+    fn append_manifest_record_if_missing(
+        &mut self,
+        remote_path: &str,
+        record_without_newline: &[u8],
+    ) -> Result<(), CommandError> {
+        let present = read_remote(remote_path)?.is_some_and(|bytes| {
+            bytes
+                .split(|byte| *byte == b'\n')
+                .any(|line| line == record_without_newline)
+        });
+        if present {
+            return Ok(());
+        }
+        if let Some(parent) = Path::new(remote_path).parent() {
+            fs::create_dir_all(parent).map_err(command_error)?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(remote_path)
+            .map_err(command_error)?;
+        file.write_all(record_without_newline)
+            .map_err(command_error)?;
+        file.write_all(b"\n").map_err(command_error)?;
+        file.sync_all().map_err(command_error)
+    }
+
+    fn contains_manifest_record(
+        &mut self,
+        remote_path: &str,
+        record_without_newline: &[u8],
+    ) -> Result<bool, CommandError> {
+        Ok(read_remote(remote_path)?.is_some_and(|bytes| {
+            bytes
+                .split(|byte| *byte == b'\n')
+                .any(|line| line == record_without_newline)
+        }))
+    }
+}
+
+fn command_error(error: impl std::fmt::Display) -> CommandError {
+    CommandError::new(error.to_string())
+}
+
+fn write_remote(remote_path: &str, bytes: &[u8]) -> Result<(), CommandError> {
+    let path = Path::new(remote_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(command_error)?;
+    }
+    fs::write(path, bytes).map_err(command_error)
+}
+
+fn read_remote(remote_path: &str) -> Result<Option<Vec<u8>>, CommandError> {
+    match fs::read(remote_path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(command_error(error)),
+    }
+}
+
 fn normalizer() -> NormalizerVersion {
     NormalizerVersion {
         name: "emoji-normalizer".to_owned(),
@@ -204,6 +361,79 @@ fn request() -> Request {
     }
 }
 
+fn canary_archive_row(rkey: &str, text: &str, emojis: &[&str]) -> ArchivePostRow {
+    ArchivePostRow {
+        did: CANARY_DID.to_owned(),
+        rkey: rkey.to_owned(),
+        cid: format!("bafy-{rkey}"),
+        normalizer: current_normalizer(),
+        account_status: None,
+        record_status: None,
+        public_content_label: None,
+        created_at_raw: Some("2026-06-17T00:00:00Z".to_owned()),
+        created_at_normalized: Some("2026-06-17T00:00:00Z".to_owned()),
+        created_at_parse_status: CreatedAtParseStatus::Valid,
+        text: text.to_owned(),
+        langs: vec!["en".to_owned()],
+        emoji_sequence: emojis.iter().map(|emoji| (*emoji).to_owned()).collect(),
+        extras_json: serde_json::json!({}),
+    }
+}
+
+fn canary_repo_receipt(rows: &[ArchivePostRow], context: &ArchiveCommitContext) -> RepoReceipt {
+    build_repo_receipt(RepoReceiptInput {
+        rows,
+        observed_at: context.observed_at,
+        did: CANARY_DID,
+        fetch_method: FetchMethod::GetRepo,
+        completeness_class: CompletenessClass::ContentAddressedSnapshot,
+        reachable_records_count: u64::try_from(rows.len()).expect("row count should fit u64"),
+        reachable_post_records_count: u64::try_from(rows.len()).expect("row count should fit u64"),
+        post_decode_error_count: 0,
+        profile_row_hash: None,
+        mst_root_cid: Some("bafy-mst-canary".to_owned()),
+        commit_cid: Some("bafy-commit-canary".to_owned()),
+        normalizer: current_normalizer(),
+    })
+    .expect("repo receipt should build")
+}
+
+fn request_from_archive_artifacts(
+    archive_root: &Path,
+    artifacts: &crate::archive::ArchiveArtifacts,
+) -> Request {
+    Request {
+        object_path: relative_artifact_path(archive_root, &artifacts.parquet_path),
+        receipt_path: relative_artifact_path(archive_root, &artifacts.object_receipt_path),
+        manifest_path: relative_artifact_path(archive_root, &artifacts.manifest_path),
+        manifest_mode: ManifestMode::AppendJsonl,
+        metadata: Metadata {
+            run_id: artifacts.manifest.run_id.clone(),
+            shard: artifacts.manifest.shard.clone(),
+            file_sequence: artifacts.manifest.file_sequence,
+            did: artifacts.manifest.did.clone(),
+            dataset: artifacts.manifest.dataset.clone(),
+            row_count: artifacts.manifest.row_count,
+            min_created_at_normalized: artifacts.manifest.min_created_at_normalized.clone(),
+            max_created_at_normalized: artifacts.manifest.max_created_at_normalized.clone(),
+            receipt_hash: artifacts.manifest.receipt_hash.clone(),
+            repo_receipt_path: artifacts
+                .manifest
+                .repo_receipt_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            normalizer: artifacts.manifest.normalizer.clone(),
+            schema_version: artifacts.manifest.schema_version,
+        },
+    }
+}
+
+fn relative_artifact_path(root: &Path, path: &Path) -> PathBuf {
+    path.strip_prefix(root)
+        .expect("artifact should live under archive root")
+        .to_path_buf()
+}
+
 fn backend(commands: FakeCommands) -> StorageBoxBackend<FakeCommands> {
     let mut config = StorageBoxConfig::new("/storage-box/emojistats");
     config.readback_bytes = 8;
@@ -217,6 +447,84 @@ fn ssh_commands() -> SshStorageBoxCommands {
             .with_ssh_arg("-p")
             .with_ssh_arg("23"),
     )
+}
+
+#[test]
+fn remote_only_derive_canary_commits_storage_box_artifacts() {
+    let temp = tempfile::TempDir::new().expect("temp dir should be created");
+    let local_archive_root = temp.path().join("local-archive");
+    let remote_archive_root = temp.path().join("remote-archive");
+    let context = ArchiveCommitContext::new("storage-box-canary", "canary0", 1);
+    let rows = vec![
+        canary_archive_row("a", "hello ✅", &["✅"]),
+        canary_archive_row("b", "fire 🔥🔥", &["🔥", "🔥"]),
+    ];
+    let repo_receipt = canary_repo_receipt(&rows, &context);
+    let artifacts = write_archive_artifacts(
+        &local_archive_root,
+        CANARY_DID,
+        &context,
+        &rows,
+        None,
+        &repo_receipt,
+    )
+    .expect("local canary archive should write");
+    let request = request_from_archive_artifacts(&local_archive_root, &artifacts);
+    let repo_receipt_path = request
+        .metadata
+        .repo_receipt_path
+        .as_ref()
+        .map(PathBuf::from)
+        .expect("repo receipt path should be advertised");
+    let mut storage_config =
+        StorageBoxConfig::new(remote_archive_root.to_string_lossy().into_owned());
+    storage_config.readback_bytes = 16;
+    let mut backend = StorageBoxBackend::new(storage_config, LocalRemoteCommands);
+
+    let remote_repo_receipt_path = backend
+        .commit_auxiliary_file(
+            &request,
+            &repo_receipt_path,
+            &artifacts.receipt_path,
+            "repo receipt",
+        )
+        .expect("repo receipt auxiliary should commit");
+    let remote_artifact = backend
+        .commit_file(&request, &artifacts.parquet_path)
+        .expect("parquet object should commit");
+    fs::remove_dir_all(&local_archive_root).expect("local staging archive should be removable");
+
+    assert!(Path::new(&remote_artifact.remote_object_path).is_file());
+    assert!(Path::new(&remote_artifact.remote_receipt_path).is_file());
+    assert!(Path::new(&remote_repo_receipt_path).is_file());
+    assert!(Path::new(&remote_artifact.remote_manifest_path).is_file());
+
+    let manifest = File::open(&remote_artifact.remote_manifest_path)
+        .expect("remote manifest should be readable");
+    let inputs = stream_committed_jsonl(BufReader::new(manifest))
+        .map(|item| match item.expect("manifest row should parse") {
+            ManifestReadItem::Input(input) => *input,
+            ManifestReadItem::Skipped(skip) => panic!("canary manifest skipped: {skip:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(inputs.len(), 1);
+    let input = inputs
+        .first()
+        .expect("canary manifest should contain one input");
+
+    let verified = verify_loader_input_for_streaming(&remote_archive_root, input)
+        .expect("streaming derive verifier should start from remote archive root");
+    let batch = debug_load_verified_clickhouse_batch(&remote_archive_root, input)
+        .expect("debug derive batch should load from remote archive root");
+
+    assert_eq!(
+        verified.object_path,
+        PathBuf::from(&remote_artifact.remote_object_path)
+    );
+    assert_eq!(verified.repo_receipt.did, CANARY_DID);
+    assert_eq!(batch.total_post_counter.posts_processed, 2);
+    assert_eq!(batch.total_post_counter.emoji_occurrences, 3);
+    assert_eq!(batch.emoji_rows.len(), 2);
 }
 
 #[test]

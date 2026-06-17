@@ -252,6 +252,16 @@ pub enum ArchiveStorageConfig {
     StorageBoxSsh(StorageBoxArchiveConfig),
 }
 
+impl ArchiveStorageConfig {
+    #[must_use]
+    pub const fn backend_name(&self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::StorageBoxSsh(_) => "storage_box_ssh",
+        }
+    }
+}
+
 /// SSH Storage Box archive backend configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageBoxArchiveConfig {

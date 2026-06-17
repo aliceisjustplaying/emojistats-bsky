@@ -12,6 +12,7 @@ use emojistats_backfill::{
     ledger::{
         AttemptOutcome, DEFAULT_CLAIM_LEASE_DURATION, RepoLedgerEntry, RetryPolicy, SqliteLedger,
     },
+    metrics::{MetricLabels, MetricName, MetricStage, PressureState, SharedMetricsRecorder},
     parse::ParseConfig,
     scheduler::{ClaimScope, HostPacer, SchedulerError, SharedHostPacer, checked_concurrency},
     transport::FetchByteBudget,
@@ -41,7 +42,6 @@ const CLAIM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const STALE_RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
 pub const DEFAULT_HOST_CONCURRENCY_CAP: u32 = 2;
 
-#[derive(Debug)]
 pub struct FleetConfig {
     pub dids_file: PathBuf,
     pub ledger_path: PathBuf,
@@ -58,6 +58,8 @@ pub struct FleetConfig {
     pub cid_verification_threads: usize,
     pub http_protocol: HttpProtocol,
     pub claim_scope: ClaimScope,
+    pub shard_label: String,
+    pub metrics: SharedMetricsRecorder,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -161,6 +163,7 @@ impl Drop for HostConcurrencyPermit {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
     checked_concurrency(config.concurrency)?;
     checked_concurrency(config.parse_concurrency)?;
@@ -199,6 +202,19 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
                 SystemTime::now(),
                 &config.claim_scope,
             )?;
+            if recovered > 0 {
+                config.metrics.increment_counter(
+                    MetricName::FleetStaleClaimsRecoveredTotal,
+                    fleet_metric_labels(
+                        &config,
+                        None,
+                        Some(MetricStage::Claim.as_str()),
+                        None,
+                        None,
+                    ),
+                    recovered,
+                );
+            }
             add_count(
                 &mut summary.stale_recovered,
                 recovered,
@@ -226,6 +242,17 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
             };
             let did = claimed.did.clone();
             increment(&mut summary.claimed, "claimed repo count")?;
+            config.metrics.increment_counter(
+                MetricName::FleetReposClaimedTotal,
+                fleet_metric_labels(
+                    &config,
+                    None,
+                    Some(MetricStage::Claim.as_str()),
+                    Some("claimed"),
+                    None,
+                ),
+                1,
+            );
             active.push(run_fleet_attempt(FleetAttemptConfig {
                 did,
                 claimed,
@@ -243,12 +270,14 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
                 claim_scope: config.claim_scope.clone(),
                 ledger_path: config.ledger_path.clone(),
             }));
+            record_active_attempts(&config, active.len());
         }
 
         let Some(attempt_result) = active.next().await else {
             break;
         };
-        complete_fleet_attempt(&ledger, &mut summary, attempt_result)?;
+        complete_fleet_attempt(&ledger, &mut summary, &config, attempt_result)?;
+        record_active_attempts(&config, active.len());
     }
 
     println!(
@@ -288,9 +317,11 @@ struct FleetAttemptResult {
     did: String,
     claimed: RepoLedgerEntry,
     result: Result<(), FetchOneFailure>,
+    elapsed: Duration,
 }
 
 async fn run_fleet_attempt(config: FleetAttemptConfig) -> FleetAttemptResult {
+    let started = Instant::now();
     let archive_context = archive_context_for_claim(&config.claimed, &config.claim_scope);
     let heartbeat = spawn_claim_heartbeat(config.ledger_path.clone(), config.claimed.clone());
     let result = match archive_context {
@@ -325,6 +356,7 @@ async fn run_fleet_attempt(config: FleetAttemptConfig) -> FleetAttemptResult {
         did: config.did,
         claimed: config.claimed,
         result,
+        elapsed: started.elapsed(),
     }
 }
 
@@ -379,6 +411,7 @@ fn archive_shard_label(claim_scope: &ClaimScope) -> String {
 fn complete_fleet_attempt(
     ledger: &SqliteLedger,
     summary: &mut FleetSummary,
+    config: &FleetConfig,
     attempt_result: FleetAttemptResult,
 ) -> anyhow::Result<()> {
     let outcome = attempt_result.result.as_ref().map_or_else(
@@ -399,6 +432,43 @@ fn complete_fleet_attempt(
         return Ok(());
     };
 
+    let outcome_label = outcome_name_for_attempt(&attempt_result.result);
+    config.metrics.increment_counter(
+        MetricName::FleetAttemptsTotal,
+        fleet_metric_labels(
+            config,
+            None,
+            Some(MetricStage::Complete.as_str()),
+            Some(outcome_label),
+            attempt_pressure_state(&attempt_result.result),
+        ),
+        1,
+    );
+    config.metrics.record_histogram(
+        MetricName::FleetAttemptDurationSeconds,
+        fleet_metric_labels(
+            config,
+            None,
+            Some(MetricStage::Complete.as_str()),
+            Some(outcome_label),
+            None,
+        ),
+        attempt_result.elapsed.as_secs_f64(),
+    );
+    if let Some(pressure_state) = attempt_pressure_state(&attempt_result.result) {
+        config.metrics.record_gauge(
+            MetricName::FleetPressureState,
+            fleet_metric_labels(
+                config,
+                None,
+                Some(MetricStage::Complete.as_str()),
+                Some(outcome_label),
+                Some(pressure_state),
+            ),
+            1,
+        );
+    }
+
     match attempt_result.result {
         Ok(()) => increment(&mut summary.succeeded, "succeeded repo count")?,
         Err(failure) => {
@@ -414,6 +484,77 @@ fn complete_fleet_attempt(
         completed.did, completed.attempts, completed.status
     );
     Ok(())
+}
+
+fn record_active_attempts(config: &FleetConfig, active_len: usize) {
+    let Ok(active) = i64::try_from(active_len) else {
+        return;
+    };
+    config.metrics.record_gauge(
+        MetricName::FleetActiveAttempts,
+        fleet_metric_labels(
+            config,
+            None,
+            Some(MetricStage::Fetch.as_str()),
+            Some("active"),
+            None,
+        ),
+        active,
+    );
+}
+
+#[allow(clippy::missing_const_for_fn)]
+fn fleet_metric_labels<'a>(
+    config: &'a FleetConfig,
+    host: Option<&'a str>,
+    stage: Option<&'a str>,
+    outcome: Option<&'a str>,
+    pressure_state: Option<&'a str>,
+) -> MetricLabels<'a> {
+    MetricLabels {
+        run_id: Some(config.run_id.as_str()),
+        worker_id: Some(config.worker_id.as_str()),
+        shard: Some(config.shard_label.as_str()),
+        host,
+        stage,
+        outcome,
+        pressure_state,
+        backend: Some(config.archive_storage.backend_name()),
+    }
+}
+
+#[allow(clippy::missing_const_for_fn)]
+fn outcome_name_for_attempt(result: &Result<(), FetchOneFailure>) -> &'static str {
+    match result {
+        Ok(()) => "succeeded",
+        Err(failure) => match failure.outcome {
+            AttemptOutcome::Succeeded => "succeeded",
+            AttemptOutcome::AccountState(_) => "account_state",
+            AttemptOutcome::RetryableFailure { .. } => "retryable_failure",
+            AttemptOutcome::RateLimited { .. } => "rate_limited",
+            AttemptOutcome::ResourceLimitExceeded { .. } => "resource_limited",
+            AttemptOutcome::PermanentFailure { .. } => "permanent_failure",
+            AttemptOutcome::OperatorDeferred { .. } => "operator_deferred",
+        },
+    }
+}
+
+#[allow(clippy::missing_const_for_fn)]
+fn attempt_pressure_state(result: &Result<(), FetchOneFailure>) -> Option<&'static str> {
+    match result {
+        Ok(()) => None,
+        Err(failure) => match failure.outcome {
+            AttemptOutcome::RateLimited { .. } => Some(PressureState::RateLimitSleep.as_str()),
+            AttemptOutcome::ResourceLimitExceeded { .. } => {
+                Some(PressureState::FetchByteBudget.as_str())
+            }
+            AttemptOutcome::OperatorDeferred { .. } => Some(PressureState::OperatorPause.as_str()),
+            AttemptOutcome::Succeeded
+            | AttemptOutcome::AccountState(_)
+            | AttemptOutcome::RetryableFailure { .. }
+            | AttemptOutcome::PermanentFailure { .. } => None,
+        },
+    }
 }
 
 #[cfg(test)]

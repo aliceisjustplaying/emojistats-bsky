@@ -16,6 +16,7 @@ use emojistats_backfill::{
     clickhouse::{ClickHouseInsertPayload, ClickHouseTable, JSON_EACH_ROW_FORMAT},
     derive::BACKFILL_DERIVE_SOURCE,
     manifest_derive::read_committed_jsonl,
+    metrics::noop_metrics_recorder,
 };
 
 use super::*;
@@ -139,6 +140,24 @@ fn clickhouse_config() -> ClickHouseClientConfig {
         "emojistats-backfill-test",
     )
     .expect("clickhouse config should build")
+}
+
+fn derive_run_context<'a>(
+    http: &'a reqwest::Client,
+    clickhouse: &'a ClickHouseClientConfig,
+    dry_run: bool,
+    derive_ledger: &'a mut DeriveLedger,
+    summary: &'a mut DeriveManifestSummary,
+    metrics: &'a SharedMetricsRecorder,
+) -> DeriveRunContext<'a> {
+    DeriveRunContext {
+        http,
+        clickhouse,
+        dry_run,
+        derive_ledger,
+        summary,
+        metrics,
+    }
 }
 
 fn read_first_input(manifest_path: &Path) -> LoaderInput {
@@ -349,18 +368,19 @@ async fn dry_run_missing_repo_receipt_attempts_zero_payloads() {
     let http = clickhouse.http_client().expect("http client");
     let mut derive_ledger = DeriveLedger::new(None).expect("derive ledger");
     let mut summary = DeriveManifestSummary::default();
-
-    let error = derive_loader_input_canonical_streaming(
-        &output_dir,
-        &input,
+    let metrics = noop_metrics_recorder();
+    let mut context = derive_run_context(
         &http,
         &clickhouse,
         true,
         &mut derive_ledger,
         &mut summary,
-    )
-    .await
-    .expect_err("missing repo receipt should fail");
+        &metrics,
+    );
+
+    let error = derive_loader_input_canonical_streaming(&output_dir, &input, &mut context)
+        .await
+        .expect_err("missing repo receipt should fail");
 
     assert!(error.to_string().contains("repo receipt is missing"));
     assert_eq!(summary.attempted_insert_payloads, 0);
@@ -397,18 +417,19 @@ async fn dry_run_corrupt_repo_receipt_attempts_zero_payloads() {
     let http = clickhouse.http_client().expect("http client");
     let mut derive_ledger = DeriveLedger::new(None).expect("derive ledger");
     let mut summary = DeriveManifestSummary::default();
-
-    let error = derive_loader_input_canonical_streaming(
-        &output_dir,
-        &input,
+    let metrics = noop_metrics_recorder();
+    let mut context = derive_run_context(
         &http,
         &clickhouse,
         true,
         &mut derive_ledger,
         &mut summary,
-    )
-    .await
-    .expect_err("corrupt repo receipt should fail");
+        &metrics,
+    );
+
+    let error = derive_loader_input_canonical_streaming(&output_dir, &input, &mut context)
+        .await
+        .expect_err("corrupt repo receipt should fail");
 
     let error_text = error.to_string();
     assert!(
@@ -423,6 +444,7 @@ async fn dry_run_corrupt_repo_receipt_attempts_zero_payloads() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn insert_payloads_records_partial_success_and_resumes_from_ledger() {
     let temp = TempDir::new("partial-ledger");
     let ledger_path = temp.path.join("derive-ledger.jsonl");
@@ -459,18 +481,19 @@ async fn insert_payloads_records_partial_success_and_resumes_from_ledger() {
     let http = clickhouse.http_client().expect("http client");
     let mut derive_ledger = DeriveLedger::new(Some(&ledger_path)).expect("derive ledger");
     let mut summary = DeriveManifestSummary::default();
-
-    let error = apply_derive_payloads(
+    let metrics = noop_metrics_recorder();
+    let mut context = derive_run_context(
         &http,
         &clickhouse,
         false,
         &mut derive_ledger,
         &mut summary,
-        &verified,
-        &payloads,
-    )
-    .await
-    .expect_err("second payload should fail");
+        &metrics,
+    );
+
+    let error = apply_derive_payloads(&mut context, &verified, &payloads)
+        .await
+        .expect_err("second payload should fail");
     let requests = handle.join().expect("server thread");
 
     assert!(error.to_string().contains("ClickHouse"));
@@ -501,18 +524,19 @@ async fn insert_payloads_records_partial_success_and_resumes_from_ledger() {
     let http = clickhouse.http_client().expect("http client");
     let mut derive_ledger = DeriveLedger::new(Some(&ledger_path)).expect("derive ledger");
     let mut summary = DeriveManifestSummary::default();
-
-    apply_derive_payloads(
+    let metrics = noop_metrics_recorder();
+    let mut context = derive_run_context(
         &http,
         &clickhouse,
         false,
         &mut derive_ledger,
         &mut summary,
-        &verified,
-        &payloads,
-    )
-    .await
-    .expect("resume should insert only missing payload");
+        &metrics,
+    );
+
+    apply_derive_payloads(&mut context, &verified, &payloads)
+        .await
+        .expect("resume should insert only missing payload");
     let requests = handle.join().expect("server thread");
 
     assert_eq!(requests.len(), 1);

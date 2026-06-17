@@ -427,4 +427,89 @@ mod tests {
         assert!(checked_concurrency(1).is_ok());
         assert!(checked_concurrency(0).is_err());
     }
+
+    fn simulated_reserve_send(
+        pacer: &mut HostPacer,
+        host: &str,
+        requested_at: Instant,
+        min_interval: Duration,
+    ) -> Instant {
+        let admitted_at = pacer
+            .ready_delay(host, requested_at)
+            .and_then(|delay| requested_at.checked_add(delay))
+            .unwrap_or(requested_at);
+        pacer.reserve_send_at(host, admitted_at, Some(min_interval));
+        admitted_at
+    }
+
+    #[test]
+    fn shared_host_pacer_spaces_aggregate_requests_across_boxes() {
+        let requested_at = Instant::now();
+        let min_interval = Duration::from_secs(2);
+        let mut shared = HostPacer::default();
+
+        let sends = (0..6)
+            .map(|_box_index| {
+                simulated_reserve_send(&mut shared, "pds.example", requested_at, min_interval)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            sends,
+            vec![
+                requested_at,
+                requested_at + Duration::from_secs(2),
+                requested_at + Duration::from_secs(4),
+                requested_at + Duration::from_secs(6),
+                requested_at + Duration::from_secs(8),
+                requested_at + Duration::from_secs(10),
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_rate_limit_state_paces_all_boxes_through_one_cooldown() {
+        let requested_at = Instant::now();
+        let observed_at = UNIX_EPOCH + Duration::from_secs(100);
+        let snapshot = RateLimitSnapshot {
+            limit: Some(100),
+            remaining: Some(0),
+            reset: Some(130),
+            retry_after: None,
+            policy: None,
+        };
+        let mut shared = HostPacer::default();
+        shared.record_rate_limit_state("pds.example", &snapshot, observed_at, requested_at);
+
+        let first = simulated_reserve_send(
+            &mut shared,
+            "pds.example",
+            requested_at,
+            Duration::from_secs(1),
+        );
+        let second = simulated_reserve_send(
+            &mut shared,
+            "pds.example",
+            requested_at,
+            Duration::from_secs(1),
+        );
+
+        assert_eq!(first, requested_at + Duration::from_secs(30));
+        assert_eq!(second, requested_at + Duration::from_secs(31));
+    }
+
+    #[test]
+    fn per_box_pacers_document_cross_box_burst_boundary() {
+        let requested_at = Instant::now();
+        let min_interval = Duration::from_secs(2);
+
+        let sends = (0..3)
+            .map(|_box_index| {
+                let mut per_box = HostPacer::default();
+                simulated_reserve_send(&mut per_box, "pds.example", requested_at, min_interval)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(sends, vec![requested_at, requested_at, requested_at]);
+    }
 }

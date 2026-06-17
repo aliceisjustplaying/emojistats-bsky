@@ -24,6 +24,7 @@ use emojistats_backfill::{
         AttemptId, AttemptOutcome, DEFAULT_CLAIM_LEASE_DURATION, ForcedFetchMode, HostOverride,
         RepoLedgerEntry, RetryPolicy, SqliteLedger, claim_repo, complete_attempt,
     },
+    metrics::{SharedMetricsRecorder, jsonl_metrics_recorder, noop_metrics_recorder},
     parse::{ParseConfig, ParseVisitError, ParsedRepoSummary, parse_repo_for_did_with_state},
     scheduler::{ClaimScope, HostPacer, SharedHostPacer},
     transport::{FetchByteBudget, FetchConfig, FetchError, fetch_repo_with_rate_limit_observer},
@@ -100,6 +101,7 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
             clickhouse_password,
             dry_run,
             derive_ledger_path,
+            metrics_jsonl,
         } => {
             derive_manifest_cmd::run(DeriveManifestConfig {
                 manifest_path,
@@ -110,6 +112,7 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
                 clickhouse_password,
                 dry_run,
                 derive_ledger_path,
+                metrics: metrics_recorder(metrics_jsonl.as_deref())?,
             })
             .await
         }
@@ -191,6 +194,7 @@ async fn run_fleet_command(command: Command) -> anyhow::Result<()> {
         canary_evidence,
         bypass_canary,
         canary_thresholds,
+        metrics_jsonl,
     } = command
     else {
         anyhow::bail!("internal command dispatch mismatch for run-fleet");
@@ -206,6 +210,10 @@ async fn run_fleet_command(command: Command) -> anyhow::Result<()> {
         storage_box_command_timeout_secs,
     )?;
     let worker_id = default_worker_id(&run_id);
+    let shard_label = shard_bucket.map_or_else(
+        || "all".to_owned(),
+        |shard| format!("shard{}", shard.bucket()),
+    );
     fleet::run(FleetConfig {
         dids_file,
         ledger_path,
@@ -224,8 +232,14 @@ async fn run_fleet_command(command: Command) -> anyhow::Result<()> {
         claim_scope: ClaimScope {
             shard_filter: shard_bucket,
         },
+        shard_label,
+        metrics: metrics_recorder(metrics_jsonl.as_deref())?,
     })
     .await
+}
+
+fn metrics_recorder(path: Option<&Path>) -> anyhow::Result<SharedMetricsRecorder> {
+    path.map_or_else(|| Ok(noop_metrics_recorder()), jsonl_metrics_recorder)
 }
 
 fn enforce_canary_gate(

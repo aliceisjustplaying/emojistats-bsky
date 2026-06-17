@@ -157,6 +157,22 @@ roadmap, conventions) so a fresh session can continue without re-deriving.
   Counter sums matched archive receipts: 16,697,088 posts, 375,030 posts with emoji,
   539,764 emoji occurrences. Serving rows and counters carried only the
   `raw_archive_posts` / `get_repo` / `content_addressed_snapshot` lane.
+- Architecture proof pass after `74c79d5`: `run-fleet` and `derive-manifest` now accept
+  `--metrics-jsonl <path>` and emit stable low-cardinality `backfill_metric` JSONL events
+  from the typed `metrics` module. `docs/backfill-v2-observability.md` is the launch
+  metric contract for names, scopes, stages, pressure states, and labels. Storage Box now
+  has a filesystem-backed remote-only derive canary test that commits object, object
+  receipt, repo receipt auxiliary, and manifest under a remote archive root, deletes local
+  staging, and verifies derive can start from the remote manifest/root alone. Scheduler
+  tests now prove the shared-host-pacer assumption across simulated boxes and explicitly
+  document that independent per-box pacers burst at the same host.
+- Metrics smoke, debug binary, `did:plc:vwzwgnygau7ed7b7wt5ux7y2`, output under ignored
+  `rust/data/metrics-smoke-20260617/`: `run-fleet --metrics-jsonl` succeeded with 1 claimed,
+  1 succeeded, 41,051,855 fetched bytes, 99,272 reachable records, 30,048 archived posts,
+  23,656 decode diagnostics, and 638 emoji rows. The fleet JSONL emitted claim, active-attempt,
+  completion counter, duration histogram, and active-attempt zeroing events. Dry-run
+  `derive-manifest --metrics-jsonl` over the committed manifest emitted manifest-scan,
+  receipt-verify, and file-read metric events and counted 2 attempted payloads / 639 rows.
 - Whale transport hardening: repo fetches default to HTTP/1 with an explicit
   `--http-protocol auto` escape hatch, TCP keepalive, and 30s connect timeout, and retry
   retryable body-stream transport/idle failures up to 3 full download attempts. Transport
