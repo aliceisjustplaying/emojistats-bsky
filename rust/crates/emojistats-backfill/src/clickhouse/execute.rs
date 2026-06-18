@@ -199,6 +199,9 @@ async fn execute_sql_statement_once(
 }
 
 fn should_retry_sql_error(error: &ClickHouseSqlError) -> bool {
+    if !sql_statement_is_retry_safe(error) {
+        return false;
+    }
     match error {
         ClickHouseSqlError::Transport { source, .. } => {
             source.is_timeout() || source.is_connect() || source.is_body()
@@ -208,6 +211,21 @@ fn should_retry_sql_error(error: &ClickHouseSqlError) -> bool {
             false
         }
     }
+}
+
+fn sql_statement_is_retry_safe(error: &ClickHouseSqlError) -> bool {
+    let statement = match error {
+        ClickHouseSqlError::Transport { context, .. }
+        | ClickHouseSqlError::RetryableStatus { context, .. }
+        | ClickHouseSqlError::PermanentStatus { context, .. } => context.statement.as_str(),
+        ClickHouseSqlError::RequestBuild { .. } => return false,
+    };
+    !is_aggregate_rebuild_insert(statement)
+}
+
+fn is_aggregate_rebuild_insert(statement: &str) -> bool {
+    let trimmed = statement.trim_start();
+    trimmed.starts_with("INSERT INTO") && trimmed.contains("__rebuild_shadow")
 }
 
 async fn response_snippet(mut response: Response) -> Result<Option<String>, reqwest::Error> {

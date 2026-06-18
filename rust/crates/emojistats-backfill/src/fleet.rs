@@ -7,16 +7,6 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use emojistats_backfill::{
-    archive::{ArchiveCommitContext, ArchiveStorageConfig},
-    ledger::{
-        AttemptOutcome, DEFAULT_CLAIM_LEASE_DURATION, RepoLedgerEntry, RetryPolicy, SqliteLedger,
-    },
-    metrics::{MetricLabels, MetricName, MetricStage, PressureState, SharedMetricsRecorder},
-    parse::ParseConfig,
-    scheduler::{ClaimScope, HostPacer, SchedulerError, SharedHostPacer, checked_concurrency},
-    transport::FetchByteBudget,
-};
 use futures_util::FutureExt;
 use tokio::{
     sync::Semaphore,
@@ -33,14 +23,28 @@ use super::{
     },
     parse_config_for_threads,
 };
+use crate::{
+    archive::{ArchiveCommitContext, ArchiveStorageConfig},
+    ledger::{
+        AttemptOutcome, DEFAULT_CLAIM_LEASE_DURATION, DeferredClaimSummary, RepoLedgerEntry,
+        RetryPolicy, SqliteLedger,
+    },
+    metrics::{MetricLabels, MetricName, MetricStage, PressureState, SharedMetricsRecorder},
+    parse::ParseConfig,
+    scheduler::{ClaimScope, HostPacer, SchedulerError, SharedHostPacer, checked_concurrency},
+    transport::FetchByteBudget,
+};
 
 #[allow(clippy::duration_suboptimal_units)]
 const CLAIM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const STALE_RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
 pub const DEFAULT_HOST_CONCURRENCY_CAP: u32 = 2;
 
+#[path = "fleet/host_limiter.rs"]
 mod host_limiter;
+#[path = "fleet/ledger_async.rs"]
 mod ledger_async;
+#[path = "fleet/ledger_io.rs"]
 mod ledger_io;
 
 pub use host_limiter::{HostConcurrencyLimiter, HostConcurrencyPermit};
@@ -75,6 +79,7 @@ struct FleetSummary {
     claimed: u64,
     succeeded: u64,
     failed: u64,
+    deferred_claims: DeferredClaimSummary,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -98,7 +103,9 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
         SystemTime::now(),
         &config.claim_scope,
         "expired claimed lease at fleet startup",
+        None,
     )?;
+    let ledger = ledger_async::SharedBlockingLedger::new(ledger);
     let host_pacer = HostPacer::shared();
     let host_limiter = HostConcurrencyLimiter::default();
     let host_override_cache = HostOverrideCache::default();
@@ -119,14 +126,15 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
 
     loop {
         let now = Instant::now();
-        if should_recover_stale_claims(active.len(), now, next_stale_recovery) {
-            let recovered = ledger_async::recover_stale_claimed_entries_for_scope(
-                config.ledger_path.clone(),
-                SystemTime::now(),
-                config.claim_scope.clone(),
-                "expired claimed lease during fleet run",
-            )
-            .await?;
+        if should_recover_stale_claims(now, next_stale_recovery) {
+            let recovered = ledger
+                .recover_stale_claimed_entries_for_scope(
+                    SystemTime::now(),
+                    config.claim_scope.clone(),
+                    "expired claimed lease during fleet run",
+                    Some(config.worker_id.clone()),
+                )
+                .await?;
             if recovered > 0 {
                 config.metrics.increment_counter(
                     MetricName::FleetStaleClaimsRecoveredTotal,
@@ -156,15 +164,15 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
             if remaining == 0 {
                 break;
             }
-            let claimed = ledger_async::try_claim_next(
-                config.ledger_path.clone(),
-                SystemTime::now(),
-                config.run_id.clone(),
-                config.worker_id.clone(),
-                DEFAULT_CLAIM_LEASE_DURATION,
-                config.claim_scope.clone(),
-            )
-            .await?;
+            let claimed = ledger
+                .try_claim_next(
+                    SystemTime::now(),
+                    config.run_id.clone(),
+                    config.worker_id.clone(),
+                    DEFAULT_CLAIM_LEASE_DURATION,
+                    config.claim_scope.clone(),
+                )
+                .await?;
             let Some(claimed) = claimed else {
                 claimable_exhausted = true;
                 break;
@@ -198,13 +206,27 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
                 byte_budget: byte_budget.clone(),
                 claim_scope: config.claim_scope.clone(),
                 ledger_path: config.ledger_path.clone(),
+                ledger: ledger.clone(),
             }));
             record_active_attempts(&config, active.len());
         }
 
-        if active.is_empty() && (draining || summary.claimed >= claim_limit || claimable_exhausted)
-        {
-            break;
+        if active.is_empty() {
+            if draining || summary.claimed >= claim_limit {
+                break;
+            }
+            if claimable_exhausted {
+                summary.deferred_claims = ledger
+                    .deferred_claim_summary(SystemTime::now(), config.claim_scope.clone())
+                    .await?;
+                if summary.deferred_claims.count > 0 {
+                    eprintln!(
+                        "fleet stopped with {} repo(s) waiting for retry/backoff; next retry at {:?}",
+                        summary.deferred_claims.count, summary.deferred_claims.next_attempt_after
+                    );
+                }
+                break;
+            }
         }
 
         tokio::select! {
@@ -214,7 +236,7 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
                 };
                 let attempt_result = joined
                     .map_err(|err| anyhow::anyhow!("fleet attempt task failed outside panic guard: {err}"))?;
-                complete_fleet_attempt(&mut summary, &config, attempt_result).await?;
+                complete_fleet_attempt(&mut summary, &config, &ledger, attempt_result).await?;
                 record_active_attempts(&config, active.len());
             }
             signal_result = &mut shutdown_signal, if !draining => {
@@ -234,18 +256,20 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
                 }
                 draining = true;
             }
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(next_stale_recovery)), if !draining => {}
         }
     }
 
     println!(
-        "fleet summary: seeded {}, existing {}, blank {}, stale_recovered {}, claimed {}, succeeded {}, failed {}",
+        "fleet summary: seeded {}, existing {}, blank {}, stale_recovered {}, claimed {}, succeeded {}, failed {}, deferred_retry_backoff {}",
         summary.seed.inserted,
         summary.seed.existing,
         summary.seed.blank,
         summary.stale_recovered,
         summary.claimed,
         summary.succeeded,
-        summary.failed
+        summary.failed,
+        summary.deferred_claims.count
     );
     Ok(())
 }
@@ -267,6 +291,7 @@ struct FleetAttemptConfig {
     byte_budget: FetchByteBudget,
     claim_scope: ClaimScope,
     ledger_path: PathBuf,
+    ledger: ledger_async::SharedBlockingLedger,
 }
 
 #[derive(Debug)]
@@ -301,7 +326,7 @@ async fn run_fleet_attempt_isolated(config: FleetAttemptConfig) -> FleetAttemptR
 async fn run_fleet_attempt(config: FleetAttemptConfig) -> FleetAttemptResult {
     let started = Instant::now();
     let archive_context = archive_context_for_claim(&config.claimed, &config.claim_scope);
-    let heartbeat = ClaimHeartbeat::spawn(config.ledger_path.clone(), config.claimed.clone());
+    let heartbeat = ClaimHeartbeat::spawn(config.ledger.clone(), config.claimed.clone());
     let result = match archive_context {
         Ok(archive_context) => {
             fetch_one_attempt_with_pacer(FetchOneAttemptConfig {
@@ -342,18 +367,14 @@ struct ClaimHeartbeat {
 }
 
 impl ClaimHeartbeat {
-    fn spawn(ledger_path: PathBuf, claimed: RepoLedgerEntry) -> Self {
+    fn spawn(ledger: ledger_async::SharedBlockingLedger, claimed: RepoLedgerEntry) -> Self {
         let handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(CLAIM_HEARTBEAT_INTERVAL).await;
                 let now = SystemTime::now();
-                match ledger_async::extend_owned_claim_lease(
-                    ledger_path.clone(),
-                    claimed.clone(),
-                    now,
-                    DEFAULT_CLAIM_LEASE_DURATION,
-                )
-                .await
+                match ledger
+                    .extend_owned_claim_lease(claimed.clone(), now, DEFAULT_CLAIM_LEASE_DURATION)
+                    .await
                 {
                     Ok(Some(_entry)) => {}
                     Ok(None) => {
@@ -418,20 +439,21 @@ fn archive_shard_label(claim_scope: &ClaimScope) -> String {
 async fn complete_fleet_attempt(
     summary: &mut FleetSummary,
     config: &FleetConfig,
+    ledger: &ledger_async::SharedBlockingLedger,
     attempt_result: FleetAttemptResult,
 ) -> anyhow::Result<()> {
     let outcome = attempt_result.result.as_ref().map_or_else(
         |failure| failure.outcome.clone(),
         |_success| AttemptOutcome::Succeeded,
     );
-    let completed = ledger_async::complete_owned_claim(
-        config.ledger_path.clone(),
-        attempt_result.claimed.clone(),
-        outcome,
-        SystemTime::now(),
-        RetryPolicy::default(),
-    )
-    .await?;
+    let completed = ledger
+        .complete_owned_claim(
+            attempt_result.claimed.clone(),
+            outcome,
+            SystemTime::now(),
+            RetryPolicy::default(),
+        )
+        .await?;
     let Some(completed) = completed else {
         eprintln!(
             "skipping completion for {} because this worker no longer owns the claim",
@@ -570,12 +592,8 @@ fn next_stale_recovery_deadline(now: Instant) -> anyhow::Result<Instant> {
         .ok_or_else(|| anyhow::anyhow!("stale recovery timer overflow"))
 }
 
-fn should_recover_stale_claims(
-    active_attempts: usize,
-    now: Instant,
-    next_recovery: Instant,
-) -> bool {
-    active_attempts == 0 && now >= next_recovery
+fn should_recover_stale_claims(now: Instant, next_recovery: Instant) -> bool {
+    now >= next_recovery
 }
 
 fn active_attempt_limit(
@@ -637,10 +655,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stale_recovery_waits_until_no_active_attempts() {
+    fn stale_recovery_runs_when_deadline_arrives() {
         let now = Instant::now();
-        assert!(!should_recover_stale_claims(1, now, now));
-        assert!(should_recover_stale_claims(0, now, now));
+        assert!(should_recover_stale_claims(now, now));
+        assert!(!should_recover_stale_claims(
+            now,
+            now + Duration::from_secs(1)
+        ));
     }
 
     #[test]

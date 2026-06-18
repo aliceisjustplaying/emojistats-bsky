@@ -2,13 +2,12 @@
 
 use std::time::SystemTime;
 
-use emojistats_backfill::{
+use super::super::FetchOneFailure;
+use crate::{
     ledger::AttemptOutcome,
     scheduler::{HostPacer, SharedHostPacer},
     transport::RateLimitSnapshot,
 };
-
-use crate::failure::FetchOneFailure;
 
 pub(crate) fn record_rate_limit_cooldown(
     host_pacer: Option<&SharedHostPacer>,

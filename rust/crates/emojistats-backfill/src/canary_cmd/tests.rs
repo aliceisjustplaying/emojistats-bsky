@@ -1,12 +1,13 @@
 use std::{fs, io::Write, path::Path};
 
-use emojistats_backfill::canary::{
+use chrono::{TimeZone, Utc};
+use serde_json::json;
+
+use super::{evaluate_file, evaluate_file_for_run, read_evidence_file};
+use crate::canary::{
     CanaryHardGate, CanaryStatus, CanaryThresholds, required_failure_injections,
     required_hard_gates, required_sample_categories,
 };
-use serde_json::json;
-
-use super::{evaluate_file, read_evidence_file};
 
 #[test]
 fn json_evidence_file_evaluates_passing_report() {
@@ -82,6 +83,92 @@ fn status_only_numeric_gate_is_rejected() {
         error
             .to_string()
             .contains("requires measurement field measured_headroom_ratio")
+    );
+}
+
+#[test]
+fn run_fleet_gate_requires_matching_fresh_metadata() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    let path = temp.path().join("canary.jsonl");
+    let mut file = fs::File::create(&path).expect("jsonl file should be created");
+    writeln!(
+        file,
+        "{}",
+        json!({
+            "kind": "metadata",
+            "run_id": "run-1",
+            "generated_at": "2026-06-18T12:00:00Z",
+            "max_age_seconds": 3600
+        })
+    )
+    .expect("metadata line should be written");
+    for record in passing_records() {
+        writeln!(file, "{record}").expect("record line should be written");
+    }
+
+    let report = evaluate_file_for_run(
+        &path,
+        test_thresholds(),
+        "run-1",
+        Utc.with_ymd_and_hms(2026, 6, 18, 12, 30, 0)
+            .single()
+            .expect("valid timestamp"),
+    )
+    .expect("fresh matching metadata should pass");
+
+    assert_eq!(report.status(), CanaryStatus::Pass);
+}
+
+#[test]
+fn run_fleet_gate_rejects_wrong_run_id() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    let path = temp.path().join("canary.jsonl");
+    fs::write(
+        &path,
+        json!({
+            "kind": "metadata",
+            "run_id": "run-1",
+            "generated_at": "2026-06-18T12:00:00Z"
+        })
+        .to_string(),
+    )
+    .expect("metadata should be written");
+
+    let error = evaluate_file_for_run(
+        &path,
+        test_thresholds(),
+        "run-2",
+        Utc.with_ymd_and_hms(2026, 6, 18, 12, 30, 0)
+            .single()
+            .expect("valid timestamp"),
+    )
+    .expect_err("wrong run id should fail");
+
+    assert!(error.to_string().contains("did not match requested run_id"));
+}
+
+#[test]
+fn status_only_integrity_gate_is_rejected() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    let path = temp.path().join("canary.jsonl");
+    fs::write(
+        &path,
+        json!({
+            "kind": "hard_gate",
+            "gate": "whale_completes_cleanly",
+            "status": "pass"
+        })
+        .to_string(),
+    )
+    .expect("evidence should be written");
+
+    let error = read_evidence_file(&path, &test_thresholds())
+        .expect_err("integrity gate without boolean measurement should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("requires boolean measurement field whale_completed_cleanly")
     );
 }
 
@@ -184,13 +271,25 @@ fn passing_gate_record(gate: CanaryHardGate) -> serde_json::Value {
             "gate": gate,
             "measured_hours": test_thresholds().max_aggregate_rebuild_hours
         }),
-        CanaryHardGate::ReceiptRecomputationDetectsCorruption
-        | CanaryHardGate::StorageBoxManifestDetectsPartialUpload
-        | CanaryHardGate::WhaleCompletesCleanly
-        | CanaryHardGate::InvalidReposClassifyLoudly => json!({
+        CanaryHardGate::ReceiptRecomputationDetectsCorruption => json!({
             "kind": "hard_gate",
             "gate": gate,
-            "status": "pass"
+            "receipt_recomputation_detected_corruption": true
+        }),
+        CanaryHardGate::StorageBoxManifestDetectsPartialUpload => json!({
+            "kind": "hard_gate",
+            "gate": gate,
+            "storage_box_manifest_detected_partial_upload": true
+        }),
+        CanaryHardGate::WhaleCompletesCleanly => json!({
+            "kind": "hard_gate",
+            "gate": gate,
+            "whale_completed_cleanly": true
+        }),
+        CanaryHardGate::InvalidReposClassifyLoudly => json!({
+            "kind": "hard_gate",
+            "gate": gate,
+            "invalid_repos_classified_loudly": true
         }),
     }
 }

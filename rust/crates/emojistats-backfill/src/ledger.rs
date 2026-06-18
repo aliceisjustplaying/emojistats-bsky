@@ -115,6 +115,13 @@ pub struct LedgerSeedBatchSummary {
     pub existing: u64,
 }
 
+/// Summary of rows that are not finished, but are waiting for a future retry/backoff deadline.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeferredClaimSummary {
+    pub count: u64,
+    pub next_attempt_after: Option<SystemTime>,
+}
+
 impl RepoLedgerEntry {
     #[must_use]
     pub fn pending(did: impl Into<String>) -> Self {

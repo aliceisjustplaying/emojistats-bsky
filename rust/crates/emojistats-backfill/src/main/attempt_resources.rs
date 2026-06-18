@@ -5,19 +5,22 @@ use std::{
     time::Instant,
 };
 
-use emojistats_backfill::{
+use tokio::sync::Semaphore;
+
+use super::{
+    super::{
+        cli::HttpProtocol,
+        failure::FetchOneFailure,
+        fleet::{DEFAULT_HOST_CONCURRENCY_CAP, HostConcurrencyLimiter, HostConcurrencyPermit},
+    },
+    archive_host::{ArchiveClaimCheck, PreparedFetchHost},
+};
+use crate::{
     archive::{ArchiveCommitContext, ArchiveStorageConfig},
     ledger::{HostOverride, RepoLedgerEntry},
     parse::ParseConfig,
-    scheduler::ClaimScope,
+    scheduler::{ClaimScope, SharedHostPacer},
     transport::FetchByteBudget,
-};
-use tokio::sync::Semaphore;
-
-use super::archive_host::{ArchiveClaimCheck, PreparedFetchHost};
-use crate::{
-    cli::HttpProtocol,
-    fleet::{DEFAULT_HOST_CONCURRENCY_CAP, HostConcurrencyLimiter, HostConcurrencyPermit},
 };
 
 pub struct LocalFetchOneAttemptConfig<'a> {
@@ -48,7 +51,7 @@ pub enum AttemptResources<'a> {
         claim_scope: ClaimScope,
     },
     Fleet {
-        host_pacer: emojistats_backfill::scheduler::SharedHostPacer,
+        host_pacer: SharedHostPacer,
         host_limiter: HostConcurrencyLimiter,
         parse_permits: Arc<Semaphore>,
         byte_budget: FetchByteBudget,
@@ -87,9 +90,7 @@ impl AttemptResources<'_> {
         }
     }
 
-    pub(crate) const fn host_pacer(
-        &self,
-    ) -> Option<&emojistats_backfill::scheduler::SharedHostPacer> {
+    pub(crate) const fn host_pacer(&self) -> Option<&SharedHostPacer> {
         match self {
             Self::Local { .. } => None,
             Self::Fleet { host_pacer, .. } => Some(host_pacer),
@@ -146,7 +147,7 @@ pub struct HostOverrideCacheEntry {
 pub async fn acquire_host_fetch_permit(
     resources: &AttemptResources<'_>,
     prepared_host: &PreparedFetchHost,
-) -> Result<Option<HostConcurrencyPermit>, crate::failure::FetchOneFailure> {
+) -> Result<Option<HostConcurrencyPermit>, FetchOneFailure> {
     let Some(limiter) = resources.host_limiter() else {
         return Ok(None);
     };

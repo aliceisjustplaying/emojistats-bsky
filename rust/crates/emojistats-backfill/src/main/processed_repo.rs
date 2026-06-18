@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 #[derive(Debug)]
 pub(crate) struct FetchedRepo {
-    pub(crate) spooled: emojistats_backfill::transport::SpooledRepo,
+    pub(crate) spooled: crate::transport::SpooledRepo,
     pub(crate) fetch_ms: u64,
 }
 

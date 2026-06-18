@@ -7,7 +7,8 @@ use std::{
     thread,
 };
 
-use emojistats_backfill::{
+use super::*;
+use crate::{
     archive::{
         ArchiveCommitContext, ArchivePostRow, CompletenessClass, CreatedAtParseStatus, FetchMethod,
         LocalManifestEntry, NormalizerVersion, RepoReceipt, RepoReceiptInput, build_repo_receipt,
@@ -18,8 +19,6 @@ use emojistats_backfill::{
     manifest_derive::debug_read_committed_jsonl,
     metrics::noop_metrics_recorder,
 };
-
-use super::*;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 

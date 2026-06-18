@@ -230,6 +230,7 @@ impl StorageBoxCommands for RcloneStorageBoxCommands {
             "rclone moveto",
             vec![
                 "moveto".to_owned(),
+                "--immutable".to_owned(),
                 "--sftp-concurrency".to_owned(),
                 "1".to_owned(),
                 "--retries".to_owned(),

@@ -3,11 +3,12 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use emojistats_backfill::{
+use serde::Serialize;
+
+use crate::{
     archive::ArchiveError, commit, ledger::AttemptOutcome, list_records::ListRecordsError,
     parse::ParseError, storage_box, transport::FetchError,
 };
-use serde::Serialize;
 
 const BYTE_PRESSURE_RETRY_AFTER: Duration = Duration::from_secs(60);
 const DEFAULT_RATE_LIMIT_RETRY_AFTER: Duration = Duration::from_secs(60);
@@ -341,9 +342,8 @@ pub fn permanent_failure(message: String) -> FetchOneFailure {
 mod tests {
     use std::{io, path::PathBuf};
 
-    use emojistats_backfill::transport::FetchError;
-
     use super::*;
+    use crate::transport::FetchError;
 
     #[test]
     fn commit_integrity_conflict_is_permanent_failure() {

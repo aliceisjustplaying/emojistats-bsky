@@ -1,4 +1,5 @@
-use emojistats_backfill::{
+use super::{add_count, count_len, increment};
+use crate::{
     archive::{ArchivePostRow, ArchivePostRowsHasher},
     clickhouse::{
         ClickHouseInsertPayload, DEFAULT_POST_SERVING_PAYLOAD_MAX_BYTES,
@@ -13,8 +14,6 @@ use emojistats_backfill::{
     hash::hash_serialized_json,
     manifest_derive::VerifiedLoaderInput,
 };
-
-use super::{add_count, count_len, increment};
 
 const DERIVE_POST_CHUNK_ROWS: usize = 10_000;
 

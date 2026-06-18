@@ -411,7 +411,7 @@ fn sqlite_recovers_expired_claims_in_batch() {
     }
 
     let recovered = store
-        .recover_expired_claims(now, 1, None, "expired claim")
+        .recover_expired_claims(now, 1, None, "expired claim", None)
         .unwrap();
     let retryable = ["did:plc:stale1", "did:plc:stale2"]
         .into_iter()
@@ -426,6 +426,87 @@ fn sqlite_recovers_expired_claims_in_batch() {
 
     assert_eq!(recovered, 1);
     assert_eq!(retryable, 1);
+}
+
+#[test]
+fn sqlite_expired_claim_recovery_excludes_current_worker() {
+    let store = SqliteLedger::open_in_memory().unwrap();
+    let now = UNIX_EPOCH + Duration::from_secs(1_000);
+    for (did, worker_id) in [
+        ("did:plc:current-worker", "worker-a"),
+        ("did:plc:other-worker", "worker-b"),
+    ] {
+        store.upsert_entry(&RepoLedgerEntry::pending(did)).unwrap();
+        store
+            .try_claim_next(
+                now - Duration::from_secs(120),
+                "run-1",
+                worker_id,
+                Duration::from_secs(60),
+                None,
+            )
+            .unwrap();
+    }
+
+    let recovered = store
+        .recover_expired_claims(now, 10, None, "expired claim", Some("worker-a"))
+        .unwrap();
+
+    assert_eq!(recovered, 1);
+    assert_eq!(
+        store
+            .load_entry("did:plc:current-worker")
+            .unwrap()
+            .unwrap()
+            .status,
+        RepoLedgerStatus::Claimed
+    );
+    assert_eq!(
+        store
+            .load_entry("did:plc:other-worker")
+            .unwrap()
+            .unwrap()
+            .status,
+        RepoLedgerStatus::RetryableFailure
+    );
+}
+
+#[test]
+fn sqlite_deferred_claim_summary_reports_future_retry_backoff() {
+    let store = SqliteLedger::open_in_memory().unwrap();
+    let now = UNIX_EPOCH + Duration::from_secs(1_000);
+    let future_retry = RepoLedgerEntry {
+        did: "did:plc:future-retry".to_owned(),
+        status: RepoLedgerStatus::RetryableFailure,
+        attempts: 1,
+        next_attempt_after: Some(now + Duration::from_secs(30)),
+        last_attempt: Some(AttemptId::new("run-1", "did:plc:future-retry", 1)),
+        last_error: Some("timeout".to_owned()),
+        worker_id: None,
+        claimed_at: None,
+        lease_until: None,
+    };
+    let done = RepoLedgerEntry {
+        did: "did:plc:done".to_owned(),
+        status: RepoLedgerStatus::Succeeded,
+        attempts: 1,
+        next_attempt_after: None,
+        last_attempt: Some(AttemptId::new("run-1", "did:plc:done", 1)),
+        last_error: None,
+        worker_id: None,
+        claimed_at: None,
+        lease_until: None,
+    };
+    store.upsert_entry(&future_retry).unwrap();
+    store.upsert_entry(&done).unwrap();
+
+    let summary = store.deferred_claim_summary(now, None).unwrap();
+
+    assert_eq!(summary.count, 1);
+    assert_eq!(
+        summary.next_attempt_after,
+        Some(now + Duration::from_secs(30))
+    );
 }
 
 #[test]

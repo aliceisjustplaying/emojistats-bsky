@@ -5,7 +5,11 @@ use std::{
     time::Instant,
 };
 
-use emojistats_backfill::{
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use serde::Serialize;
+
+use super::{add_count, count_len, increment, payload_row_count};
+use crate::{
     archive::archive_post_rows_from_record_batch,
     clickhouse::{
         ClickHouseClientConfig, ClickHouseInsertPayload, ClickHouseInsertReceipt,
@@ -17,23 +21,22 @@ use emojistats_backfill::{
     },
     metrics::{MetricLabels, MetricName, MetricStage, SharedMetricsRecorder},
 };
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use serde::Serialize;
 
-use super::{add_count, count_len, increment, payload_row_count};
-
+#[path = "derive_manifest_cmd/ledger.rs"]
 mod ledger;
+#[path = "derive_manifest_cmd/streaming.rs"]
 mod streaming;
 
+use ledger::DeriveLedger;
+use streaming::{CanonicalStreamingPayloadState, CanonicalStreamingValidationState};
+
 #[cfg(test)]
-use emojistats_backfill::clickhouse::DEFAULT_POST_SERVING_PAYLOAD_MAX_BYTES;
+use crate::clickhouse::DEFAULT_POST_SERVING_PAYLOAD_MAX_BYTES;
 #[cfg(test)]
-use emojistats_backfill::derive::{
+use crate::derive::{
     DeriveManifestIdentity, PostServingRow, TotalPostCounterInput,
     canonical_streaming_counter_dedupe_token, canonical_streaming_post_dedupe_token,
 };
-use ledger::DeriveLedger;
-use streaming::{CanonicalStreamingPayloadState, CanonicalStreamingValidationState};
 
 pub struct DeriveManifestConfig {
     pub manifest_path: PathBuf,
@@ -391,4 +394,5 @@ fn derive_metric_labels<'a>(
 }
 
 #[cfg(test)]
+#[path = "derive_manifest_cmd/tests.rs"]
 mod tests;

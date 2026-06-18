@@ -580,6 +580,45 @@ async fn execute_sql_statements_sends_statements_in_order() {
     assert!(requests.get(1).expect("second").body.is_empty());
 }
 
+#[tokio::test]
+async fn aggregate_rebuild_insert_is_not_retried() {
+    let statements =
+        vec!["INSERT INTO emojistats.v2_emoji_total_r3__rebuild_shadow SELECT 1;".to_owned()];
+    let (url, handle) = spawn_http_server(vec![(503, "busy".to_owned())]);
+    let config = ClickHouseClientConfig::new(
+        &url,
+        "emojistats",
+        "alice",
+        "secret",
+        "emojistats-backfill-test",
+    )
+    .expect("client config")
+    .with_timeout_and_retry_policy(
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+        Duration::ZERO,
+        Duration::ZERO,
+        2,
+    );
+    let client = Client::new();
+
+    let error = execute_sql_statements(&client, &config, &statements)
+        .await
+        .expect_err("ambiguous shadow insert failure should not retry");
+    let requests = handle.join().expect("server thread");
+
+    assert_eq!(requests.len(), 1);
+    match error {
+        ClickHouseSqlError::RetryableStatus {
+            context, status, ..
+        } => {
+            assert_eq!(context.statement_index, 0);
+            assert_eq!(status, 503);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
 #[test]
 fn classify_sql_status_marks_server_errors_retryable() {
     let context = ClickHouseSqlContext {

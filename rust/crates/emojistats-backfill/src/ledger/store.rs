@@ -1,15 +1,16 @@
 use std::{
     path::Path,
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use rusqlite_migration::{M, Migrations};
 
 use super::{
-    AttemptOutcome, ForcedFetchMode, HostOverride, LedgerSeedBatchSummary, LedgerStoreError,
-    RepoLedgerEntry, RepoLedgerStatus, RetryPolicy, SHARD_BUCKET_MIGRATION_BATCH_SIZE, ShardFilter,
-    complete_attempt, did_shard_bucket, validate_worker_id,
+    AttemptOutcome, DeferredClaimSummary, ForcedFetchMode, HostOverride, LedgerSeedBatchSummary,
+    LedgerStoreError, RepoLedgerEntry, RepoLedgerStatus, RetryPolicy,
+    SHARD_BUCKET_MIGRATION_BATCH_SIZE, ShardFilter, complete_attempt, did_shard_bucket,
+    validate_worker_id,
 };
 use crate::ledger::codec::{
     StoredStatus, bool_to_i64, force_mode_name, load_entry_in_transaction,
@@ -658,7 +659,11 @@ impl SqliteLedger {
         limit: u32,
         shard: Option<ShardFilter>,
         message: &str,
+        excluded_worker_id: Option<&str>,
     ) -> Result<u64, LedgerStoreError> {
+        if let Some(worker_id) = excluded_worker_id {
+            validate_worker_id(worker_id).map_err(LedgerStoreError::Ledger)?;
+        }
         if limit == 0 {
             return Ok(0);
         }
@@ -677,14 +682,16 @@ impl SqliteLedger {
                     AND lease_until_ms IS NOT NULL
                     AND lease_until_ms <= ?1
                     AND (?2 IS NULL OR shard_bucket = ?2)
+                    AND (?3 IS NULL OR worker_id IS NULL OR worker_id <> ?3)
                 ORDER BY lease_until_ms, did
-                LIMIT ?3
+                LIMIT ?4
                 ",
             )?;
             statement
-                .query_map(params![now_ms, shard_bucket, i64::from(limit)], |row| {
-                    row.get::<_, String>(0)
-                })?
+                .query_map(
+                    params![now_ms, shard_bucket, excluded_worker_id, i64::from(limit)],
+                    |row| row.get::<_, String>(0),
+                )?
                 .collect::<Result<Vec<_>, _>>()?
         };
 
@@ -693,6 +700,11 @@ impl SqliteLedger {
             let Some(current) = load_entry_in_transaction(&transaction, &did)? else {
                 continue;
             };
+            if excluded_worker_id
+                .is_some_and(|worker_id| current.worker_id.as_deref() == Some(worker_id))
+            {
+                continue;
+            }
             let recovered = complete_attempt(
                 &current,
                 AttemptOutcome::RetryableFailure {
@@ -715,6 +727,39 @@ impl SqliteLedger {
         }
         transaction.commit()?;
         Ok(recovered_count)
+    }
+
+    /// Summarize retry/backoff rows that are not currently claimable but may become due later.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerStoreError`] when SQLite fails or a stored deadline cannot be decoded.
+    pub fn deferred_claim_summary(
+        &self,
+        now: SystemTime,
+        shard: Option<ShardFilter>,
+    ) -> Result<DeferredClaimSummary, LedgerStoreError> {
+        let now_ms = time_to_millis(now)?;
+        let shard_bucket = shard
+            .map(|filter| shard_bucket_to_i64(filter.bucket()))
+            .transpose()?;
+        let (count, next_attempt_after_ms): (i64, Option<i64>) = self.connection.query_row(
+            "
+            SELECT COUNT(*), MIN(next_attempt_after_ms)
+            FROM repo_ledger
+            WHERE
+                status IN ('pending', 'retryable_failure', 'throttled', 'operator_deferred')
+                AND next_attempt_after_ms IS NOT NULL
+                AND next_attempt_after_ms > ?1
+                AND (?2 IS NULL OR shard_bucket = ?2)
+            ",
+            params![now_ms, shard_bucket],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(DeferredClaimSummary {
+            count: u64::try_from(count).map_err(|_err| LedgerStoreError::IntegerOverflow)?,
+            next_attempt_after: next_attempt_after_ms.map(time_from_millis).transpose()?,
+        })
     }
 
     /// Load one ledger entry by DID.
@@ -1025,4 +1070,11 @@ fn manifest_sequence_shard(shard: Option<ShardFilter>) -> String {
         || "all".to_owned(),
         |filter| format!("shard{}", filter.bucket()),
     )
+}
+
+fn time_from_millis(millis: i64) -> Result<SystemTime, LedgerStoreError> {
+    let millis = u64::try_from(millis).map_err(|_err| LedgerStoreError::IntegerOverflow)?;
+    UNIX_EPOCH
+        .checked_add(Duration::from_millis(millis))
+        .ok_or(LedgerStoreError::IntegerOverflow)
 }

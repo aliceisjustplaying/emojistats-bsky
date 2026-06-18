@@ -5,12 +5,12 @@ use std::{
     time::SystemTime,
 };
 
-#[cfg(test)]
-use emojistats_backfill::ledger::RepoLedgerEntry;
-use emojistats_backfill::{ledger::SqliteLedger, scheduler::ClaimScope};
 use jacquard_common::types::did::Did;
 
-use crate::{add_count, increment};
+use super::super::{add_count, increment};
+#[cfg(test)]
+use crate::ledger::RepoLedgerEntry;
+use crate::{ledger::SqliteLedger, scheduler::ClaimScope};
 
 const SEED_BATCH_SIZE: usize = 1_000;
 const STALE_RECOVERY_BATCH_SIZE: u32 = 512;
@@ -50,6 +50,7 @@ pub fn recover_stale_claimed_entries(
         now,
         &ClaimScope::default(),
         "expired claimed lease at fleet startup",
+        None,
     )
 }
 
@@ -58,6 +59,7 @@ pub(super) fn recover_stale_claimed_entries_for_scope_with_message(
     now: SystemTime,
     claim_scope: &ClaimScope,
     message: &str,
+    excluded_worker_id: Option<&str>,
 ) -> anyhow::Result<u64> {
     let mut recovered = 0_u64;
     loop {
@@ -66,6 +68,7 @@ pub(super) fn recover_stale_claimed_entries_for_scope_with_message(
             STALE_RECOVERY_BATCH_SIZE,
             claim_scope.shard_filter(),
             message,
+            excluded_worker_id,
         )?;
         add_count(
             &mut recovered,

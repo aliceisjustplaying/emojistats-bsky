@@ -5,14 +5,9 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use emojistats_backfill::{
-    archive::{ArchiveCommitContext, ArchiveStorageConfig},
-    list_records::{ListRecordsConfig, fetch_and_archive_list_records_with_precommit_check},
-    scheduler::SharedHostPacer,
-};
 use jacquard_common::{deps::fluent_uri::Uri, types::did::Did};
 
-use crate::{
+use super::super::{
     failure::{
         FetchOneFailure, SmokeTelemetry, classify_list_records_error, current_rss_kb, elapsed_ms,
         emit_smoke_telemetry, outcome_name,
@@ -25,6 +20,11 @@ use crate::{
             ProcessedRepoCounts,
         },
     },
+};
+use crate::{
+    archive::{ArchiveCommitContext, ArchiveStorageConfig},
+    list_records::{ListRecordsConfig, fetch_and_archive_list_records_with_precommit_check},
+    scheduler::SharedHostPacer,
 };
 
 pub(crate) struct ListRecordsStep<'a> {
@@ -61,11 +61,7 @@ pub(crate) async fn fetch_archive_list_records_or_emit_failure(
         step.archive_storage.clone(),
         ListRecordsConfig::default(),
         host_pacer.map(|pacer| {
-            emojistats_backfill::list_records::ListRecordsHostPacing::new(
-                pacer,
-                host,
-                step.host_min_interval,
-            )
+            crate::list_records::ListRecordsHostPacing::new(pacer, host, step.host_min_interval)
         }),
         |rate_limit| record_rate_limit_snapshot(host_pacer, host, rate_limit, SystemTime::now()),
         move || {

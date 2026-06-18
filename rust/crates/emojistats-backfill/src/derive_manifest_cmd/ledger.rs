@@ -5,12 +5,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use emojistats_backfill::{
+use serde::Serialize;
+
+use crate::{
     clickhouse::{ClickHouseInsertPayload, ClickHouseInsertReceipt},
     derive::DeriveCheckpointRecord,
     manifest_derive::VerifiedLoaderInput,
 };
-use serde::Serialize;
 
 #[derive(Debug)]
 pub(super) struct DeriveLedger {

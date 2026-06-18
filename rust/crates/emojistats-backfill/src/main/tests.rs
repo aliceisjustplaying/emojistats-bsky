@@ -7,7 +7,17 @@ use std::{
 };
 
 use clap::Parser;
-use emojistats_backfill::{
+use jacquard_common::deps::fluent_uri::Uri;
+
+use super::{
+    ArchiveBackend, Cli, Command, HostOverrideCache, fetch_mode_for_host, load_host_override,
+    pds_host_key, prepare_fetch_host, should_fallback_get_repo_to_list_records,
+};
+use crate::{
+    app::fleet::{
+        HostConcurrencyLimiter, SeedSummary, claimable_entries_for_scope,
+        recover_stale_claimed_entries, seed_ledger_from_file,
+    },
     ledger::{
         AttemptId, AttemptOutcome, ForcedFetchMode, HostOverride, RepoLedgerEntry,
         RepoLedgerStatus, ShardFilter, SqliteLedger, claim_repo_with_lease, did_shard_bucket,
@@ -15,16 +25,6 @@ use emojistats_backfill::{
     parse::default_cid_verification_threads,
     scheduler::ClaimScope,
     transport::{FetchError, RateLimitSnapshot},
-};
-use jacquard_common::deps::fluent_uri::Uri;
-
-use super::{
-    ArchiveBackend, Cli, Command, HostOverrideCache, fetch_mode_for_host, load_host_override,
-    pds_host_key, prepare_fetch_host, should_fallback_get_repo_to_list_records,
-};
-use crate::fleet::{
-    HostConcurrencyLimiter, SeedSummary, claimable_entries_for_scope,
-    recover_stale_claimed_entries, seed_ledger_from_file,
 };
 
 #[test]

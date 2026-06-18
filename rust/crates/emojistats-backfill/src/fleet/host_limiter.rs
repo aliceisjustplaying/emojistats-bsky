@@ -5,7 +5,7 @@ use std::{
 
 use tokio::sync::Notify;
 
-use crate::failure::{FetchOneFailure, retryable_failure};
+use super::super::failure::{FetchOneFailure, retryable_failure};
 
 #[derive(Debug, Clone, Default)]
 pub struct HostConcurrencyLimiter {

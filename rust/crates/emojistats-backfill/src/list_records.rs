@@ -607,11 +607,6 @@ async fn read_response_body_with_cap(
     .await
     .map_err(|_elapsed| list_records_timeout_error(started, config, observed))?
     {
-        enforce_page_progress(
-            &mut progress_window_started,
-            &mut progress_window_bytes,
-            config,
-        )?;
         let chunk = next_chunk?;
         let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
         observed =
@@ -630,6 +625,11 @@ async fn read_response_body_with_cap(
                 observed: u64::MAX,
                 max: config.min_progress_bytes,
             },
+        )?;
+        enforce_page_progress(
+            &mut progress_window_started,
+            &mut progress_window_bytes,
+            config,
         )?;
     }
     Ok(body)

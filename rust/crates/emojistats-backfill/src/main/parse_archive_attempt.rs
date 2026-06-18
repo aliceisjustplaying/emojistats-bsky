@@ -2,13 +2,9 @@
 
 use std::{path::Path, sync::Arc, time::Instant};
 
-use emojistats_backfill::{
-    archive::{ArchiveCommitContext, ArchiveStorageConfig},
-    parse::ParseConfig,
-};
 use tokio::sync::Semaphore;
 
-use crate::{
+use super::super::{
     failure::{
         FetchOneFailure, SmokeTelemetry, current_rss_kb, elapsed_ms, emit_smoke_telemetry,
         outcome_name, retryable_failure,
@@ -17,6 +13,10 @@ use crate::{
         archive_host::{ArchiveClaimCheck, parse_and_archive_spooled_repo},
         processed_repo::{FetchedRepo, ProcessedRepo},
     },
+};
+use crate::{
+    archive::{ArchiveCommitContext, ArchiveStorageConfig},
+    parse::ParseConfig,
 };
 
 pub(crate) struct ParseArchiveStep<'a> {

@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use emojistats_backfill::scheduler::SharedHostPacer;
 use jacquard_identity::resolver::IdentityResolver;
 use tokio::sync::Semaphore;
 
@@ -25,6 +24,7 @@ use super::{
     processed_repo::ProcessedRepo,
     repo_fetch::{FetchStep, fetch_spooled_repo, repo_fetch_client},
 };
+use crate::scheduler::SharedHostPacer;
 
 const METHOD_WALL_FORCE_MODE_TTL: Duration = Duration::from_hours(24);
 
