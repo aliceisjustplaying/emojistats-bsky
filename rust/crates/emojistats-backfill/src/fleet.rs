@@ -7,6 +7,17 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use emojistats_backfill::{
+    archive::{ArchiveCommitContext, ArchiveStorageConfig},
+    ledger::{
+        AttemptOutcome, DEFAULT_CLAIM_LEASE_DURATION, DeferredClaimSummary, RepoLedgerEntry,
+        RetryPolicy, SqliteLedger,
+    },
+    metrics::{MetricLabels, MetricName, MetricStage, PressureState, SharedMetricsRecorder},
+    parse::ParseConfig,
+    scheduler::{ClaimScope, HostPacer, SchedulerError, SharedHostPacer, checked_concurrency},
+    transport::FetchByteBudget,
+};
 use futures_util::FutureExt;
 use tokio::{
     sync::Semaphore,
@@ -23,17 +34,6 @@ use super::{
     },
     parse_config_for_threads,
 };
-use crate::{
-    archive::{ArchiveCommitContext, ArchiveStorageConfig},
-    ledger::{
-        AttemptOutcome, DEFAULT_CLAIM_LEASE_DURATION, DeferredClaimSummary, RepoLedgerEntry,
-        RetryPolicy, SqliteLedger,
-    },
-    metrics::{MetricLabels, MetricName, MetricStage, PressureState, SharedMetricsRecorder},
-    parse::ParseConfig,
-    scheduler::{ClaimScope, HostPacer, SchedulerError, SharedHostPacer, checked_concurrency},
-    transport::FetchByteBudget,
-};
 
 #[allow(clippy::duration_suboptimal_units)]
 const CLAIM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15 * 60);
@@ -48,6 +48,7 @@ mod ledger_async;
 mod ledger_io;
 
 pub use host_limiter::{HostConcurrencyLimiter, HostConcurrencyPermit};
+pub use ledger_async::SharedBlockingLedger;
 pub use ledger_io::{SeedSummary, seed_ledger_from_file};
 #[cfg(test)]
 pub use ledger_io::{claimable_entries_for_scope, recover_stale_claimed_entries};
@@ -205,7 +206,6 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
                 parse_permits: parse_permits.clone(),
                 byte_budget: byte_budget.clone(),
                 claim_scope: config.claim_scope.clone(),
-                ledger_path: config.ledger_path.clone(),
                 ledger: ledger.clone(),
             }));
             record_active_attempts(&config, active.len());
@@ -290,7 +290,6 @@ struct FleetAttemptConfig {
     parse_permits: Arc<Semaphore>,
     byte_budget: FetchByteBudget,
     claim_scope: ClaimScope,
-    ledger_path: PathBuf,
     ledger: ledger_async::SharedBlockingLedger,
 }
 
@@ -342,9 +341,9 @@ async fn run_fleet_attempt(config: FleetAttemptConfig) -> FleetAttemptResult {
                     host_limiter: config.host_limiter,
                     parse_permits: config.parse_permits,
                     byte_budget: config.byte_budget,
+                    ledger: config.ledger.clone(),
                     claimed: Box::new(config.claimed.clone()),
                     claim_scope: &config.claim_scope,
-                    host_override_ledger_path: &config.ledger_path,
                     host_override_cache: config.host_override_cache,
                 },
                 parse_config: config.parse_config,

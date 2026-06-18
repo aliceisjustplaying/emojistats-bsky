@@ -1,6 +1,5 @@
 //! Library surface for the v2 backfill vertical slice.
 
-pub mod app;
 pub mod archive;
 pub mod canary;
 pub mod census;

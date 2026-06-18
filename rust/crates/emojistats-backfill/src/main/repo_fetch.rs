@@ -1,5 +1,9 @@
 use std::time::{Duration, Instant, SystemTime};
 
+use emojistats_backfill::{
+    scheduler::{HostPacer, SharedHostPacer},
+    transport::{FetchConfig, FetchError, fetch_repo_with_rate_limit_observer},
+};
 use jacquard_common::{deps::fluent_uri::Uri, types::did::Did};
 use sha2::{Digest, Sha256};
 
@@ -10,10 +14,6 @@ use super::{
     },
     host_rate_limit::record_rate_limit_snapshot,
     processed_repo::FetchedRepo,
-};
-use crate::{
-    scheduler::{HostPacer, SharedHostPacer},
-    transport::{FetchConfig, FetchError, fetch_repo_with_rate_limit_observer},
 };
 
 pub(super) struct FetchStep<'a> {

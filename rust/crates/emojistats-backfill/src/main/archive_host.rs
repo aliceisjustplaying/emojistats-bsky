@@ -3,10 +3,11 @@ use super::{
         ArchiveCommitContext, ArchiveError, ArchiveStorageConfig, AttemptOutcome, ClaimScope,
         CompletenessClass, DEFAULT_CLAIM_LEASE_DURATION, FetchMethod, FetchOneFailure,
         ForcedFetchMode, HOST_OVERRIDE_CACHE_TTL, HostOverride, Instant, NormalizerVersion,
-        ParseConfig, ParseVisitError, ParsedRepoSummary, Path, PathBuf, RepoLedgerEntry,
-        SqliteLedger, StreamingArchiveSink, StreamingReceiptInput, SystemTime, Uri,
+        ParseConfig, ParseVisitError, ParsedRepoSummary, Path, RepoLedgerEntry,
+        StreamingArchiveSink, StreamingReceiptInput, SystemTime, Uri,
         archive_row_from_owned_post_observed_at, classify_archive_error, classify_parse_error,
-        elapsed_ms, hash_profile_record, parse_repo_for_did_with_state, retryable_failure,
+        elapsed_ms, fleet::SharedBlockingLedger, hash_profile_record,
+        parse_repo_for_did_with_state, retryable_failure,
     },
     fetch_attempt::{HostOverrideCache, HostOverrideCacheEntry},
     processed_repo::{
@@ -128,19 +129,14 @@ pub fn parse_and_archive_spooled_repo(
 
 #[derive(Debug, Clone)]
 pub struct ArchiveClaimCheck {
-    pub ledger_path: PathBuf,
+    pub ledger: SharedBlockingLedger,
     pub claimed: RepoLedgerEntry,
 }
 
 impl ArchiveClaimCheck {
     pub fn ensure_owned_before_commit(&self, did_str: &str) -> Result<(), FetchOneFailure> {
-        let ledger = SqliteLedger::open(&self.ledger_path).map_err(|err| {
-            retryable_failure(format!(
-                "open ledger before archive commit for {did_str}: {err}"
-            ))
-        })?;
-        ledger
-            .extend_owned_claim_lease(
+        self.ledger
+            .extend_owned_claim_lease_blocking(
                 &self.claimed,
                 SystemTime::now(),
                 DEFAULT_CLAIM_LEASE_DURATION,
@@ -226,7 +222,7 @@ pub async fn prepare_fetch_host(
     did_str: &str,
     pds: &Uri<String>,
     claim_scope: &ClaimScope,
-    host_override_ledger_path: Option<&Path>,
+    host_override_ledger: Option<SharedBlockingLedger>,
     host_override_cache: Option<HostOverrideCache>,
 ) -> Result<PreparedFetchHost, FetchOneFailure> {
     if !claim_scope.includes_did(did_str) {
@@ -237,8 +233,7 @@ pub async fn prepare_fetch_host(
     let host = pds_host_key(pds);
     let now = SystemTime::now();
     let host_override =
-        load_host_override_async(host_override_ledger_path, host_override_cache, &host, now)
-            .await?;
+        load_host_override_async(host_override_ledger, host_override_cache, &host, now).await?;
     let fetch_mode = fetch_mode_for_host(&host, host_override.as_ref(), now)?;
     Ok(PreparedFetchHost {
         host,
@@ -261,6 +256,7 @@ pub fn pds_host_key(pds: &Uri<String>) -> String {
     )
 }
 
+#[cfg(test)]
 pub fn load_host_override(
     ledger_path: Option<&Path>,
     cache: Option<HostOverrideCache>,
@@ -276,7 +272,7 @@ pub fn load_host_override(
             CachedHostOverride::Miss => {}
         }
     }
-    let ledger = SqliteLedger::open(ledger_path)
+    let ledger = emojistats_backfill::ledger::SqliteLedger::open(ledger_path)
         .map_err(|err| retryable_failure(format!("open ledger for host override {host}: {err}")))?;
     let override_record = ledger
         .load_host_override(host)
@@ -290,12 +286,12 @@ pub fn load_host_override(
 }
 
 async fn load_host_override_async(
-    ledger_path: Option<&Path>,
+    ledger: Option<SharedBlockingLedger>,
     cache: Option<HostOverrideCache>,
     host: &str,
     now: SystemTime,
 ) -> Result<Option<HostOverride>, FetchOneFailure> {
-    let Some(ledger_path) = ledger_path else {
+    let Some(ledger) = ledger else {
         return Ok(None);
     };
     if let Some(ref cache) = cache {
@@ -304,17 +300,53 @@ async fn load_host_override_async(
             CachedHostOverride::Miss => {}
         }
     }
-    let ledger_path = ledger_path.to_path_buf();
     let host_owned = host.to_owned();
-    let override_record = tokio::task::spawn_blocking(move || {
-        load_host_override(Some(&ledger_path), None, &host_owned, now)
-    })
-    .await
-    .map_err(|err| retryable_failure(format!("host override task failed for {host}: {err}")))??;
+    let override_record = ledger
+        .load_host_override(host_owned)
+        .await
+        .map_err(|err| retryable_failure(format!("load host override for {host}: {err}")))?
+        .map(|record| normalize_host_override_shared(&ledger, host, record, now))
+        .transpose()?;
     if let Some(cache) = cache {
         store_cached_host_override(&cache, host, override_record.clone())?;
     }
     Ok(override_record)
+}
+
+fn normalize_host_override_shared(
+    ledger: &SharedBlockingLedger,
+    host: &str,
+    mut record: HostOverride,
+    now: SystemTime,
+) -> Result<HostOverride, FetchOneFailure> {
+    if record.disabled
+        && record
+            .revive_after
+            .is_some_and(|revive_after| revive_after <= now)
+    {
+        record.disabled = false;
+        record.revive_after = None;
+        ledger
+            .upsert_host_override_blocking(&record)
+            .map_err(|err| {
+                retryable_failure(format!(
+                    "clear expired disabled host override for {host}: {err}"
+                ))
+            })?;
+    }
+    if record
+        .force_mode_revive_after
+        .is_some_and(|revive_after| revive_after <= now)
+    {
+        record.force_mode = None;
+        record.force_mode_revive_after = None;
+        ledger
+            .upsert_host_override_blocking(&record)
+            .map_err(|err| {
+                retryable_failure(format!("clear expired forced fetch mode for {host}: {err}"))
+            })?;
+    }
+    Ok(record)
 }
 
 enum CachedHostOverride {
@@ -357,8 +389,9 @@ fn store_cached_host_override(
     Ok(())
 }
 
+#[cfg(test)]
 fn normalize_host_override(
-    ledger: &SqliteLedger,
+    ledger: &emojistats_backfill::ledger::SqliteLedger,
     host: &str,
     mut record: HostOverride,
     now: SystemTime,

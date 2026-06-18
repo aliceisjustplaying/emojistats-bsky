@@ -969,6 +969,7 @@ dependencies = [
  "fs4",
  "futures-util",
  "hex",
+ "hmac",
  "http",
  "httpdate",
  "ipld-core",

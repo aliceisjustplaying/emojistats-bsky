@@ -7,8 +7,7 @@ use std::{
     thread,
 };
 
-use super::*;
-use crate::{
+use emojistats_backfill::{
     archive::{
         ArchiveCommitContext, ArchivePostRow, CompletenessClass, CreatedAtParseStatus, FetchMethod,
         LocalManifestEntry, NormalizerVersion, RepoReceipt, RepoReceiptInput, build_repo_receipt,
@@ -19,6 +18,8 @@ use crate::{
     manifest_derive::debug_read_committed_jsonl,
     metrics::noop_metrics_recorder,
 };
+
+use super::*;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -457,8 +458,12 @@ async fn insert_payloads_records_partial_success_and_resumes_from_ledger() {
             "{\"b\":2}\n",
         ),
     ];
-    let (url, handle) =
-        spawn_http_server(vec![(200, "emoji-ok".to_owned()), (503, "busy".to_owned())]);
+    let (url, handle) = spawn_http_server(vec![
+        (200, "0\n".to_owned()),
+        (200, "emoji-ok".to_owned()),
+        (200, "0\n".to_owned()),
+        (503, "busy".to_owned()),
+    ]);
     let clickhouse = ClickHouseClientConfig::new(
         &url,
         "emojistats",
@@ -493,7 +498,7 @@ async fn insert_payloads_records_partial_success_and_resumes_from_ledger() {
     let requests = handle.join().expect("server thread");
 
     assert!(error.to_string().contains("ClickHouse"));
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 4);
     assert_eq!(summary.attempted_insert_payloads, 2);
     assert_eq!(summary.attempted_insert_rows, 2);
     assert_eq!(summary.inserted_payloads, 1);
@@ -501,7 +506,10 @@ async fn insert_payloads_records_partial_success_and_resumes_from_ledger() {
     let ledger_lines = fs::read_to_string(&ledger_path).expect("ledger should exist");
     assert_eq!(ledger_lines.lines().count(), 1);
 
-    let (url, handle) = spawn_http_server(vec![(200, "counter-ok".to_owned())]);
+    let (url, handle) = spawn_http_server(vec![
+        (200, "0\n".to_owned()),
+        (200, "counter-ok".to_owned()),
+    ]);
     let clickhouse = ClickHouseClientConfig::new(
         &url,
         "emojistats",
@@ -535,9 +543,9 @@ async fn insert_payloads_records_partial_success_and_resumes_from_ledger() {
         .expect("resume should insert only missing payload");
     let requests = handle.join().expect("server thread");
 
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 2);
     assert_eq!(
-        requests.first().expect("request").body,
+        requests.get(1).expect("insert request").body,
         payloads.get(1).expect("second payload").body
     );
     assert_eq!(summary.skipped_insert_payloads, 1);
@@ -546,6 +554,58 @@ async fn insert_payloads_records_partial_success_and_resumes_from_ledger() {
     assert_eq!(summary.inserted_payloads, 1);
     let ledger_lines = fs::read_to_string(&ledger_path).expect("ledger should exist");
     assert_eq!(ledger_lines.lines().count(), 2);
+}
+
+#[tokio::test]
+async fn clickhouse_present_payload_repairs_missing_derive_ledger() {
+    let temp = TempDir::new("clickhouse-ledger-repair");
+    let ledger_path = temp.path.join("derive-ledger.jsonl");
+    let verified = verified_input();
+    let payloads = vec![payload(
+        ClickHouseTable::TotalPostCounter,
+        "derive:counter:already-present",
+        "{\"b\":2}\n",
+    )];
+    let (url, handle) = spawn_http_server(vec![(200, "1\n".to_owned())]);
+    let clickhouse = ClickHouseClientConfig::new(
+        &url,
+        "emojistats",
+        "alice",
+        "secret",
+        "emojistats-backfill-test",
+    )
+    .expect("clickhouse config")
+    .with_timeout_and_retry_policy(
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(10),
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+        1,
+    );
+    let http = clickhouse.http_client().expect("http client");
+    let mut derive_ledger = DeriveLedger::new(Some(&ledger_path)).expect("derive ledger");
+    let mut summary = DeriveManifestSummary::default();
+    let metrics = noop_metrics_recorder();
+    let mut context = derive_run_context(
+        &http,
+        &clickhouse,
+        false,
+        &mut derive_ledger,
+        &mut summary,
+        &metrics,
+    );
+
+    apply_derive_payloads(&mut context, &verified, &payloads)
+        .await
+        .expect("present ClickHouse payload should be treated as complete");
+    let requests = handle.join().expect("server thread");
+
+    assert_eq!(requests.len(), 1);
+    assert!(requests.first().expect("probe").body.is_empty());
+    assert_eq!(summary.skipped_insert_payloads, 1);
+    assert_eq!(summary.inserted_payloads, 0);
+    let ledger_lines = fs::read_to_string(&ledger_path).expect("ledger should exist");
+    assert_eq!(ledger_lines.lines().count(), 1);
 }
 
 struct TempDir {

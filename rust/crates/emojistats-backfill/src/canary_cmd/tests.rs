@@ -1,12 +1,15 @@
 use std::{fs, io::Write, path::Path};
 
 use chrono::{TimeZone, Utc};
-use serde_json::json;
-
-use super::{evaluate_file, evaluate_file_for_run, read_evidence_file};
-use crate::canary::{
+use emojistats_backfill::canary::{
     CanaryHardGate, CanaryStatus, CanaryThresholds, required_failure_injections,
     required_hard_gates, required_sample_categories,
+};
+use serde_json::json;
+
+use super::{
+    CanaryEvidenceMetadata, CanaryEvidenceSignatureKey, evaluate_file, evaluate_file_for_run,
+    read_evidence_file, sign_test_evidence,
 };
 
 #[test]
@@ -90,6 +93,48 @@ fn status_only_numeric_gate_is_rejected() {
 fn run_fleet_gate_requires_matching_fresh_metadata() {
     let temp = tempfile::tempdir().expect("tempdir should be created");
     let path = temp.path().join("canary.jsonl");
+    let key = test_signature_key();
+    write_signed_passing_jsonl(&path, "run-1", &key);
+
+    let report = evaluate_file_for_run(
+        &path,
+        test_thresholds(),
+        "run-1",
+        Utc.with_ymd_and_hms(2026, 6, 18, 12, 30, 0)
+            .single()
+            .expect("valid timestamp"),
+        &key,
+    )
+    .expect("fresh matching metadata should pass");
+
+    assert_eq!(report.status(), CanaryStatus::Pass);
+}
+
+#[test]
+fn run_fleet_gate_rejects_wrong_run_id() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    let path = temp.path().join("canary.jsonl");
+    let key = test_signature_key();
+    write_signed_passing_jsonl(&path, "run-1", &key);
+
+    let error = evaluate_file_for_run(
+        &path,
+        test_thresholds(),
+        "run-2",
+        Utc.with_ymd_and_hms(2026, 6, 18, 12, 30, 0)
+            .single()
+            .expect("valid timestamp"),
+        &key,
+    )
+    .expect_err("wrong run id should fail");
+
+    assert!(error.to_string().contains("did not match requested run_id"));
+}
+
+#[test]
+fn run_fleet_gate_rejects_unsigned_metadata() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    let path = temp.path().join("canary.jsonl");
     let mut file = fs::File::create(&path).expect("jsonl file should be created");
     writeln!(
         file,
@@ -106,45 +151,18 @@ fn run_fleet_gate_requires_matching_fresh_metadata() {
         writeln!(file, "{record}").expect("record line should be written");
     }
 
-    let report = evaluate_file_for_run(
+    let error = evaluate_file_for_run(
         &path,
         test_thresholds(),
         "run-1",
         Utc.with_ymd_and_hms(2026, 6, 18, 12, 30, 0)
             .single()
             .expect("valid timestamp"),
+        &test_signature_key(),
     )
-    .expect("fresh matching metadata should pass");
+    .expect_err("unsigned evidence should fail the paid gate");
 
-    assert_eq!(report.status(), CanaryStatus::Pass);
-}
-
-#[test]
-fn run_fleet_gate_rejects_wrong_run_id() {
-    let temp = tempfile::tempdir().expect("tempdir should be created");
-    let path = temp.path().join("canary.jsonl");
-    fs::write(
-        &path,
-        json!({
-            "kind": "metadata",
-            "run_id": "run-1",
-            "generated_at": "2026-06-18T12:00:00Z"
-        })
-        .to_string(),
-    )
-    .expect("metadata should be written");
-
-    let error = evaluate_file_for_run(
-        &path,
-        test_thresholds(),
-        "run-2",
-        Utc.with_ymd_and_hms(2026, 6, 18, 12, 30, 0)
-            .single()
-            .expect("valid timestamp"),
-    )
-    .expect_err("wrong run id should fail");
-
-    assert!(error.to_string().contains("did not match requested run_id"));
+    assert!(error.to_string().contains("requires metadata hmac_sha256"));
 }
 
 #[test]
@@ -212,6 +230,62 @@ fn write_passing_jsonl(path: &Path) {
     }
     for gate in required_hard_gates() {
         writeln!(file, "{}", passing_gate_record(gate)).expect("gate line should be written");
+    }
+}
+
+fn write_signed_passing_jsonl(path: &Path, run_id: &str, key: &CanaryEvidenceSignatureKey) {
+    let generated_at = Utc
+        .with_ymd_and_hms(2026, 6, 18, 12, 0, 0)
+        .single()
+        .expect("valid timestamp");
+    let mut metadata = CanaryEvidenceMetadata {
+        run_id: run_id.to_owned(),
+        generated_at,
+        max_age_seconds: Some(3600),
+        hmac_sha256: None,
+    };
+    let unsigned_records = passing_records();
+    let unsigned_path = path.with_extension("unsigned.jsonl");
+    let mut unsigned_file = fs::File::create(&unsigned_path).expect("unsigned jsonl");
+    writeln!(
+        unsigned_file,
+        "{}",
+        json!({
+            "kind": "metadata",
+            "run_id": run_id,
+            "generated_at": generated_at.to_rfc3339(),
+            "max_age_seconds": 3600
+        })
+    )
+    .expect("metadata line should be written");
+    for record in &unsigned_records {
+        writeln!(unsigned_file, "{record}").expect("record line should be written");
+    }
+    let (_metadata, evidence) =
+        read_evidence_file(&unsigned_path, &test_thresholds()).expect("unsigned evidence parses");
+    metadata.hmac_sha256 = Some(sign_test_evidence(&metadata, &evidence, key));
+
+    let mut file = fs::File::create(path).expect("jsonl file should be created");
+    writeln!(
+        file,
+        "{}",
+        json!({
+            "kind": "metadata",
+            "run_id": metadata.run_id,
+            "generated_at": metadata.generated_at.to_rfc3339(),
+            "max_age_seconds": metadata.max_age_seconds,
+            "hmac_sha256": metadata.hmac_sha256
+        })
+    )
+    .expect("metadata line should be written");
+    for record in unsigned_records {
+        writeln!(file, "{record}").expect("record line should be written");
+    }
+}
+
+fn test_signature_key() -> CanaryEvidenceSignatureKey {
+    CanaryEvidenceSignatureKey {
+        bytes: b"test-canary-secret".to_vec(),
     }
 }
 

@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-
-use crate::{
+use emojistats_backfill::{
     canary::CanaryThresholds, ledger::ShardFilter, parse::default_cid_verification_threads,
 };
 
@@ -73,6 +72,10 @@ pub enum ArchiveBackend {
 }
 
 #[derive(Subcommand, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "clap subcommands keep their parsed fields inline"
+)]
 pub enum Command {
     /// Fetch and process a single repo by DID (vertical-slice milestone).
     FetchOne {
@@ -207,6 +210,9 @@ pub enum Command {
         /// Passing canary evidence required before fleet work starts.
         #[arg(long)]
         canary_evidence: Option<PathBuf>,
+        /// Environment variable containing the HMAC key for canary evidence.
+        #[arg(long, default_value = "EMOJISTATS_CANARY_HMAC_KEY")]
+        canary_evidence_hmac_key_env: String,
         /// Explicitly bypass the canary gate for smoke/local runs.
         #[arg(long)]
         bypass_canary: bool,

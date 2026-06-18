@@ -32,6 +32,8 @@ const INSERT_DEDUPLICATION_TOKEN_SETTING: &str = "insert_deduplication_token";
 const DATE_TIME_INPUT_FORMAT_SETTING: &str = "date_time_input_format";
 const CLICKHOUSE_RESPONSE_SNIPPET_MAX_BYTES: usize = 4_096;
 pub const DEFAULT_POST_SERVING_PAYLOAD_MAX_BYTES: usize = 8_388_608;
+const POST_SERVING_ROW_SIZE_DEDUPE_TOKEN: &str =
+    "derive:post:0000000000000000000000000000000000000000000000000000000000000000";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
@@ -254,6 +256,19 @@ impl ClickHouseClientConfig {
         statements: &[String],
     ) -> Result<Vec<ClickHouseSqlReceipt>, ClickHouseSqlError> {
         execute_sql_statements(client, self, statements).await
+    }
+
+    /// Return whether the target table already contains the rows for this derive payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClickHouseSqlError`] when the probe request fails or returns an invalid count.
+    pub async fn derive_payload_exists(
+        &self,
+        client: &Client,
+        payload: &ClickHouseInsertPayload,
+    ) -> Result<bool, ClickHouseSqlError> {
+        derive_payload_exists(client, self, payload).await
     }
 
     fn headers(&self) -> Result<HeaderMap, ClickHouseSchemaError> {
@@ -497,7 +512,7 @@ pub fn post_serving_rows_insert_payload(
 ) -> Result<ClickHouseInsertPayload, ClickHouseSchemaError> {
     let rows = post_rows
         .iter()
-        .map(|row| PostServingInsertRow::from_projection(row, identity))
+        .map(|row| PostServingInsertRow::from_projection(row, identity, dedupe_token.as_str()))
         .collect::<Vec<_>>();
     Ok(ClickHouseInsertPayload {
         table: ClickHouseTable::PostServing,
@@ -518,12 +533,16 @@ pub fn post_serving_row_body_bytes(
     identity: &DeriveManifestIdentity,
     row: &PostServingRow,
 ) -> Result<usize, ClickHouseSchemaError> {
-    serde_json::to_string(&PostServingInsertRow::from_projection(row, identity))?
-        .len()
-        .checked_add(1)
-        .ok_or(ClickHouseSchemaError::CountOverflow {
-            field: "post_serving_row_body_bytes",
-        })
+    serde_json::to_string(&PostServingInsertRow::from_projection(
+        row,
+        identity,
+        POST_SERVING_ROW_SIZE_DEDUPE_TOKEN,
+    ))?
+    .len()
+    .checked_add(1)
+    .ok_or(ClickHouseSchemaError::CountOverflow {
+        field: "post_serving_row_body_bytes",
+    })
 }
 
 /// Format the total-post counter as a `ClickHouse` `JSONEachRow` insert payload.
@@ -551,7 +570,7 @@ pub fn total_post_counter_insert_payload_for_counter(
     dedupe_token: String,
     checkpoint_key: DeriveCheckpointKey,
 ) -> Result<ClickHouseInsertPayload, ClickHouseSchemaError> {
-    let row = TotalPostCounterInsertRow::from_counter(counter);
+    let row = TotalPostCounterInsertRow::from_counter(counter, dedupe_token.as_str());
     Ok(ClickHouseInsertPayload {
         table: ClickHouseTable::TotalPostCounter,
         format: JSON_EACH_ROW_FORMAT,
@@ -571,9 +590,54 @@ fn json_each_row<T: Serialize>(rows: &[T]) -> Result<String, serde_json::Error> 
     Ok(output)
 }
 
+/// Return whether the target table already contains the rows for this derive payload.
+///
+/// # Errors
+///
+/// Returns [`ClickHouseSqlError`] when the probe request fails or returns an invalid count.
+pub async fn derive_payload_exists(
+    client: &Client,
+    config: &ClickHouseClientConfig,
+    payload: &ClickHouseInsertPayload,
+) -> Result<bool, ClickHouseSqlError> {
+    let statement = format!(
+        "SELECT count() FROM {} FINAL WHERE derive_dedupe_token = '{}' FORMAT TabSeparated",
+        payload.table.name(),
+        clickhouse_string_literal(payload.dedupe_token.as_str())
+    );
+    let mut receipts = execute_sql_statements(client, config, &[statement]).await?;
+    let receipt = receipts
+        .pop()
+        .ok_or_else(|| ClickHouseSqlError::PermanentStatus {
+            context: ClickHouseSqlContext {
+                statement_index: 0,
+                statement: "derive payload existence probe".to_owned(),
+            },
+            status: 200,
+            response_snippet: Some("ClickHouse returned no receipt".to_owned()),
+        })?;
+    let count = receipt
+        .response_snippet
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .parse::<usize>()
+        .map_err(|error| ClickHouseSqlError::PermanentStatus {
+            context: receipt.context.clone(),
+            status: receipt.status,
+            response_snippet: Some(format!("invalid derive payload count: {error}")),
+        })?;
+    Ok(count >= payload.row_count)
+}
+
+fn clickhouse_string_literal(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct PostServingInsertRow<'a> {
     src: &'static str,
+    derive_dedupe_token: &'a str,
     run_id: &'a str,
     shard: &'a str,
     file_sequence: u64,
@@ -597,9 +661,14 @@ struct PostServingInsertRow<'a> {
 }
 
 impl<'a> PostServingInsertRow<'a> {
-    fn from_projection(row: &'a PostServingRow, identity: &'a DeriveManifestIdentity) -> Self {
+    fn from_projection(
+        row: &'a PostServingRow,
+        identity: &'a DeriveManifestIdentity,
+        derive_dedupe_token: &'a str,
+    ) -> Self {
         Self {
             src: BACKFILL_DERIVE_SOURCE,
+            derive_dedupe_token,
             run_id: identity.run_id.as_str(),
             shard: identity.shard.as_str(),
             file_sequence: identity.file_sequence,
@@ -627,6 +696,7 @@ impl<'a> PostServingInsertRow<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct TotalPostCounterInsertRow<'a> {
     src: &'a str,
+    derive_dedupe_token: &'a str,
     run_id: &'a str,
     shard: &'a str,
     file_sequence: u64,
@@ -648,9 +718,10 @@ struct TotalPostCounterInsertRow<'a> {
 }
 
 impl<'a> TotalPostCounterInsertRow<'a> {
-    fn from_counter(counter: &'a TotalPostCounterInput) -> Self {
+    fn from_counter(counter: &'a TotalPostCounterInput, derive_dedupe_token: &'a str) -> Self {
         Self {
             src: counter.source.as_str(),
+            derive_dedupe_token,
             run_id: counter.run_id.as_str(),
             shard: counter.shard.as_str(),
             file_sequence: counter.file_sequence,

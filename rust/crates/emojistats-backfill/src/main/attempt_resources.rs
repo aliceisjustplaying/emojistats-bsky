@@ -1,26 +1,29 @@
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Instant,
 };
 
+use emojistats_backfill::{
+    archive::{ArchiveCommitContext, ArchiveStorageConfig},
+    ledger::{HostOverride, RepoLedgerEntry},
+    parse::ParseConfig,
+    scheduler::{ClaimScope, SharedHostPacer},
+    transport::FetchByteBudget,
+};
 use tokio::sync::Semaphore;
 
 use super::{
     super::{
         cli::HttpProtocol,
         failure::FetchOneFailure,
-        fleet::{DEFAULT_HOST_CONCURRENCY_CAP, HostConcurrencyLimiter, HostConcurrencyPermit},
+        fleet::{
+            DEFAULT_HOST_CONCURRENCY_CAP, HostConcurrencyLimiter, HostConcurrencyPermit,
+            SharedBlockingLedger,
+        },
     },
     archive_host::{ArchiveClaimCheck, PreparedFetchHost},
-};
-use crate::{
-    archive::{ArchiveCommitContext, ArchiveStorageConfig},
-    ledger::{HostOverride, RepoLedgerEntry},
-    parse::ParseConfig,
-    scheduler::{ClaimScope, SharedHostPacer},
-    transport::FetchByteBudget,
 };
 
 pub struct LocalFetchOneAttemptConfig<'a> {
@@ -55,9 +58,9 @@ pub enum AttemptResources<'a> {
         host_limiter: HostConcurrencyLimiter,
         parse_permits: Arc<Semaphore>,
         byte_budget: FetchByteBudget,
+        ledger: SharedBlockingLedger,
         claimed: Box<RepoLedgerEntry>,
         claim_scope: &'a ClaimScope,
-        host_override_ledger_path: &'a Path,
         host_override_cache: HostOverrideCache,
     },
 }
@@ -70,13 +73,10 @@ impl AttemptResources<'_> {
         }
     }
 
-    pub(crate) const fn host_override_ledger_path(&self) -> Option<&Path> {
+    pub(crate) fn shared_ledger(&self) -> Option<SharedBlockingLedger> {
         match self {
             Self::Local { .. } => None,
-            Self::Fleet {
-                host_override_ledger_path,
-                ..
-            } => Some(*host_override_ledger_path),
+            Self::Fleet { ledger, .. } => Some(ledger.clone()),
         }
     }
 
@@ -115,11 +115,9 @@ impl AttemptResources<'_> {
         match self {
             Self::Local { .. } => None,
             Self::Fleet {
-                claimed,
-                host_override_ledger_path,
-                ..
+                claimed, ledger, ..
             } => Some(ArchiveClaimCheck {
-                ledger_path: (*host_override_ledger_path).to_path_buf(),
+                ledger: ledger.clone(),
                 claimed: (**claimed).clone(),
             }),
         }

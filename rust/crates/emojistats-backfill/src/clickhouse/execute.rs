@@ -5,7 +5,7 @@ use reqwest::{Client, Response, StatusCode};
 use super::{
     CLICKHOUSE_RESPONSE_SNIPPET_MAX_BYTES, ClickHouseClientConfig, ClickHouseInsertContext,
     ClickHouseInsertError, ClickHouseInsertPayload, ClickHouseInsertReceipt, ClickHouseSqlContext,
-    ClickHouseSqlError, ClickHouseSqlReceipt,
+    ClickHouseSqlError, ClickHouseSqlReceipt, schema::AGGREGATE_REBUILD_SHADOW_SUFFIX,
 };
 
 /// Execute insert payloads in order through the provided HTTP client.
@@ -225,7 +225,7 @@ fn sql_statement_is_retry_safe(error: &ClickHouseSqlError) -> bool {
 
 fn is_aggregate_rebuild_insert(statement: &str) -> bool {
     let trimmed = statement.trim_start();
-    trimmed.starts_with("INSERT INTO") && trimmed.contains("__rebuild_shadow")
+    trimmed.starts_with("INSERT INTO") && trimmed.contains(AGGREGATE_REBUILD_SHADOW_SUFFIX)
 }
 
 async fn response_snippet(mut response: Response) -> Result<Option<String>, reqwest::Error> {

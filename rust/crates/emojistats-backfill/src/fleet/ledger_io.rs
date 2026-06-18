@@ -5,12 +5,12 @@ use std::{
     time::SystemTime,
 };
 
+#[cfg(test)]
+use emojistats_backfill::ledger::RepoLedgerEntry;
+use emojistats_backfill::{ledger::SqliteLedger, scheduler::ClaimScope};
 use jacquard_common::types::did::Did;
 
 use super::super::{add_count, increment};
-#[cfg(test)]
-use crate::ledger::RepoLedgerEntry;
-use crate::{ledger::SqliteLedger, scheduler::ClaimScope};
 
 const SEED_BATCH_SIZE: usize = 1_000;
 const STALE_RECOVERY_BATCH_SIZE: u32 = 512;

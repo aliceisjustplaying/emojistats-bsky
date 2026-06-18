@@ -5,13 +5,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::Serialize;
-
-use crate::{
+use emojistats_backfill::{
     clickhouse::{ClickHouseInsertPayload, ClickHouseInsertReceipt},
     derive::DeriveCheckpointRecord,
     manifest_derive::VerifiedLoaderInput,
 };
+use serde::Serialize;
 
 #[derive(Debug)]
 pub(super) struct DeriveLedger {
@@ -54,6 +53,10 @@ impl DeriveLedger {
         payload: &ClickHouseInsertPayload,
     ) -> anyhow::Result<bool> {
         Ok(self.completed.contains(&Self::checkpoint(payload)?))
+    }
+
+    pub(super) const fn is_durable(&self) -> bool {
+        self.path.is_some()
     }
 
     pub(super) fn append_success(

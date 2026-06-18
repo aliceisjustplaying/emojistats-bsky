@@ -180,12 +180,16 @@ fn schema_sql_contains_typed_table_names_and_engines() {
     assert!(sql.contains("dataset LowCardinality(String)"));
     assert!(sql.contains("fetch_method LowCardinality(String)"));
     assert!(sql.contains("completeness_class LowCardinality(String)"));
+    assert!(sql.contains("derive_dedupe_token String CODEC(ZSTD(1))"));
+    assert!(sql.contains(
+        "ALTER TABLE emojistats.v2_post_serving_r3 ADD COLUMN IF NOT EXISTS derive_dedupe_token"
+    ));
     assert!(sql.contains("emojis Array(LowCardinality(String))"));
     assert!(sql.contains(
-        "ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, did, rkey)"
+        "ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, derive_dedupe_token, did, rkey)"
     ));
     assert!(sql.contains(
-        "ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, run_id, shard, file_sequence, receipt_hash, did)"
+        "ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, derive_dedupe_token, run_id, shard, file_sequence, receipt_hash, did)"
     ));
 }
 

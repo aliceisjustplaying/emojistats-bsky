@@ -1,4 +1,7 @@
+#[path = "app.rs"]
+mod app;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    emojistats_backfill::app::run_cli().await
+    app::run_cli().await
 }

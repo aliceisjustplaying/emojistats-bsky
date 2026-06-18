@@ -1,12 +1,13 @@
 use std::{path::Path, time::Instant};
 
+use emojistats_backfill::{
+    archive::{ArchiveCommitContext, ArchiveStorageConfig},
+    parse::{ParseVisitError, PostRecordBody, parse_repo_for_did_with_state},
+};
+
 use super::{
     failure::{current_rss_kb, elapsed_ms, outcome_name},
     parse_and_archive_spooled_repo, parse_config_for_threads,
-};
-use crate::{
-    archive::{ArchiveCommitContext, ArchiveStorageConfig},
-    parse::{ParseVisitError, PostRecordBody, parse_repo_for_did_with_state},
 };
 
 pub fn run(

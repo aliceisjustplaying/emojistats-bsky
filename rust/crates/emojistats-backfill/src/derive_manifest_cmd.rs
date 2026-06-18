@@ -5,15 +5,11 @@ use std::{
     time::Instant,
 };
 
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use serde::Serialize;
-
-use super::{add_count, count_len, increment, payload_row_count};
-use crate::{
+use emojistats_backfill::{
     archive::archive_post_rows_from_record_batch,
     clickhouse::{
-        ClickHouseClientConfig, ClickHouseInsertPayload, ClickHouseInsertReceipt,
-        execute_insert_payloads,
+        ClickHouseClientConfig, ClickHouseInsertContext, ClickHouseInsertPayload,
+        ClickHouseInsertReceipt, derive_payload_exists, execute_insert_payloads,
     },
     manifest_derive::{
         LoaderInput, ManifestReadItem, VerifiedLoaderInput, stream_committed_jsonl,
@@ -21,22 +17,25 @@ use crate::{
     },
     metrics::{MetricLabels, MetricName, MetricStage, SharedMetricsRecorder},
 };
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use serde::Serialize;
+
+use super::{add_count, count_len, increment, payload_row_count};
 
 #[path = "derive_manifest_cmd/ledger.rs"]
 mod ledger;
 #[path = "derive_manifest_cmd/streaming.rs"]
 mod streaming;
 
-use ledger::DeriveLedger;
-use streaming::{CanonicalStreamingPayloadState, CanonicalStreamingValidationState};
-
 #[cfg(test)]
-use crate::clickhouse::DEFAULT_POST_SERVING_PAYLOAD_MAX_BYTES;
+use emojistats_backfill::clickhouse::DEFAULT_POST_SERVING_PAYLOAD_MAX_BYTES;
 #[cfg(test)]
-use crate::derive::{
+use emojistats_backfill::derive::{
     DeriveManifestIdentity, PostServingRow, TotalPostCounterInput,
     canonical_streaming_counter_dedupe_token, canonical_streaming_post_dedupe_token,
 };
+use ledger::DeriveLedger;
+use streaming::{CanonicalStreamingPayloadState, CanonicalStreamingValidationState};
 
 pub struct DeriveManifestConfig {
     pub manifest_path: PathBuf,
@@ -281,7 +280,7 @@ async fn apply_derive_payloads(
 
     for payload in payloads {
         let payload_rows = count_len(payload.row_count, "derive payload row count")?;
-        if context.derive_ledger.is_completed(verified, payload)? {
+        if payload_completed(context, verified, payload).await? {
             increment(
                 &mut context.summary.skipped_insert_payloads,
                 "skipped payload total",
@@ -329,6 +328,35 @@ async fn apply_derive_payloads(
         )?;
     }
     Ok(())
+}
+
+async fn payload_completed(
+    context: &mut DeriveRunContext<'_>,
+    verified: &VerifiedLoaderInput,
+    payload: &ClickHouseInsertPayload,
+) -> anyhow::Result<bool> {
+    if context.derive_ledger.is_completed(verified, payload)? {
+        return Ok(true);
+    }
+    if !context.derive_ledger.is_durable()
+        || !derive_payload_exists(context.http, context.clickhouse, payload).await?
+    {
+        return Ok(false);
+    }
+    let receipt = ClickHouseInsertReceipt {
+        context: ClickHouseInsertContext {
+            table: payload.table,
+            row_count: payload.row_count,
+            dedupe_token: payload.dedupe_token.clone(),
+            insert_deduplicate: true,
+        },
+        status: 200,
+        response_snippet: Some("derive payload already present in ClickHouse".to_owned()),
+    };
+    context
+        .derive_ledger
+        .append_success(verified, payload, &receipt)?;
+    Ok(true)
 }
 
 fn record_insert_metrics(

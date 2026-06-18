@@ -2,7 +2,7 @@ use super::ClickHouseSchemaError;
 
 const AGGREGATE_REBUILD_MAX_MEMORY_USAGE: u64 = 8_589_934_592;
 const AGGREGATE_REBUILD_MAX_BYTES_BEFORE_EXTERNAL_GROUP_BY: u64 = 1_073_741_824;
-const AGGREGATE_REBUILD_SHADOW_SUFFIX: &str = "__rebuild_shadow";
+pub(super) const AGGREGATE_REBUILD_SHADOW_SUFFIX: &str = "__rebuild_shadow";
 const AGGREGATE_REBUILD_TABLES: [AggregateRebuildTable; 4] = [
     AggregateRebuildTable::EmojiTotal,
     AggregateRebuildTable::EmojiTotalByLang,
@@ -85,15 +85,30 @@ impl ClickHouseTable {
 ///
 /// Returns [`ClickHouseSchemaError`] if the database name is not a valid `ClickHouse` identifier.
 pub fn create_schema_sql(database: &str) -> Result<String, ClickHouseSchemaError> {
+    let database = ClickHouseIdentifier::new(database)?;
     let statements = [
-        ClickHouseTable::PostServing.create_table_sql(database)?,
-        ClickHouseTable::TotalPostCounter.create_table_sql(database)?,
-        ClickHouseTable::EmojiTotal.create_table_sql(database)?,
-        ClickHouseTable::EmojiTotalByLang.create_table_sql(database)?,
-        ClickHouseTable::LangTotal.create_table_sql(database)?,
-        ClickHouseTable::PostsHourly.create_table_sql(database)?,
+        ClickHouseTable::PostServing.create_table_sql(database.0.as_str())?,
+        ClickHouseTable::TotalPostCounter.create_table_sql(database.0.as_str())?,
+        ClickHouseTable::EmojiTotal.create_table_sql(database.0.as_str())?,
+        ClickHouseTable::EmojiTotalByLang.create_table_sql(database.0.as_str())?,
+        ClickHouseTable::LangTotal.create_table_sql(database.0.as_str())?,
+        ClickHouseTable::PostsHourly.create_table_sql(database.0.as_str())?,
+        post_serving_dedupe_token_migration_sql(&database),
+        total_post_counter_dedupe_token_migration_sql(&database),
     ];
     Ok(statements.join("\n\n"))
+}
+
+fn post_serving_dedupe_token_migration_sql(database: &ClickHouseIdentifier) -> String {
+    format!(
+        "ALTER TABLE {database}.v2_post_serving_r3 ADD COLUMN IF NOT EXISTS derive_dedupe_token String CODEC(ZSTD(1)) AFTER src;"
+    )
+}
+
+fn total_post_counter_dedupe_token_migration_sql(database: &ClickHouseIdentifier) -> String {
+    format!(
+        "ALTER TABLE {database}.v2_total_post_counters_r3 ADD COLUMN IF NOT EXISTS derive_dedupe_token String CODEC(ZSTD(1)) AFTER src;"
+    )
 }
 
 /// Return aggregate rebuild SQL statements that derive serving caches from compact post rows.
@@ -233,6 +248,7 @@ fn post_serving_table_sql(database: &ClickHouseIdentifier) -> String {
     format!(
         r"CREATE TABLE IF NOT EXISTS {database}.v2_post_serving_r3 (
   src LowCardinality(String),
+  derive_dedupe_token String CODEC(ZSTD(1)),
   run_id LowCardinality(String),
   shard LowCardinality(String),
   file_sequence UInt64,
@@ -256,7 +272,7 @@ fn post_serving_table_sql(database: &ClickHouseIdentifier) -> String {
   inserted_at DateTime64(6, 'UTC') DEFAULT now64(6)
 ) ENGINE = ReplacingMergeTree(observed_at)
 PARTITION BY cityHash64(did) % 256
-ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, did, rkey)
+ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, derive_dedupe_token, did, rkey)
 SETTINGS non_replicated_deduplication_window = 10000;"
     )
 }
@@ -265,6 +281,7 @@ fn total_post_counter_table_sql(database: &ClickHouseIdentifier) -> String {
     format!(
         r"CREATE TABLE IF NOT EXISTS {database}.v2_total_post_counters_r3 (
   src LowCardinality(String),
+  derive_dedupe_token String CODEC(ZSTD(1)),
   run_id LowCardinality(String),
   shard LowCardinality(String),
   file_sequence UInt64,
@@ -285,7 +302,7 @@ fn total_post_counter_table_sql(database: &ClickHouseIdentifier) -> String {
   max_created_at Nullable(DateTime64(6, 'UTC')) CODEC(Delta(8), ZSTD(1)),
   inserted_at DateTime64(6, 'UTC') DEFAULT now64(6)
 ) ENGINE = ReplacingMergeTree(inserted_at)
-ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, run_id, shard, file_sequence, receipt_hash, did)
+ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, derive_dedupe_token, run_id, shard, file_sequence, receipt_hash, did)
 SETTINGS non_replicated_deduplication_window = 10000;"
     )
 }

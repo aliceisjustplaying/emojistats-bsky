@@ -2,6 +2,10 @@
 
 use std::{path::Path, sync::Arc, time::Instant};
 
+use emojistats_backfill::{
+    archive::{ArchiveCommitContext, ArchiveStorageConfig},
+    parse::ParseConfig,
+};
 use tokio::sync::Semaphore;
 
 use super::super::{
@@ -13,10 +17,6 @@ use super::super::{
         archive_host::{ArchiveClaimCheck, parse_and_archive_spooled_repo},
         processed_repo::{FetchedRepo, ProcessedRepo},
     },
-};
-use crate::{
-    archive::{ArchiveCommitContext, ArchiveStorageConfig},
-    parse::ParseConfig,
 };
 
 pub(crate) struct ParseArchiveStep<'a> {

@@ -11,10 +11,7 @@ use std::{
 };
 
 use clap::Parser;
-use jacquard_common::{deps::fluent_uri::Uri, types::did::Did};
-use jacquard_identity::PublicResolver;
-
-use crate::{
+use emojistats_backfill::{
     archive::{
         ArchiveCommitContext, ArchiveError, ArchiveStorageConfig, CompletenessClass, FetchMethod,
         NormalizerVersion, StorageBoxArchiveConfig, StorageBoxRcloneArchiveConfig,
@@ -31,13 +28,15 @@ use crate::{
     },
     ledger::{
         AttemptId, AttemptOutcome, DEFAULT_CLAIM_LEASE_DURATION, ForcedFetchMode, HostOverride,
-        RepoLedgerEntry, RetryPolicy, SqliteLedger, claim_repo, complete_attempt,
+        RepoLedgerEntry, RetryPolicy, claim_repo, complete_attempt,
     },
     metrics::{SharedMetricsRecorder, jsonl_metrics_recorder, noop_metrics_recorder},
     parse::{ParseConfig, ParseVisitError, ParsedRepoSummary, parse_repo_for_did_with_state},
     scheduler::ClaimScope,
     transport::{FetchConfig, FetchError},
 };
+use jacquard_common::{deps::fluent_uri::Uri, types::did::Did};
+use jacquard_identity::PublicResolver;
 
 #[path = "canary_cmd.rs"]
 mod canary_cmd;
@@ -50,7 +49,7 @@ mod failure;
 #[path = "fleet.rs"]
 mod fleet;
 #[path = "main/mod.rs"]
-pub(crate) mod main;
+mod main;
 #[path = "profile_cmd.rs"]
 mod profile_cmd;
 
@@ -232,6 +231,7 @@ async fn run_fleet_command(command: Command) -> anyhow::Result<()> {
         cid_verification_threads,
         http_protocol,
         canary_evidence,
+        canary_evidence_hmac_key_env,
         bypass_canary,
         canary_thresholds,
         metrics_jsonl,
@@ -241,6 +241,7 @@ async fn run_fleet_command(command: Command) -> anyhow::Result<()> {
     };
     enforce_canary_gate(
         canary_evidence.as_deref(),
+        &canary_evidence_hmac_key_env,
         bypass_canary,
         canary_thresholds,
         &run_id,
@@ -390,6 +391,7 @@ fn metrics_recorder(path: Option<&Path>) -> anyhow::Result<SharedMetricsRecorder
 
 fn enforce_canary_gate(
     canary_evidence: Option<&Path>,
+    canary_evidence_hmac_key_env: &str,
     bypass_canary: bool,
     thresholds: cli::CanaryThresholdArgs,
     run_id: &str,
@@ -401,7 +403,9 @@ fn enforce_canary_gate(
     let Some(path) = canary_evidence else {
         anyhow::bail!("run-fleet requires --canary-evidence <path> or explicit --bypass-canary");
     };
-    canary_cmd::require_passing_evidence(path, thresholds.into_thresholds(), run_id)
+    let signature_key =
+        canary_cmd::CanaryEvidenceSignatureKey::from_env_var(canary_evidence_hmac_key_env)?;
+    canary_cmd::require_passing_evidence(path, thresholds.into_thresholds(), run_id, &signature_key)
 }
 
 fn parse_config_for_threads(cid_verification_threads: usize) -> ParseConfig {
@@ -568,7 +572,7 @@ fn count_len(value: usize, context: &str) -> anyhow::Result<u64> {
 }
 
 fn payload_row_count(
-    payloads: &[crate::clickhouse::ClickHouseInsertPayload],
+    payloads: &[emojistats_backfill::clickhouse::ClickHouseInsertPayload],
 ) -> anyhow::Result<u64> {
     payloads.iter().try_fold(0_u64, |total, payload| {
         let rows = count_len(payload.row_count, "payload row count")?;

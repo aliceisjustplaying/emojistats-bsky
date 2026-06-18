@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use emojistats_backfill::scheduler::SharedHostPacer;
 use jacquard_identity::resolver::IdentityResolver;
 use tokio::sync::Semaphore;
 
@@ -13,8 +14,8 @@ use super::{
     super::{
         ArchiveCommitContext, ArchiveStorageConfig, ClaimScope, Did, Duration, FetchConfig,
         FetchError, FetchOneFailure, ForcedFetchMode, Instant, ParseConfig, Path, PublicResolver,
-        SmokeTelemetry, SqliteLedger, SystemTime, Uri, classify_fetch_error, current_rss_kb,
-        elapsed_ms, emit_smoke_telemetry, outcome_name, permanent_failure, retryable_failure,
+        SmokeTelemetry, SystemTime, Uri, classify_fetch_error, current_rss_kb, elapsed_ms,
+        emit_smoke_telemetry, outcome_name, permanent_failure, retryable_failure,
     },
     archive_host::{ArchiveClaimCheck, prepare_fetch_host},
     attempt_resources::acquire_host_fetch_permit,
@@ -24,7 +25,6 @@ use super::{
     processed_repo::ProcessedRepo,
     repo_fetch::{FetchStep, fetch_spooled_repo, repo_fetch_client},
 };
-use crate::scheduler::SharedHostPacer;
 
 const METHOD_WALL_FORCE_MODE_TTL: Duration = Duration::from_hours(24);
 
@@ -66,7 +66,7 @@ pub(crate) async fn fetch_one_attempt_with_pacer(
         did_str,
         &pds,
         config.resources.claim_scope(),
-        config.resources.host_override_ledger_path(),
+        config.resources.shared_ledger(),
         config.resources.host_override_cache(),
     )
     .await?;
@@ -96,7 +96,7 @@ pub(crate) async fn fetch_one_attempt_with_pacer(
             archive_context: config.archive_context,
             archive_storage: config.archive_storage,
             host_pacer: config.resources.host_pacer(),
-            host_override_ledger_path: config.resources.host_override_ledger_path(),
+            host_override_ledger: config.resources.shared_ledger(),
             parse_permits: config.resources.parse_permits(),
             claim_check: config.resources.archive_claim_check(),
             parse_config: config.parse_config,
@@ -156,7 +156,7 @@ struct FetchModeStep<'a> {
     archive_context: ArchiveCommitContext,
     archive_storage: ArchiveStorageConfig,
     host_pacer: Option<&'a SharedHostPacer>,
-    host_override_ledger_path: Option<&'a Path>,
+    host_override_ledger: Option<super::super::fleet::SharedBlockingLedger>,
     parse_permits: Option<&'a Arc<Semaphore>>,
     claim_check: Option<ArchiveClaimCheck>,
     parse_config: ParseConfig,
@@ -207,7 +207,7 @@ async fn fetch_get_repo_and_archive(
         Ok(fetched) => fetched,
         Err(err) if should_fallback_get_repo_to_list_records(&err) => {
             emit_get_repo_fallback(step.did_str, step.host, step.attempt_started, &err);
-            let host_override_ledger_path = step.host_override_ledger_path;
+            let host_override_ledger = step.host_override_ledger.clone();
             let host = step.host;
             let host_min_interval = step.host_min_interval;
             let result = fetch_archive_list_records_or_emit_failure(ListRecordsStep {
@@ -227,7 +227,7 @@ async fn fetch_get_repo_and_archive(
             .await;
             if result.is_ok() {
                 persist_list_records_method_wall_override(
-                    host_override_ledger_path,
+                    host_override_ledger,
                     host,
                     host_min_interval,
                     &err,
@@ -297,12 +297,12 @@ fn emit_get_repo_fallback(did_str: &str, host: &str, attempt_started: Instant, e
 }
 
 async fn persist_list_records_method_wall_override(
-    host_override_ledger_path: Option<&Path>,
+    host_override_ledger: Option<super::super::fleet::SharedBlockingLedger>,
     host: &str,
     host_min_interval: Option<Duration>,
     error: &FetchError,
 ) {
-    let Some(ledger_path) = host_override_ledger_path else {
+    let Some(ledger) = host_override_ledger else {
         return;
     };
     let Some(force_mode_revive_after) = SystemTime::now().checked_add(METHOD_WALL_FORCE_MODE_TTL)
@@ -310,21 +310,14 @@ async fn persist_list_records_method_wall_override(
         eprintln!("failed to persist listRecords host override for {host}: expiry overflow");
         return;
     };
-    let ledger_path = ledger_path.to_path_buf();
-    let host_owned = host.to_owned();
-    let result = tokio::task::spawn_blocking(move || {
-        SqliteLedger::open(&ledger_path).and_then(|ledger| {
-            ledger.upsert_host_override_force_mode(
-                &host_owned,
-                Some(ForcedFetchMode::ListRecords),
-                host_min_interval,
-                Some(force_mode_revive_after),
-            )
-        })
-    })
-    .await
-    .map_err(|err| anyhow::anyhow!("host override task failed for {host}: {err}"))
-    .and_then(|result| result.map_err(Into::into));
+    let result = ledger
+        .upsert_host_override_force_mode(
+            host.to_owned(),
+            Some(ForcedFetchMode::ListRecords),
+            host_min_interval,
+            Some(force_mode_revive_after),
+        )
+        .await;
     match result {
         Ok(()) => eprintln!(
             "recorded listRecords host override for {host} after getRepo method wall: {error}"

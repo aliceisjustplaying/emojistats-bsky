@@ -7,17 +7,7 @@ use std::{
 };
 
 use clap::Parser;
-use jacquard_common::deps::fluent_uri::Uri;
-
-use super::{
-    ArchiveBackend, Cli, Command, HostOverrideCache, fetch_mode_for_host, load_host_override,
-    pds_host_key, prepare_fetch_host, should_fallback_get_repo_to_list_records,
-};
-use crate::{
-    app::fleet::{
-        HostConcurrencyLimiter, SeedSummary, claimable_entries_for_scope,
-        recover_stale_claimed_entries, seed_ledger_from_file,
-    },
+use emojistats_backfill::{
     ledger::{
         AttemptId, AttemptOutcome, ForcedFetchMode, HostOverride, RepoLedgerEntry,
         RepoLedgerStatus, ShardFilter, SqliteLedger, claim_repo_with_lease, did_shard_bucket,
@@ -25,6 +15,16 @@ use crate::{
     parse::default_cid_verification_threads,
     scheduler::ClaimScope,
     transport::{FetchError, RateLimitSnapshot},
+};
+use jacquard_common::deps::fluent_uri::Uri;
+
+use super::{
+    ArchiveBackend, Cli, Command, HostOverrideCache, fetch_mode_for_host,
+    fleet::{
+        HostConcurrencyLimiter, SeedSummary, SharedBlockingLedger, claimable_entries_for_scope,
+        recover_stale_claimed_entries, seed_ledger_from_file,
+    },
+    load_host_override, pds_host_key, prepare_fetch_host, should_fallback_get_repo_to_list_records,
 };
 
 #[test]
@@ -661,14 +661,14 @@ async fn forced_list_records_host_preparation_is_allowed() {
             never_diff: false,
         })
         .unwrap();
-    drop(store);
+    let shared_ledger = SharedBlockingLedger::new(store);
     let pds = Uri::parse("https://pds.example.com").unwrap().to_owned();
 
     let prepared = prepare_fetch_host(
         "did:plc:target",
         &pds,
         &ClaimScope::default(),
-        Some(&db_path),
+        Some(shared_ledger),
         None,
     )
     .await

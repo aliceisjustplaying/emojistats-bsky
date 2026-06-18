@@ -4,13 +4,16 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::{
-    ledger::{AttemptOutcome, DeferredClaimSummary, RepoLedgerEntry, RetryPolicy, SqliteLedger},
+use emojistats_backfill::{
+    ledger::{
+        AttemptOutcome, DeferredClaimSummary, ForcedFetchMode, HostOverride, RepoLedgerEntry,
+        RetryPolicy, SqliteLedger,
+    },
     scheduler::ClaimScope,
 };
 
 #[derive(Clone)]
-pub(super) struct SharedBlockingLedger {
+pub struct SharedBlockingLedger {
     ledger: Arc<Mutex<SqliteLedger>>,
 }
 
@@ -21,7 +24,7 @@ impl fmt::Debug for SharedBlockingLedger {
 }
 
 impl SharedBlockingLedger {
-    pub(super) fn new(ledger: SqliteLedger) -> Self {
+    pub fn new(ledger: SqliteLedger) -> Self {
         Self {
             ledger: Arc::new(Mutex::new(ledger)),
         }
@@ -87,6 +90,68 @@ impl SharedBlockingLedger {
                 .lock()
                 .map_err(|_err| anyhow::anyhow!("shared ledger mutex poisoned"))?
                 .extend_owned_claim_lease(&claimed, now, lease_duration)
+                .map_err(Into::into)
+        })
+        .await?
+    }
+
+    pub(crate) fn extend_owned_claim_lease_blocking(
+        &self,
+        claimed: &RepoLedgerEntry,
+        now: SystemTime,
+        lease_duration: Duration,
+    ) -> anyhow::Result<Option<RepoLedgerEntry>> {
+        self.ledger
+            .lock()
+            .map_err(|_err| anyhow::anyhow!("shared ledger mutex poisoned"))?
+            .extend_owned_claim_lease(claimed, now, lease_duration)
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn upsert_host_override_blocking(
+        &self,
+        record: &HostOverride,
+    ) -> anyhow::Result<()> {
+        self.ledger
+            .lock()
+            .map_err(|_err| anyhow::anyhow!("shared ledger mutex poisoned"))?
+            .upsert_host_override(record)
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn load_host_override(
+        &self,
+        host: String,
+    ) -> anyhow::Result<Option<HostOverride>> {
+        let ledger = Arc::clone(&self.ledger);
+        tokio::task::spawn_blocking(move || {
+            ledger
+                .lock()
+                .map_err(|_err| anyhow::anyhow!("shared ledger mutex poisoned"))?
+                .load_host_override(&host)
+                .map_err(Into::into)
+        })
+        .await?
+    }
+
+    pub(crate) async fn upsert_host_override_force_mode(
+        &self,
+        host: String,
+        force_mode: Option<ForcedFetchMode>,
+        default_min_interval: Option<Duration>,
+        force_mode_revive_after: Option<SystemTime>,
+    ) -> anyhow::Result<()> {
+        let ledger = Arc::clone(&self.ledger);
+        tokio::task::spawn_blocking(move || {
+            ledger
+                .lock()
+                .map_err(|_err| anyhow::anyhow!("shared ledger mutex poisoned"))?
+                .upsert_host_override_force_mode(
+                    &host,
+                    force_mode,
+                    default_min_interval,
+                    force_mode_revive_after,
+                )
                 .map_err(Into::into)
         })
         .await?

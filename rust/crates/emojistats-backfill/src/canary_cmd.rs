@@ -1,19 +1,20 @@
 use std::{
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
-
-use crate::canary::{
+use emojistats_backfill::canary::{
     CanaryEvidence, CanaryFailureInjection, CanaryGateObservation, CanaryHardGate,
     CanaryInjectionObservation, CanaryPolicy, CanaryReport, CanarySampleCategory,
     CanarySampleObservation, CanaryStatus, CanaryThresholds, evaluate_canary,
     observe_aggregate_rebuild_hours, observe_clickhouse_serving_box_fit, observe_derive_crawl_pace,
     observe_mushroom_budget_and_429s, observe_storage_box_headroom, observe_sustained_throughput,
 };
+use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 
 #[derive(Debug, Clone)]
 pub struct CanaryCommandConfig {
@@ -21,12 +22,40 @@ pub struct CanaryCommandConfig {
     pub thresholds: CanaryThresholds,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct CanaryEvidenceMetadata {
     run_id: String,
     generated_at: DateTime<Utc>,
     #[serde(default)]
     max_age_seconds: Option<u64>,
+    #[serde(default)]
+    hmac_sha256: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct CanaryEvidenceSignatureKey {
+    bytes: Vec<u8>,
+}
+
+impl CanaryEvidenceSignatureKey {
+    /// Load the canary evidence HMAC key from an environment variable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the variable is missing or empty.
+    pub fn from_env_var(name: &str) -> anyhow::Result<Self> {
+        let value = env::var(name).map_err(|_err| {
+            anyhow::anyhow!("canary evidence HMAC key env var {name} is not set")
+        })?;
+        if value.is_empty() {
+            anyhow::bail!("canary evidence HMAC key env var {name} is empty");
+        }
+        Ok(Self {
+            bytes: value.into_bytes(),
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,12 +66,16 @@ enum CanaryEvidenceRecord {
         generated_at: DateTime<Utc>,
         #[serde(default)]
         max_age_seconds: Option<u64>,
+        #[serde(default)]
+        hmac_sha256: Option<String>,
     },
     Header {
         run_id: String,
         generated_at: DateTime<Utc>,
         #[serde(default)]
         max_age_seconds: Option<u64>,
+        #[serde(default)]
+        hmac_sha256: Option<String>,
     },
     Sample {
         category: CanarySampleCategory,
@@ -132,8 +165,10 @@ pub fn require_passing_evidence(
     path: &Path,
     thresholds: CanaryThresholds,
     expected_run_id: &str,
+    signature_key: &CanaryEvidenceSignatureKey,
 ) -> anyhow::Result<()> {
-    let report = evaluate_file_for_run(path, thresholds, expected_run_id, Utc::now())?;
+    let report =
+        evaluate_file_for_run(path, thresholds, expected_run_id, Utc::now(), signature_key)?;
     if report.is_pass() {
         return Ok(());
     }
@@ -155,10 +190,12 @@ fn evaluate_file_for_run(
     thresholds: CanaryThresholds,
     expected_run_id: &str,
     now: DateTime<Utc>,
+    signature_key: &CanaryEvidenceSignatureKey,
 ) -> anyhow::Result<CanaryReport> {
     let policy = CanaryPolicy::design_default(thresholds);
     let (metadata, evidence) = read_evidence_file(path, &policy.thresholds)?;
-    validate_metadata(path, metadata.as_ref(), expected_run_id, now)?;
+    let metadata = validate_metadata(path, metadata.as_ref(), expected_run_id, now)?;
+    validate_signature(path, metadata, &evidence, signature_key)?;
     Ok(evaluate_canary(&policy, &evidence))
 }
 
@@ -236,11 +273,13 @@ fn push_record(
             run_id,
             generated_at,
             max_age_seconds,
+            hmac_sha256,
         }
         | CanaryEvidenceRecord::Header {
             run_id,
             generated_at,
             max_age_seconds,
+            hmac_sha256,
         } => {
             if metadata.is_some() {
                 anyhow::bail!("canary evidence contained multiple metadata records");
@@ -249,6 +288,7 @@ fn push_record(
                 run_id,
                 generated_at,
                 max_age_seconds,
+                hmac_sha256,
             });
         }
         CanaryEvidenceRecord::Sample {
@@ -469,16 +509,16 @@ fn observe_bool_gate(
     }
 }
 
-fn validate_metadata(
+fn validate_metadata<'a>(
     path: &Path,
-    metadata: Option<&CanaryEvidenceMetadata>,
+    metadata: Option<&'a CanaryEvidenceMetadata>,
     expected_run_id: &str,
     now: DateTime<Utc>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<&'a CanaryEvidenceMetadata> {
     const DEFAULT_MAX_AGE: Duration = Duration::from_hours(24);
     let metadata = metadata.ok_or_else(|| {
         anyhow::anyhow!(
-            "canary evidence {} requires metadata record with run_id and generated_at",
+            "canary evidence {} requires metadata record with run_id, generated_at, and hmac_sha256",
             path.display()
         )
     })?;
@@ -502,7 +542,72 @@ fn validate_metadata(
     if age > max_age {
         anyhow::bail!("canary evidence is stale: age {age:?} exceeds max age {max_age:?}");
     }
-    Ok(())
+    if metadata.hmac_sha256.as_deref().is_none_or(str::is_empty) {
+        anyhow::bail!(
+            "canary evidence {} requires metadata hmac_sha256 for run-fleet",
+            path.display()
+        );
+    }
+    Ok(metadata)
+}
+
+#[derive(Serialize)]
+struct SignedCanaryEvidence<'a> {
+    run_id: &'a str,
+    generated_at: DateTime<Utc>,
+    max_age_seconds: Option<u64>,
+    evidence: &'a CanaryEvidence,
+}
+
+fn validate_signature(
+    path: &Path,
+    metadata: &CanaryEvidenceMetadata,
+    evidence: &CanaryEvidence,
+    signature_key: &CanaryEvidenceSignatureKey,
+) -> anyhow::Result<()> {
+    let expected = metadata
+        .hmac_sha256
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("canary evidence {} missing hmac_sha256", path.display()))?;
+    let expected_bytes = hex::decode(expected).map_err(|err| {
+        anyhow::anyhow!(
+            "canary evidence {} has invalid hmac_sha256 hex: {err}",
+            path.display()
+        )
+    })?;
+    let payload = serde_json::to_vec(&SignedCanaryEvidence {
+        run_id: metadata.run_id.as_str(),
+        generated_at: metadata.generated_at,
+        max_age_seconds: metadata.max_age_seconds,
+        evidence,
+    })?;
+    let mut mac = HmacSha256::new_from_slice(&signature_key.bytes)
+        .map_err(|err| anyhow::anyhow!("invalid canary evidence HMAC key: {err}"))?;
+    mac.update(&payload);
+    mac.verify_slice(&expected_bytes).map_err(|_err| {
+        anyhow::anyhow!(
+            "canary evidence {} hmac_sha256 did not validate",
+            path.display()
+        )
+    })
+}
+
+#[cfg(test)]
+fn sign_test_evidence(
+    metadata: &CanaryEvidenceMetadata,
+    evidence: &CanaryEvidence,
+    signature_key: &CanaryEvidenceSignatureKey,
+) -> String {
+    let payload = serde_json::to_vec(&SignedCanaryEvidence {
+        run_id: metadata.run_id.as_str(),
+        generated_at: metadata.generated_at,
+        max_age_seconds: metadata.max_age_seconds,
+        evidence,
+    })
+    .expect("signed canary payload");
+    let mut mac = HmacSha256::new_from_slice(&signature_key.bytes).expect("hmac key");
+    mac.update(&payload);
+    hex::encode(mac.finalize().into_bytes())
 }
 
 #[cfg(test)]
