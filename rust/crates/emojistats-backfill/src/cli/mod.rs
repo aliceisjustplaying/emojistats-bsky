@@ -216,6 +216,81 @@ pub enum Command {
         #[arg(long)]
         metrics_jsonl: Option<PathBuf>,
     },
+    /// Mirror the PLC export into local census tables.
+    PlcMirror {
+        /// SQLite ledger/census path.
+        #[arg(long, default_value = "data/ledger/backfill.sqlite")]
+        ledger_path: PathBuf,
+        /// Directory for raw PLC export page files.
+        #[arg(long, default_value = "data/plc-mirror")]
+        mirror_dir: PathBuf,
+        /// PLC directory base URL.
+        #[arg(long, default_value = "https://plc.directory")]
+        plc_directory_url: String,
+        /// Export page size.
+        #[arg(long, default_value_t = 1_000)]
+        page_size: u16,
+        /// Stop after this many PLC export pages.
+        #[arg(long, value_parser = parse_positive_u64)]
+        limit_pages: Option<u64>,
+        /// Stop after this many PLC ops.
+        #[arg(long, value_parser = parse_positive_u64)]
+        limit_ops: Option<u64>,
+        /// Per-page request timeout in seconds.
+        #[arg(long, default_value_t = 60, value_parser = parse_positive_u64)]
+        request_timeout_secs: u64,
+        /// Parallel sequence-range workers. Requires no page/op limit.
+        #[arg(long, default_value_t = 1, value_parser = parse_positive_usize)]
+        workers: usize,
+        /// Start mirroring after this PLC seq instead of the stored cursor.
+        #[arg(long)]
+        start_after: Option<u64>,
+        /// Stop this mirror shard at this PLC seq.
+        #[arg(long)]
+        end_at: Option<u64>,
+    },
+    /// Discover the PLC export head and print disjoint seq ranges.
+    PlcPlan {
+        /// Number of ranges to print.
+        #[arg(long, default_value_t = 8, value_parser = parse_positive_usize)]
+        parts: usize,
+        /// PLC directory base URL.
+        #[arg(long, default_value = "https://plc.directory")]
+        plc_directory_url: String,
+        /// Export page size used for head probing.
+        #[arg(long, default_value_t = 1_000)]
+        page_size: u16,
+        /// Start splitting after this PLC seq.
+        #[arg(long, default_value_t = 0)]
+        start_after: u64,
+        /// Per-request timeout in seconds.
+        #[arg(long, default_value_t = 60, value_parser = parse_positive_u64)]
+        request_timeout_secs: u64,
+    },
+    /// Health-check PDS hosts and seed admitted DIDs into the fleet ledger.
+    PdsCensus {
+        /// SQLite ledger/census path.
+        #[arg(long, default_value = "data/ledger/backfill.sqlite")]
+        ledger_path: PathBuf,
+        /// Optional newline DID file of admitted identities.
+        #[arg(long)]
+        admitted_dids_file: Option<PathBuf>,
+        /// Optional JSONL file of quarantined hosts.
+        #[arg(long)]
+        quarantined_hosts_file: Option<PathBuf>,
+        /// Concurrent host health checks.
+        #[arg(long, default_value_t = 64, value_parser = parse_positive_usize)]
+        health_concurrency: usize,
+        /// Per-host health request timeout in seconds.
+        #[arg(long, default_value_t = 30, value_parser = parse_positive_u64)]
+        request_timeout_secs: u64,
+        /// Stop after this many distinct PDS hosts.
+        #[arg(long, value_parser = parse_positive_u64)]
+        max_hosts: Option<u64>,
+        /// Do not seed admitted DIDs into `repo_ledger`.
+        #[arg(long)]
+        no_seed_ledger: bool,
+    },
     /// Verify a committed archive manifest and load derived rows into `ClickHouse`.
     DeriveManifest {
         /// Committed JSONL manifest path.
