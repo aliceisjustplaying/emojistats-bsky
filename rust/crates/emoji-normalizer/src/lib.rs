@@ -70,8 +70,33 @@ pub fn extract_emoji_sequence(text: &str) -> Vec<String> {
         return Vec::new();
     }
     let mut output = Vec::new();
-    for glyph in text.graphemes(true) {
+    let mut offset = 0;
+    while offset < text.len() {
+        let remainder = &text[offset..];
+        let Some(first) = remainder.chars().next() else {
+            break;
+        };
+        if is_regional_indicator(first) {
+            let mut run = Vec::new();
+            for ch in remainder
+                .chars()
+                .take_while(|ch| is_regional_indicator(*ch))
+            {
+                run.push(ch);
+            }
+            let run_bytes = run.iter().map(|ch| ch.len_utf8()).sum::<usize>();
+            offset = offset.checked_add(run_bytes).unwrap_or(text.len());
+            push_regional_indicator_run(&mut output, &run);
+            if output.len() >= EMOJI_MAX_PER_POST {
+                break;
+            }
+            continue;
+        }
+        let Some(glyph) = remainder.graphemes(true).next() else {
+            break;
+        };
         push_normalized_glyph(&mut output, glyph);
+        offset = offset.checked_add(glyph.len()).unwrap_or(text.len());
         if output.len() >= EMOJI_MAX_PER_POST {
             break;
         }
@@ -84,7 +109,9 @@ fn push_normalized_glyph(output: &mut Vec<String>, glyph: &str) {
         output.push(normalized);
         return;
     }
-    for ch in glyph.chars() {
+    let chars = glyph.chars().collect::<Vec<_>>();
+    let mut index = 0;
+    while let Some(&ch) = chars.get(index) {
         if output.len() >= EMOJI_MAX_PER_POST {
             break;
         }
@@ -92,11 +119,45 @@ fn push_normalized_glyph(output: &mut Vec<String>, glyph: &str) {
             ch,
             ZERO_WIDTH_JOINER | TEXT_PRESENTATION_SELECTOR | EMOJI_PRESENTATION_SELECTOR
         ) {
+            index = index.saturating_add(1);
             continue;
+        }
+        let next_index = index.saturating_add(1);
+        if chars
+            .get(next_index)
+            .is_some_and(|next| is_emoji_modifier_char(*next))
+        {
+            let Some(&modifier) = chars.get(next_index) else {
+                break;
+            };
+            let pair = [ch, modifier].iter().collect::<String>();
+            if let Some(normalized) = normalize_emoji_glyph(&pair) {
+                output.push(normalized);
+                index = index.saturating_add(2);
+                continue;
+            }
         }
         let scalar = ch.to_string();
         if let Some(normalized) = normalize_emoji_glyph(&scalar) {
             output.push(normalized);
+        }
+        index = index.saturating_add(1);
+    }
+}
+
+fn push_regional_indicator_run(output: &mut Vec<String>, run: &[char]) {
+    let mut index = 0_usize;
+    while output.len() < EMOJI_MAX_PER_POST {
+        let next_index = index.saturating_add(1);
+        let (Some(&first), Some(&second)) = (run.get(index), run.get(next_index)) else {
+            break;
+        };
+        let pair = [first, second].iter().collect::<String>();
+        if let Some(normalized) = normalize_emoji_glyph(&pair) {
+            output.push(normalized);
+            index = index.saturating_add(2);
+        } else {
+            index = index.saturating_add(1);
         }
     }
 }
@@ -301,7 +362,15 @@ fn is_keycap_without_combining_mark(glyph: &str) -> bool {
 
 fn is_emoji_modifier(glyph: &str) -> bool {
     let mut chars = glyph.chars();
-    matches!(chars.next().map(u32::from), Some(0x1f3fb..=0x1f3ff)) && chars.next().is_none()
+    chars.next().is_some_and(is_emoji_modifier_char) && chars.next().is_none()
+}
+
+fn is_emoji_modifier_char(ch: char) -> bool {
+    matches!(u32::from(ch), 0x1f3fb..=0x1f3ff)
+}
+
+fn is_regional_indicator(ch: char) -> bool {
+    matches!(u32::from(ch), 0x1f1e6..=0x1f1ff)
 }
 
 fn is_emoji_component(glyph: &str) -> bool {
@@ -349,6 +418,18 @@ mod tests {
     #[test]
     fn keeps_a_skin_tone_modifier_sequence_as_one_glyph() {
         assert_eq!(extract_emoji_sequence("\u{1f44d}\u{1f3fd}"), vec!["👍🏽"]);
+    }
+
+    #[test]
+    fn matches_legacy_adjacent_skin_tone_modifier_fallback() {
+        assert_eq!(
+            extract_emoji_sequence("\u{1f44c}\u{1f3fb}\u{1f3fe}"),
+            vec!["👌🏻", "🏾"]
+        );
+        assert_eq!(
+            extract_emoji_sequence("\u{1f44d}\u{1f3fd}\u{1f3fe}"),
+            vec!["👍🏽", "🏾"]
+        );
     }
 
     #[test]
@@ -412,6 +493,14 @@ mod tests {
     #[test]
     fn keeps_regional_indicator_flags_as_one_glyph() {
         assert_eq!(extract_emoji_sequence("flags 🇺🇸🇯🇵"), vec!["🇺🇸", "🇯🇵"]);
+    }
+
+    #[test]
+    fn matches_legacy_regional_indicator_resync() {
+        assert_eq!(
+            extract_emoji_sequence("\u{1f1fa}\u{1f1f8}\u{1f1ef}\u{1f1ef}\u{1f1f5}"),
+            vec!["🇺🇸", "🇯🇵"]
+        );
     }
 
     #[test]
