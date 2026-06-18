@@ -1,5 +1,6 @@
 use std::{
     any::Any,
+    collections::BTreeMap,
     fs,
     panic::AssertUnwindSafe,
     path::PathBuf,
@@ -38,6 +39,7 @@ use super::{
 #[allow(clippy::duration_suboptimal_units)]
 const CLAIM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const STALE_RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
+const DRAIN_DEADLINE: Duration = Duration::from_mins(30);
 pub const DEFAULT_HOST_CONCURRENCY_CAP: u32 = 2;
 
 #[path = "fleet/host_limiter.rs"]
@@ -113,6 +115,7 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
     let parse_permits = Arc::new(Semaphore::new(config.parse_concurrency));
     let byte_budget = FetchByteBudget::new(config.max_inflight_spool_bytes);
     let mut active = JoinSet::new();
+    let mut active_claims = BTreeMap::new();
     let active_attempt_limit = active_attempt_limit(
         config.concurrency,
         config.parse_concurrency,
@@ -122,6 +125,7 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
     let claim_limit = u64::from(config.claim_limit);
     let mut next_stale_recovery = next_stale_recovery_deadline(Instant::now())?;
     let mut draining = false;
+    let mut drain_deadline = None;
     let shutdown_signal = shutdown_signal();
     tokio::pin!(shutdown_signal);
 
@@ -191,6 +195,7 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
                 ),
                 1,
             );
+            active_claims.insert(did.clone(), claimed.clone());
             active.spawn(run_fleet_attempt_isolated(FleetAttemptConfig {
                 did,
                 claimed,
@@ -211,6 +216,7 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
             record_active_attempts(&config, active.len());
         }
 
+        let mut next_deferred_retry = None;
         if active.is_empty() {
             if draining || summary.claimed >= claim_limit {
                 break;
@@ -221,11 +227,18 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
                     .await?;
                 if summary.deferred_claims.count > 0 {
                     eprintln!(
-                        "fleet stopped with {} repo(s) waiting for retry/backoff; next retry at {:?}",
+                        "fleet waiting on {} repo(s) in retry/backoff; next retry at {:?}",
                         summary.deferred_claims.count, summary.deferred_claims.next_attempt_after
                     );
+                    next_deferred_retry = deferred_retry_deadline(
+                        Instant::now(),
+                        SystemTime::now(),
+                        summary.deferred_claims.next_attempt_after,
+                    )?;
                 }
-                break;
+                if next_deferred_retry.is_none() {
+                    break;
+                }
             }
         }
 
@@ -236,6 +249,7 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
                 };
                 let attempt_result = joined
                     .map_err(|err| anyhow::anyhow!("fleet attempt task failed outside panic guard: {err}"))?;
+                active_claims.remove(&attempt_result.did);
                 complete_fleet_attempt(&mut summary, &config, &ledger, attempt_result).await?;
                 record_active_attempts(&config, active.len());
             }
@@ -255,8 +269,20 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
                     }
                 }
                 draining = true;
+                drain_deadline = Instant::now().checked_add(DRAIN_DEADLINE);
+            }
+            () = sleep_until_instant(drain_deadline), if draining && !active.is_empty() && drain_deadline.is_some() => {
+                eprintln!(
+                    "fleet drain deadline elapsed; aborting {} active attempt(s)",
+                    active.len()
+                );
+                active.abort_all();
+                complete_aborted_active_attempts(&mut summary, &config, &ledger, &active_claims).await?;
+                active_claims.clear();
+                break;
             }
             () = tokio::time::sleep_until(tokio::time::Instant::from_std(next_stale_recovery)), if !draining => {}
+            () = sleep_until_instant(next_deferred_retry), if !draining && next_deferred_retry.is_some() => {}
         }
     }
 
@@ -270,6 +296,41 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
         summary.succeeded,
         summary.failed,
         summary.deferred_claims.count
+    );
+    Ok(())
+}
+
+async fn complete_aborted_active_attempts(
+    summary: &mut FleetSummary,
+    config: &FleetConfig,
+    ledger: &ledger_async::SharedBlockingLedger,
+    active_claims: &BTreeMap<String, RepoLedgerEntry>,
+) -> anyhow::Result<()> {
+    for claimed in active_claims.values() {
+        let completed = ledger
+            .complete_owned_claim(
+                claimed.clone(),
+                AttemptOutcome::RetryableFailure {
+                    message: "aborted after fleet drain deadline".to_owned(),
+                },
+                SystemTime::now(),
+                RetryPolicy::default(),
+            )
+            .await?;
+        if completed.is_some() {
+            increment(&mut summary.failed, "failed repo count")?;
+        }
+    }
+    config.metrics.increment_counter(
+        MetricName::FleetAttemptsTotal,
+        fleet_metric_labels(
+            config,
+            None,
+            Some(MetricStage::Complete.as_str()),
+            Some("drain_aborted"),
+            None,
+        ),
+        u64::try_from(active_claims.len())?,
     );
     Ok(())
 }
@@ -595,6 +656,29 @@ fn should_recover_stale_claims(now: Instant, next_recovery: Instant) -> bool {
     now >= next_recovery
 }
 
+fn deferred_retry_deadline(
+    now: Instant,
+    now_system: SystemTime,
+    next_attempt_after: Option<SystemTime>,
+) -> anyhow::Result<Option<Instant>> {
+    let Some(next_attempt_after) = next_attempt_after else {
+        return Ok(None);
+    };
+    let wait = next_attempt_after
+        .duration_since(now_system)
+        .unwrap_or(Duration::ZERO);
+    now.checked_add(wait)
+        .ok_or_else(|| anyhow::anyhow!("deferred retry timer overflow"))
+        .map(Some)
+}
+
+async fn sleep_until_instant(deadline: Option<Instant>) {
+    let Some(deadline) = deadline else {
+        return;
+    };
+    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+}
+
 fn active_attempt_limit(
     concurrency: usize,
     parse_concurrency: usize,
@@ -668,5 +752,108 @@ mod tests {
         assert_eq!(active_attempt_limit(8, 1, 2_000, 1_000), 3);
         assert_eq!(active_attempt_limit(2, 8, 2_000, 1_000), 2);
         assert_eq!(active_attempt_limit(8, 1, 500, 1_000), 2);
+    }
+
+    #[test]
+    fn deferred_retry_deadline_waits_until_next_attempt() {
+        let now = Instant::now();
+        let now_system = SystemTime::now();
+        let deadline =
+            deferred_retry_deadline(now, now_system, Some(now_system + Duration::from_secs(5)))
+                .expect("deadline should compute")
+                .expect("deferred retry deadline");
+
+        assert!(deadline >= now + Duration::from_secs(4));
+        assert!(deadline <= now + Duration::from_secs(6));
+    }
+
+    #[tokio::test]
+    async fn run_seeds_empty_did_file_and_exits() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let dids_file = temp.path().join("dids.txt");
+        fs::write(&dids_file, "\n").expect("dids file should be written");
+
+        run(FleetConfig {
+            dids_file,
+            ledger_path: temp.path().join("ledger.sqlite"),
+            run_id: "test-run".to_owned(),
+            worker_id: "test-worker".to_owned(),
+            claim_limit: 1,
+            concurrency: 1,
+            parse_concurrency: 1,
+            max_inflight_spool_bytes: 1,
+            spool_dir: temp.path().join("spool"),
+            max_bytes: 1,
+            archive_dir: temp.path().join("archive"),
+            archive_storage: ArchiveStorageConfig::Local,
+            cid_verification_threads: 1,
+            http_protocol: HttpProtocol::Http1,
+            claim_scope: ClaimScope::default(),
+            shard_label: "all".to_owned(),
+            metrics: emojistats_backfill::metrics::noop_metrics_recorder(),
+        })
+        .await
+        .expect("empty fleet run should exit");
+    }
+
+    #[tokio::test]
+    async fn drain_deadline_completion_releases_active_claims() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let ledger_path = temp.path().join("ledger.sqlite");
+        let store = SqliteLedger::open(&ledger_path).expect("ledger should open");
+        store
+            .upsert_entry(&RepoLedgerEntry::pending("did:plc:active"))
+            .expect("pending row should save");
+        let ledger = SharedBlockingLedger::new(store);
+        let claimed = ledger
+            .try_claim_next(
+                SystemTime::now(),
+                "test-run".to_owned(),
+                "test-worker".to_owned(),
+                DEFAULT_CLAIM_LEASE_DURATION,
+                ClaimScope::default(),
+            )
+            .await
+            .expect("claim should succeed")
+            .expect("row should be claimable");
+        let mut active_claims = BTreeMap::new();
+        active_claims.insert(claimed.did.clone(), claimed);
+        let mut summary = FleetSummary::default();
+        let config = FleetConfig {
+            dids_file: temp.path().join("dids.txt"),
+            ledger_path: ledger_path.clone(),
+            run_id: "test-run".to_owned(),
+            worker_id: "test-worker".to_owned(),
+            claim_limit: 1,
+            concurrency: 1,
+            parse_concurrency: 1,
+            max_inflight_spool_bytes: 1,
+            spool_dir: temp.path().join("spool"),
+            max_bytes: 1,
+            archive_dir: temp.path().join("archive"),
+            archive_storage: ArchiveStorageConfig::Local,
+            cid_verification_threads: 1,
+            http_protocol: HttpProtocol::Http1,
+            claim_scope: ClaimScope::default(),
+            shard_label: "all".to_owned(),
+            metrics: emojistats_backfill::metrics::noop_metrics_recorder(),
+        };
+
+        complete_aborted_active_attempts(&mut summary, &config, &ledger, &active_claims)
+            .await
+            .expect("aborted claim should complete");
+
+        let reopened = SqliteLedger::open(&ledger_path).expect("ledger should reopen");
+        let entry = reopened
+            .load_entry("did:plc:active")
+            .expect("entry should load")
+            .expect("entry should exist");
+        assert_eq!(summary.failed, 1);
+        assert_eq!(
+            entry.status,
+            emojistats_backfill::ledger::RepoLedgerStatus::RetryableFailure
+        );
+        assert!(entry.worker_id.is_none());
+        assert!(entry.lease_until.is_none());
     }
 }

@@ -564,7 +564,6 @@ fn commits_in_verified_remote_order_before_manifest_append() {
             "read_prefix",
             "rename",
             "stat",
-            "sha256",
             "remove",
             "upload",
             "stat",
@@ -572,7 +571,6 @@ fn commits_in_verified_remote_order_before_manifest_append() {
             "read_prefix",
             "rename",
             "stat",
-            "sha256",
             "remove",
             "append_manifest_record_if_missing",
             "contains_manifest_record"
@@ -590,7 +588,7 @@ fn commits_in_verified_remote_order_before_manifest_append() {
     assert_eq!(
         commands
             .operations
-            .get(17)
+            .get(14)
             .expect("manifest append operation should exist")
             .path,
         "/storage-box/emojistats/manifests/raw.jsonl"

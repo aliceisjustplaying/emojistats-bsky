@@ -19,12 +19,17 @@ use emojistats_backfill::{
 use jacquard_common::deps::fluent_uri::Uri;
 
 use super::{
-    ArchiveBackend, Cli, Command, HostOverrideCache, fetch_mode_for_host,
+    Cli, Command,
+    cli::ArchiveBackend,
     fleet::{
         HostConcurrencyLimiter, SeedSummary, SharedBlockingLedger, claimable_entries_for_scope,
         recover_stale_claimed_entries, seed_ledger_from_file,
     },
-    load_host_override, pds_host_key, prepare_fetch_host, should_fallback_get_repo_to_list_records,
+    main::{
+        archive_host::{fetch_mode_for_host, load_host_override, pds_host_key, prepare_fetch_host},
+        attempt_resources::HostOverrideCache,
+        fetch_attempt::should_fallback_get_repo_to_list_records,
+    },
 };
 
 #[test]

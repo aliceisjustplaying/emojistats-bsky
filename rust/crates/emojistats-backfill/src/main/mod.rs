@@ -1,8 +1,8 @@
-pub mod archive_host;
-pub mod attempt_resources;
-pub mod fetch_attempt;
-pub mod host_rate_limit;
-pub mod list_records_attempt;
-pub mod parse_archive_attempt;
-pub mod processed_repo;
-pub mod repo_fetch;
+pub(super) mod archive_host;
+pub(super) mod attempt_resources;
+pub(super) mod fetch_attempt;
+pub(super) mod host_rate_limit;
+pub(super) mod list_records_attempt;
+pub(super) mod parse_archive_attempt;
+pub(super) mod processed_repo;
+pub(super) mod repo_fetch;

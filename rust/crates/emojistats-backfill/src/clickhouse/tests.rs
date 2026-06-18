@@ -210,6 +210,9 @@ fn aggregate_rebuild_sql_uses_compact_post_rows_and_array_join() {
     assert!(sql.contains("arrayJoin(emojis) AS emoji"));
     assert!(sql.contains("INSERT INTO emojistats.v2_posts_hourly_r3__rebuild_shadow"));
     assert!(sql.contains("sum(emoji_occurrences) AS total_emoji_occurrences"));
+    assert!(sql.contains("requires an Atomic database for EXCHANGE TABLES"));
+    assert!(sql.contains("sum(emoji_occurrences) AS occurrences,\n  count() AS posts"));
+    assert!(!sql.contains("countIf(emoji_occurrences > 0) AS posts\n"));
     assert_eq!(sql.matches("max_memory_usage = 8589934592").count(), 4);
     assert_eq!(
         sql.matches("max_bytes_before_external_group_by = 1073741824")
@@ -229,7 +232,11 @@ fn aggregate_rebuild_statements_are_ordered_shadow_insert_exchange_drop() {
         ClickHouseTable::PostsHourly,
     ];
 
-    assert_eq!(statements.len(), tables.len() * 5);
+    assert_eq!(statements.len(), tables.len() * 5 + 1);
+    assert_eq!(
+        statements.first().expect("atomic guard"),
+        "SELECT throwIf(engine != 'Atomic', 'ClickHouse aggregate rebuild requires an Atomic database for EXCHANGE TABLES') FROM system.databases WHERE name = currentDatabase();"
+    );
     assert!(
         statements
             .iter()
@@ -237,7 +244,7 @@ fn aggregate_rebuild_statements_are_ordered_shadow_insert_exchange_drop() {
     );
 
     for (table_index, table) in tables.iter().enumerate() {
-        let offset = table_index * 5;
+        let offset = table_index * 5 + 1;
         let table_name = table.name();
         let shadow_table = format!("{table_name}__rebuild_shadow");
         let create_prefix = format!("CREATE TABLE emojistats.{shadow_table} (");

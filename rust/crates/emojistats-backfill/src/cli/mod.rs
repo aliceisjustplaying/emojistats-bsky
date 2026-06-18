@@ -359,6 +359,23 @@ pub enum Command {
         #[command(flatten)]
         thresholds: CanaryThresholdArgs,
     },
+    /// Sign canary evidence for `run-fleet`.
+    CanarySign {
+        /// Unsigned JSON or JSONL canary evidence file.
+        evidence_path: PathBuf,
+        /// Run id this evidence authorizes.
+        #[arg(long)]
+        run_id: String,
+        /// Maximum accepted evidence age in seconds.
+        #[arg(long, default_value_t = 86_400)]
+        max_age_seconds: u64,
+        /// Environment variable containing the HMAC key for canary evidence.
+        #[arg(long, default_value = "EMOJISTATS_CANARY_HMAC_KEY")]
+        hmac_key_env: String,
+        /// Policy thresholds used to normalize measured gates before signing.
+        #[command(flatten)]
+        thresholds: CanaryThresholdArgs,
+    },
 }
 
 fn parse_positive_u32(value: &str) -> Result<u32, String> {

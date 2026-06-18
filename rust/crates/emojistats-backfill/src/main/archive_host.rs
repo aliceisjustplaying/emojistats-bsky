@@ -2,11 +2,10 @@ use super::{
     super::{
         ArchiveCommitContext, ArchiveError, ArchiveStorageConfig, AttemptOutcome, ClaimScope,
         CompletenessClass, DEFAULT_CLAIM_LEASE_DURATION, FetchMethod, FetchOneFailure,
-        ForcedFetchMode, HOST_OVERRIDE_CACHE_TTL, HostOverride, Instant, NormalizerVersion,
-        ParseConfig, ParseVisitError, ParsedRepoSummary, Path, RepoLedgerEntry,
-        StreamingArchiveSink, StreamingReceiptInput, SystemTime, Uri,
-        archive_row_from_owned_post_observed_at, classify_archive_error, classify_parse_error,
-        elapsed_ms, fleet::SharedBlockingLedger, hash_profile_record,
+        ForcedFetchMode, HostOverride, Instant, NormalizerVersion, ParseConfig, ParseVisitError,
+        ParsedRepoSummary, Path, RepoLedgerEntry, StreamingArchiveSink, StreamingReceiptInput,
+        SystemTime, Uri, archive_row_from_owned_post_observed_at, classify_archive_error,
+        classify_parse_error, elapsed_ms, fleet::SharedBlockingLedger, hash_profile_record,
         parse_repo_for_did_with_state, retryable_failure,
     },
     fetch_attempt::{HostOverrideCache, HostOverrideCacheEntry},
@@ -15,6 +14,8 @@ use super::{
         ProcessedRepoCounts,
     },
 };
+
+const HOST_OVERRIDE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 struct ArchiveRunState {
     sink: StreamingArchiveSink,

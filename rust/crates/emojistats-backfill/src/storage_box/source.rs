@@ -291,7 +291,7 @@ where
     let rename_result = commands.rename(temp_path, final_path);
     match rename_result {
         Ok(()) => {
-            verify_remote_final(commands, final_path, expected_digest)?;
+            verify_promoted_final_len(commands, final_path, expected_digest)?;
             cleanup_remote_temp(commands, temp_path, artifact_kind)
         }
         Err(source) => match check_final_state(commands, final_path, expected_digest)? {
@@ -356,7 +356,7 @@ where
     }
 }
 
-fn verify_remote_final<C>(
+fn verify_promoted_final_len<C>(
     commands: &mut C,
     remote_path: &str,
     expected_digest: &DigestResult,
@@ -364,11 +364,22 @@ fn verify_remote_final<C>(
 where
     C: StorageBoxCommands,
 {
-    let state = check_final_state(commands, remote_path, expected_digest)?;
-    match state {
-        FinalState::Exact => Ok(()),
-        FinalState::Absent => Err(Error::MissingRemoteFile {
-            operation: "stat final file",
+    let actual_len = commands
+        .stat_len(remote_path)
+        .map_err(|source| Error::Command {
+            operation: "stat promoted final file",
+            path: remote_path.to_owned(),
+            source,
+        })?;
+    match actual_len {
+        Some(actual) if actual == expected_digest.bytes => Ok(()),
+        Some(actual) => Err(Error::VerifySizeMismatch {
+            path: remote_path.to_owned(),
+            expected: expected_digest.bytes,
+            actual,
+        }),
+        None => Err(Error::MissingRemoteFile {
+            operation: "stat promoted final file",
             path: remote_path.to_owned(),
         }),
     }

@@ -195,23 +195,11 @@ async fn mirror_plc_export_parallel(
         range_summaries.push(handle.await??);
     }
     let mut summary = writer.await??;
-    let completed_all_ranges = range_summaries
-        .iter()
-        .all(|range_summary| range_summary.complete);
-    let persisted_cursor = range_summaries
-        .iter()
-        .map(|range_summary| range_summary.cursor)
-        .min()
-        .unwrap_or(cursor);
-    let final_cursor = if completed_all_ranges {
-        head_upper
-    } else {
-        persisted_cursor
-    };
+    let resume = parallel_resume_cursor(cursor, head_upper, &range_summaries);
     let connection = open_census_connection(&config.ledger_path)?;
-    set_cursor(&connection, final_cursor)?;
-    summary.cursor = final_cursor;
-    summary.caught_up = completed_all_ranges;
+    set_cursor(&connection, resume.cursor)?;
+    summary.cursor = resume.cursor;
+    summary.caught_up = resume.caught_up;
     Ok(summary)
 }
 
@@ -335,6 +323,36 @@ fn split_seq_ranges(cursor: u64, head_upper: u64, workers: usize) -> anyhow::Res
         });
     }
     Ok(ranges)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParallelResume {
+    cursor: u64,
+    caught_up: bool,
+}
+
+fn parallel_resume_cursor(
+    start_cursor: u64,
+    head_upper: u64,
+    range_summaries: &[PlcRangeSummary],
+) -> ParallelResume {
+    let completed_all_ranges = range_summaries
+        .iter()
+        .all(|range_summary| range_summary.complete);
+    if completed_all_ranges {
+        return ParallelResume {
+            cursor: head_upper,
+            caught_up: true,
+        };
+    }
+    ParallelResume {
+        cursor: range_summaries
+            .iter()
+            .map(|range_summary| range_summary.cursor)
+            .min()
+            .unwrap_or(start_cursor),
+        caught_up: false,
+    }
 }
 
 async fn fetch_plc_range(
@@ -479,7 +497,8 @@ fn write_plc_page(
 
 #[cfg(test)]
 mod tests {
-    use super::pds_host_from_endpoint;
+    use super::{parallel_resume_cursor, pds_host_from_endpoint, split_seq_ranges};
+    use crate::census::types::PlcRangeSummary;
 
     #[test]
     fn endpoint_host_normalization_preserves_http_scheme() {
@@ -491,5 +510,62 @@ mod tests {
             pds_host_from_endpoint("http://example.com:2583"),
             Some("http://example.com:2583".to_owned())
         );
+    }
+
+    #[test]
+    fn parallel_plc_ranges_are_disjoint_and_cover_head() {
+        let ranges = split_seq_ranges(10, 23, 4).expect("ranges should split");
+
+        let actual = ranges
+            .iter()
+            .map(|range| (range.start_after, range.end_inclusive))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, vec![(10, 14), (14, 18), (18, 22), (22, 23)]);
+    }
+
+    #[test]
+    fn parallel_plc_resume_cursor_reaches_head_only_after_all_ranges_complete() {
+        let summaries = [
+            PlcRangeSummary {
+                cursor: 14,
+                complete: true,
+            },
+            PlcRangeSummary {
+                cursor: 18,
+                complete: true,
+            },
+            PlcRangeSummary {
+                cursor: 23,
+                complete: true,
+            },
+        ];
+
+        let resume = parallel_resume_cursor(10, 23, &summaries);
+
+        assert_eq!(resume.cursor, 23);
+        assert!(resume.caught_up);
+    }
+
+    #[test]
+    fn parallel_plc_resume_cursor_rewinds_to_lowest_incomplete_progress() {
+        let summaries = [
+            PlcRangeSummary {
+                cursor: 14,
+                complete: true,
+            },
+            PlcRangeSummary {
+                cursor: 16,
+                complete: false,
+            },
+            PlcRangeSummary {
+                cursor: 23,
+                complete: true,
+            },
+        ];
+
+        let resume = parallel_resume_cursor(10, 23, &summaries);
+
+        assert_eq!(resume.cursor, 14);
+        assert!(!resume.caught_up);
     }
 }

@@ -127,7 +127,7 @@ pub fn aggregate_rebuild_sql(database: &str) -> Result<String, ClickHouseSchemaE
 /// Returns [`ClickHouseSchemaError`] if the database name is not a valid `ClickHouse` identifier.
 pub fn aggregate_rebuild_statements(database: &str) -> Result<Vec<String>, ClickHouseSchemaError> {
     let database = ClickHouseIdentifier::new(database)?;
-    let mut statements = Vec::new();
+    let mut statements = vec![atomic_database_guard_sql()];
 
     for table in AGGREGATE_REBUILD_TABLES {
         statements.extend(aggregate_rebuild_table_statements(&database, table));
@@ -168,6 +168,10 @@ fn exchange_tables_sql(
     shadow_table: &str,
 ) -> String {
     format!("EXCHANGE TABLES {database}.{target_table} AND {database}.{shadow_table};")
+}
+
+fn atomic_database_guard_sql() -> String {
+    "SELECT throwIf(engine != 'Atomic', 'ClickHouse aggregate rebuild requires an Atomic database for EXCHANGE TABLES') FROM system.databases WHERE name = currentDatabase();".to_owned()
 }
 
 fn create_aggregate_shadow_table_sql(
@@ -490,7 +494,7 @@ SELECT
   completeness_class,
   lang,
   sum(emoji_occurrences) AS occurrences,
-  countIf(emoji_occurrences > 0) AS posts
+  count() AS posts
 FROM {database}.v2_post_serving_r3 FINAL
 ARRAY JOIN langs AS lang
 GROUP BY src, normalizer_git_rev, dataset, fetch_method, completeness_class, lang

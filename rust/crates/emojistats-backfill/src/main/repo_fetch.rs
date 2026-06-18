@@ -8,13 +8,15 @@ use jacquard_common::{deps::fluent_uri::Uri, types::did::Did};
 use sha2::{Digest, Sha256};
 
 use super::{
-    super::{
-        CRAWLER_USER_AGENT, FETCH_TRANSPORT_ATTEMPTS, FETCH_TRANSPORT_RETRY_BASE_DELAY,
-        FETCH_TRANSPORT_RETRY_MAX_DELAY, cli::HttpProtocol, failure::elapsed_ms,
-    },
+    super::{cli::HttpProtocol, failure::elapsed_ms},
     host_rate_limit::record_rate_limit_snapshot,
     processed_repo::FetchedRepo,
 };
+
+const FETCH_TRANSPORT_ATTEMPTS: u8 = 3;
+const FETCH_TRANSPORT_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+const FETCH_TRANSPORT_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+const CRAWLER_USER_AGENT: &str = "emojistats-backfill/0.1 (+https://emojistats.at)";
 
 pub(super) struct FetchStep<'a> {
     pub(super) http: &'a reqwest::Client,

@@ -423,6 +423,12 @@ Hard gates:
 
 Fail any gate -> fix before all-8 fan-out.
 
+Canary evidence signing is an operational guard, not an adversarial proof. The fleet gate
+requires fresh, run-id-bound HMAC evidence so stale or edited files do not accidentally open
+paid fan-out. Because the same operator can run the signer locally, the signature does not
+prove that a canary ran; the launch process must generate evidence from the rehearsal runner.
+Hard gates must carry measured numeric/boolean inputs, not bare `status: pass` assertions.
+
 ---
 
 ## Jacquard: scope & responsibilities

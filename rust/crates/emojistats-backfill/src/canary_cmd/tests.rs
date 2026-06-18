@@ -9,7 +9,7 @@ use serde_json::json;
 
 use super::{
     CanaryEvidenceMetadata, CanaryEvidenceSignatureKey, evaluate_file, evaluate_file_for_run,
-    read_evidence_file, sign_test_evidence,
+    read_evidence_file, sign_evidence, unsigned_evidence_values,
 };
 
 #[test]
@@ -108,6 +108,73 @@ fn run_fleet_gate_requires_matching_fresh_metadata() {
     .expect("fresh matching metadata should pass");
 
     assert_eq!(report.status(), CanaryStatus::Pass);
+}
+
+#[test]
+fn run_fleet_gate_accepts_small_clock_skew() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    let path = temp.path().join("canary.jsonl");
+    let key = test_signature_key();
+    write_signed_passing_jsonl(&path, "run-1", &key);
+
+    let report = evaluate_file_for_run(
+        &path,
+        test_thresholds(),
+        "run-1",
+        Utc.with_ymd_and_hms(2026, 6, 18, 11, 56, 0)
+            .single()
+            .expect("valid timestamp"),
+        &key,
+    )
+    .expect("small clock skew should pass");
+
+    assert_eq!(report.status(), CanaryStatus::Pass);
+}
+
+#[test]
+fn gate_observation_records_are_rejected() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    let path = temp.path().join("canary.jsonl");
+    fs::write(
+        &path,
+        json!({
+            "kind": "gate_observation",
+            "gate": "whale_completes_cleanly",
+            "status": "pass"
+        })
+        .to_string(),
+    )
+    .expect("evidence should be written");
+
+    let error = read_evidence_file(&path, &test_thresholds())
+        .expect_err("bare hard-gate status should fail");
+
+    assert!(error.to_string().contains("gate_observation"));
+}
+
+#[test]
+fn canary_sign_rejects_gate_observation_records() {
+    let error = unsigned_evidence_values(vec![json!({
+        "kind": "gate_observation",
+        "gate": "whale_completes_cleanly",
+        "status": "pass"
+    })])
+    .expect_err("signer should reject bare gate observations");
+
+    assert!(error.to_string().contains("measured hard-gate records"));
+}
+
+#[test]
+fn canary_sign_rejects_already_signed_metadata() {
+    let error = unsigned_evidence_values(vec![json!({
+        "kind": "metadata",
+        "run_id": "run-1",
+        "generated_at": "2026-06-18T12:00:00Z",
+        "hmac_sha256": "abc123"
+    })])
+    .expect_err("signer should reject already signed evidence");
+
+    assert!(error.to_string().contains("already signed"));
 }
 
 #[test]
@@ -263,7 +330,7 @@ fn write_signed_passing_jsonl(path: &Path, run_id: &str, key: &CanaryEvidenceSig
     }
     let (_metadata, evidence) =
         read_evidence_file(&unsigned_path, &test_thresholds()).expect("unsigned evidence parses");
-    metadata.hmac_sha256 = Some(sign_test_evidence(&metadata, &evidence, key));
+    metadata.hmac_sha256 = Some(sign_evidence(&metadata, &evidence, key).expect("signed evidence"));
 
     let mut file = fs::File::create(path).expect("jsonl file should be created");
     writeln!(
