@@ -1,5 +1,7 @@
 use std::{
+    any::Any,
     fs,
+    panic::AssertUnwindSafe,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant, SystemTime},
@@ -15,8 +17,11 @@ use emojistats_backfill::{
     scheduler::{ClaimScope, HostPacer, SchedulerError, SharedHostPacer, checked_concurrency},
     transport::FetchByteBudget,
 };
-use futures_util::{StreamExt, stream::FuturesUnordered};
-use tokio::{sync::Semaphore, task::JoinHandle};
+use futures_util::FutureExt;
+use tokio::{
+    sync::Semaphore,
+    task::{JoinHandle, JoinSet},
+};
 
 use super::{
     add_count,
@@ -99,13 +104,22 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
     let host_override_cache = HostOverrideCache::default();
     let parse_permits = Arc::new(Semaphore::new(config.parse_concurrency));
     let byte_budget = FetchByteBudget::new(config.max_inflight_spool_bytes);
-    let mut active = FuturesUnordered::new();
+    let mut active = JoinSet::new();
+    let active_attempt_limit = active_attempt_limit(
+        config.concurrency,
+        config.parse_concurrency,
+        config.max_inflight_spool_bytes,
+        config.max_bytes,
+    );
     let claim_limit = u64::from(config.claim_limit);
     let mut next_stale_recovery = next_stale_recovery_deadline(Instant::now())?;
+    let mut draining = false;
+    let shutdown_signal = shutdown_signal();
+    tokio::pin!(shutdown_signal);
 
     loop {
         let now = Instant::now();
-        if now >= next_stale_recovery {
+        if should_recover_stale_claims(active.len(), now, next_stale_recovery) {
             let recovered = ledger_async::recover_stale_claimed_entries_for_scope(
                 config.ledger_path.clone(),
                 SystemTime::now(),
@@ -134,7 +148,8 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
             next_stale_recovery = next_stale_recovery_deadline(now)?;
         }
 
-        while active.len() < config.concurrency && summary.claimed < claim_limit {
+        let mut claimable_exhausted = false;
+        while !draining && active.len() < active_attempt_limit && summary.claimed < claim_limit {
             let remaining = claim_limit
                 .checked_sub(summary.claimed)
                 .ok_or(SchedulerError::ClaimLimitOverflow)?;
@@ -151,6 +166,7 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
             )
             .await?;
             let Some(claimed) = claimed else {
+                claimable_exhausted = true;
                 break;
             };
             let did = claimed.did.clone();
@@ -166,7 +182,7 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
                 ),
                 1,
             );
-            active.push(run_fleet_attempt(FleetAttemptConfig {
+            active.spawn(run_fleet_attempt_isolated(FleetAttemptConfig {
                 did,
                 claimed,
                 spool_dir: config.spool_dir.clone(),
@@ -186,11 +202,39 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
             record_active_attempts(&config, active.len());
         }
 
-        let Some(attempt_result) = active.next().await else {
+        if active.is_empty() && (draining || summary.claimed >= claim_limit || claimable_exhausted)
+        {
             break;
-        };
-        complete_fleet_attempt(&mut summary, &config, attempt_result).await?;
-        record_active_attempts(&config, active.len());
+        }
+
+        tokio::select! {
+            joined = active.join_next(), if !active.is_empty() => {
+                let Some(joined) = joined else {
+                    continue;
+                };
+                let attempt_result = joined
+                    .map_err(|err| anyhow::anyhow!("fleet attempt task failed outside panic guard: {err}"))?;
+                complete_fleet_attempt(&mut summary, &config, attempt_result).await?;
+                record_active_attempts(&config, active.len());
+            }
+            signal_result = &mut shutdown_signal, if !draining => {
+                match signal_result {
+                    Ok(signal) => {
+                        eprintln!(
+                            "received {signal}; draining {} active fleet attempt(s) before shutdown",
+                            active.len()
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "shutdown signal listener failed: {error}; draining {} active fleet attempt(s)",
+                            active.len()
+                        );
+                    }
+                }
+                draining = true;
+            }
+        }
     }
 
     println!(
@@ -233,10 +277,31 @@ struct FleetAttemptResult {
     elapsed: Duration,
 }
 
+async fn run_fleet_attempt_isolated(config: FleetAttemptConfig) -> FleetAttemptResult {
+    let started = Instant::now();
+    let did = config.did.clone();
+    let claimed = config.claimed.clone();
+    let result = AssertUnwindSafe(run_fleet_attempt(config))
+        .catch_unwind()
+        .await;
+    match result {
+        Ok(result) => result,
+        Err(payload) => FleetAttemptResult {
+            did,
+            claimed,
+            result: Err(retryable_failure(format!(
+                "fleet attempt panicked: {}",
+                panic_payload_message(payload.as_ref())
+            ))),
+            elapsed: started.elapsed(),
+        },
+    }
+}
+
 async fn run_fleet_attempt(config: FleetAttemptConfig) -> FleetAttemptResult {
     let started = Instant::now();
     let archive_context = archive_context_for_claim(&config.claimed, &config.claim_scope);
-    let heartbeat = spawn_claim_heartbeat(config.ledger_path.clone(), config.claimed.clone());
+    let heartbeat = ClaimHeartbeat::spawn(config.ledger_path.clone(), config.claimed.clone());
     let result = match archive_context {
         Ok(archive_context) => {
             fetch_one_attempt_with_pacer(FetchOneAttemptConfig {
@@ -263,8 +328,7 @@ async fn run_fleet_attempt(config: FleetAttemptConfig) -> FleetAttemptResult {
         }
         Err(failure) => Err(failure),
     };
-    heartbeat.abort();
-    let _ignored = heartbeat.await;
+    heartbeat.stop().await;
     FleetAttemptResult {
         did: config.did,
         claimed: config.claimed,
@@ -273,33 +337,58 @@ async fn run_fleet_attempt(config: FleetAttemptConfig) -> FleetAttemptResult {
     }
 }
 
-fn spawn_claim_heartbeat(ledger_path: PathBuf, claimed: RepoLedgerEntry) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(CLAIM_HEARTBEAT_INTERVAL).await;
-            let now = SystemTime::now();
-            match ledger_async::extend_owned_claim_lease(
-                ledger_path.clone(),
-                claimed.clone(),
-                now,
-                DEFAULT_CLAIM_LEASE_DURATION,
-            )
-            .await
-            {
-                Ok(Some(_entry)) => {}
-                Ok(None) => {
-                    eprintln!(
-                        "stopping claim heartbeat for {} because this worker no longer owns it",
-                        claimed.did
-                    );
-                    break;
-                }
-                Err(error) => {
-                    eprintln!("claim heartbeat failed for {}: {error}", claimed.did);
+struct ClaimHeartbeat {
+    handle: Option<JoinHandle<()>>,
+}
+
+impl ClaimHeartbeat {
+    fn spawn(ledger_path: PathBuf, claimed: RepoLedgerEntry) -> Self {
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(CLAIM_HEARTBEAT_INTERVAL).await;
+                let now = SystemTime::now();
+                match ledger_async::extend_owned_claim_lease(
+                    ledger_path.clone(),
+                    claimed.clone(),
+                    now,
+                    DEFAULT_CLAIM_LEASE_DURATION,
+                )
+                .await
+                {
+                    Ok(Some(_entry)) => {}
+                    Ok(None) => {
+                        eprintln!(
+                            "stopping claim heartbeat for {} because this worker no longer owns it",
+                            claimed.did
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        eprintln!("claim heartbeat failed for {}: {error}", claimed.did);
+                    }
                 }
             }
+        });
+        Self {
+            handle: Some(handle),
         }
-    })
+    }
+
+    async fn stop(mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        handle.abort();
+        let _ignored = handle.await;
+    }
+}
+
+impl Drop for ClaimHeartbeat {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
 }
 
 fn archive_context_for_claim(
@@ -481,7 +570,83 @@ fn next_stale_recovery_deadline(now: Instant) -> anyhow::Result<Instant> {
         .ok_or_else(|| anyhow::anyhow!("stale recovery timer overflow"))
 }
 
+fn should_recover_stale_claims(
+    active_attempts: usize,
+    now: Instant,
+    next_recovery: Instant,
+) -> bool {
+    active_attempts == 0 && now >= next_recovery
+}
+
+fn active_attempt_limit(
+    concurrency: usize,
+    parse_concurrency: usize,
+    max_inflight_spool_bytes: u64,
+    max_bytes: u64,
+) -> usize {
+    let spool_slots = if max_bytes == 0 || max_inflight_spool_bytes == 0 {
+        concurrency
+    } else {
+        usize::try_from(
+            max_inflight_spool_bytes
+                .checked_div(max_bytes)
+                .unwrap_or(u64::MAX),
+        )
+        .unwrap_or(usize::MAX)
+        .max(1)
+    };
+    let backpressure_limit = parse_concurrency.saturating_add(spool_slots).max(1);
+    concurrency.min(backpressure_limit).max(1)
+}
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    payload
+        .downcast_ref::<&'static str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic payload".to_owned())
+}
+
+async fn shutdown_signal() -> anyhow::Result<&'static str> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result?;
+                Ok("SIGINT")
+            }
+            _ = terminate.recv() => Ok("SIGTERM"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        Ok("SIGINT")
+    }
+}
+
 pub fn default_worker_id(run_id: &str) -> String {
     let host = std::env::var("HOSTNAME").unwrap_or_else(|_err| "unknown-host".to_owned());
     format!("{run_id}:{host}:{}", std::process::id())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_recovery_waits_until_no_active_attempts() {
+        let now = Instant::now();
+        assert!(!should_recover_stale_claims(1, now, now));
+        assert!(should_recover_stale_claims(0, now, now));
+    }
+
+    #[test]
+    fn active_attempt_limit_accounts_for_parse_and_spool_backpressure() {
+        assert_eq!(active_attempt_limit(8, 1, 2_000, 1_000), 3);
+        assert_eq!(active_attempt_limit(2, 8, 2_000, 1_000), 2);
+        assert_eq!(active_attempt_limit(8, 1, 500, 1_000), 2);
+    }
 }

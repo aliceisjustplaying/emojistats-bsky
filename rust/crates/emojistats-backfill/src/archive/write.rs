@@ -13,7 +13,10 @@ use super::{
     format_observed_at, fs,
     hash::hash_post_row_into,
     hash_serialized_json,
-    naming::{stable_artifact_stem, stable_object_receipt_path, stable_repo_receipt_name},
+    naming::{
+        stable_artifact_stem, stable_manifest_path, stable_object_receipt_path,
+        stable_repo_receipt_name,
+    },
     parquet::{archive_schema, parquet_writer_properties, post_record_batch},
     projection_writer::StreamingProjectionWriter,
     promote_temp_idempotent,
@@ -286,7 +289,10 @@ impl StreamingArchiveSink {
         let request = Request {
             object_path: PathBuf::from(format!("{artifact_stem}.posts.parquet")),
             receipt_path: stable_object_receipt_path(artifact_stem, receipt_hash, "posts"),
-            manifest_path: PathBuf::from(format!("{artifact_stem}.manifest.jsonl")),
+            manifest_path: stable_manifest_path(
+                &self.commit_context.run_id,
+                &self.commit_context.shard,
+            ),
             manifest_mode: ManifestMode::AppendJsonl,
             metadata: self.streaming_posts_metadata(receipt_hash, dataset, repo_receipt_path)?,
         };

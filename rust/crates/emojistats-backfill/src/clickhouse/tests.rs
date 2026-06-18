@@ -193,46 +193,89 @@ fn schema_sql_contains_typed_table_names_and_engines() {
 fn aggregate_rebuild_sql_uses_compact_post_rows_and_array_join() {
     let sql = aggregate_rebuild_sql("emojistats").expect("aggregate rebuild sql");
 
-    assert!(sql.contains("TRUNCATE TABLE IF EXISTS emojistats.v2_emoji_total_r3"));
-    assert!(sql.contains("INSERT INTO emojistats.v2_emoji_total_r3"));
-    assert!(sql.contains("TRUNCATE TABLE IF EXISTS emojistats.v2_posts_hourly_r3"));
+    assert!(!sql.contains("TRUNCATE TABLE"));
+    assert!(sql.contains("DROP TABLE IF EXISTS emojistats.v2_emoji_total_r3__rebuild_shadow SYNC"));
+    assert!(sql.contains("CREATE TABLE emojistats.v2_emoji_total_r3__rebuild_shadow"));
+    assert!(sql.contains("INSERT INTO emojistats.v2_emoji_total_r3__rebuild_shadow"));
+    assert!(sql.contains(
+        "EXCHANGE TABLES emojistats.v2_emoji_total_r3 AND emojistats.v2_emoji_total_r3__rebuild_shadow"
+    ));
     assert!(sql.contains("FROM emojistats.v2_post_serving_r3 FINAL"));
     assert!(sql.contains("ARRAY JOIN emojis AS emoji"));
     assert!(sql.contains("arrayJoin(langs) AS lang"));
     assert!(sql.contains("arrayJoin(emojis) AS emoji"));
-    assert!(sql.contains("INSERT INTO emojistats.v2_posts_hourly_r3"));
+    assert!(sql.contains("INSERT INTO emojistats.v2_posts_hourly_r3__rebuild_shadow"));
     assert!(sql.contains("sum(emoji_occurrences) AS total_emoji_occurrences"));
+    assert_eq!(sql.matches("max_memory_usage = 8589934592").count(), 4);
+    assert_eq!(
+        sql.matches("max_bytes_before_external_group_by = 1073741824")
+            .count(),
+        4
+    );
 }
 
 #[test]
-fn aggregate_rebuild_statements_are_ordered_truncate_then_insert() {
+fn aggregate_rebuild_statements_are_ordered_shadow_insert_exchange_drop() {
     let statements = aggregate_rebuild_statements("emojistats").expect("aggregate statements");
 
-    assert_eq!(statements.len(), 8);
+    let tables = [
+        ClickHouseTable::EmojiTotal,
+        ClickHouseTable::EmojiTotalByLang,
+        ClickHouseTable::LangTotal,
+        ClickHouseTable::PostsHourly,
+    ];
+
+    assert_eq!(statements.len(), tables.len() * 5);
     assert!(
         statements
-            .first()
-            .expect("first")
-            .starts_with("TRUNCATE TABLE")
+            .iter()
+            .all(|statement| !statement.starts_with("TRUNCATE TABLE"))
     );
-    assert!(
-        statements
-            .get(1)
-            .expect("second")
-            .starts_with("INSERT INTO")
-    );
-    assert!(
-        statements
-            .get(6)
-            .expect("seventh")
-            .contains("v2_posts_hourly_r3")
-    );
-    assert!(
-        statements
-            .get(7)
-            .expect("eighth")
-            .contains("FROM emojistats.v2_post_serving_r3 FINAL")
-    );
+
+    for (table_index, table) in tables.iter().enumerate() {
+        let offset = table_index * 5;
+        let table_name = table.name();
+        let shadow_table = format!("{table_name}__rebuild_shadow");
+        let create_prefix = format!("CREATE TABLE emojistats.{shadow_table} (");
+        let insert_prefix = format!("INSERT INTO emojistats.{shadow_table}");
+
+        assert_eq!(
+            statements.get(offset).expect("drop shadow"),
+            &format!("DROP TABLE IF EXISTS emojistats.{shadow_table} SYNC;")
+        );
+        assert!(
+            statements
+                .get(offset + 1)
+                .expect("create shadow")
+                .starts_with(create_prefix.as_str())
+        );
+        assert!(
+            statements
+                .get(offset + 2)
+                .expect("insert shadow")
+                .starts_with(insert_prefix.as_str())
+        );
+        assert!(
+            statements
+                .get(offset + 2)
+                .expect("insert shadow")
+                .contains("max_memory_usage = 8589934592")
+        );
+        assert!(
+            statements
+                .get(offset + 2)
+                .expect("insert shadow")
+                .contains("max_bytes_before_external_group_by = 1073741824")
+        );
+        assert_eq!(
+            statements.get(offset + 3).expect("exchange"),
+            &format!("EXCHANGE TABLES emojistats.{table_name} AND emojistats.{shadow_table};")
+        );
+        assert_eq!(
+            statements.get(offset + 4).expect("drop old table"),
+            &format!("DROP TABLE IF EXISTS emojistats.{shadow_table} SYNC;")
+        );
+    }
 }
 
 #[test]

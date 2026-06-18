@@ -1,6 +1,6 @@
 use std::{
     fs, io,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use emojistats_backfill::{
@@ -10,6 +10,7 @@ use emojistats_backfill::{
 use serde::Serialize;
 
 const BYTE_PRESSURE_RETRY_AFTER: Duration = Duration::from_secs(60);
+const DEFAULT_RATE_LIMIT_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 #[derive(Serialize)]
 pub struct SmokeTelemetry<'a> {
@@ -77,14 +78,19 @@ pub fn classify_fetch_error(did: &str, error: &FetchError) -> FetchOneFailure {
         FetchError::AccountState { state, .. } => AttemptOutcome::AccountState(*state),
         FetchError::HttpStatus {
             status, rate_limit, ..
-        } if *status == 429 => rate_limit.retry_after.map_or_else(
-            || AttemptOutcome::RetryableFailure {
-                message: message.clone(),
-            },
-            |retry_after| AttemptOutcome::RateLimited { retry_after },
-        ),
+        } if *status == 429 => AttemptOutcome::RateLimited {
+            retry_after: rate_limit
+                .cooldown_delay(SystemTime::now())
+                .unwrap_or(DEFAULT_RATE_LIMIT_RETRY_AFTER),
+        },
         FetchError::HttpStatus { status, .. } if *status >= 500 => {
             AttemptOutcome::RetryableFailure {
+                message: message.clone(),
+            }
+        }
+        FetchError::Io { source } if is_operator_io_error(source) => {
+            AttemptOutcome::OperatorDeferred {
+                retry_after: None,
                 message: message.clone(),
             }
         }
@@ -127,18 +133,12 @@ pub fn classify_list_records_error(did: &str, error: &ListRecordsError) -> Fetch
     let message = format!("fetch listRecords for {did}: {error}");
     let outcome = match error {
         ListRecordsError::AccountState { state, .. } => AttemptOutcome::AccountState(*state),
-        ListRecordsError::HttpStatus { status, .. }
-            if *status == 429
-                && error
-                    .rate_limit()
-                    .and_then(|limit| limit.retry_after)
-                    .is_some() =>
-        {
+        ListRecordsError::HttpStatus { status, .. } if *status == 429 => {
             AttemptOutcome::RateLimited {
                 retry_after: error
                     .rate_limit()
-                    .and_then(|limit| limit.retry_after)
-                    .unwrap_or(Duration::ZERO),
+                    .and_then(|limit| limit.cooldown_delay(SystemTime::now()))
+                    .unwrap_or(DEFAULT_RATE_LIMIT_RETRY_AFTER),
             }
         }
         ListRecordsError::HttpStatus { .. } if error.is_retryable() => {

@@ -14,6 +14,12 @@ pub(super) fn stable_artifact_stem(did: &str, dataset: &str, content_hash: &str)
     )
 }
 
+pub(super) fn stable_manifest_path(run_id: &str, shard: &str) -> PathBuf {
+    PathBuf::from("manifests")
+        .join(safe_file_component(run_id))
+        .join(format!("{}.jsonl", safe_file_component(shard)))
+}
+
 pub(super) fn stable_repo_receipt_name(did: &str, receipt_hash: &str) -> String {
     format!("{}.{}.receipt.json", safe_file_component(did), receipt_hash)
 }
@@ -28,7 +34,7 @@ pub(super) fn stable_object_receipt_path(
     ))
 }
 
-fn safe_file_component(value: &str) -> String {
+pub(super) fn safe_file_component(value: &str) -> String {
     let mut safe = String::new();
     for ch in value.chars() {
         if ch.is_ascii_alphanumeric() {

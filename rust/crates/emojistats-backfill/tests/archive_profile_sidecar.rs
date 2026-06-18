@@ -52,15 +52,17 @@ fn profile_sidecar_is_written_as_committed_artifact() {
     let receipt: Receipt = read_json(&profile_receipt_path);
     let manifest = fs::read_to_string(&profile_manifest_path)
         .expect("profile sidecar manifest should be readable");
-    let mut lines = manifest.lines();
-    let entry: ManifestEntry = serde_json::from_str(
-        lines
-            .next()
-            .expect("profile sidecar manifest should contain one entry"),
-    )
-    .expect("profile sidecar manifest entry should decode");
+    let entries = manifest
+        .lines()
+        .map(serde_json::from_str::<ManifestEntry>)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("profile sidecar manifest entries should decode");
+    let entry = entries
+        .iter()
+        .find(|entry| entry.dataset == "raw_profile_sidecar")
+        .expect("profile sidecar manifest should contain a profile entry");
 
-    assert!(lines.next().is_none());
+    assert_eq!(entries.len(), 2);
     assert_eq!(profile_path.parent(), Some(output_dir.as_path()));
     assert_path_name_shape(&profile_path, "did_plc_fixture123__", ".profile.json");
     assert_path_name_shape(
@@ -71,11 +73,15 @@ fn profile_sidecar_is_written_as_committed_artifact() {
         ".receipts",
     );
     assert_path_name_shape(&profile_receipt_path, "", ".profile.object-receipt.json");
-    assert_path_name_shape(
-        &profile_manifest_path,
-        "did_plc_fixture123__",
-        ".profile.manifest.jsonl",
+    assert_eq!(
+        profile_manifest_path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(std::ffi::OsStr::to_str)
+            .map(|name| name.starts_with("run_test__")),
+        Some(true)
     );
+    assert_path_name_shape(&profile_manifest_path, "shard3__", ".jsonl");
     assert_eq!(receipt.dataset, "raw_profile_sidecar");
     assert_eq!(receipt.run_id, "run-test");
     assert_eq!(receipt.shard, "shard3");

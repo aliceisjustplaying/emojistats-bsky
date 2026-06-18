@@ -243,19 +243,12 @@ impl StorageBoxCommands for RcloneStorageBoxCommands {
 
     fn append_manifest_record_if_missing(
         &mut self,
-        remote_path: &str,
-        record_without_newline: &[u8],
+        _remote_path: &str,
+        _record_without_newline: &[u8],
     ) -> Result<(), CommandError> {
-        let mut current = self.read_all(remote_path)?.unwrap_or_default();
-        if contains_line(&current, record_without_newline) {
-            return Ok(());
-        }
-        if !current.is_empty() && !current.ends_with(b"\n") {
-            current.push(b'\n');
-        }
-        current.extend_from_slice(record_without_newline);
-        current.push(b'\n');
-        self.write_bytes_to_remote(remote_path, &current)
+        Err(CommandError::new(
+            "rclone backend cannot atomically append manifests; use SSH Storage Box for manifest publication",
+        ))
     }
 
     fn contains_manifest_record(

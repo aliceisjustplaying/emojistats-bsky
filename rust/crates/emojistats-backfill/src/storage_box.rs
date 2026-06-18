@@ -396,7 +396,7 @@ where
         request: &Request,
         object_bytes: &[u8],
     ) -> Result<RemoteArtifact, Error> {
-        self.commit_source(request, UploadSource::Bytes(object_bytes))
+        self.commit_source(request, UploadSource::Bytes(object_bytes), true)
     }
 
     /// Commit one local object file without buffering the object bytes in memory.
@@ -416,6 +416,29 @@ where
                 path: object_path,
                 open_operation: "open object source",
             },
+            true,
+        )
+    }
+
+    /// Commit one local object file and its receipt without publishing a remote manifest.
+    ///
+    /// This supports transports that cannot provide the append-if-missing manifest lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if local reading, path validation, upload, verification, or rename fails.
+    pub fn commit_file_without_manifest(
+        &mut self,
+        request: &Request,
+        object_path: &Path,
+    ) -> Result<RemoteArtifact, Error> {
+        self.commit_source(
+            request,
+            UploadSource::File {
+                path: object_path,
+                open_operation: "open object source",
+            },
+            false,
         )
     }
 
@@ -423,8 +446,9 @@ where
         &mut self,
         request: &Request,
         object_source: UploadSource<'_>,
+        append_manifest: bool,
     ) -> Result<RemoteArtifact, Error> {
-        if request.manifest_mode != ManifestMode::AppendJsonl {
+        if append_manifest && request.manifest_mode != ManifestMode::AppendJsonl {
             return Err(Error::UnsupportedManifestMode);
         }
 
@@ -435,6 +459,7 @@ where
             &paths,
             object_source,
             self.config.readback_bytes,
+            append_manifest,
         );
         cleanup_remote_temps_on_error(&mut self.commands, &paths, &result);
         result
@@ -512,6 +537,7 @@ fn commit_source_pipeline<C>(
     paths: &RemotePaths,
     object_source: UploadSource<'_>,
     readback_bytes: usize,
+    append_manifest: bool,
 ) -> Result<RemoteArtifact, Error>
 where
     C: StorageBoxCommands,
@@ -540,8 +566,10 @@ where
         readback_bytes,
     )?;
 
-    let manifest_line = jsonl_bytes("manifest", &plan.entry)?;
-    append_manifest_if_missing(commands, &paths.manifest, &manifest_line)?;
+    if append_manifest {
+        let manifest_line = jsonl_bytes("manifest", &plan.entry)?;
+        append_manifest_if_missing(commands, &paths.manifest, &manifest_line)?;
+    }
 
     Ok(RemoteArtifact {
         remote_object_path: paths.object.clone(),

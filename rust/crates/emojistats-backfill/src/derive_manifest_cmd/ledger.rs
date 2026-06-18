@@ -51,8 +51,8 @@ impl DeriveLedger {
         &self,
         _verified: &VerifiedLoaderInput,
         payload: &ClickHouseInsertPayload,
-    ) -> bool {
-        self.completed.contains(&Self::checkpoint(payload))
+    ) -> anyhow::Result<bool> {
+        Ok(self.completed.contains(&Self::checkpoint(payload)?))
     }
 
     pub(super) fn append_success(
@@ -61,7 +61,7 @@ impl DeriveLedger {
         payload: &ClickHouseInsertPayload,
         receipt: &ClickHouseInsertReceipt,
     ) -> anyhow::Result<()> {
-        let checkpoint = Self::checkpoint(payload);
+        let checkpoint = Self::checkpoint(payload)?;
         let Some(path) = &self.path else {
             self.completed.insert(checkpoint);
             return Ok(());
@@ -107,18 +107,12 @@ impl DeriveLedger {
         Ok(completed)
     }
 
-    fn checkpoint(payload: &ClickHouseInsertPayload) -> DeriveCheckpointRecord {
-        DeriveCheckpointRecord::from_payload_body(
+    fn checkpoint(payload: &ClickHouseInsertPayload) -> anyhow::Result<DeriveCheckpointRecord> {
+        Ok(DeriveCheckpointRecord::from_payload_body(
             payload.checkpoint_key.clone(),
             payload.dedupe_token.clone(),
             payload.row_count,
             &payload.body,
-        )
-        .unwrap_or_else(|_err| DeriveCheckpointRecord {
-            key: payload.checkpoint_key.clone(),
-            dedupe_token: payload.dedupe_token.clone(),
-            row_count: u64::MAX,
-            payload_hash: String::new(),
-        })
+        )?)
     }
 }

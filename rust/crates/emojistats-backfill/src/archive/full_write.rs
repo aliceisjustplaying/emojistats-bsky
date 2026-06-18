@@ -7,7 +7,10 @@ use super::{
         write_json_pretty,
     },
     derive_emoji_projection_rows, fs, hash_serialized_json,
-    naming::{stable_artifact_stem, stable_object_receipt_path, stable_repo_receipt_name},
+    naming::{
+        stable_artifact_stem, stable_manifest_path, stable_object_receipt_path,
+        stable_repo_receipt_name,
+    },
     parquet::write_posts_parquet_to_writer,
     write_temp_idempotent,
 };
@@ -34,7 +37,7 @@ pub fn write_local_archive_artifacts(
     let receipt_path = output_dir.join(stable_repo_receipt_name(did, &receipt_hash));
     let object_receipt_object_path =
         stable_object_receipt_path(&artifact_stem, &receipt_hash, "posts");
-    let manifest_object_path = PathBuf::from(format!("{artifact_stem}.manifest.jsonl"));
+    let manifest_object_path = stable_manifest_path(&commit_context.run_id, &commit_context.shard);
     let emoji_projection_stem =
         stable_artifact_stem(did, "emoji_projection", &receipt.emoji_projection_hash);
     let emoji_projection_path = output_dir.join(format!("{emoji_projection_stem}.emoji.jsonl"));
@@ -47,7 +50,7 @@ pub fn write_local_archive_artifacts(
     let profile_sidecar_receipt_object_path =
         stable_object_receipt_path(&profile_stem, &receipt_hash, "profile");
     let profile_sidecar_manifest_object_path =
-        PathBuf::from(format!("{profile_stem}.profile.manifest.jsonl"));
+        stable_manifest_path(&commit_context.run_id, &commit_context.shard);
 
     write_temp_idempotent(&receipt_path, |path| write_json_pretty(path, receipt))?;
     let store = LocalStore::new(output_dir);

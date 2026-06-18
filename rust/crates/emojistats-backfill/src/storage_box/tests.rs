@@ -9,8 +9,8 @@ use std::{
 use sha2::{Digest, Sha256};
 
 use super::{
-    CommandError, Error, SshStorageBoxCommands, StorageBoxBackend, StorageBoxCommands,
-    StorageBoxConfig, StorageBoxSshConfig,
+    CommandError, Error, RcloneStorageBoxCommands, SshStorageBoxCommands, StorageBoxBackend,
+    StorageBoxCommands, StorageBoxConfig, StorageBoxRcloneConfig, StorageBoxSshConfig,
 };
 use crate::{
     archive::{
@@ -525,6 +525,21 @@ fn remote_only_derive_canary_commits_storage_box_artifacts() {
     assert_eq!(batch.total_post_counter.posts_processed, 2);
     assert_eq!(batch.total_post_counter.emoji_occurrences, 3);
     assert_eq!(batch.post_rows.len(), 2);
+}
+
+#[test]
+fn rclone_manifest_append_fails_closed_without_remote_lock() {
+    let config = StorageBoxRcloneConfig::new("/run/secrets/rclone.conf", "storagebox");
+    let mut commands = RcloneStorageBoxCommands::new(config);
+    let error = commands
+        .append_manifest_record_if_missing("/storage-box/emojistats/manifest.jsonl", b"{\"x\":1}")
+        .expect_err("rclone manifest append should fail closed");
+
+    assert!(
+        error
+            .to_string()
+            .contains("cannot atomically append manifests")
+    );
 }
 
 #[test]

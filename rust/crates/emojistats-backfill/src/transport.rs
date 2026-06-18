@@ -260,12 +260,6 @@ async fn stream_to_temp_file(
             bytes,
         )
     })? {
-        enforce_progress(
-            &mut progress_window_started,
-            &mut progress_window_bytes,
-            limits.min_progress_interval,
-            limits.min_progress_bytes,
-        )?;
         let chunk = next_chunk.map_err(|err| transport_error(err, Some(bytes)))?;
         let chunk_len =
             u64::try_from(chunk.len()).map_err(|_err| FetchError::MaxBytesExceeded {
@@ -297,6 +291,12 @@ async fn stream_to_temp_file(
                     min_bytes: limits.min_progress_bytes,
                     observed_bytes: u64::MAX,
                 })?;
+        enforce_progress(
+            &mut progress_window_started,
+            &mut progress_window_bytes,
+            limits.min_progress_interval,
+            limits.min_progress_bytes,
+        )?;
     }
 
     file.sync_all().await?;

@@ -33,7 +33,7 @@ use emojistats_backfill::derive::{
     canonical_streaming_counter_dedupe_token, canonical_streaming_post_dedupe_token,
 };
 use ledger::DeriveLedger;
-use streaming::CanonicalStreamingPayloadState;
+use streaming::{CanonicalStreamingPayloadState, CanonicalStreamingValidationState};
 
 pub struct DeriveManifestConfig {
     pub manifest_path: PathBuf,
@@ -67,6 +67,40 @@ struct DeriveRunContext<'a> {
     derive_ledger: &'a mut DeriveLedger,
     summary: &'a mut DeriveManifestSummary,
     metrics: &'a SharedMetricsRecorder,
+}
+
+#[derive(Default)]
+struct PendingDryRunInserts {
+    attempted_payloads: u64,
+    attempted_rows: u64,
+}
+
+impl PendingDryRunInserts {
+    fn add_payloads(&mut self, payloads: &[ClickHouseInsertPayload]) -> anyhow::Result<()> {
+        add_count(
+            &mut self.attempted_payloads,
+            count_len(payloads.len(), "derive payload count")?,
+            "derive attempted payload total",
+        )?;
+        add_count(
+            &mut self.attempted_rows,
+            payload_row_count(payloads)?,
+            "derive attempted row total",
+        )
+    }
+
+    fn commit(self, summary: &mut DeriveManifestSummary) -> anyhow::Result<()> {
+        add_count(
+            &mut summary.attempted_insert_payloads,
+            self.attempted_payloads,
+            "derive attempted payload total",
+        )?;
+        add_count(
+            &mut summary.attempted_insert_rows,
+            self.attempted_rows,
+            "derive attempted row total",
+        )
+    }
 }
 
 pub async fn run(config: DeriveManifestConfig) -> anyhow::Result<()> {
@@ -142,7 +176,8 @@ async fn derive_verified_input_canonical_streaming(
     verified: &VerifiedLoaderInput,
     context: &mut DeriveRunContext<'_>,
 ) -> anyhow::Result<()> {
-    let payloads = build_verified_input_payloads_canonical_streaming(verified)?;
+    validate_verified_input_canonical_streaming(verified)?;
+    stream_verified_input_payloads_canonical_streaming(verified, context).await?;
     context.metrics.increment_counter(
         MetricName::DeriveRowsVerifiedTotal,
         derive_metric_labels(
@@ -152,7 +187,6 @@ async fn derive_verified_input_canonical_streaming(
         ),
         verified.repo_receipt.archived_post_rows_count,
     );
-    apply_derive_payloads(context, verified, &payloads).await?;
     context.metrics.increment_counter(
         MetricName::DeriveFilesReadTotal,
         derive_metric_labels(
@@ -168,23 +202,55 @@ async fn derive_verified_input_canonical_streaming(
     )
 }
 
-fn build_verified_input_payloads_canonical_streaming(
+fn validate_verified_input_canonical_streaming(
     verified: &VerifiedLoaderInput,
-) -> anyhow::Result<Vec<ClickHouseInsertPayload>> {
+) -> anyhow::Result<()> {
+    let file = File::open(&verified.object_path)?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    let mut state = CanonicalStreamingValidationState::new(verified);
+
+    for batch in reader {
+        let rows = archive_post_rows_from_record_batch(&batch?)?;
+        state.consume_rows(&rows)?;
+    }
+
+    state.finish()
+}
+
+async fn stream_verified_input_payloads_canonical_streaming(
+    verified: &VerifiedLoaderInput,
+    context: &mut DeriveRunContext<'_>,
+) -> anyhow::Result<()> {
     let file = File::open(&verified.object_path)?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
     let mut state = CanonicalStreamingPayloadState::new(verified);
-    let mut output = Vec::new();
+    let mut pending_dry_run = PendingDryRunInserts::default();
 
     for batch in reader {
         let rows = archive_post_rows_from_record_batch(&batch?)?;
         let payloads = state.consume_rows(&rows)?;
-        output.extend(payloads);
+        handle_streamed_derive_payloads(context, verified, &payloads, &mut pending_dry_run).await?;
     }
 
     let payloads = state.finish()?;
-    output.extend(payloads);
-    Ok(output)
+    handle_streamed_derive_payloads(context, verified, &payloads, &mut pending_dry_run).await?;
+    if context.dry_run {
+        pending_dry_run.commit(context.summary)?;
+    }
+    Ok(())
+}
+
+async fn handle_streamed_derive_payloads(
+    context: &mut DeriveRunContext<'_>,
+    verified: &VerifiedLoaderInput,
+    payloads: &[ClickHouseInsertPayload],
+    pending_dry_run: &mut PendingDryRunInserts,
+) -> anyhow::Result<()> {
+    if context.dry_run {
+        pending_dry_run.add_payloads(payloads)
+    } else {
+        apply_derive_payloads(context, verified, payloads).await
+    }
 }
 
 async fn apply_derive_payloads(
@@ -212,7 +278,7 @@ async fn apply_derive_payloads(
 
     for payload in payloads {
         let payload_rows = count_len(payload.row_count, "derive payload row count")?;
-        if context.derive_ledger.is_completed(verified, payload) {
+        if context.derive_ledger.is_completed(verified, payload)? {
             increment(
                 &mut context.summary.skipped_insert_payloads,
                 "skipped payload total",

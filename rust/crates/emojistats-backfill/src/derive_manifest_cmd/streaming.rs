@@ -29,6 +29,35 @@ pub(super) struct CanonicalStreamingPayloadState<'a> {
     post_chunk_index: u64,
 }
 
+pub(super) struct CanonicalStreamingValidationState<'a> {
+    verified: &'a VerifiedLoaderInput,
+    row_hasher: ArchivePostRowsHasher,
+    rows: u64,
+}
+
+impl<'a> CanonicalStreamingValidationState<'a> {
+    pub(super) fn new(verified: &'a VerifiedLoaderInput) -> Self {
+        Self {
+            verified,
+            row_hasher: ArchivePostRowsHasher::new(),
+            rows: 0,
+        }
+    }
+
+    pub(super) fn consume_rows(&mut self, rows: &[ArchivePostRow]) -> anyhow::Result<()> {
+        for row in rows {
+            self.row_hasher.push_row(row)?;
+            increment(&mut self.rows, "streaming derive validation row count")?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish(mut self) -> anyhow::Result<()> {
+        let row_hash = std::mem::take(&mut self.row_hasher).finish();
+        validate_streamed_receipt(self.verified, self.rows, &row_hash)
+    }
+}
+
 impl<'a> CanonicalStreamingPayloadState<'a> {
     pub(super) fn new(verified: &'a VerifiedLoaderInput) -> Self {
         Self {
@@ -87,7 +116,7 @@ impl<'a> CanonicalStreamingPayloadState<'a> {
             payloads.push(self.flush_post_chunk()?);
         }
         let row_hash = std::mem::take(&mut self.row_hasher).finish();
-        self.validate_receipt(&row_hash)?;
+        validate_streamed_receipt(self.verified, self.rows, &row_hash)?;
         let counter = TotalPostCounterInput {
             source: BACKFILL_DERIVE_SOURCE.to_owned(),
             run_id: self.verified.manifest.run_id.clone(),
@@ -112,48 +141,6 @@ impl<'a> CanonicalStreamingPayloadState<'a> {
             DeriveCheckpointKey::total_post_counter(&self.verified.identity),
         )?);
         Ok(payloads)
-    }
-
-    fn validate_receipt(&self, row_hash: &str) -> anyhow::Result<()> {
-        if self.verified.manifest.row_count != self.rows {
-            anyhow::bail!(
-                "manifest row_count {} did not match streamed archive row count {} for {}",
-                self.verified.manifest.row_count,
-                self.rows,
-                self.verified.object_path.display()
-            );
-        }
-        let receipt = &self.verified.repo_receipt;
-        if receipt.archived_post_rows_count != self.rows {
-            anyhow::bail!(
-                "repo receipt archived_post_rows_count {} did not match streamed archive row count {} for {}",
-                receipt.archived_post_rows_count,
-                self.rows,
-                self.verified.object_path.display()
-            );
-        }
-        if receipt.normalizer != self.verified.manifest.normalizer {
-            anyhow::bail!(
-                "repo receipt normalizer did not match manifest normalizer for {}",
-                self.verified.object_path.display()
-            );
-        }
-        if receipt.post_rows_hash != row_hash || receipt.archive_rows_hash != row_hash {
-            anyhow::bail!(
-                "repo receipt row hash did not match streamed archive rows for {}",
-                self.verified.object_path.display()
-            );
-        }
-        let receipt_hash = hash_serialized_json(receipt)?;
-        if self.verified.manifest.receipt_hash != receipt_hash {
-            anyhow::bail!(
-                "manifest receipt_hash {} did not match repo receipt hash {} for {}",
-                self.verified.manifest.receipt_hash,
-                receipt_hash,
-                self.verified.object_path.display()
-            );
-        }
-        Ok(())
     }
 
     fn flush_post_chunk_if_needed(
@@ -192,6 +179,52 @@ impl<'a> CanonicalStreamingPayloadState<'a> {
             DeriveCheckpointKey::post_serving(&self.verified.identity, chunk_index),
         )?)
     }
+}
+
+fn validate_streamed_receipt(
+    verified: &VerifiedLoaderInput,
+    rows: u64,
+    row_hash: &str,
+) -> anyhow::Result<()> {
+    if verified.manifest.row_count != rows {
+        anyhow::bail!(
+            "manifest row_count {} did not match streamed archive row count {} for {}",
+            verified.manifest.row_count,
+            rows,
+            verified.object_path.display()
+        );
+    }
+    let receipt = &verified.repo_receipt;
+    if receipt.archived_post_rows_count != rows {
+        anyhow::bail!(
+            "repo receipt archived_post_rows_count {} did not match streamed archive row count {} for {}",
+            receipt.archived_post_rows_count,
+            rows,
+            verified.object_path.display()
+        );
+    }
+    if receipt.normalizer != verified.manifest.normalizer {
+        anyhow::bail!(
+            "repo receipt normalizer did not match manifest normalizer for {}",
+            verified.object_path.display()
+        );
+    }
+    if receipt.post_rows_hash != row_hash || receipt.archive_rows_hash != row_hash {
+        anyhow::bail!(
+            "repo receipt row hash did not match streamed archive rows for {}",
+            verified.object_path.display()
+        );
+    }
+    let receipt_hash = hash_serialized_json(receipt)?;
+    if verified.manifest.receipt_hash != receipt_hash {
+        anyhow::bail!(
+            "manifest receipt_hash {} did not match repo receipt hash {} for {}",
+            verified.manifest.receipt_hash,
+            receipt_hash,
+            verified.object_path.display()
+        );
+    }
+    Ok(())
 }
 
 fn validate_post_row_payload_size(
