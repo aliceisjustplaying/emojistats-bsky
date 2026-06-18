@@ -7,7 +7,7 @@ use super::{
     cli::{self, Command},
     fleet::{self, FleetConfig, default_worker_id},
     metrics::metrics_recorder,
-    storage::{ArchiveStorageArgs, archive_storage_config},
+    storage::archive_storage_config,
 };
 
 pub(super) async fn run_fleet_command(command: Command) -> anyhow::Result<()> {
@@ -23,15 +23,7 @@ pub(super) async fn run_fleet_command(command: Command) -> anyhow::Result<()> {
         spool_dir,
         max_bytes,
         archive_dir,
-        archive_backend,
-        storage_box_remote,
-        storage_box_rclone_remote,
-        storage_box_rclone_config,
-        storage_box_rclone_program,
-        storage_box_root,
-        storage_box_ssh_program,
-        storage_box_ssh_arg,
-        storage_box_command_timeout_secs,
+        archive_storage,
         cid_verification_threads,
         http_protocol,
         canary_evidence,
@@ -51,17 +43,7 @@ pub(super) async fn run_fleet_command(command: Command) -> anyhow::Result<()> {
         &run_id,
     )?;
     validate_fleet_spool_budget(max_inflight_spool_bytes, max_bytes)?;
-    let archive_storage = archive_storage_config(ArchiveStorageArgs {
-        backend: archive_backend,
-        storage_box_remote,
-        storage_box_rclone_remote,
-        storage_box_rclone_config,
-        storage_box_rclone_program,
-        storage_box_root,
-        storage_box_ssh_program,
-        storage_box_ssh_arg,
-        storage_box_command_timeout_secs,
-    })?;
+    let archive_storage = archive_storage_config(archive_storage)?;
     let worker_id = default_worker_id(&run_id);
     let shard_label = shard_bucket.map_or_else(
         || "all".to_owned(),

@@ -1,26 +1,15 @@
 use std::{
     io::{self, Read, Write},
-    path::{Path, PathBuf},
-    process::{Command as ProcessCommand, Stdio},
-    thread,
-    time::{Duration, Instant},
+    path::Path,
 };
 
 use serde::Deserialize;
 use tempfile::NamedTempFile;
 
-use super::{CommandError, RcloneStorageBoxCommands, StorageBoxCommands, StorageBoxRcloneConfig};
-
-const COMMAND_OUTPUT_MAX_BYTES: usize = 64 * 1024;
-const COMMAND_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CommandSpec {
-    operation: &'static str,
-    program: PathBuf,
-    args: Vec<String>,
-    timeout: Duration,
-}
+use super::{
+    CommandError, RcloneStorageBoxCommands, StorageBoxCommands, StorageBoxRcloneConfig,
+    process::{CommandSpec, run_command},
+};
 
 #[derive(Debug, Deserialize)]
 struct StatItem {
@@ -39,6 +28,7 @@ impl StorageBoxRcloneConfig {
             operation,
             program: self.rclone_program.clone(),
             args: command_args,
+            stdin: false,
             timeout: self.command_timeout,
         }
     }
@@ -69,7 +59,7 @@ impl RcloneStorageBoxCommands {
                 target,
             ],
         );
-        run_command(&command).map(|_stdout| ())
+        run_command(&command, None).map(|_stdout| ())
     }
 
     fn write_bytes_to_remote(&self, remote_path: &str, bytes: &[u8]) -> Result<(), CommandError> {
@@ -93,7 +83,7 @@ impl RcloneStorageBoxCommands {
                 target,
             ],
         );
-        match run_command(&command) {
+        match run_command(&command, None) {
             Ok(stdout) => Ok(Some(stdout)),
             Err(error) if is_not_found_message(&error.to_string()) => Ok(None),
             Err(error) => Err(error),
@@ -131,7 +121,7 @@ impl StorageBoxCommands for RcloneStorageBoxCommands {
                 target,
             ],
         );
-        match run_command(&command) {
+        match run_command(&command, None) {
             Ok(stdout) => {
                 let item: Option<StatItem> = serde_json::from_slice(&stdout).map_err(|error| {
                     CommandError::new(format!("lsjson stat output was not JSON: {error}"))
@@ -156,7 +146,7 @@ impl StorageBoxCommands for RcloneStorageBoxCommands {
                 target,
             ],
         );
-        match run_command(&command) {
+        match run_command(&command, None) {
             Ok(stdout) => {
                 let text = std::str::from_utf8(&stdout).map_err(|error| {
                     CommandError::new(format!("hashsum output was not UTF-8: {error}"))
@@ -193,7 +183,7 @@ impl StorageBoxCommands for RcloneStorageBoxCommands {
                 target,
             ],
         );
-        match run_command(&command) {
+        match run_command(&command, None) {
             Ok(stdout) => Ok(Some(stdout)),
             Err(error) if is_not_found_message(&error.to_string()) => Ok(None),
             Err(error) => Err(error),
@@ -211,7 +201,7 @@ impl StorageBoxCommands for RcloneStorageBoxCommands {
                 target,
             ],
         );
-        match run_command(&command) {
+        match run_command(&command, None) {
             Ok(_stdout) => Ok(()),
             Err(error) if is_not_found_message(&error.to_string()) => Ok(()),
             Err(error) => Err(error),
@@ -239,7 +229,7 @@ impl StorageBoxCommands for RcloneStorageBoxCommands {
                 target,
             ],
         );
-        run_command(&command).map(|_stdout| ())
+        run_command(&command, None).map(|_stdout| ())
     }
 
     fn append_manifest_record_if_missing(
@@ -290,148 +280,4 @@ fn validate_remote_path(remote_path: &str) -> Result<(), CommandError> {
 fn is_not_found_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("not found") || lower.contains("doesn't exist") || lower.contains("no such file")
-}
-
-fn run_command(spec: &CommandSpec) -> Result<Vec<u8>, CommandError> {
-    let mut child = ProcessCommand::new(&spec.program)
-        .args(&spec.args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| CommandError::new(format!("{} spawn failed: {error}", spec.operation)))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| CommandError::new(format!("{} stdout was not available", spec.operation)))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| CommandError::new(format!("{} stderr was not available", spec.operation)))?;
-    let stdout_reader = read_pipe(spec.operation, "stdout", stdout);
-    let stderr_reader = read_pipe(spec.operation, "stderr", stderr);
-    let status = wait_with_timeout(spec, &mut child);
-    let stdout = join_pipe_reader(spec.operation, "stdout", stdout_reader)?;
-    let stderr = join_pipe_reader(spec.operation, "stderr", stderr_reader)?;
-
-    match status {
-        Ok(CommandStatus::Exited(status)) if status.success() => {
-            if stdout.truncated {
-                Err(CommandError::new(format!(
-                    "{} stdout exceeded {} bytes",
-                    spec.operation, COMMAND_OUTPUT_MAX_BYTES
-                )))
-            } else {
-                Ok(stdout.bytes)
-            }
-        }
-        Ok(CommandStatus::Exited(status)) => Err(CommandError::new(format!(
-            "{} exited with {}: stdout={} stderr={}",
-            spec.operation,
-            status,
-            format_pipe_output(&stdout),
-            format_pipe_output(&stderr)
-        ))),
-        Ok(CommandStatus::TimedOut) => Err(CommandError::new(format!(
-            "{} timed out after {:?} and was killed: stdout={} stderr={}",
-            spec.operation,
-            spec.timeout,
-            format_pipe_output(&stdout),
-            format_pipe_output(&stderr)
-        ))),
-        Err(error) => Err(error),
-    }
-}
-
-enum CommandStatus {
-    Exited(std::process::ExitStatus),
-    TimedOut,
-}
-
-fn wait_with_timeout(
-    spec: &CommandSpec,
-    child: &mut std::process::Child,
-) -> Result<CommandStatus, CommandError> {
-    let started = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait().map_err(|error| {
-            CommandError::new(format!("{} wait failed: {error}", spec.operation))
-        })? {
-            return Ok(CommandStatus::Exited(status));
-        }
-        if started.elapsed() >= spec.timeout {
-            child.kill().map_err(|error| {
-                CommandError::new(format!(
-                    "{} kill after timeout failed: {error}",
-                    spec.operation
-                ))
-            })?;
-            child.wait().map_err(|error| {
-                CommandError::new(format!(
-                    "{} wait after kill failed: {error}",
-                    spec.operation
-                ))
-            })?;
-            return Ok(CommandStatus::TimedOut);
-        }
-        thread::sleep(COMMAND_WAIT_POLL_INTERVAL.min(spec.timeout));
-    }
-}
-
-#[derive(Debug)]
-struct PipeOutput {
-    bytes: Vec<u8>,
-    truncated: bool,
-}
-
-fn read_pipe(
-    operation: &'static str,
-    name: &'static str,
-    mut pipe: impl Read + Send + 'static,
-) -> thread::JoinHandle<Result<PipeOutput, CommandError>> {
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let mut truncated = false;
-        let mut buffer = vec![0_u8; 8_192].into_boxed_slice();
-        loop {
-            let read = pipe.read(&mut buffer).map_err(|error| {
-                CommandError::new(format!("{operation} {name} read failed: {error}"))
-            })?;
-            if read == 0 {
-                break;
-            }
-            let remaining = COMMAND_OUTPUT_MAX_BYTES.saturating_sub(bytes.len());
-            if remaining == 0 {
-                truncated = true;
-                continue;
-            }
-            let take = remaining.min(read);
-            let chunk = buffer.get(..take).ok_or_else(|| {
-                CommandError::new(format!("{operation} {name} slice exceeded read buffer"))
-            })?;
-            bytes.extend_from_slice(chunk);
-            if take < read {
-                truncated = true;
-            }
-        }
-        Ok(PipeOutput { bytes, truncated })
-    })
-}
-
-fn join_pipe_reader(
-    operation: &'static str,
-    name: &'static str,
-    handle: thread::JoinHandle<Result<PipeOutput, CommandError>>,
-) -> Result<PipeOutput, CommandError> {
-    handle
-        .join()
-        .unwrap_or_else(|_panic| Err(CommandError::new(format!("{operation} {name} panicked"))))
-}
-
-fn format_pipe_output(output: &PipeOutput) -> String {
-    let mut text = String::from_utf8_lossy(&output.bytes).into_owned();
-    if output.truncated {
-        text.push_str("...[truncated]");
-    }
-    text
 }

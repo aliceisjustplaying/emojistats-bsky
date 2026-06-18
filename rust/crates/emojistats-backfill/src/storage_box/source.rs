@@ -15,13 +15,12 @@ pub(super) enum UploadSource<'a> {
 }
 
 impl UploadSource<'_> {
-    fn prepare(self, kind: &'static str, readback_bytes: usize) -> Result<PreparedSource, Error> {
+    fn prepare(self, kind: &'static str) -> Result<PreparedSource, Error> {
         match self {
             Self::Bytes(bytes) => Ok(PreparedSource {
                 digest: digest_bytes(kind, bytes)?,
-                prefix: prefix_bytes(bytes, readback_bytes)?,
             }),
-            Self::File { path, .. } => digest_file(kind, path, readback_bytes),
+            Self::File { path, .. } => digest_file(kind, path),
         }
     }
 
@@ -67,14 +66,9 @@ impl UploadSource<'_> {
 
 struct PreparedSource {
     digest: DigestResult,
-    prefix: Vec<u8>,
 }
 
-fn digest_file(
-    kind: &'static str,
-    path: &Path,
-    readback_bytes: usize,
-) -> Result<PreparedSource, Error> {
+fn digest_file(kind: &'static str, path: &Path) -> Result<PreparedSource, Error> {
     let mut file = File::open(path).map_err(|source| Error::LocalIo {
         operation: "open source",
         path: path.to_path_buf(),
@@ -82,7 +76,6 @@ fn digest_file(
     })?;
     let mut hasher = Sha256::new();
     let mut byte_count = 0_u64;
-    let mut prefix = Vec::with_capacity(readback_bytes);
     let mut buffer = vec![0_u8; 65_536].into_boxed_slice();
     loop {
         let read = file.read(&mut buffer).map_err(|source| Error::LocalIo {
@@ -101,21 +94,12 @@ fn digest_file(
         byte_count = byte_count
             .checked_add(read_u64)
             .ok_or(Error::ByteCountOverflow { kind })?;
-        let remaining_prefix = readback_bytes.saturating_sub(prefix.len());
-        if remaining_prefix > 0 {
-            let prefix_len = remaining_prefix.min(chunk.len());
-            let prefix_chunk = chunk
-                .get(..prefix_len)
-                .ok_or(Error::ByteCountOverflow { kind })?;
-            prefix.extend_from_slice(prefix_chunk);
-        }
     }
     Ok(PreparedSource {
         digest: DigestResult {
             bytes: byte_count,
             sha256: hex::encode(hasher.finalize()),
         },
-        prefix,
     })
 }
 
@@ -125,20 +109,14 @@ pub(super) fn upload_verify_promote<C>(
     final_path: &str,
     artifact_kind: &'static str,
     source: UploadSource<'_>,
-    readback_bytes: usize,
+    _readback_bytes: usize,
 ) -> Result<DigestResult, Error>
 where
     C: StorageBoxCommands,
 {
-    let prepared = source.prepare(artifact_kind, readback_bytes)?;
+    let prepared = source.prepare(artifact_kind)?;
     source.upload(commands, temp_path, upload_operation(artifact_kind))?;
-    verify_remote_uploaded(
-        commands,
-        temp_path,
-        &prepared.digest,
-        &prepared.prefix,
-        readback_bytes,
-    )?;
+    verify_remote_uploaded(commands, temp_path, &prepared.digest)?;
     promote_temp_to_final(
         commands,
         temp_path,
@@ -153,8 +131,6 @@ fn verify_remote_uploaded<C>(
     commands: &mut C,
     remote_path: &str,
     expected_digest: &DigestResult,
-    expected_prefix: &[u8],
-    readback_bytes: usize,
 ) -> Result<(), Error>
 where
     C: StorageBoxCommands,
@@ -206,24 +182,7 @@ where
             });
         }
     }
-
-    let actual_prefix = commands
-        .read_prefix(remote_path, readback_bytes)
-        .map_err(|source| Error::Command {
-            operation: "read uploaded file prefix",
-            path: remote_path.to_owned(),
-            source,
-        })?;
-    match actual_prefix {
-        Some(actual) if actual.as_slice() == expected_prefix => Ok(()),
-        Some(_) => Err(Error::VerifyReadbackMismatch {
-            path: remote_path.to_owned(),
-        }),
-        None => Err(Error::MissingRemoteFile {
-            operation: "read uploaded file prefix",
-            path: remote_path.to_owned(),
-        }),
-    }
+    Ok(())
 }
 
 pub(super) fn cleanup_remote_temp<C>(
@@ -262,14 +221,6 @@ fn digest_bytes(kind: &'static str, bytes: &[u8]) -> Result<DigestResult, Error>
         bytes: byte_count,
         sha256: hex::encode(hasher.finalize()),
     })
-}
-
-fn prefix_bytes(bytes: &[u8], readback_bytes: usize) -> Result<Vec<u8>, Error> {
-    let expected_prefix_len = bytes.len().min(readback_bytes);
-    let prefix = bytes
-        .get(..expected_prefix_len)
-        .ok_or(Error::ByteCountOverflow { kind: "prefix" })?;
-    Ok(prefix.to_vec())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

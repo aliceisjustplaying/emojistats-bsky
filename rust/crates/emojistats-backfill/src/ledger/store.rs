@@ -291,6 +291,12 @@ impl SqliteLedger {
         Ok(())
     }
 
+    /// Return the configured SQLite connection owned by this ledger.
+    #[must_use]
+    pub fn into_connection(self) -> Connection {
+        self.connection
+    }
+
     /// Insert or replace one ledger entry by DID.
     ///
     /// # Errors

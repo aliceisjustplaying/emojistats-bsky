@@ -10,6 +10,7 @@ use serde::Serialize;
 use crate::commit::{CommitPlan, ManifestEntry, ManifestMode, Receipt, Request};
 
 mod paths;
+mod process;
 mod rclone;
 mod source;
 mod ssh;

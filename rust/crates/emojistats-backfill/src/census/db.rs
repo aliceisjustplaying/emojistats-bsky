@@ -1,5 +1,6 @@
-use std::{path::Path, time::Duration};
+use std::path::Path;
 
+use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::{
@@ -16,12 +17,7 @@ use crate::{
 const PLC_META_CURSOR: &str = "plc_cursor";
 
 pub(super) fn open_census_connection(path: &Path) -> anyhow::Result<Connection> {
-    drop(SqliteLedger::open(path)?);
-    let connection = Connection::open(path)?;
-    connection.busy_timeout(Duration::from_secs(30))?;
-    connection.pragma_update(None, "journal_mode", "WAL")?;
-    connection.pragma_update(None, "synchronous", "NORMAL")?;
-    Ok(connection)
+    Ok(SqliteLedger::open(path)?.into_connection())
 }
 
 pub(super) fn create_census_schema(connection: &Connection) -> anyhow::Result<()> {
@@ -65,17 +61,6 @@ pub(super) fn load_cursor(connection: &Connection) -> anyhow::Result<u64> {
     Ok(cursor)
 }
 
-pub(super) fn set_cursor(connection: &Connection, cursor: u64) -> anyhow::Result<()> {
-    connection.execute(
-        "
-        INSERT INTO plc_meta (key, value) VALUES (?1, ?2)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        ",
-        params![PLC_META_CURSOR, cursor.to_string()],
-    )?;
-    Ok(())
-}
-
 pub(super) fn persist_plc_page(
     connection: &mut Connection,
     previous_cursor: u64,
@@ -89,9 +74,7 @@ pub(super) fn persist_plc_page(
         ..PagePersistSummary::default()
     };
     for line in page {
-        let seq = line
-            .seq
-            .ok_or_else(|| anyhow::anyhow!("PLC export line missing seq for {}", line.did))?;
+        let seq = plc_line_cursor(line)?;
         if summary.ops == 0 {
             summary.first_seq = seq;
         }
@@ -146,6 +129,15 @@ pub(super) fn persist_plc_page(
     }
     transaction.commit()?;
     Ok(summary)
+}
+
+fn plc_line_cursor(line: &PlcExportLine) -> anyhow::Result<u64> {
+    if let Some(created_at) = line.created_at.as_deref() {
+        let timestamp = DateTime::parse_from_rfc3339(created_at)?.with_timezone(&Utc);
+        return u64::try_from(timestamp.timestamp_millis()).map_err(Into::into);
+    }
+    line.seq
+        .ok_or_else(|| anyhow::anyhow!("PLC export line missing createdAt/seq for {}", line.did))
 }
 
 fn upsert_plc_identity(

@@ -71,11 +71,38 @@ pub enum ArchiveBackend {
     StorageBoxRclone,
 }
 
+#[derive(Args, Debug, Clone)]
+pub struct ArchiveStorageArgs {
+    /// Archive commit backend.
+    #[arg(long, value_enum, default_value_t = ArchiveBackend::Local)]
+    pub archive_backend: ArchiveBackend,
+    /// Storage Box SSH destination, e.g. u123@u123.your-storagebox.de.
+    #[arg(long)]
+    pub storage_box_remote: Option<String>,
+    /// Rclone remote name for Storage Box, e.g. storagebox.
+    #[arg(long, default_value = "storagebox")]
+    pub storage_box_rclone_remote: String,
+    /// Rclone config path for Storage Box.
+    #[arg(long)]
+    pub storage_box_rclone_config: Option<PathBuf>,
+    /// Rclone program for Storage Box commands.
+    #[arg(long, default_value = "rclone")]
+    pub storage_box_rclone_program: PathBuf,
+    /// Absolute Storage Box archive root.
+    #[arg(long)]
+    pub storage_box_root: Option<String>,
+    /// SSH program for Storage Box commands.
+    #[arg(long, default_value = "ssh")]
+    pub storage_box_ssh_program: PathBuf,
+    /// Extra SSH args for Storage Box commands. Repeat for multiple args.
+    #[arg(long, allow_hyphen_values = true)]
+    pub storage_box_ssh_arg: Vec<String>,
+    /// Per-command Storage Box SSH timeout in seconds.
+    #[arg(long, default_value_t = 300, value_parser = parse_positive_u64)]
+    pub storage_box_command_timeout_secs: u64,
+}
+
 #[derive(Subcommand, Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "clap subcommands keep their parsed fields inline"
-)]
 pub enum Command {
     /// Fetch and process a single repo by DID (vertical-slice milestone).
     FetchOne {
@@ -90,33 +117,9 @@ pub enum Command {
         /// Directory for local archive artifacts.
         #[arg(long, default_value = "data/archive")]
         archive_dir: PathBuf,
-        /// Archive commit backend.
-        #[arg(long, value_enum, default_value_t = ArchiveBackend::Local)]
-        archive_backend: ArchiveBackend,
-        /// Storage Box SSH destination, e.g. u123@u123.your-storagebox.de.
-        #[arg(long)]
-        storage_box_remote: Option<String>,
-        /// Rclone remote name for Storage Box, e.g. storagebox.
-        #[arg(long, default_value = "storagebox")]
-        storage_box_rclone_remote: String,
-        /// Rclone config path for Storage Box.
-        #[arg(long)]
-        storage_box_rclone_config: Option<PathBuf>,
-        /// Rclone program for Storage Box commands.
-        #[arg(long, default_value = "rclone")]
-        storage_box_rclone_program: PathBuf,
-        /// Absolute Storage Box archive root.
-        #[arg(long)]
-        storage_box_root: Option<String>,
-        /// SSH program for Storage Box commands.
-        #[arg(long, default_value = "ssh")]
-        storage_box_ssh_program: PathBuf,
-        /// Extra SSH args for Storage Box commands. Repeat for multiple args.
-        #[arg(long, allow_hyphen_values = true)]
-        storage_box_ssh_arg: Vec<String>,
-        /// Per-command Storage Box SSH timeout in seconds.
-        #[arg(long, default_value_t = 300, value_parser = parse_positive_u64)]
-        storage_box_command_timeout_secs: u64,
+        /// Archive storage backend settings.
+        #[command(flatten)]
+        archive_storage: ArchiveStorageArgs,
         /// Worker threads used for CAR block CID verification.
         #[arg(long, default_value_t = default_cid_verification_threads(), value_parser = parse_positive_usize)]
         cid_verification_threads: usize,
@@ -174,33 +177,9 @@ pub enum Command {
         /// Directory for local archive artifacts.
         #[arg(long, default_value = "data/archive")]
         archive_dir: PathBuf,
-        /// Archive commit backend.
-        #[arg(long, value_enum, default_value_t = ArchiveBackend::Local)]
-        archive_backend: ArchiveBackend,
-        /// Storage Box SSH destination, e.g. u123@u123.your-storagebox.de.
-        #[arg(long)]
-        storage_box_remote: Option<String>,
-        /// Rclone remote name for Storage Box, e.g. storagebox.
-        #[arg(long, default_value = "storagebox")]
-        storage_box_rclone_remote: String,
-        /// Rclone config path for Storage Box.
-        #[arg(long)]
-        storage_box_rclone_config: Option<PathBuf>,
-        /// Rclone program for Storage Box commands.
-        #[arg(long, default_value = "rclone")]
-        storage_box_rclone_program: PathBuf,
-        /// Absolute Storage Box archive root.
-        #[arg(long)]
-        storage_box_root: Option<String>,
-        /// SSH program for Storage Box commands.
-        #[arg(long, default_value = "ssh")]
-        storage_box_ssh_program: PathBuf,
-        /// Extra SSH args for Storage Box commands. Repeat for multiple args.
-        #[arg(long, allow_hyphen_values = true)]
-        storage_box_ssh_arg: Vec<String>,
-        /// Per-command Storage Box SSH timeout in seconds.
-        #[arg(long, default_value_t = 300, value_parser = parse_positive_u64)]
-        storage_box_command_timeout_secs: u64,
+        /// Archive storage backend settings.
+        #[command(flatten)]
+        archive_storage: ArchiveStorageArgs,
         /// Worker threads used for CAR block CID verification.
         #[arg(long, default_value_t = default_cid_verification_threads(), value_parser = parse_positive_usize)]
         cid_verification_threads: usize,
@@ -235,7 +214,7 @@ pub enum Command {
         #[arg(long, default_value = "https://plc.directory")]
         plc_directory_url: String,
         /// Export page size.
-        #[arg(long, default_value_t = 1_000)]
+        #[arg(long, default_value_t = 1_000, value_parser = parse_positive_u16)]
         page_size: u16,
         /// Stop after this many PLC export pages.
         #[arg(long, value_parser = parse_positive_u64)]
@@ -246,33 +225,15 @@ pub enum Command {
         /// Per-page request timeout in seconds.
         #[arg(long, default_value_t = 60, value_parser = parse_positive_u64)]
         request_timeout_secs: u64,
-        /// Parallel sequence-range workers. Requires no page/op limit.
+        /// Parallel sequence-range workers. Disabled for plc.directory createdAt cursors.
         #[arg(long, default_value_t = 1, value_parser = parse_positive_usize)]
         workers: usize,
-        /// Start mirroring after this PLC seq instead of the stored cursor.
+        /// Start mirroring after this PLC createdAt unix-millisecond cursor instead of the stored cursor.
         #[arg(long)]
         start_after: Option<u64>,
-        /// Stop this mirror shard at this PLC seq.
+        /// Stop this mirror shard at this PLC createdAt unix-millisecond cursor.
         #[arg(long)]
         end_at: Option<u64>,
-    },
-    /// Discover the PLC export head and print disjoint seq ranges.
-    PlcPlan {
-        /// Number of ranges to print.
-        #[arg(long, default_value_t = 8, value_parser = parse_positive_usize)]
-        parts: usize,
-        /// PLC directory base URL.
-        #[arg(long, default_value = "https://plc.directory")]
-        plc_directory_url: String,
-        /// Export page size used for head probing.
-        #[arg(long, default_value_t = 1_000)]
-        page_size: u16,
-        /// Start splitting after this PLC seq.
-        #[arg(long, default_value_t = 0)]
-        start_after: u64,
-        /// Per-request timeout in seconds.
-        #[arg(long, default_value_t = 60, value_parser = parse_positive_u64)]
-        request_timeout_secs: u64,
     },
     /// Health-check PDS hosts and seed admitted DIDs into the fleet ledger.
     PdsCensus {
@@ -326,6 +287,30 @@ pub enum Command {
         /// Optional JSONL file for stable launch metrics.
         #[arg(long)]
         metrics_jsonl: Option<PathBuf>,
+        /// Optional shared JSONL claim ledger for one-chunk-at-a-time derive workers.
+        #[arg(long)]
+        claim_ledger_path: Option<PathBuf>,
+        /// Worker id written to the derive claim ledger.
+        #[arg(long)]
+        claim_worker_id: Option<String>,
+        /// Maximum committed manifest entries per claimed derive chunk.
+        #[arg(long, default_value_t = 64, value_parser = parse_positive_usize)]
+        claim_max_entries: usize,
+        /// Maximum manifest `row_count` sum per claimed derive chunk.
+        #[arg(long, default_value_t = 5_000_000, value_parser = parse_positive_u64)]
+        claim_max_rows: u64,
+        /// Seconds before an unfinished derive chunk claim can be reclaimed.
+        #[arg(long, default_value_t = 3600, value_parser = parse_positive_u64)]
+        claim_stale_seconds: u64,
+        /// Optional shared directory of locked slot files limiting concurrent `ClickHouse` inserts.
+        #[arg(long)]
+        clickhouse_insert_slots_dir: Option<PathBuf>,
+        /// Number of shared `ClickHouse` insert slot files in the slot directory.
+        #[arg(long, default_value_t = 4, value_parser = parse_positive_usize)]
+        clickhouse_insert_slots: usize,
+        /// Maximum seconds to wait for a `ClickHouse` insert slot.
+        #[arg(long, default_value_t = 300, value_parser = parse_positive_u64)]
+        clickhouse_insert_slot_timeout_secs: u64,
     },
     /// Print the v2 `ClickHouse` schema SQL.
     ClickhouseSchema {
@@ -381,6 +366,16 @@ pub enum Command {
 fn parse_positive_u32(value: &str) -> Result<u32, String> {
     let parsed = value
         .parse::<u32>()
+        .map_err(|err| format!("expected a positive integer: {err}"))?;
+    if parsed == 0 {
+        return Err("expected a positive integer".to_owned());
+    }
+    Ok(parsed)
+}
+
+fn parse_positive_u16(value: &str) -> Result<u16, String> {
+    let parsed = value
+        .parse::<u16>()
         .map_err(|err| format!("expected a positive integer: {err}"))?;
     if parsed == 0 {
         return Err("expected a positive integer".to_owned());

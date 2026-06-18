@@ -58,7 +58,7 @@ mod metrics;
 #[path = "app/storage.rs"]
 mod storage;
 
-use census_cmd::{run_pds_census_command, run_plc_mirror_command, run_plc_plan_command};
+use census_cmd::{run_pds_census_command, run_plc_mirror_command};
 use cli::{Cli, Command};
 use clickhouse_cmd::run_clickhouse_rebuild_aggregates_command;
 use counts::{add_count, count_len, increment, payload_row_count};
@@ -100,32 +100,8 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
         ),
         command @ Command::RunFleet { .. } => run_fleet_command(command).await,
         command @ Command::PlcMirror { .. } => run_plc_mirror_command(command).await,
-        command @ Command::PlcPlan { .. } => run_plc_plan_command(command).await,
         command @ Command::PdsCensus { .. } => run_pds_census_command(command).await,
-        Command::DeriveManifest {
-            manifest_path,
-            archive_root,
-            clickhouse_url,
-            clickhouse_database,
-            clickhouse_user,
-            clickhouse_password,
-            dry_run,
-            derive_ledger_path,
-            metrics_jsonl,
-        } => {
-            derive_manifest_cmd::run(DeriveManifestConfig {
-                manifest_path,
-                archive_root,
-                clickhouse_url,
-                clickhouse_database,
-                clickhouse_user,
-                clickhouse_password,
-                dry_run,
-                derive_ledger_path,
-                metrics: metrics_recorder(metrics_jsonl.as_deref())?,
-            })
-            .await
-        }
+        command @ Command::DeriveManifest { .. } => run_derive_manifest_command(command).await,
         Command::ClickhouseSchema {
             clickhouse_database,
         } => {
@@ -169,6 +145,70 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
             thresholds: thresholds.into_thresholds(),
         }),
     }
+}
+
+async fn run_derive_manifest_command(command: Command) -> anyhow::Result<()> {
+    let Command::DeriveManifest {
+        manifest_path,
+        archive_root,
+        clickhouse_url,
+        clickhouse_database,
+        clickhouse_user,
+        clickhouse_password,
+        dry_run,
+        derive_ledger_path,
+        metrics_jsonl,
+        claim_ledger_path,
+        claim_worker_id,
+        claim_max_entries,
+        claim_max_rows,
+        claim_stale_seconds,
+        clickhouse_insert_slots_dir,
+        clickhouse_insert_slots,
+        clickhouse_insert_slot_timeout_secs,
+    } = command
+    else {
+        anyhow::bail!("internal command dispatch mismatch for derive-manifest");
+    };
+
+    derive_manifest_cmd::run(DeriveManifestConfig {
+        manifest_path,
+        archive_root,
+        clickhouse_url,
+        clickhouse_database,
+        clickhouse_user,
+        clickhouse_password,
+        dry_run,
+        derive_ledger_path,
+        claim_config: claim_ledger_path.map(|ledger_path| {
+            derive_manifest_cmd::DeriveManifestClaimConfig {
+                ledger_path,
+                worker_id: claim_worker_id.unwrap_or_else(default_worker_id),
+                max_entries: claim_max_entries,
+                max_rows: claim_max_rows,
+                stale_seconds: claim_stale_seconds,
+            }
+        }),
+        throttle_config: clickhouse_insert_slots_dir.map(|slots_dir| {
+            derive_manifest_cmd::ClickHouseInsertThrottleConfig {
+                slots_dir,
+                slots: clickhouse_insert_slots,
+                max_wait_seconds: clickhouse_insert_slot_timeout_secs,
+            }
+        }),
+        metrics: metrics_recorder(metrics_jsonl.as_deref())?,
+    })
+    .await
+}
+
+fn default_worker_id() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|host| !host.trim().is_empty())
+        .map_or_else(
+            || format!("worker-{}", std::process::id()),
+            |host| format!("{host}-{}", std::process::id()),
+        )
 }
 
 #[cfg(test)]

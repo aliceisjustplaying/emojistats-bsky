@@ -45,37 +45,6 @@ impl PlcMirrorConfig {
     }
 }
 
-/// Configuration for printing split PLC seq ranges for multiple boxes.
-#[derive(Debug, Clone)]
-pub struct PlcPlanConfig {
-    pub plc_directory_url: String,
-    pub page_size: u16,
-    pub request_timeout: Duration,
-    pub parts: usize,
-    pub start_after: u64,
-}
-
-impl PlcPlanConfig {
-    #[must_use]
-    pub fn new(parts: usize) -> Self {
-        Self {
-            plc_directory_url: "https://plc.directory".to_owned(),
-            page_size: DEFAULT_EXPORT_PAGE_SIZE,
-            request_timeout: Duration::from_secs(60),
-            parts,
-            start_after: 0,
-        }
-    }
-}
-
-/// One disjoint PLC sequence range.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PlcSeqRange {
-    pub index: usize,
-    pub start_after: u64,
-    pub end_at: u64,
-}
-
 /// Summary emitted after a PLC mirror pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PlcMirrorSummary {
@@ -129,6 +98,8 @@ pub struct PdsCensusSummary {
 pub(super) struct PlcExportLine {
     pub(super) did: String,
     pub(super) seq: Option<u64>,
+    #[serde(rename = "createdAt")]
+    pub(super) created_at: Option<String>,
     pub(super) nullified: Option<bool>,
     pub(super) operation: PlcOperation,
 }
@@ -169,19 +140,6 @@ pub(super) struct HostCandidate {
     pub(super) endpoint: Option<String>,
 }
 
-pub(super) struct WorkerPage {
-    pub(super) first_seq: u64,
-    pub(super) cursor: u64,
-    pub(super) raw: String,
-    pub(super) lines: Vec<PlcExportLine>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct PlcRangeSummary {
-    pub(super) cursor: u64,
-    pub(super) complete: bool,
-}
-
 #[derive(Debug)]
 pub(super) struct PlcExportPacer {
     pub(super) next_request_at: Mutex<Instant>,
@@ -209,12 +167,6 @@ impl HostCensusStatus {
             Self::Quarantined => "quarantined",
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct SeqRange {
-    pub(super) start_after: u64,
-    pub(super) end_inclusive: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]

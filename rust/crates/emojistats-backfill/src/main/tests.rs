@@ -32,6 +32,13 @@ use super::{
     },
 };
 
+fn assert_float_eq(actual: f64, expected: f64) {
+    assert!(
+        (actual - expected).abs() <= f64::EPSILON,
+        "expected {expected}, got {actual}"
+    );
+}
+
 #[test]
 fn parses_fetch_one_did() {
     let cli = Cli::try_parse_from(["emojistats-backfill", "fetch-one", "did:plc:abc123"]).unwrap();
@@ -209,24 +216,30 @@ fn parses_storage_box_archive_backend_options() {
     ])
     .unwrap();
     let Command::RunFleet {
-        archive_backend,
-        storage_box_remote,
-        storage_box_root,
-        storage_box_ssh_program,
-        storage_box_ssh_arg,
-        storage_box_command_timeout_secs,
-        ..
+        archive_storage, ..
     } = cli.command
     else {
         unreachable!("expected run-fleet command");
     };
 
-    assert_eq!(archive_backend, ArchiveBackend::StorageBoxSsh);
-    assert_eq!(storage_box_remote.as_deref(), Some("u123@example.invalid"));
-    assert_eq!(storage_box_root.as_deref(), Some("/storage-box/emojistats"));
-    assert_eq!(storage_box_ssh_program, PathBuf::from("/usr/bin/ssh"));
-    assert_eq!(storage_box_ssh_arg, vec!["-p", "23"]);
-    assert_eq!(storage_box_command_timeout_secs, 42);
+    assert_eq!(
+        archive_storage.archive_backend,
+        ArchiveBackend::StorageBoxSsh
+    );
+    assert_eq!(
+        archive_storage.storage_box_remote.as_deref(),
+        Some("u123@example.invalid")
+    );
+    assert_eq!(
+        archive_storage.storage_box_root.as_deref(),
+        Some("/storage-box/emojistats")
+    );
+    assert_eq!(
+        archive_storage.storage_box_ssh_program,
+        PathBuf::from("/usr/bin/ssh")
+    );
+    assert_eq!(archive_storage.storage_box_ssh_arg, vec!["-p", "23"]);
+    assert_eq!(archive_storage.storage_box_command_timeout_secs, 42);
 }
 
 #[test]
@@ -250,30 +263,30 @@ fn parses_storage_box_rclone_archive_backend_options() {
     ])
     .unwrap();
     let Command::RunFleet {
-        archive_backend,
-        storage_box_root,
-        storage_box_rclone_remote,
-        storage_box_rclone_config,
-        storage_box_rclone_program,
-        storage_box_command_timeout_secs,
-        ..
+        archive_storage, ..
     } = cli.command
     else {
         unreachable!("expected run-fleet command");
     };
 
-    assert_eq!(archive_backend, ArchiveBackend::StorageBoxRclone);
     assert_eq!(
-        storage_box_root.as_deref(),
+        archive_storage.archive_backend,
+        ArchiveBackend::StorageBoxRclone
+    );
+    assert_eq!(
+        archive_storage.storage_box_root.as_deref(),
         Some("/emojistats-archive/canary")
     );
-    assert_eq!(storage_box_rclone_remote, "storagebox");
+    assert_eq!(archive_storage.storage_box_rclone_remote, "storagebox");
     assert_eq!(
-        storage_box_rclone_config.as_deref(),
+        archive_storage.storage_box_rclone_config.as_deref(),
         Some(Path::new("/run/secret/rclone.conf"))
     );
-    assert_eq!(storage_box_rclone_program, PathBuf::from("/usr/bin/rclone"));
-    assert_eq!(storage_box_command_timeout_secs, 42);
+    assert_eq!(
+        archive_storage.storage_box_rclone_program,
+        PathBuf::from("/usr/bin/rclone")
+    );
+    assert_eq!(archive_storage.storage_box_command_timeout_secs, 42);
 }
 
 #[test]
@@ -283,14 +296,57 @@ fn parses_run_fleet_shard_bucket() {
         "run-fleet",
         "dids.txt",
         "--shard-bucket",
-        "3",
+        "7",
     ])
     .unwrap();
     let Command::RunFleet { shard_bucket, .. } = cli.command else {
         unreachable!("expected run-fleet command");
     };
 
-    assert_eq!(shard_bucket, Some(ShardFilter::new(3).unwrap()));
+    assert_eq!(shard_bucket, Some(ShardFilter::new(7).unwrap()));
+}
+
+#[test]
+fn parses_canary_threshold_options() {
+    let cli = Cli::try_parse_from([
+        "emojistats-backfill",
+        "run-fleet",
+        "dids.txt",
+        "--canary-evidence",
+        "canary.jsonl",
+        "--min-storage-box-headroom-ratio",
+        "0.25",
+        "--max-clickhouse-serving-box-ratio",
+        "0.70",
+        "--min-derive-to-crawl-ratio",
+        "1.5",
+        "--min-sustained-repos-per-second",
+        "123.4",
+        "--min-mushroom-budget-utilization-ratio",
+        "0.80",
+        "--max-mushroom-429-ratio",
+        "0.02",
+        "--max-aggregate-rebuild-hours",
+        "1.25",
+    ])
+    .unwrap();
+    let Command::RunFleet {
+        canary_thresholds, ..
+    } = cli.command
+    else {
+        unreachable!("expected run-fleet command");
+    };
+
+    assert_float_eq(canary_thresholds.min_storage_box_headroom_ratio, 0.25);
+    assert_float_eq(canary_thresholds.max_clickhouse_serving_box_ratio, 0.70);
+    assert_float_eq(canary_thresholds.min_derive_to_crawl_ratio, 1.5);
+    assert_float_eq(canary_thresholds.min_sustained_repos_per_second, 123.4);
+    assert_float_eq(
+        canary_thresholds.min_mushroom_budget_utilization_ratio,
+        0.80,
+    );
+    assert_float_eq(canary_thresholds.max_mushroom_429_ratio, 0.02);
+    assert_float_eq(canary_thresholds.max_aggregate_rebuild_hours, 1.25);
 }
 
 #[test]
@@ -358,6 +414,63 @@ fn parses_derive_manifest_clickhouse_options() {
     assert_eq!(clickhouse_user, "writer");
     assert_eq!(clickhouse_password, "secret");
     assert!(dry_run);
+}
+
+#[test]
+fn parses_derive_manifest_claim_and_throttle_options() {
+    let cli = Cli::try_parse_from([
+        "emojistats-backfill",
+        "derive-manifest",
+        "manifest.jsonl",
+        "--claim-ledger-path",
+        "claims.jsonl",
+        "--claim-worker-id",
+        "worker-a",
+        "--claim-max-entries",
+        "7",
+        "--claim-max-rows",
+        "12345",
+        "--claim-stale-seconds",
+        "99",
+        "--clickhouse-insert-slots-dir",
+        "slots",
+        "--clickhouse-insert-slots",
+        "3",
+        "--clickhouse-insert-slot-timeout-secs",
+        "42",
+    ])
+    .unwrap();
+    let Command::DeriveManifest {
+        claim_ledger_path,
+        claim_worker_id,
+        claim_max_entries,
+        claim_max_rows,
+        claim_stale_seconds,
+        clickhouse_insert_slots_dir,
+        clickhouse_insert_slots,
+        clickhouse_insert_slot_timeout_secs,
+        ..
+    } = cli.command
+    else {
+        unreachable!("expected derive-manifest command");
+    };
+
+    assert_eq!(claim_ledger_path, Some(PathBuf::from("claims.jsonl")));
+    assert_eq!(claim_worker_id.as_deref(), Some("worker-a"));
+    assert_eq!(claim_max_entries, 7);
+    assert_eq!(claim_max_rows, 12_345);
+    assert_eq!(claim_stale_seconds, 99);
+    assert_eq!(clickhouse_insert_slots_dir, Some(PathBuf::from("slots")));
+    assert_eq!(clickhouse_insert_slots, 3);
+    assert_eq!(clickhouse_insert_slot_timeout_secs, 42);
+}
+
+#[test]
+fn rejects_zero_plc_page_size() {
+    let error = Cli::try_parse_from(["emojistats-backfill", "plc-mirror", "--page-size", "0"])
+        .expect_err("zero page size should be rejected");
+
+    assert!(error.to_string().contains("expected a positive integer"));
 }
 
 #[test]

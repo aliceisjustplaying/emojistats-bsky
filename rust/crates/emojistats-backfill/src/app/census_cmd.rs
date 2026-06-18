@@ -1,8 +1,7 @@
 use std::time::Duration;
 
 use emojistats_backfill::census::{
-    PdsCensusConfig, PlcMirrorConfig, PlcPlanConfig, mirror_plc_export, plan_plc_ranges,
-    run_pds_census,
+    PdsCensusConfig, PlcMirrorConfig, mirror_plc_export, run_pds_census,
 };
 
 use super::cli::Command;
@@ -43,32 +42,6 @@ pub(super) async fn run_plc_mirror_command(command: Command) -> anyhow::Result<(
         summary.cursor,
         summary.caught_up
     );
-    Ok(())
-}
-
-pub(super) async fn run_plc_plan_command(command: Command) -> anyhow::Result<()> {
-    let Command::PlcPlan {
-        parts,
-        plc_directory_url,
-        page_size,
-        start_after,
-        request_timeout_secs,
-    } = command
-    else {
-        anyhow::bail!("internal command dispatch mismatch for plc-plan");
-    };
-    let mut config = PlcPlanConfig::new(parts);
-    config.plc_directory_url = plc_directory_url;
-    config.page_size = page_size;
-    config.start_after = start_after;
-    config.request_timeout = Duration::from_secs(request_timeout_secs);
-    let ranges = plan_plc_ranges(config).await?;
-    for range in ranges {
-        println!(
-            "range={} start_after={} end_at={} args=\"--start-after {} --end-at {}\"",
-            range.index, range.start_after, range.end_at, range.start_after, range.end_at
-        );
-    }
     Ok(())
 }
 

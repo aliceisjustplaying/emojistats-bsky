@@ -1,28 +1,16 @@
-use std::{path::PathBuf, time::Duration};
+use std::time::Duration;
 
 use emojistats_backfill::archive::{
     ArchiveStorageConfig, StorageBoxArchiveConfig, StorageBoxRcloneArchiveConfig,
 };
 
-use super::cli::ArchiveBackend;
-
-pub(super) struct ArchiveStorageArgs {
-    pub(super) backend: ArchiveBackend,
-    pub(super) storage_box_remote: Option<String>,
-    pub(super) storage_box_rclone_remote: String,
-    pub(super) storage_box_rclone_config: Option<PathBuf>,
-    pub(super) storage_box_rclone_program: PathBuf,
-    pub(super) storage_box_root: Option<String>,
-    pub(super) storage_box_ssh_program: PathBuf,
-    pub(super) storage_box_ssh_arg: Vec<String>,
-    pub(super) storage_box_command_timeout_secs: u64,
-}
+use super::cli::{ArchiveBackend, ArchiveStorageArgs};
 
 pub(super) fn archive_storage_config(
     args: ArchiveStorageArgs,
 ) -> anyhow::Result<ArchiveStorageConfig> {
     let ArchiveStorageArgs {
-        backend,
+        archive_backend,
         storage_box_remote,
         storage_box_rclone_remote,
         storage_box_rclone_config,
@@ -32,7 +20,7 @@ pub(super) fn archive_storage_config(
         storage_box_ssh_arg,
         storage_box_command_timeout_secs,
     } = args;
-    match backend {
+    match archive_backend {
         ArchiveBackend::Local => Ok(ArchiveStorageConfig::Local),
         ArchiveBackend::StorageBoxSsh => {
             let remote = storage_box_remote

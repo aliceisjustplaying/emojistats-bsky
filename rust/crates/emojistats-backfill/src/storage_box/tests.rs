@@ -561,14 +561,12 @@ fn commits_in_verified_remote_order_before_manifest_append() {
             "upload",
             "stat",
             "sha256",
-            "read_prefix",
             "rename",
             "stat",
             "remove",
             "upload",
             "stat",
             "sha256",
-            "read_prefix",
             "rename",
             "stat",
             "remove",
@@ -579,7 +577,7 @@ fn commits_in_verified_remote_order_before_manifest_append() {
     assert_eq!(
         commands
             .operations
-            .get(4)
+            .get(3)
             .expect("object rename operation should exist")
             .target
             .as_deref(),
@@ -588,7 +586,7 @@ fn commits_in_verified_remote_order_before_manifest_append() {
     assert_eq!(
         commands
             .operations
-            .get(14)
+            .get(12)
             .expect("manifest append operation should exist")
             .path,
         "/storage-box/emojistats/manifests/raw.jsonl"
@@ -932,7 +930,7 @@ fn ssh_shell_quote_handles_shell_metacharacters() {
 
 #[test]
 fn ssh_run_command_times_out_and_kills_child() {
-    let spec = super::ssh::CommandSpec {
+    let spec = super::process::CommandSpec {
         operation: "timeout_test",
         program: PathBuf::from("/bin/sh"),
         args: vec!["-c".to_owned(), "sleep 5".to_owned()],
@@ -940,7 +938,7 @@ fn ssh_run_command_times_out_and_kills_child() {
         timeout: Duration::from_millis(50),
     };
 
-    let error = super::ssh::run_command(&spec, None)
+    let error = super::process::run_command(&spec, None)
         .expect_err("sleeping command should be killed after timeout");
 
     assert!(error.to_string().contains("timed out"));

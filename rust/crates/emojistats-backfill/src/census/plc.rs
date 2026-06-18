@@ -1,7 +1,7 @@
 use std::{
     fs,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    path::Path,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -9,11 +9,8 @@ use reqwest::{Client, StatusCode, Url};
 use tokio::time::{Instant, sleep};
 
 use crate::census::{
-    db::{create_census_schema, load_cursor, open_census_connection, persist_plc_page, set_cursor},
-    types::{
-        PagePersistSummary, PlcExportLine, PlcExportPacer, PlcMirrorConfig, PlcMirrorSummary,
-        PlcPlanConfig, PlcRangeSummary, PlcSeqRange, SeqRange, WorkerPage,
-    },
+    db::{create_census_schema, load_cursor, open_census_connection, persist_plc_page},
+    types::{PagePersistSummary, PlcExportLine, PlcExportPacer, PlcMirrorConfig, PlcMirrorSummary},
 };
 
 const PLC_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(300);
@@ -70,8 +67,10 @@ pub async fn mirror_plc_export(config: PlcMirrorConfig) -> anyhow::Result<PlcMir
     } else {
         load_cursor(&connection)?
     };
-    if config.workers > 1 && config.limit_pages.is_none() && config.limit_ops.is_none() {
-        return mirror_plc_export_parallel(config, client, Arc::clone(&pacer), cursor).await;
+    if config.workers > 1 {
+        anyhow::bail!(
+            "parallel PLC mirror is disabled for plc.directory because its export cursor is createdAt, not seq"
+        );
     }
     let mut summary = PlcMirrorSummary {
         cursor,
@@ -110,97 +109,10 @@ pub async fn mirror_plc_export(config: PlcMirrorConfig) -> anyhow::Result<PlcMir
             summary.caught_up = true;
             return Ok(summary);
         }
+        if config.end_at.is_some_and(|end_at| cursor >= end_at) {
+            return Ok(summary);
+        }
     }
-}
-
-/// Discover the current PLC export head and split it into disjoint seq ranges.
-///
-/// # Errors
-///
-/// Returns an error when the PLC export cannot be probed.
-pub async fn plan_plc_ranges(config: PlcPlanConfig) -> anyhow::Result<Vec<PlcSeqRange>> {
-    let client = Client::builder().timeout(config.request_timeout).build()?;
-    let pacer = Arc::new(PlcExportPacer::new());
-    let mirror_config = PlcMirrorConfig {
-        ledger_path: PathBuf::new(),
-        mirror_dir: PathBuf::new(),
-        plc_directory_url: config.plc_directory_url,
-        page_size: config.page_size,
-        limit_pages: None,
-        limit_ops: None,
-        request_timeout: config.request_timeout,
-        workers: 1,
-        start_after: None,
-        end_at: None,
-    };
-    let head_upper =
-        discover_plc_head_upper(&client, &mirror_config, &pacer, config.start_after).await?;
-    split_seq_ranges(config.start_after, head_upper, config.parts)?
-        .into_iter()
-        .enumerate()
-        .map(|(index, range)| {
-            Ok(PlcSeqRange {
-                index,
-                start_after: range.start_after,
-                end_at: range.end_inclusive,
-            })
-        })
-        .collect()
-}
-
-async fn mirror_plc_export_parallel(
-    config: PlcMirrorConfig,
-    client: Client,
-    pacer: Arc<PlcExportPacer>,
-    cursor: u64,
-) -> anyhow::Result<PlcMirrorSummary> {
-    let head_upper = match config.end_at {
-        Some(end_at) => end_at,
-        None => discover_plc_head_upper(&client, &config, &pacer, cursor).await?,
-    };
-    if cursor >= head_upper {
-        return Ok(PlcMirrorSummary {
-            cursor,
-            caught_up: true,
-            ..PlcMirrorSummary::default()
-        });
-    }
-    let ranges = split_seq_ranges(cursor, head_upper, config.workers)?;
-    let (sender, receiver) = mpsc::channel::<WorkerPage>();
-    let ledger_path = config.ledger_path.clone();
-    let mirror_dir = config.mirror_dir.clone();
-    let writer = tokio::task::spawn_blocking(move || {
-        write_worker_pages(&ledger_path, &mirror_dir, receiver)
-    });
-    let mut handles = Vec::with_capacity(ranges.len());
-    for range in ranges {
-        let worker_client = client.clone();
-        let worker_config = config.clone();
-        let worker_pacer = Arc::clone(&pacer);
-        let worker_sender = sender.clone();
-        handles.push(tokio::spawn(async move {
-            fetch_plc_range(
-                worker_client,
-                worker_config,
-                worker_pacer,
-                range,
-                worker_sender,
-            )
-            .await
-        }));
-    }
-    drop(sender);
-    let mut range_summaries = Vec::with_capacity(handles.len());
-    for handle in handles {
-        range_summaries.push(handle.await??);
-    }
-    let mut summary = writer.await??;
-    let resume = parallel_resume_cursor(cursor, head_upper, &range_summaries);
-    let connection = open_census_connection(&config.ledger_path)?;
-    set_cursor(&connection, resume.cursor)?;
-    summary.cursor = resume.cursor;
-    summary.caught_up = resume.caught_up;
-    Ok(summary)
 }
 
 async fn fetch_plc_page(
@@ -216,7 +128,7 @@ async fn fetch_plc_page(
         .push("export");
     url.query_pairs_mut()
         .append_pair("count", &config.page_size.to_string())
-        .append_pair("after", &cursor.to_string());
+        .append_pair("after", &plc_after_cursor(cursor)?);
     for attempt in 1_u32..=6 {
         pacer.wait_turn().await?;
         let response = client.get(url.clone()).send().await?;
@@ -256,182 +168,24 @@ fn parse_plc_page(raw: &str) -> anyhow::Result<Vec<PlcExportLine>> {
         .collect()
 }
 
-async fn discover_plc_head_upper(
-    client: &Client,
-    config: &PlcMirrorConfig,
-    pacer: &Arc<PlcExportPacer>,
-    cursor: u64,
-) -> anyhow::Result<u64> {
-    let mut lower = cursor;
-    let mut upper = cursor.checked_add(1_000_000).ok_or_else(|| {
-        anyhow::anyhow!("PLC head discovery overflow while building initial upper bound")
-    })?;
-    while plc_page_exists(client, config, pacer, upper).await? {
-        lower = upper;
-        upper = upper
-            .checked_mul(2)
-            .ok_or_else(|| anyhow::anyhow!("PLC head discovery upper bound overflow"))?;
+fn plc_after_cursor(cursor: u64) -> anyhow::Result<String> {
+    if cursor == 0 {
+        return Ok("1970-01-01T00:00:00.000Z".to_owned());
     }
-    while upper.saturating_sub(lower) > u64::from(config.page_size) {
-        let midpoint = lower
-            .checked_add(upper.saturating_sub(lower) / 2)
-            .ok_or_else(|| anyhow::anyhow!("PLC head discovery midpoint overflow"))?;
-        if plc_page_exists(client, config, pacer, midpoint).await? {
-            lower = midpoint;
-        } else {
-            upper = midpoint;
-        }
-    }
-    Ok(upper)
+    let millis = i64::try_from(cursor)?;
+    let timestamp = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis)
+        .ok_or_else(|| anyhow::anyhow!("PLC cursor millis out of timestamp range: {cursor}"))?;
+    Ok(timestamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
-async fn plc_page_exists(
-    client: &Client,
-    config: &PlcMirrorConfig,
-    pacer: &Arc<PlcExportPacer>,
-    cursor: u64,
-) -> anyhow::Result<bool> {
-    Ok(!fetch_plc_page(client, config, pacer, cursor)
-        .await?
-        .trim()
-        .is_empty())
-}
-
-fn split_seq_ranges(cursor: u64, head_upper: u64, workers: usize) -> anyhow::Result<Vec<SeqRange>> {
-    let worker_count = u64::try_from(workers)?;
-    let span = head_upper.saturating_sub(cursor);
-    let chunk = span
-        .checked_add(worker_count.saturating_sub(1))
-        .ok_or_else(|| anyhow::anyhow!("PLC range chunk overflow"))?
-        .checked_div(worker_count)
-        .ok_or_else(|| anyhow::anyhow!("PLC range worker count cannot be zero"))?;
-    let mut ranges = Vec::new();
-    for index in 0..worker_count {
-        let offset = index
-            .checked_mul(chunk)
-            .ok_or_else(|| anyhow::anyhow!("PLC range offset overflow"))?;
-        let start_after = cursor
-            .checked_add(offset)
-            .ok_or_else(|| anyhow::anyhow!("PLC range start overflow"))?;
-        if start_after >= head_upper {
-            break;
-        }
-        let end_inclusive = start_after.saturating_add(chunk).min(head_upper);
-        ranges.push(SeqRange {
-            start_after,
-            end_inclusive,
-        });
+#[cfg(test)]
+fn plc_line_cursor(line: &PlcExportLine) -> anyhow::Result<u64> {
+    if let Some(created_at) = line.created_at.as_deref() {
+        let timestamp = chrono::DateTime::parse_from_rfc3339(created_at)?;
+        return u64::try_from(timestamp.timestamp_millis()).map_err(Into::into);
     }
-    Ok(ranges)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ParallelResume {
-    cursor: u64,
-    caught_up: bool,
-}
-
-fn parallel_resume_cursor(
-    start_cursor: u64,
-    head_upper: u64,
-    range_summaries: &[PlcRangeSummary],
-) -> ParallelResume {
-    let completed_all_ranges = range_summaries
-        .iter()
-        .all(|range_summary| range_summary.complete);
-    if completed_all_ranges {
-        return ParallelResume {
-            cursor: head_upper,
-            caught_up: true,
-        };
-    }
-    ParallelResume {
-        cursor: range_summaries
-            .iter()
-            .map(|range_summary| range_summary.cursor)
-            .min()
-            .unwrap_or(start_cursor),
-        caught_up: false,
-    }
-}
-
-async fn fetch_plc_range(
-    client: Client,
-    config: PlcMirrorConfig,
-    pacer: Arc<PlcExportPacer>,
-    range: SeqRange,
-    sender: mpsc::Sender<WorkerPage>,
-) -> anyhow::Result<PlcRangeSummary> {
-    let mut cursor = range.start_after;
-    loop {
-        let raw = fetch_plc_page(&client, &config, &pacer, cursor).await?;
-        if raw.trim().is_empty() {
-            return Ok(PlcRangeSummary {
-                cursor,
-                complete: true,
-            });
-        }
-        let raw_lines: Vec<&str> = raw.lines().filter(|line| !line.trim().is_empty()).collect();
-        let raw_line_count = raw_lines.len();
-        let page = parse_plc_page(&raw)?;
-        let mut lines = Vec::new();
-        let mut page_raw = String::new();
-        let mut hit_range_end = false;
-        for (raw_line, line) in raw_lines.into_iter().zip(page) {
-            let seq = line
-                .seq
-                .ok_or_else(|| anyhow::anyhow!("PLC export line missing seq for {}", line.did))?;
-            if seq > range.end_inclusive {
-                hit_range_end = true;
-                break;
-            }
-            cursor = seq;
-            page_raw.push_str(raw_line);
-            page_raw.push('\n');
-            lines.push(line);
-        }
-        if lines.is_empty() {
-            return Ok(PlcRangeSummary {
-                cursor,
-                complete: false,
-            });
-        }
-        let first_seq = lines
-            .first()
-            .and_then(|line| line.seq)
-            .ok_or_else(|| anyhow::anyhow!("PLC worker page missing first seq"))?;
-        sender.send(WorkerPage {
-            first_seq,
-            cursor,
-            raw: page_raw,
-            lines,
-        })?;
-        if hit_range_end
-            || raw_line_count < usize::from(config.page_size)
-            || cursor >= range.end_inclusive
-        {
-            return Ok(PlcRangeSummary {
-                cursor,
-                complete: true,
-            });
-        }
-    }
-}
-
-fn write_worker_pages(
-    ledger_path: &Path,
-    mirror_dir: &Path,
-    receiver: mpsc::Receiver<WorkerPage>,
-) -> anyhow::Result<PlcMirrorSummary> {
-    let mut connection = open_census_connection(ledger_path)?;
-    create_census_schema(&connection)?;
-    let mut summary = PlcMirrorSummary::default();
-    for page in receiver {
-        let page_summary = persist_plc_page(&mut connection, summary.cursor, &page.lines, false)?;
-        write_plc_page(mirror_dir, page.first_seq, page.cursor, &page.raw)?;
-        add_page_summary(&mut summary, page_summary)?;
-    }
-    Ok(summary)
+    line.seq
+        .ok_or_else(|| anyhow::anyhow!("PLC export line missing createdAt/seq for {}", line.did))
 }
 
 fn add_page_summary(
@@ -497,8 +251,7 @@ fn write_plc_page(
 
 #[cfg(test)]
 mod tests {
-    use super::{parallel_resume_cursor, pds_host_from_endpoint, split_seq_ranges};
-    use crate::census::types::PlcRangeSummary;
+    use super::{parse_plc_page, pds_host_from_endpoint, plc_after_cursor, plc_line_cursor};
 
     #[test]
     fn endpoint_host_normalization_preserves_http_scheme() {
@@ -513,59 +266,17 @@ mod tests {
     }
 
     #[test]
-    fn parallel_plc_ranges_are_disjoint_and_cover_head() {
-        let ranges = split_seq_ranges(10, 23, 4).expect("ranges should split");
+    fn plc_directory_export_lines_use_created_at_cursor() {
+        let page = parse_plc_page(
+            r#"{"did":"did:plc:abc","createdAt":"2022-11-17T00:35:16.391Z","operation":{"type":"create","service":"https://bsky.social"},"nullified":false}"#,
+        )
+        .expect("parse plc page");
+        let cursor = plc_line_cursor(page.first().expect("line")).expect("cursor");
 
-        let actual = ranges
-            .iter()
-            .map(|range| (range.start_after, range.end_inclusive))
-            .collect::<Vec<_>>();
-        assert_eq!(actual, vec![(10, 14), (14, 18), (18, 22), (22, 23)]);
-    }
-
-    #[test]
-    fn parallel_plc_resume_cursor_reaches_head_only_after_all_ranges_complete() {
-        let summaries = [
-            PlcRangeSummary {
-                cursor: 14,
-                complete: true,
-            },
-            PlcRangeSummary {
-                cursor: 18,
-                complete: true,
-            },
-            PlcRangeSummary {
-                cursor: 23,
-                complete: true,
-            },
-        ];
-
-        let resume = parallel_resume_cursor(10, 23, &summaries);
-
-        assert_eq!(resume.cursor, 23);
-        assert!(resume.caught_up);
-    }
-
-    #[test]
-    fn parallel_plc_resume_cursor_rewinds_to_lowest_incomplete_progress() {
-        let summaries = [
-            PlcRangeSummary {
-                cursor: 14,
-                complete: true,
-            },
-            PlcRangeSummary {
-                cursor: 16,
-                complete: false,
-            },
-            PlcRangeSummary {
-                cursor: 23,
-                complete: true,
-            },
-        ];
-
-        let resume = parallel_resume_cursor(10, 23, &summaries);
-
-        assert_eq!(resume.cursor, 14);
-        assert!(!resume.caught_up);
+        assert_eq!(cursor, 1_668_645_316_391);
+        assert_eq!(
+            plc_after_cursor(cursor).expect("format cursor"),
+            "2022-11-17T00:35:16.391Z"
+        );
     }
 }

@@ -12,7 +12,7 @@ use super::{
     cli::{self, Command},
     failure::outcome_name,
     main::fetch_attempt::{LocalFetchOneAttemptConfig, fetch_one_attempt},
-    storage::{ArchiveStorageArgs, archive_storage_config},
+    storage::archive_storage_config,
 };
 
 pub(super) async fn run_fetch_one_command(command: Command) -> anyhow::Result<()> {
@@ -21,32 +21,14 @@ pub(super) async fn run_fetch_one_command(command: Command) -> anyhow::Result<()
         spool_dir,
         max_bytes,
         archive_dir,
-        archive_backend,
-        storage_box_remote,
-        storage_box_rclone_remote,
-        storage_box_rclone_config,
-        storage_box_rclone_program,
-        storage_box_root,
-        storage_box_ssh_program,
-        storage_box_ssh_arg,
-        storage_box_command_timeout_secs,
+        archive_storage,
         cid_verification_threads,
         http_protocol,
     } = command
     else {
         anyhow::bail!("internal command dispatch mismatch for fetch-one");
     };
-    let archive_storage = archive_storage_config(ArchiveStorageArgs {
-        backend: archive_backend,
-        storage_box_remote,
-        storage_box_rclone_remote,
-        storage_box_rclone_config,
-        storage_box_rclone_program,
-        storage_box_root,
-        storage_box_ssh_program,
-        storage_box_ssh_arg,
-        storage_box_command_timeout_secs,
-    })?;
+    let archive_storage = archive_storage_config(archive_storage)?;
     fetch_one(
         &did,
         spool_dir,
