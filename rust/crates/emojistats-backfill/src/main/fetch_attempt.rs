@@ -26,7 +26,8 @@ use super::{
     repo_fetch::{FetchStep, fetch_spooled_repo, repo_fetch_client},
 };
 
-const METHOD_WALL_FORCE_MODE_TTL: Duration = Duration::from_hours(24);
+#[allow(clippy::duration_suboptimal_units)]
+const METHOD_WALL_FORCE_MODE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub(crate) async fn fetch_one_attempt(
     config: LocalFetchOneAttemptConfig<'_>,

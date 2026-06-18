@@ -12,7 +12,8 @@ mod execute;
 mod schema;
 
 #[cfg(test)]
-use execute::{classify_insert_status, classify_sql_status};
+use execute::classify_insert_status;
+use execute::{classify_sql_status, response_snippet};
 pub use execute::{execute_insert_payloads, execute_sql_statements};
 use schema::ClickHouseIdentifier;
 pub use schema::{
@@ -212,6 +213,15 @@ impl ClickHouseClientConfig {
         client: &Client,
         query: &str,
     ) -> Result<Request, ClickHouseSchemaError> {
+        self.sql_request_with_client_and_params(client, query, &[])
+    }
+
+    fn sql_request_with_client_and_params(
+        &self,
+        client: &Client,
+        query: &str,
+        params: &[(&str, &str)],
+    ) -> Result<Request, ClickHouseSchemaError> {
         let mut request = client
             .request(Method::POST, self.url.clone())
             .headers(self.headers()?)
@@ -220,6 +230,7 @@ impl ClickHouseClientConfig {
                 ("query", query),
                 (DATE_TIME_INPUT_FORMAT_SETTING, "best_effort"),
             ])
+            .query(params)
             .timeout(self.request_timeout)
             .body(String::new())
             .build()
@@ -601,37 +612,53 @@ pub async fn derive_payload_exists(
     payload: &ClickHouseInsertPayload,
 ) -> Result<bool, ClickHouseSqlError> {
     let statement = format!(
-        "SELECT count() FROM {} FINAL WHERE derive_dedupe_token = '{}' FORMAT TabSeparated",
-        payload.table.name(),
-        clickhouse_string_literal(payload.dedupe_token.as_str())
+        "SELECT count() FROM {} FINAL WHERE derive_dedupe_token = {{token:String}} FORMAT TabSeparated",
+        payload.table.name()
     );
-    let mut receipts = execute_sql_statements(client, config, &[statement]).await?;
-    let receipt = receipts
-        .pop()
-        .ok_or_else(|| ClickHouseSqlError::PermanentStatus {
-            context: ClickHouseSqlContext {
-                statement_index: 0,
-                statement: "derive payload existence probe".to_owned(),
-            },
-            status: 200,
-            response_snippet: Some("ClickHouse returned no receipt".to_owned()),
+    let context = ClickHouseSqlContext {
+        statement_index: 0,
+        statement,
+    };
+    let request = config
+        .sql_request_with_client_and_params(
+            client,
+            context.statement.as_str(),
+            &[("param_token", payload.dedupe_token.as_str())],
+        )
+        .map_err(|source| ClickHouseSqlError::RequestBuild {
+            statement_index: context.statement_index,
+            source,
         })?;
-    let count = receipt
-        .response_snippet
+    let response =
+        client
+            .execute(request)
+            .await
+            .map_err(|source| ClickHouseSqlError::Transport {
+                context: context.clone(),
+                source,
+            })?;
+    let status = response.status();
+    let response_snippet =
+        response_snippet(response)
+            .await
+            .map_err(|source| ClickHouseSqlError::Transport {
+                context: context.clone(),
+                source,
+            })?;
+    if !status.is_success() {
+        return Err(classify_sql_status(context, status, response_snippet));
+    }
+    let count = response_snippet
         .as_deref()
         .unwrap_or_default()
         .trim()
         .parse::<usize>()
         .map_err(|error| ClickHouseSqlError::PermanentStatus {
-            context: receipt.context.clone(),
-            status: receipt.status,
+            context: context.clone(),
+            status: status.as_u16(),
             response_snippet: Some(format!("invalid derive payload count: {error}")),
         })?;
-    Ok(count >= payload.row_count)
-}
-
-fn clickhouse_string_literal(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('\'', "\\'")
+    Ok(count == payload.row_count)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

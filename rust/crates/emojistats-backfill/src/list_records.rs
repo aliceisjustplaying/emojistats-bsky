@@ -35,6 +35,7 @@ const DEFAULT_MAX_PAGES: u64 = 100_000;
 const DEFAULT_MAX_RECORDS: u64 = 10_000_000;
 const DEFAULT_MAX_DECODE_ERRORS: u64 = 100_000;
 const DEFAULT_MAX_PAGE_BYTES: u64 = 8_388_608;
+const ERROR_BODY_MAX_BYTES: u64 = 65_536;
 const DEFAULT_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 #[allow(clippy::duration_suboptimal_units)]
@@ -575,14 +576,26 @@ async fn fetch_list_records_page(
     })??;
     let status = response.status();
     let rate_limit = RateLimitSnapshot::from_headers(response.headers());
+    if !status.is_success() {
+        if let Some(content_length) = response.content_length() {
+            enforce_cap("max_error_body_bytes", content_length, ERROR_BODY_MAX_BYTES)?;
+        }
+        let body = read_response_body_with_cap(
+            response,
+            &config,
+            ERROR_BODY_MAX_BYTES,
+            "max_error_body_bytes",
+        )
+        .await?;
+        return Err(classify_error_status(status, &rate_limit, &body));
+    }
+
     if let Some(content_length) = response.content_length() {
         enforce_cap("max_page_bytes", content_length, config.max_page_bytes)?;
     }
-    let body = read_response_body_with_cap(response, &config).await?;
-
-    if !status.is_success() {
-        return Err(classify_error_status(status, &rate_limit, &body));
-    }
+    let body =
+        read_response_body_with_cap(response, &config, config.max_page_bytes, "max_page_bytes")
+            .await?;
 
     serde_json::from_slice::<ListRecordsPage>(&body)
         .map(|page| FetchedListRecordsPage { page, rate_limit })
@@ -592,6 +605,8 @@ async fn fetch_list_records_page(
 async fn read_response_body_with_cap(
     response: reqwest::Response,
     config: &ListRecordsConfig,
+    max_bytes: u64,
+    cap_name: &'static str,
 ) -> Result<Vec<u8>, ListRecordsError> {
     let mut body = Vec::new();
     let mut observed = 0_u64;
@@ -613,11 +628,11 @@ async fn read_response_body_with_cap(
             observed
                 .checked_add(chunk_len)
                 .ok_or(ListRecordsError::ResourceLimitExceeded {
-                    limit: "max_page_bytes",
+                    limit: cap_name,
                     observed: u64::MAX,
-                    max: config.max_page_bytes,
+                    max: max_bytes,
                 })?;
-        enforce_cap("max_page_bytes", observed, config.max_page_bytes)?;
+        enforce_cap(cap_name, observed, max_bytes)?;
         body.extend_from_slice(&chunk);
         progress_window_bytes = progress_window_bytes.checked_add(chunk_len).ok_or(
             ListRecordsError::ResourceLimitExceeded {

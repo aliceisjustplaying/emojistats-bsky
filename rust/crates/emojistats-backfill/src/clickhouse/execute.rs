@@ -220,7 +220,7 @@ fn sql_statement_is_retry_safe(error: &ClickHouseSqlError) -> bool {
         | ClickHouseSqlError::PermanentStatus { context, .. } => context.statement.as_str(),
         ClickHouseSqlError::RequestBuild { .. } => return false,
     };
-    !is_aggregate_rebuild_insert(statement)
+    !is_aggregate_rebuild_insert(statement) && !is_aggregate_rebuild_exchange(statement)
 }
 
 fn is_aggregate_rebuild_insert(statement: &str) -> bool {
@@ -228,7 +228,14 @@ fn is_aggregate_rebuild_insert(statement: &str) -> bool {
     trimmed.starts_with("INSERT INTO") && trimmed.contains(AGGREGATE_REBUILD_SHADOW_SUFFIX)
 }
 
-async fn response_snippet(mut response: Response) -> Result<Option<String>, reqwest::Error> {
+fn is_aggregate_rebuild_exchange(statement: &str) -> bool {
+    let trimmed = statement.trim_start();
+    trimmed.starts_with("EXCHANGE TABLES") && trimmed.contains(AGGREGATE_REBUILD_SHADOW_SUFFIX)
+}
+
+pub(super) async fn response_snippet(
+    mut response: Response,
+) -> Result<Option<String>, reqwest::Error> {
     let mut bytes = Vec::with_capacity(CLICKHOUSE_RESPONSE_SNIPPET_MAX_BYTES);
     while bytes.len() < CLICKHOUSE_RESPONSE_SNIPPET_MAX_BYTES {
         let Some(chunk) = response.chunk().await? else {

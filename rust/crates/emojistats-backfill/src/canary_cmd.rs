@@ -617,7 +617,8 @@ fn validate_metadata<'a>(
     expected_run_id: &str,
     now: DateTime<Utc>,
 ) -> anyhow::Result<&'a CanaryEvidenceMetadata> {
-    const DEFAULT_MAX_AGE: Duration = Duration::from_hours(24);
+    #[allow(clippy::duration_suboptimal_units)]
+    const DEFAULT_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
     const ALLOWED_CLOCK_SKEW: Duration = Duration::from_secs(300);
     let metadata = metadata.ok_or_else(|| {
         anyhow::anyhow!(

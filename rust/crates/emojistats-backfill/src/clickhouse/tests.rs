@@ -171,7 +171,7 @@ fn schema_sql_contains_typed_table_names_and_engines() {
     assert!(sql.contains("CREATE TABLE IF NOT EXISTS emojistats.v2_total_post_counters_r3"));
     assert!(sql.contains("CREATE TABLE IF NOT EXISTS emojistats.v2_emoji_total_r3"));
     assert!(sql.contains("CREATE TABLE IF NOT EXISTS emojistats.v2_posts_hourly_r3"));
-    assert!(sql.contains("ENGINE = ReplacingMergeTree(observed_at)"));
+    assert!(sql.contains("ENGINE = ReplacingMergeTree(inserted_at)"));
     assert!(sql.contains("non_replicated_deduplication_window = 10000"));
     assert!(sql.contains("LowCardinality(String)"));
     assert!(sql.contains("normalizer_git_rev LowCardinality(String)"));
@@ -186,10 +186,10 @@ fn schema_sql_contains_typed_table_names_and_engines() {
     ));
     assert!(sql.contains("emojis Array(LowCardinality(String))"));
     assert!(sql.contains(
-        "ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, derive_dedupe_token, did, rkey)"
+        "ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, did, rkey)"
     ));
     assert!(sql.contains(
-        "ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, derive_dedupe_token, run_id, shard, file_sequence, receipt_hash, did)"
+        "ORDER BY (src, normalizer_git_rev, dataset, fetch_method, completeness_class, run_id, shard, file_sequence, receipt_hash, did)"
     ));
 }
 
@@ -465,6 +465,32 @@ async fn execute_insert_payloads_sends_payloads_in_order() {
 }
 
 #[tokio::test]
+async fn derive_payload_probe_requires_exact_row_count() {
+    let payload = derive_insert_payloads(&batch())
+        .expect("payloads")
+        .remove(0);
+    let (url, handle) = spawn_http_server(vec![(200, "3\n".to_owned())]);
+    let config = ClickHouseClientConfig::new(
+        &url,
+        "emojistats",
+        "alice",
+        "secret",
+        "emojistats-backfill-test",
+    )
+    .expect("client config");
+    let client = Client::new();
+
+    let exists = super::derive_payload_exists(&client, &config, &payload)
+        .await
+        .expect("probe should run");
+    let requests = handle.join().expect("server thread");
+
+    assert!(!exists);
+    assert_eq!(requests.len(), 1);
+    assert!(requests.first().expect("request").target.contains("count"));
+}
+
+#[tokio::test]
 async fn execute_insert_payloads_classifies_retryable_status_with_snippet() {
     let payload = derive_insert_payloads(&batch())
         .expect("payloads")
@@ -616,6 +642,46 @@ async fn aggregate_rebuild_insert_is_not_retried() {
     let error = execute_sql_statements(&client, &config, &statements)
         .await
         .expect_err("ambiguous shadow insert failure should not retry");
+    let requests = handle.join().expect("server thread");
+
+    assert_eq!(requests.len(), 1);
+    match error {
+        ClickHouseSqlError::RetryableStatus {
+            context, status, ..
+        } => {
+            assert_eq!(context.statement_index, 0);
+            assert_eq!(status, 503);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn aggregate_rebuild_exchange_is_not_retried() {
+    let statements = vec![
+        "EXCHANGE TABLES emojistats.v2_emoji_total_r3 AND emojistats.v2_emoji_total_r3__rebuild_shadow;".to_owned(),
+    ];
+    let (url, handle) = spawn_http_server(vec![(503, "busy".to_owned())]);
+    let config = ClickHouseClientConfig::new(
+        &url,
+        "emojistats",
+        "alice",
+        "secret",
+        "emojistats-backfill-test",
+    )
+    .expect("client config")
+    .with_timeout_and_retry_policy(
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+        Duration::ZERO,
+        Duration::ZERO,
+        2,
+    );
+    let client = Client::new();
+
+    let error = execute_sql_statements(&client, &config, &statements)
+        .await
+        .expect_err("ambiguous shadow exchange failure should not retry");
     let requests = handle.join().expect("server thread");
 
     assert_eq!(requests.len(), 1);

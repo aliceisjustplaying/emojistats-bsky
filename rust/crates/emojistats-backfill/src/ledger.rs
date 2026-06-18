@@ -317,6 +317,10 @@ pub fn complete_attempt(
         }
         AttemptOutcome::RateLimited { retry_after } => {
             next.status = RepoLedgerStatus::Throttled;
+            next.attempts = next
+                .attempts
+                .checked_sub(1)
+                .ok_or(LedgerError::AttemptOverflow)?;
             next.next_attempt_after = Some(add_duration(now, retry_after)?);
             next.last_error = Some("rate_limited".to_owned());
         }

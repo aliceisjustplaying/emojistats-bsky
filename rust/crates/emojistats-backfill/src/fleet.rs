@@ -1,6 +1,5 @@
 use std::{
     any::Any,
-    collections::BTreeMap,
     fs,
     panic::AssertUnwindSafe,
     path::PathBuf,
@@ -39,7 +38,8 @@ use super::{
 #[allow(clippy::duration_suboptimal_units)]
 const CLAIM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const STALE_RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
-const DRAIN_DEADLINE: Duration = Duration::from_mins(30);
+#[allow(clippy::duration_suboptimal_units)]
+const DRAIN_DEADLINE: Duration = Duration::from_secs(30 * 60);
 pub const DEFAULT_HOST_CONCURRENCY_CAP: u32 = 2;
 
 #[path = "fleet/host_limiter.rs"]
@@ -115,7 +115,6 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
     let parse_permits = Arc::new(Semaphore::new(config.parse_concurrency));
     let byte_budget = FetchByteBudget::new(config.max_inflight_spool_bytes);
     let mut active = JoinSet::new();
-    let mut active_claims = BTreeMap::new();
     let active_attempt_limit = active_attempt_limit(
         config.concurrency,
         config.parse_concurrency,
@@ -195,7 +194,6 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
                 ),
                 1,
             );
-            active_claims.insert(did.clone(), claimed.clone());
             active.spawn(run_fleet_attempt_isolated(FleetAttemptConfig {
                 did,
                 claimed,
@@ -249,7 +247,6 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
                 };
                 let attempt_result = joined
                     .map_err(|err| anyhow::anyhow!("fleet attempt task failed outside panic guard: {err}"))?;
-                active_claims.remove(&attempt_result.did);
                 complete_fleet_attempt(&mut summary, &config, &ledger, attempt_result).await?;
                 record_active_attempts(&config, active.len());
             }
@@ -273,12 +270,10 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
             }
             () = sleep_until_instant(drain_deadline), if draining && !active.is_empty() && drain_deadline.is_some() => {
                 eprintln!(
-                    "fleet drain deadline elapsed; aborting {} active attempt(s)",
+                    "fleet drain deadline elapsed; aborting {} active attempt(s); claims remain leased until expiry",
                     active.len()
                 );
                 active.abort_all();
-                complete_aborted_active_attempts(&mut summary, &config, &ledger, &active_claims).await?;
-                active_claims.clear();
                 break;
             }
             () = tokio::time::sleep_until(tokio::time::Instant::from_std(next_stale_recovery)), if !draining => {}
@@ -296,41 +291,6 @@ pub async fn run(config: FleetConfig) -> anyhow::Result<()> {
         summary.succeeded,
         summary.failed,
         summary.deferred_claims.count
-    );
-    Ok(())
-}
-
-async fn complete_aborted_active_attempts(
-    summary: &mut FleetSummary,
-    config: &FleetConfig,
-    ledger: &ledger_async::SharedBlockingLedger,
-    active_claims: &BTreeMap<String, RepoLedgerEntry>,
-) -> anyhow::Result<()> {
-    for claimed in active_claims.values() {
-        let completed = ledger
-            .complete_owned_claim(
-                claimed.clone(),
-                AttemptOutcome::RetryableFailure {
-                    message: "aborted after fleet drain deadline".to_owned(),
-                },
-                SystemTime::now(),
-                RetryPolicy::default(),
-            )
-            .await?;
-        if completed.is_some() {
-            increment(&mut summary.failed, "failed repo count")?;
-        }
-    }
-    config.metrics.increment_counter(
-        MetricName::FleetAttemptsTotal,
-        fleet_metric_labels(
-            config,
-            None,
-            Some(MetricStage::Complete.as_str()),
-            Some("drain_aborted"),
-            None,
-        ),
-        u64::try_from(active_claims.len())?,
     );
     Ok(())
 }
@@ -797,7 +757,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_deadline_completion_releases_active_claims() {
+    async fn drain_deadline_keeps_active_claim_leased_for_fail_closed_abort() {
         let temp = tempfile::tempdir().expect("tempdir should be created");
         let ledger_path = temp.path().join("ledger.sqlite");
         let store = SqliteLedger::open(&ledger_path).expect("ledger should open");
@@ -816,44 +776,18 @@ mod tests {
             .await
             .expect("claim should succeed")
             .expect("row should be claimable");
-        let mut active_claims = BTreeMap::new();
-        active_claims.insert(claimed.did.clone(), claimed);
-        let mut summary = FleetSummary::default();
-        let config = FleetConfig {
-            dids_file: temp.path().join("dids.txt"),
-            ledger_path: ledger_path.clone(),
-            run_id: "test-run".to_owned(),
-            worker_id: "test-worker".to_owned(),
-            claim_limit: 1,
-            concurrency: 1,
-            parse_concurrency: 1,
-            max_inflight_spool_bytes: 1,
-            spool_dir: temp.path().join("spool"),
-            max_bytes: 1,
-            archive_dir: temp.path().join("archive"),
-            archive_storage: ArchiveStorageConfig::Local,
-            cid_verification_threads: 1,
-            http_protocol: HttpProtocol::Http1,
-            claim_scope: ClaimScope::default(),
-            shard_label: "all".to_owned(),
-            metrics: emojistats_backfill::metrics::noop_metrics_recorder(),
-        };
-
-        complete_aborted_active_attempts(&mut summary, &config, &ledger, &active_claims)
-            .await
-            .expect("aborted claim should complete");
 
         let reopened = SqliteLedger::open(&ledger_path).expect("ledger should reopen");
         let entry = reopened
             .load_entry("did:plc:active")
             .expect("entry should load")
             .expect("entry should exist");
-        assert_eq!(summary.failed, 1);
         assert_eq!(
             entry.status,
-            emojistats_backfill::ledger::RepoLedgerStatus::RetryableFailure
+            emojistats_backfill::ledger::RepoLedgerStatus::Claimed
         );
-        assert!(entry.worker_id.is_none());
-        assert!(entry.lease_until.is_none());
+        assert_eq!(entry.worker_id.as_deref(), Some("test-worker"));
+        assert_eq!(entry.last_attempt, claimed.last_attempt);
+        assert!(entry.lease_until.is_some());
     }
 }

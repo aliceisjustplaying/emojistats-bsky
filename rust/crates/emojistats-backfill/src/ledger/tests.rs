@@ -131,6 +131,7 @@ fn unready_throttled_repo_is_not_claimable() {
     )
     .unwrap();
 
+    assert_eq!(throttled.attempts, 0);
     let error = claim_repo(
         &throttled,
         AttemptId::new("run-1", "did:plc:abc", 2),

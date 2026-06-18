@@ -146,6 +146,11 @@ pub fn classify_list_records_error(did: &str, error: &ListRecordsError) -> Fetch
                 message: message.clone(),
             }
         }
+        ListRecordsError::Transport(source) if is_permanent_reqwest_error(source) => {
+            AttemptOutcome::PermanentFailure {
+                message: message.clone(),
+            }
+        }
         ListRecordsError::Transport(_)
         | ListRecordsError::ResponseHeaderTimeout { .. }
         | ListRecordsError::InactivityTimeout { .. }
@@ -173,6 +178,19 @@ pub fn classify_list_records_error(did: &str, error: &ListRecordsError) -> Fetch
         outcome,
         error: anyhow::anyhow!(message),
     }
+}
+
+fn is_permanent_reqwest_error(error: &reqwest::Error) -> bool {
+    if error.is_builder() {
+        return true;
+    }
+    let text = error.to_string().to_ascii_lowercase();
+    text.contains("dns error")
+        || text.contains("failed to lookup address information")
+        || text.contains("invalid peer certificate")
+        || text.contains("certificate verify failed")
+        || text.contains("self signed certificate")
+        || text.contains("unknown issuer")
 }
 
 pub fn classify_parse_error(did: &str, error: &ParseError) -> FetchOneFailure {
