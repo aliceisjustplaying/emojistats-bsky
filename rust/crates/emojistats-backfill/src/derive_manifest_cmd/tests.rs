@@ -13,7 +13,10 @@ use emojistats_backfill::{
         LocalManifestEntry, NormalizerVersion, RepoReceipt, RepoReceiptInput, build_repo_receipt,
         current_normalizer, write_local_archive_artifacts,
     },
-    clickhouse::{ClickHouseInsertPayload, ClickHouseTable, JSON_EACH_ROW_FORMAT},
+    clickhouse::{
+        ClickHouseInsertContext, ClickHouseInsertPayload, ClickHouseInsertReceipt, ClickHouseTable,
+        JSON_EACH_ROW_FORMAT,
+    },
     commit::ManifestEntry,
     derive::{BACKFILL_DERIVE_SOURCE, DeriveCheckpointKey},
     manifest_derive::debug_read_committed_jsonl,
@@ -585,6 +588,52 @@ async fn insert_payloads_records_partial_success_and_resumes_from_ledger() {
     assert_eq!(summary.inserted_payloads, 1);
     let ledger_lines = fs::read_to_string(&ledger_path).expect("ledger should exist");
     assert_eq!(ledger_lines.lines().count(), 2);
+}
+
+#[test]
+fn derive_ledger_serializes_concurrent_appends() {
+    let temp = TempDir::new("concurrent-derive-ledger");
+    let ledger_path = temp.path.join("derive-ledger.jsonl");
+    let workers = 8;
+    let records_per_worker = 32;
+    let mut handles = Vec::new();
+
+    for worker in 0..workers {
+        let ledger_path = ledger_path.clone();
+        handles.push(thread::spawn(move || {
+            let verified = verified_input();
+            let mut ledger = DeriveLedger::new(Some(&ledger_path)).expect("derive ledger");
+            for record in 0..records_per_worker {
+                let token = format!("derive:counter:{worker}:{record}");
+                let payload = payload(
+                    ClickHouseTable::TotalPostCounter,
+                    &token,
+                    &format!("{{\"worker\":{worker},\"record\":{record}}}\n"),
+                );
+                let receipt = ClickHouseInsertReceipt {
+                    context: ClickHouseInsertContext {
+                        table: payload.table,
+                        row_count: payload.row_count,
+                        dedupe_token: payload.dedupe_token.clone(),
+                        insert_deduplicate: true,
+                    },
+                    status: 200,
+                    response_snippet: None,
+                };
+                ledger
+                    .append_success(&verified, &payload, &receipt)
+                    .expect("append should be serialized");
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().expect("worker should not panic");
+    }
+
+    let ledger_lines = fs::read_to_string(&ledger_path).expect("ledger should exist");
+    assert_eq!(ledger_lines.lines().count(), workers * records_per_worker);
+    DeriveLedger::new(Some(&ledger_path)).expect("concurrent ledger should parse");
 }
 
 #[tokio::test]

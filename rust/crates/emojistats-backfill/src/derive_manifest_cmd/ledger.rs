@@ -3,6 +3,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use emojistats_backfill::{
@@ -10,6 +11,7 @@ use emojistats_backfill::{
     derive::DeriveCheckpointRecord,
     manifest_derive::VerifiedLoaderInput,
 };
+use fs4::{FileExt, TryLockError};
 use serde::Serialize;
 
 #[derive(Debug)]
@@ -38,7 +40,10 @@ impl DeriveLedger {
             fs::create_dir_all(parent)?;
         }
         let completed = match path {
-            Some(path) if path.try_exists()? => Self::read_completed(path)?,
+            Some(path) if path.try_exists()? => {
+                let _lock = DeriveLedgerFileLock::acquire(path)?;
+                Self::read_completed(path)?
+            }
             Some(_) | None => HashSet::new(),
         };
         Ok(Self {
@@ -70,6 +75,7 @@ impl DeriveLedger {
             self.completed.insert(checkpoint);
             return Ok(());
         };
+        let _lock = DeriveLedgerFileLock::acquire(path)?;
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         let record = DeriveLedgerRecord {
             checkpoint: checkpoint.clone(),
@@ -118,5 +124,45 @@ impl DeriveLedger {
             payload.row_count,
             &payload.body,
         )?)
+    }
+}
+
+struct DeriveLedgerFileLock {
+    file: File,
+}
+
+impl DeriveLedgerFileLock {
+    fn acquire(path: &Path) -> anyhow::Result<Self> {
+        let lock_path = path.with_extension("lock");
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)?;
+        let started = Instant::now();
+        loop {
+            match FileExt::try_lock(&file) {
+                Ok(()) => return Ok(Self { file }),
+                Err(TryLockError::WouldBlock) => {
+                    if started.elapsed() >= Duration::from_secs(60) {
+                        anyhow::bail!(
+                            "timed out waiting for derive ledger lock at {}",
+                            lock_path.display()
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(TryLockError::Error(source)) => return Err(source.into()),
+            }
+        }
+    }
+}
+
+impl Drop for DeriveLedgerFileLock {
+    fn drop(&mut self) {
+        let _ignored = FileExt::unlock(&self.file);
     }
 }
