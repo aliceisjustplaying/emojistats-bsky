@@ -29,35 +29,6 @@ pub(super) struct CanonicalStreamingPayloadState<'a> {
     post_chunk_index: u64,
 }
 
-pub(super) struct CanonicalStreamingValidationState<'a> {
-    verified: &'a VerifiedLoaderInput,
-    row_hasher: ArchivePostRowsHasher,
-    rows: u64,
-}
-
-impl<'a> CanonicalStreamingValidationState<'a> {
-    pub(super) fn new(verified: &'a VerifiedLoaderInput) -> Self {
-        Self {
-            verified,
-            row_hasher: ArchivePostRowsHasher::new(),
-            rows: 0,
-        }
-    }
-
-    pub(super) fn consume_rows(&mut self, rows: &[ArchivePostRow]) -> anyhow::Result<()> {
-        for row in rows {
-            self.row_hasher.push_row(row)?;
-            increment(&mut self.rows, "streaming derive validation row count")?;
-        }
-        Ok(())
-    }
-
-    pub(super) fn finish(mut self) -> anyhow::Result<()> {
-        let row_hash = std::mem::take(&mut self.row_hasher).finish();
-        validate_streamed_receipt(self.verified, self.rows, &row_hash)
-    }
-}
-
 impl<'a> CanonicalStreamingPayloadState<'a> {
     pub(super) fn new(verified: &'a VerifiedLoaderInput) -> Self {
         Self {

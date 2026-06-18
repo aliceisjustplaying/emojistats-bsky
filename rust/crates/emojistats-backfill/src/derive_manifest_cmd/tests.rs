@@ -14,6 +14,7 @@ use emojistats_backfill::{
         current_normalizer, write_local_archive_artifacts,
     },
     clickhouse::{ClickHouseInsertPayload, ClickHouseTable, JSON_EACH_ROW_FORMAT},
+    commit::ManifestEntry,
     derive::{BACKFILL_DERIVE_SOURCE, DeriveCheckpointKey},
     manifest_derive::debug_read_committed_jsonl,
     metrics::noop_metrics_recorder,
@@ -154,6 +155,7 @@ fn derive_run_context<'a>(
         derive_ledger,
         summary,
         metrics,
+        throttle: None,
     }
 }
 
@@ -244,6 +246,35 @@ fn payload(table: ClickHouseTable, token: &str, body: &str) -> ClickHouseInsertP
         row_count: body.lines().count(),
         dedupe_token: token.to_owned(),
         checkpoint_key: DeriveCheckpointKey::total_post_counter(&identity()),
+    }
+}
+
+fn manifest_entry(sequence: u64, dataset: &str, row_count: u64) -> ManifestEntry {
+    ManifestEntry {
+        manifest_format_version: 1,
+        run_id: "run-1".to_owned(),
+        shard: "all".to_owned(),
+        file_sequence: sequence,
+        did: format!("did:plc:test{sequence}"),
+        dataset: dataset.to_owned(),
+        object_path: format!("object-{sequence}.posts.parquet"),
+        row_count,
+        bytes: 100,
+        content_hash: format!("content-hash-{sequence}"),
+        min_created_at_normalized: None,
+        max_created_at_normalized: None,
+        receipt_hash: format!("receipt-hash-{sequence}"),
+        repo_receipt_path: None,
+        normalizer: current_normalizer(),
+        schema_version: 3,
+    }
+}
+
+fn write_manifest(path: &Path, entries: &[ManifestEntry]) {
+    let mut file = fs::File::create(path).expect("manifest should be created");
+    for entry in entries {
+        serde_json::to_writer(&mut file, entry).expect("manifest entry should serialize");
+        writeln!(file).expect("manifest line should write");
     }
 }
 
@@ -606,6 +637,174 @@ async fn clickhouse_present_payload_repairs_missing_derive_ledger() {
     assert_eq!(summary.inserted_payloads, 0);
     let ledger_lines = fs::read_to_string(&ledger_path).expect("ledger should exist");
     assert_eq!(ledger_lines.lines().count(), 1);
+}
+
+#[test]
+fn manifest_chunks_respect_entry_and_row_caps() {
+    let temp = TempDir::new("manifest-chunks");
+    let manifest_path = temp.path.join("manifest.jsonl");
+    write_manifest(
+        &manifest_path,
+        &[
+            manifest_entry(1, "raw_archive_posts", 10),
+            manifest_entry(2, "raw_profile_sidecar", 0),
+            manifest_entry(3, "raw_archive_posts", 11),
+            manifest_entry(4, "raw_archive_posts", 50),
+        ],
+    );
+
+    let chunks = build_manifest_chunks(&manifest_path, 3, 20).expect("chunks should build");
+
+    assert_eq!(
+        chunks,
+        vec![
+            ManifestChunk {
+                chunk_id: "lines-1-2".to_owned(),
+                start_line: 1,
+                end_line: 2,
+                row_count: 10,
+                entries: 2,
+            },
+            ManifestChunk {
+                chunk_id: "lines-3-3".to_owned(),
+                start_line: 3,
+                end_line: 3,
+                row_count: 11,
+                entries: 1,
+            },
+            ManifestChunk {
+                chunk_id: "lines-4-4".to_owned(),
+                start_line: 4,
+                end_line: 4,
+                row_count: 50,
+                entries: 1,
+            },
+        ]
+    );
+}
+
+#[test]
+fn claim_ledger_claims_completes_and_reclaims_expired_chunks() {
+    let temp = TempDir::new("claim-ledger");
+    let manifest_path = temp.path.join("manifest.jsonl");
+    let ledger_path = temp.path.join("claims.jsonl");
+    write_manifest(
+        &manifest_path,
+        &[
+            manifest_entry(1, "raw_archive_posts", 10),
+            manifest_entry(2, "raw_archive_posts", 10),
+            manifest_entry(3, "raw_archive_posts", 10),
+        ],
+    );
+    let config = DeriveManifestClaimConfig {
+        ledger_path: ledger_path.clone(),
+        worker_id: "worker-a".to_owned(),
+        max_entries: 1,
+        max_rows: 100,
+        stale_seconds: 3600,
+    };
+    let ledger = ManifestClaimLedger::new(&ledger_path, &manifest_path, &config).expect("ledger");
+
+    let first = ledger.claim_next().expect("claim").expect("first chunk");
+    let second = ledger.claim_next().expect("claim").expect("second chunk");
+    ledger.complete(&first).expect("complete first");
+
+    assert_eq!(first.chunk_id, "lines-1-1");
+    assert_eq!(second.chunk_id, "lines-2-2");
+    let third = ledger.claim_next().expect("claim").expect("third chunk");
+    assert_eq!(third.chunk_id, "lines-3-3");
+
+    let expired = ClaimLedgerRecord::Claim(ClaimedManifestChunk {
+        manifest_path: manifest_path.to_string_lossy().into_owned(),
+        chunk_id: "lines-2-2".to_owned(),
+        start_line: 2,
+        end_line: 2,
+        row_count: 10,
+        entries: 1,
+        worker_id: "stale-worker".to_owned(),
+        claimed_at_unix_ms: 1,
+        expires_at_unix_ms: 1,
+    });
+    append_claim_record(&ledger_path, &expired).expect("expired claim should append");
+    let reclaimed = ledger
+        .claim_next()
+        .expect("claim")
+        .expect("reclaimed chunk");
+
+    assert_eq!(reclaimed.chunk_id, "lines-2-2");
+}
+
+#[tokio::test]
+async fn claim_ledger_requires_durable_derive_ledger_for_real_run() {
+    let temp = TempDir::new("claim-requires-ledger");
+    let error = run(DeriveManifestConfig {
+        manifest_path: temp.path.join("manifest.jsonl"),
+        archive_root: temp.path.join("archive"),
+        clickhouse_url: "http://127.0.0.1:8123".to_owned(),
+        clickhouse_database: "emojistats".to_owned(),
+        clickhouse_user: "default".to_owned(),
+        clickhouse_password: String::new(),
+        dry_run: false,
+        derive_ledger_path: None,
+        claim_config: Some(DeriveManifestClaimConfig {
+            ledger_path: temp.path.join("claims.jsonl"),
+            worker_id: "worker-a".to_owned(),
+            max_entries: 1,
+            max_rows: 1,
+            stale_seconds: 60,
+        }),
+        throttle_config: None,
+        metrics: noop_metrics_recorder(),
+    })
+    .await
+    .expect_err("claim ledger should require durable derive ledger");
+
+    assert!(
+        error
+            .to_string()
+            .contains("--claim-ledger-path requires --derive-ledger-path")
+    );
+}
+
+#[test]
+fn claimed_manifest_reader_returns_only_claimed_lines() {
+    let temp = TempDir::new("claimed-reader");
+    let manifest_path = temp.path.join("manifest.jsonl");
+    write_manifest(
+        &manifest_path,
+        &[
+            manifest_entry(1, "raw_archive_posts", 10),
+            manifest_entry(2, "raw_archive_posts", 11),
+            manifest_entry(3, "raw_archive_posts", 12),
+        ],
+    );
+
+    let bytes = read_claimed_manifest_lines(&manifest_path, 2, 3).expect("claimed lines");
+    let items = stream_committed_jsonl(BufReader::new(Cursor::new(bytes)))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("claimed manifest should parse");
+
+    assert_eq!(items.len(), 2);
+}
+
+#[tokio::test]
+async fn clickhouse_insert_throttle_serializes_single_slot() {
+    let temp = TempDir::new("insert-throttle");
+    let throttle = ClickHouseInsertThrottle::new(ClickHouseInsertThrottleConfig {
+        slots_dir: temp.path.join("slots"),
+        slots: 1,
+        max_wait_seconds: 1,
+    })
+    .expect("throttle should build");
+
+    let first = throttle.acquire().await.expect("first slot");
+    let blocked =
+        tokio::time::timeout(std::time::Duration::from_millis(50), throttle.acquire()).await;
+    drop(first);
+    let second = throttle.acquire().await.expect("second slot");
+
+    assert!(blocked.is_err());
+    drop(second);
 }
 
 struct TempDir {
